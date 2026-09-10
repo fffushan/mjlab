@@ -18,6 +18,9 @@ Fixed
   ``params/env.yaml``, so watching or evaluating a checkpoint trained with
   lookahead works without manually repeating the flag. The saved YAML uses
   Python-specific tags (``!!python/tuple``), which are now parsed safely.
+- The deployment ONNX exporter now reconstructs the saved lookahead setting and
+  can convert a state-estimation tracking checkpoint to the no-state-estimation
+  observation layout required by the G1 deployment controller.
 
 Changed
 ^^^^^^^

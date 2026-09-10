@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import onnx
 import yaml
@@ -32,6 +33,12 @@ def main() -> None:
   parser.add_argument(
     "--out", required=True, type=Path, help="Output deploy.yaml path."
   )
+  parser.add_argument(
+    "--lookahead-s",
+    type=float,
+    default=0.5,
+    help="Lookahead duration used by the trained policy (default: 0.5).",
+  )
   args = parser.parse_args()
 
   model = onnx.load(str(args.onnx))
@@ -40,7 +47,7 @@ def main() -> None:
   n_joints = 29
   assert len(meta["joint_names"].split(",")) == n_joints
 
-  deploy_yaml = {
+  deploy_yaml: dict[str, Any] = {
     "joint_ids_map": list(range(n_joints)),
     "step_dt": 0.02,  # 50 Hz control (0.005 s physics x decimation 4)
     "stiffness": _csv_to_list(meta["joint_stiffness"]),
@@ -60,6 +67,12 @@ def main() -> None:
     "observations": {
       "motion_command": {
         "params": {"command_name": "motion"},
+        "clip": None,
+        "scale": [1.0] * 58,
+        "history_length": 1,
+      },
+      "motion_lookahead": {
+        "params": {"command_name": "motion", "lookahead_s": args.lookahead_s},
         "clip": None,
         "scale": [1.0] * 58,
         "history_length": 1,
@@ -104,8 +117,8 @@ def main() -> None:
 
   # Sanity: obs dims sum
   total = sum(len(v["scale"]) for v in deploy_yaml["observations"].values())
-  print(f"  obs dims total: {total} (expect 154)")
-  assert total == 154, f"Expected 154-dim NSE obs, got {total}"
+  print(f"  obs dims total: {total} (expect 212)")
+  assert total == 212, f"Expected 212-dim lookahead NSE obs, got {total}"
 
 
 if __name__ == "__main__":
