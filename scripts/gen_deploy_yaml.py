@@ -23,8 +23,15 @@ def _csv_to_list(s: str) -> list[float]:
 
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--onnx", required=True, type=Path, help="Auto-exported tracking ONNX (has metadata).")
-  parser.add_argument("--out", required=True, type=Path, help="Output deploy.yaml path.")
+  parser.add_argument(
+    "--onnx",
+    required=True,
+    type=Path,
+    help="Auto-exported tracking ONNX (has metadata).",
+  )
+  parser.add_argument(
+    "--out", required=True, type=Path, help="Output deploy.yaml path."
+  )
   args = parser.parse_args()
 
   model = onnx.load(str(args.onnx))

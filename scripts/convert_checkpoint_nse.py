@@ -23,10 +23,8 @@ Then resume training:
 from __future__ import annotations
 
 import argparse
-import math
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import torch
@@ -79,9 +77,7 @@ def compute_keep_columns(
 
   old_dim = sum(d for _, d in old_layout)
   new_dim = sum(d for _, d in new_layout)
-  dropped_dim = sum(
-    d for n, d in old_layout if n not in new_names
-  )
+  dropped_dim = sum(d for n, d in old_layout if n not in new_names)
   if old_dim - dropped_dim != new_dim:
     raise ValueError(
       f"Layout mismatch: old_dim={old_dim}, dropped={dropped_dim}, new_dim={new_dim}"
@@ -102,7 +98,9 @@ def compute_keep_columns(
 
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--source", type=Path, required=True, help="Source model_*.pt checkpoint.")
+  parser.add_argument(
+    "--source", type=Path, required=True, help="Source model_*.pt checkpoint."
+  )
   parser.add_argument("--motion-file", type=Path, default=Path("./qianghuo.npz"))
   parser.add_argument(
     "--output-dir",
@@ -110,7 +108,12 @@ def main() -> None:
     default=Path("logs/rsl_rl/g1_tracking/nse_from_29999"),
     help="Run directory for the converted checkpoint (must live under the log root).",
   )
-  parser.add_argument("--output-name", type=str, default=None, help="Checkpoint file name (default: source stem).")
+  parser.add_argument(
+    "--output-name",
+    type=str,
+    default=None,
+    help="Checkpoint file name (default: source stem).",
+  )
   args = parser.parse_args()
 
   configure_torch_backends()
@@ -152,7 +155,9 @@ def main() -> None:
   args.output_dir.mkdir(parents=True, exist_ok=True)
   new_env = RslRlVecEnvWrapper(new_env, clip_actions=None)
   agent_cfg = asdict(load_rl_cfg(NSE_TASK))
-  runner = MotionTrackingOnPolicyRunner(new_env, agent_cfg, str(args.output_dir), device)
+  runner = MotionTrackingOnPolicyRunner(
+    new_env, agent_cfg, str(args.output_dir), device
+  )
 
   actor = runner.alg.get_policy()
   actor.load_state_dict(new_actor_sd, strict=True)
@@ -164,7 +169,7 @@ def main() -> None:
   assert actor.mlp[0].weight.shape == (512, new_dim), actor.mlp[0].weight.shape
   critic = runner.alg._raw_critic  # type: ignore[attr-defined]
   critic.load_state_dict(ckpt["critic_state_dict"], strict=True)
-  print(f"[INFO] Critic transferred 1:1 (obs unchanged).")
+  print("[INFO] Critic transferred 1:1 (obs unchanged).")
 
   # 4. Save through the real runner: fresh optimizer + converted weights,
   #    plus a fresh NSE ONNX export as a sanity artifact.
@@ -183,7 +188,9 @@ def main() -> None:
   new_critic_dim = reloaded["critic_state_dict"]["mlp.0.weight"].shape[1]
   assert old_critic_dim == new_critic_dim, (old_critic_dim, new_critic_dim)
   print(f"[VERIFY] mlp.0.weight {reloaded['actor_state_dict']['mlp.0.weight'].shape}")
-  print(f"[VERIFY] critic mlp.0.weight {reloaded['critic_state_dict']['mlp.0.weight'].shape}")
+  print(
+    f"[VERIFY] critic mlp.0.weight {reloaded['critic_state_dict']['mlp.0.weight'].shape}"
+  )
   print(f"[VERIFY] iter={reloaded['iter']} (fresh run)")
 
   old_env.close()

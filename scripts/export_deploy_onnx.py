@@ -49,7 +49,9 @@ def main() -> None:
     type=Path,
     help="Output path for policy.onnx (deploy expects 'exported/policy.onnx').",
   )
-  parser.add_argument("--task", default="Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation")
+  parser.add_argument(
+    "--task", default="Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation"
+  )
   parser.add_argument("--num-envs", type=int, default=1)
   args = parser.parse_args()
 
