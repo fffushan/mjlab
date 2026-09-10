@@ -16,6 +16,7 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.scripts._cli import maybe_print_top_level_help
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.tasks.tracking.mdp.commands import load_saved_lookahead_s
 from mjlab.utils.os import get_wandb_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
@@ -154,6 +155,24 @@ def run_play(task_id: str, cfg: PlayConfig):
         f"[INFO]: Loading checkpoint: {checkpoint_name} (run: {run_id}, {cached_str})"
       )
     log_dir = resume_path.parent
+
+    # Restore the lookahead setting used during training so the actor
+    # observation dimension matches the checkpoint. The play CLI does not
+    # accept --env.* overrides, so this reconstruction is required whenever
+    # the policy was trained with lookahead enabled.
+    if is_tracking_task:
+      motion_cmd = env_cfg.commands["motion"]
+      assert isinstance(motion_cmd, MotionCommandCfg)
+      saved_lookahead_s = load_saved_lookahead_s(resume_path, cfg.wandb_run_path)
+      if saved_lookahead_s is None:
+        print(
+          "[WARN] No saved params/env.yaml found; motion lookahead_s left at "
+          f"default ({motion_cmd.lookahead_s:g}). Loading may fail if the "
+          "checkpoint was trained with lookahead."
+        )
+      else:
+        motion_cmd.lookahead_s = saved_lookahead_s
+        print(f"[INFO] Restored lookahead_s={saved_lookahead_s:g} from params/env.yaml")
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs

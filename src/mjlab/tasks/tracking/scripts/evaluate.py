@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
-from mjlab.tasks.tracking.mdp.commands import MotionCommand
+from mjlab.tasks.tracking.mdp.commands import MotionCommand, load_saved_lookahead_s
 from mjlab.tasks.tracking.mdp.metrics import (
   compute_ee_orientation_error,
   compute_ee_position_error,
@@ -68,6 +69,21 @@ def run_evaluate(task_id: str, cfg: EvaluateConfig) -> dict[str, float]:
     raise RuntimeError("No motion artifact found in the run.")
   motion_cmd.motion_file = str(Path(art.download()) / "motion.npz")
 
+  resume_path, _ = get_wandb_checkpoint_path(
+    (Path(cfg.log_root) / agent_cfg.experiment_name).resolve(),
+    Path(cfg.wandb_run_path),
+    cfg.wandb_checkpoint_name,
+  )
+  saved_lookahead_s = load_saved_lookahead_s(resume_path, cfg.wandb_run_path)
+  if saved_lookahead_s is None:
+    raise RuntimeError(
+      "Could not load params/env.yaml needed to reconstruct the training "
+      "observation configuration."
+    )
+  if not math.isclose(motion_cmd.lookahead_s, saved_lookahead_s):
+    print(f"[INFO] Using saved lookahead_s={saved_lookahead_s:g} from params/env.yaml")
+  motion_cmd.lookahead_s = saved_lookahead_s
+
   # Evaluation config.
   motion_cmd.sampling_mode = "start"
   env_cfg.observations["actor"].enable_corruption = True
@@ -77,10 +93,6 @@ def run_evaluate(task_id: str, cfg: EvaluateConfig) -> dict[str, float]:
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-  log_root_path = (Path(cfg.log_root) / agent_cfg.experiment_name).resolve()
-  resume_path, _ = get_wandb_checkpoint_path(
-    log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
-  )
   print(f"[INFO] Loading checkpoint: {resume_path}")
 
   runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner

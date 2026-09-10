@@ -5,6 +5,20 @@ Changelog
 Upcoming version (not yet released)
 -----------------------------------
 
+Added
+^^^^^
+
+- Motion-tracking policies can optionally receive a single future reference frame
+  through ``MotionCommandCfg.lookahead_s``.
+
+Fixed
+^^^^^
+
+- ``play.py`` and ``evaluate.py`` now restore ``lookahead_s`` from the saved
+  ``params/env.yaml``, so watching or evaluating a checkpoint trained with
+  lookahead works without manually repeating the flag. The saved YAML uses
+  Python-specific tags (``!!python/tuple``), which are now parsed safely.
+
 Changed
 ^^^^^^^
 

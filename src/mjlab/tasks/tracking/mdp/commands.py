@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import math
+import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -38,6 +40,20 @@ class MotionLoader:
     self, motion_file: str, body_indexes: torch.Tensor, device: str = "cpu"
   ) -> None:
     data = np.load(motion_file)
+    if "fps" in data:
+      fps_array = np.asarray(data["fps"])
+      if fps_array.size != 1 or not np.isfinite(fps_array.item()):
+        raise ValueError(f"Motion file {motion_file!r} contains an invalid fps")
+      self.fps = float(fps_array.item())
+      if self.fps <= 0.0:
+        raise ValueError(f"Motion file {motion_file!r} contains a non-positive fps")
+    else:
+      self.fps = 50.0
+      warnings.warn(
+        f"Motion file {motion_file!r} has no fps field; assuming 50 Hz.",
+        UserWarning,
+        stacklevel=2,
+      )
     self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
     self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
     self._body_pos_w = torch.tensor(
@@ -81,6 +97,20 @@ class MotionCommand(CommandTerm):
     self.motion = MotionLoader(
       self.cfg.motion_file, self.body_indexes, device=self.device
     )
+    if not math.isfinite(self.cfg.lookahead_s):
+      raise ValueError("MotionCommandCfg.lookahead_s must be finite")
+    self.lookahead_steps = 0
+    if self.cfg.lookahead_s > 0.0:
+      self.lookahead_steps = max(1, math.ceil(self.cfg.lookahead_s * self.motion.fps))
+    motion_fps = self.motion.fps
+    env_fps = 1.0 / env.step_dt
+    if not math.isclose(motion_fps, env_fps):
+      warnings.warn(
+        f"Motion trajectory FPS ({motion_fps:g}) differs from environment rate "
+        f"({env_fps:g} Hz); the trajectory still advances one frame per env step.",
+        UserWarning,
+        stacklevel=2,
+      )
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self.body_pos_relative_w = torch.zeros(
       self.num_envs, len(cfg.body_names), 3, device=self.device
@@ -126,6 +156,22 @@ class MotionCommand(CommandTerm):
   @property
   def command(self) -> torch.Tensor:
     return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+
+  @property
+  def lookahead_command(self) -> torch.Tensor:
+    """Return the future joint target, or an empty tensor when disabled."""
+    if self.lookahead_steps == 0:
+      return torch.empty(
+        self.num_envs, 0, dtype=self.motion.joint_pos.dtype, device=self.device
+      )
+    lookahead_steps = torch.clamp(
+      self.time_steps + self.lookahead_steps,
+      max=self.motion.time_step_total - 1,
+    )
+    return torch.cat(
+      [self.motion.joint_pos[lookahead_steps], self.motion.joint_vel[lookahead_steps]],
+      dim=1,
+    )
 
   @property
   def joint_pos(self) -> torch.Tensor:
@@ -613,6 +659,8 @@ class MotionCommandCfg(CommandTermCfg):
   pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   joint_position_range: tuple[float, float] = (-0.52, 0.52)
+  lookahead_s: float = 0.0
+  """Preview duration in seconds; non-positive values disable preview."""
   adaptive_kernel_size: int = 1
   adaptive_lambda: float = 0.8
   adaptive_uniform_ratio: float = 0.1
@@ -628,3 +676,78 @@ class MotionCommandCfg(CommandTermCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> MotionCommand:
     return MotionCommand(self, env)
+
+
+def load_saved_lookahead_s(
+  checkpoint_path: Path, wandb_run_path: str | None = None
+) -> float | None:
+  """Load the ``lookahead_s`` value saved alongside a training checkpoint.
+
+  The setting is read from ``params/env.yaml`` in the checkpoint's parent
+  directory; when the file is absent and ``wandb_run_path`` is provided, it is
+  downloaded from the W&B run. Returns ``None`` when no saved configuration is
+  available, and raises when the saved value is invalid.
+  """
+  env_yaml = checkpoint_path.parent / "params" / "env.yaml"
+  if not env_yaml.exists() and wandb_run_path is not None:
+    try:
+      import wandb
+
+      api = wandb.Api()
+      wandb_run = api.run(str(wandb_run_path))
+      wandb_file = wandb_run.file("params/env.yaml")
+      if wandb_file is not None:
+        env_yaml.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = wandb_file.download(root=str(env_yaml.parent), replace=True)
+        candidate = Path(downloaded)
+        env_yaml = candidate if candidate.exists() else env_yaml.parent / candidate.name
+    except Exception as exc:
+      raise RuntimeError(
+        "Could not load params/env.yaml needed to reconstruct the training "
+        "observation configuration."
+      ) from exc
+  if not env_yaml.exists():
+    return None
+
+  saved_cfg = _load_saved_env_yaml(env_yaml)
+  try:
+    value = saved_cfg["commands"]["motion"].get("lookahead_s", 0.0)
+  except (AttributeError, KeyError, TypeError) as exc:
+    raise RuntimeError(f"Invalid motion command configuration in {env_yaml}") from exc
+  try:
+    lookahead_s = float(value)
+  except (TypeError, ValueError) as exc:
+    raise RuntimeError(f"Invalid lookahead_s value in {env_yaml}: {value!r}") from exc
+  if not math.isfinite(lookahead_s):
+    raise RuntimeError(f"Non-finite lookahead_s value in {env_yaml}")
+  return lookahead_s
+
+
+def _load_saved_env_yaml(path: Path) -> dict:
+  """Load a saved ``env.yaml`` artifact produced by ``dump_yaml``.
+
+  The artifact is an ``asdict`` dump and contains tags that ``yaml.safe_load``
+  rejects (e.g. ``!!python/tuple`` for ranges and ``!!python/name`` for
+  observation functions). A SafeLoader subclass handles those tags without
+  executing arbitrary Python.
+  """
+  import yaml
+
+  class _SavedEnvLoader(yaml.SafeLoader):
+    pass
+
+  def _python_tag_constructor(
+    loader: yaml.Loader, tag_suffix: str, node: yaml.Node
+  ) -> object:
+    del tag_suffix
+    if isinstance(node, yaml.SequenceNode):
+      return tuple(loader.construct_sequence(node))
+    if isinstance(node, yaml.MappingNode):
+      return loader.construct_mapping(node)
+    return loader.construct_scalar(node)  # pyright: ignore[reportArgumentType]
+
+  _SavedEnvLoader.add_multi_constructor(
+    "tag:yaml.org,2002:python/", _python_tag_constructor
+  )
+  with path.open() as file:
+    return yaml.load(file, Loader=_SavedEnvLoader) or {}

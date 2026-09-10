@@ -78,8 +78,11 @@ Each task ships with its own command terms tailored to its objective.
        start-frame sampling modes: ``"start"`` (always frame 0),
        ``"uniform"`` (random), and ``"adaptive"`` (biased toward
        difficult regions). At reset the robot is initialized from the
-       sampled frame with optional perturbations. Used by the tracking
-       task.
+       sampled frame with optional perturbations. An optional
+       ``lookahead_s`` setting exposes one future joint-position and
+       joint-velocity frame to the actor. The duration is converted to
+       frames using the motion file's stored FPS, and the index is
+       clamped at the final frame. Used by the tracking task.
 
 Each term can render debug visualizations in the interactive viewer
 when ``debug_vis=True`` is set in the configuration. The image below
@@ -121,3 +124,16 @@ safely ignore ``env_ids``.
 
 The configuration must implement a ``build(env)`` method that
 constructs the paired term instance.
+
+Motion preview
+--------------
+
+``MotionCommandCfg.lookahead_s`` controls optional reference preview for the
+tracking policy. A non-positive value disables preview. For a positive value,
+the command loads the motion file's ``fps`` field and computes
+``max(1, ceil(lookahead_s * fps))`` future frames. The future index is clamped
+to the last frame rather than wrapping into another sampled segment. Legacy
+motion files without an ``fps`` field use 50 Hz with a warning. The preview is
+provided as a separate actor observation containing
+``[joint_pos(t+K), joint_vel(t+K)]``; rewards and critic observations are
+unchanged.
