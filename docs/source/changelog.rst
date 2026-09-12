@@ -8,6 +8,14 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- New script ``scripts/record_tracking_policy_commands.py`` records the motor commands
+  a tracking checkpoint issues in the training simulator: for every actuated joint it
+  logs the reference frame's joint state, the actor observation, the raw and clipped
+  actions, the processed position target, the simulator target, pre/post joint state,
+  actuator torque, root state, gains, effort limits and timing, plus provenance and a
+  nominal-diagnostic override list. It supports an optional deploy-ONNX parity check on
+  identical actor inputs and refuses to overwrite an existing recording. See
+  ``docs/tracking_policy_command_recording.md``.
 - Motion-tracking policies can optionally receive a single future reference frame
   through ``MotionCommandCfg.lookahead_s``.
 - The G1 29DOF mode-15 tracking task adds dedicated foot-tracking reward terms

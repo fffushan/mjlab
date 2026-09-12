@@ -78,8 +78,8 @@ def unitree_g1_29dof_mode_15_flat_tracking_env_cfg(
   foot_bodies = ("left_ankle_roll_link", "right_ankle_roll_link")
   cfg.rewards["motion_feet_pos"] = RewardTermCfg(
     func=mdp.motion_relative_body_position_error_exp,
-    weight=0.3,
-    params={"command_name": "motion", "std": 0.3, "body_names": foot_bodies},
+    weight=1.0,
+    params={"command_name": "motion", "std": 0.15, "body_names": foot_bodies},
   )
   cfg.rewards["motion_feet_lin_vel"] = RewardTermCfg(
     func=mdp.motion_global_body_linear_velocity_error_exp,
