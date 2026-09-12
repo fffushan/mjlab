@@ -73,6 +73,7 @@ dev = [
   "pytest>=v9.0.3",
   "ruff>=0.16.1",
   "ty>=v0.0.14",
+  "setuptools<82; python_version >= '3.12'",
 ]
 docs = [
   "myst-parser>=4.0.1",

@@ -22,9 +22,28 @@ G1_XML: Path = (
 )
 assert G1_XML.exists()
 
+G1_29DOF_MODE_15_XML: Path = (
+  MJLAB_SRC_PATH
+  / "asset_zoo"
+  / "robots"
+  / "unitree_g1"
+  / "xmls"
+  / "g1_29dof_mode_15.xml"
+)
+assert G1_29DOF_MODE_15_XML.exists()
+
 
 def get_spec() -> mujoco.MjSpec:
   return mujoco.MjSpec.from_file(str(G1_XML))
+
+
+def get_g1_29dof_mode_15_spec() -> mujoco.MjSpec:
+  """Get the mode-15 MJCF spec.
+
+  Mode 15 shares the base g1_29dof mesh/joint topology; it only changes the
+  weight distribution (inertials) and the hip actuator ratings.
+  """
+  return mujoco.MjSpec.from_file(str(G1_29DOF_MODE_15_XML))
 
 
 ##
@@ -157,6 +176,27 @@ G1_ACTUATOR_4010 = BuiltinPositionActuatorCfg(
   armature=ACTUATOR_4010.reflected_inertia,
 )
 
+# Mode-15 actuator reclassification (g1_29dof_mode_15).
+#
+# In the mode-15 variant the hip pitch and hip roll joints use the 7520-22
+# actuator (effort 139 Nm, velocity 20 rad/s) instead of the 7520-14
+# (effort 88 Nm, velocity 32 rad/s). The remaining joints keep the base
+# assignments (see the mode_15 URDF joint limits for the source values).
+G1_29DOF_MODE_15_ACTUATOR_7520_14 = BuiltinPositionActuatorCfg(
+  target_names_expr=(".*_hip_yaw_joint", "waist_yaw_joint"),
+  stiffness=STIFFNESS_7520_14,
+  damping=DAMPING_7520_14,
+  effort_limit=ACTUATOR_7520_14.effort_limit,
+  armature=ACTUATOR_7520_14.reflected_inertia,
+)
+G1_29DOF_MODE_15_ACTUATOR_7520_22 = BuiltinPositionActuatorCfg(
+  target_names_expr=(".*_hip_pitch_joint", ".*_hip_roll_joint", ".*_knee_joint"),
+  stiffness=STIFFNESS_7520_22,
+  damping=DAMPING_7520_22,
+  effort_limit=ACTUATOR_7520_22.effort_limit,
+  armature=ACTUATOR_7520_22.reflected_inertia,
+)
+
 # Waist pitch/roll and ankles are 4-bar linkages with 2 5020 actuators.
 # Due to the parallel linkage, the effective armature at the ankle and waist joints
 # is configuration dependent. Since the exact geometry of the linkage is unknown, we
@@ -262,6 +302,18 @@ G1_ARTICULATION = EntityArticulationInfoCfg(
   soft_joint_pos_limit_factor=0.9,
 )
 
+G1_29DOF_MODE_15_ARTICULATION = EntityArticulationInfoCfg(
+  actuators=(
+    G1_ACTUATOR_5020,
+    G1_29DOF_MODE_15_ACTUATOR_7520_14,
+    G1_29DOF_MODE_15_ACTUATOR_7520_22,
+    G1_ACTUATOR_4010,
+    G1_ACTUATOR_WAIST,
+    G1_ACTUATOR_ANKLE,
+  ),
+  soft_joint_pos_limit_factor=0.9,
+)
+
 
 def get_g1_robot_cfg() -> EntityCfg:
   """Get a fresh G1 robot configuration instance.
@@ -277,6 +329,22 @@ def get_g1_robot_cfg() -> EntityCfg:
   )
 
 
+def get_g1_29dof_mode_15_robot_cfg() -> EntityCfg:
+  """Get a fresh G1 29DOF mode-15 robot configuration instance.
+
+  Mode 15 shares the base G1 mesh/joint topology but uses the mode-15 weight
+  distribution (inertials) and hip actuator ratings from
+  ``g1_29dof_mode_15.urdf``. Returns a new EntityCfg each time to avoid
+  mutation issues when the config is shared across multiple places.
+  """
+  return EntityCfg(
+    init_state=KNEES_BENT_KEYFRAME,
+    collisions=(FULL_COLLISION,),
+    spec_fn=get_g1_29dof_mode_15_spec,
+    articulation=G1_29DOF_MODE_15_ARTICULATION,
+  )
+
+
 G1_ACTION_SCALE: dict[str, float] = {}
 for a in G1_ARTICULATION.actuators:
   assert isinstance(a, BuiltinPositionActuatorCfg)
@@ -286,6 +354,16 @@ for a in G1_ARTICULATION.actuators:
   assert e is not None
   for n in names:
     G1_ACTION_SCALE[n] = 0.25 * e / s
+
+G1_29DOF_MODE_15_ACTION_SCALE: dict[str, float] = {}
+for a in G1_29DOF_MODE_15_ARTICULATION.actuators:
+  assert isinstance(a, BuiltinPositionActuatorCfg)
+  e = a.effort_limit
+  s = a.stiffness
+  names = a.target_names_expr
+  assert e is not None
+  for n in names:
+    G1_29DOF_MODE_15_ACTION_SCALE[n] = 0.25 * e / s
 
 
 if __name__ == "__main__":

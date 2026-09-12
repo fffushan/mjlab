@@ -344,6 +344,28 @@ class MotionCommand(CommandTerm):
     self.metrics["sampling_top1_prob"][:] = 1.0 / self.bin_count
     self.metrics["sampling_top1_bin"][:] = 0.5  # No specific bin preference.
 
+  def _weighted_sampling(self, env_ids: torch.Tensor):
+    """Sample start frames with density p(t) proportional to exp(-t/tau)."""
+    tau = self.cfg.init_weight_s
+    if tau <= 0.0:
+      self._uniform_sampling(env_ids)
+      return
+    total = self.motion.time_step_total
+    dt = 1.0 / self.motion.fps
+    horizon = total * dt
+    u = sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device)
+    # Inverse CDF of the truncated exponential on [0, horizon].
+    t = -tau * (1.0 - u * (1.0 - math.exp(-horizon / tau))).log()
+    self.time_steps[env_ids] = torch.clamp((t / dt).long(), 0, total - 1)
+    # Metrics for the discrete truncated-exponential distribution.
+    frames = torch.arange(total, device=self.device)
+    probs = torch.exp(-frames * dt / tau)
+    probs = probs / probs.sum()
+    h = -(probs * probs.log()).sum()
+    self.metrics["sampling_entropy"][:] = h / math.log(total)
+    self.metrics["sampling_top1_prob"][:] = probs.max() * total
+    self.metrics["sampling_top1_bin"][:] = 0.0  # Start-weighted preference.
+
   def _write_reference_state_to_sim(
     self,
     env_ids: torch.Tensor,
@@ -368,6 +390,8 @@ class MotionCommand(CommandTerm):
       self.time_steps[env_ids] = 0
     elif self.cfg.sampling_mode == "uniform":
       self._uniform_sampling(env_ids)
+    elif self.cfg.sampling_mode == "weighted":
+      self._weighted_sampling(env_ids)
     else:
       assert self.cfg.sampling_mode == "adaptive"
       self._adaptive_sampling(env_ids)
@@ -665,7 +689,16 @@ class MotionCommandCfg(CommandTermCfg):
   adaptive_lambda: float = 0.8
   adaptive_uniform_ratio: float = 0.1
   adaptive_alpha: float = 0.001
-  sampling_mode: Literal["adaptive", "uniform", "start"] = "adaptive"
+  sampling_mode: Literal["adaptive", "uniform", "start", "weighted"] = "adaptive"
+  init_weight_s: float = 0.0
+  """Exponential decay timescale (seconds) for ``weighted`` init-frame sampling.
+
+  In ``weighted`` mode, the probability density of the sampled start frame is
+  proportional to ``exp(-t / init_weight_s)``, so early frames of the motion
+  receive more training mass. Non-positive values fall back to uniform
+  sampling. Example: ``init_weight_s=3`` puts ~63% of episode starts within
+  the first 3 seconds of the trajectory.
+  """
 
   @dataclass
   class VizCfg:

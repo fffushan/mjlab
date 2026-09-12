@@ -17,3 +17,5 @@ benchmark_results/
 # Documentation outputs.
 **/_build/*
 **/generated/*
+
+data/*

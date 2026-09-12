@@ -5,7 +5,13 @@ from mjlab.asset_zoo.robots.i2rt_yam.yam_constants import (
   get_yam_robot_cfg as get_yam_robot_cfg,
 )
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+  G1_29DOF_MODE_15_ACTION_SCALE as G1_29DOF_MODE_15_ACTION_SCALE,
+)
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
   G1_ACTION_SCALE as G1_ACTION_SCALE,
+)
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+  get_g1_29dof_mode_15_robot_cfg as get_g1_29dof_mode_15_robot_cfg,
 )
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
   get_g1_robot_cfg as get_g1_robot_cfg,

@@ -10,6 +10,22 @@ Added
 
 - Motion-tracking policies can optionally receive a single future reference frame
   through ``MotionCommandCfg.lookahead_s``.
+- The G1 29DOF mode-15 tracking task adds dedicated foot-tracking reward terms
+  (``motion_feet_pos``, ``motion_feet_lin_vel``) that grade ankle position and
+  swing velocity directly instead of diluting them in the all-bodies mean.
+- Tracking task init-frame sampling gains a ``weighted`` mode: with
+  ``MotionCommandCfg.init_weight_s > 0``, episode start frames are drawn from
+  an exponential distribution over the trajectory (``p(t) ∝ exp(-t/τ)``),
+  concentrating training on the beginning of the motion.
+- New script ``scripts/evaluate_tracking_policy.py`` evaluates a tracking
+  checkpoint against a local motion file without Weights & Biases, reporting
+  MPKPE, joint velocity error, end-effector errors, success rate and a
+  termination-time histogram over the full trajectory.
+- New script ``scripts/retarget_npz_to_tracking_npz.py`` converts a retargeted
+  qpos motion (e.g. UMR / SMPL-X retargeting output: ``qpos``, ``fps``,
+  ``robot_joint_names``) into the tracking-format npz consumed by ``train.py``.
+  It resamples the trajectory to the environment rate (50 Hz by default) and
+  replays it kinematically through the G1 29DOF mode-15 robot.
 
 Fixed
 ^^^^^

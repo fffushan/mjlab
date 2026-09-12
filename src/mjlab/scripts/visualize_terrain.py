@@ -26,6 +26,7 @@ from mjviser.conversions import (
 from mujoco import mjtGeom
 
 from mjlab.asset_zoo.robots import (
+  get_g1_29dof_mode_15_robot_cfg,
   get_g1_robot_cfg,
   get_go1_robot_cfg,
   get_yam_robot_cfg,
@@ -41,6 +42,7 @@ ROBOT_CFG_GETTERS = {
   "None": None,
   "Unitree Go1": get_go1_robot_cfg,
   "Unitree G1": get_g1_robot_cfg,
+  "Unitree G1 29DOF Mode-15": get_g1_29dof_mode_15_robot_cfg,
   "Yam": get_yam_robot_cfg,
 }
 
