@@ -5,6 +5,7 @@ from mjlab.asset_zoo.robots import (
   get_g1_29dof_mode_15_robot_cfg,
   get_g1_robot_cfg,
   get_go1_robot_cfg,
+  get_x2_robot_cfg,
 )
 from mjlab.entity import Entity
 
@@ -15,6 +16,7 @@ from mjlab.entity import Entity
     ("G1", get_g1_robot_cfg),
     ("G1 29DOF Mode-15", get_g1_29dof_mode_15_robot_cfg),
     ("GO1", get_go1_robot_cfg),
+    ("X2", get_x2_robot_cfg),
   ],
 )
 def test_robot_compiles_parametrized(robot_name: str, robot_cfg_fn) -> None:

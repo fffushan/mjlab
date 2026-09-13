@@ -8,6 +8,14 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- AgiBot X2 Ultra (flagship revision, vendor URDF release v1.3.0) joins the asset
+  zoo as ``get_x2_robot_cfg``, together with the motion-tracking tasks
+  ``Mjlab-Tracking-Flat-AgiBot-X2`` and its no-state-estimation variant. Actuator
+  parameters are derived from AgiBot's PFP joint-module data (rotor inertia and
+  reducer ratio) and the peak joint torques of the flagship revision, and
+  ``scripts/convert_agibot_x2_to_mjcf.py`` ports a vendor release into an
+  mjlab-convention MJCF (URDF body inertials, named collision geoms, mjlab IMU
+  sensor names).
 - New script ``scripts/record_tracking_policy_commands.py`` records the motor commands
   a tracking checkpoint issues in the training simulator: for every actuated joint it
   logs the reference frame's joint state, the actor observation, the raw and clipped
@@ -49,6 +57,9 @@ Fixed
 Changed
 ^^^^^^^
 
+- ``scripts/retarget_npz_to_tracking_npz.py`` takes a ``--task`` argument instead of
+  hard-coding the G1 29DOF mode-15 environment, so a retargeted motion can be replayed
+  onto any registered tracking robot.
 - Bumped ``rsl-rl-lib`` from 5.4.2 to 5.5.0. This update removes the ``logger_type``
   attribute of the ``rsl_rl.utils.Logger``, so code that previously checked
   ``logger.logger_type`` must instead check the type of ``logger.writer``.

@@ -1,5 +1,5 @@
-"""Replay a retargeted qpos motion onto the G1 29DOF mode-15 robot and export
-the tracking-format motion npz consumed by ``train.py``.
+"""Replay a retargeted qpos motion onto an mjlab robot and export the
+tracking-format motion npz consumed by ``train.py``.
 
 Retargeting pipelines (e.g. UMR / SMPL-X retargeting) emit an npz with a raw
 qpos trajectory:
@@ -26,11 +26,17 @@ Example:
   uv run python scripts/retarget_npz_to_tracking_npz.py \
     --input data/qianghuo_smplx_unitree_g1_29dof_mode_15.npz \
     --output data/qianghuo_smplx_unitree_g1_29dof_mode_15_tracking.npz
+
+  uv run python scripts/retarget_npz_to_tracking_npz.py \
+    --input data/qianghuo_smplx_agibot_x2.npz \
+    --output data/qianghuo_smplx_agibot_x2_tracking.npz \
+    --task Mjlab-Tracking-Flat-AgiBot-X2
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -41,9 +47,7 @@ import mjlab
 from mjlab.entity import Entity
 from mjlab.scene import Scene
 from mjlab.sim.sim import Simulation, SimulationCfg
-from mjlab.tasks.tracking.config.g1_29dof_mode_15.env_cfgs import (
-  unitree_g1_29dof_mode_15_flat_tracking_env_cfg,
-)
+from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import (
   axis_angle_from_quat,
   quat_conjugate,
@@ -116,10 +120,11 @@ def replay_and_save(
   joint_names: list[str],
   output: Path,
   device: str,
+  task: str,
 ) -> None:
-  """Replay the qpos trajectory through the mjlab mode-15 robot and save."""
+  """Replay the qpos trajectory through the task's robot and save."""
   output_fps = float(fps)
-  env_cfg = unitree_g1_29dof_mode_15_flat_tracking_env_cfg()
+  env_cfg = load_env_cfg(task)
 
   sim_cfg = SimulationCfg()
   sim_cfg.mujoco.timestep = 1.0 / output_fps
@@ -174,7 +179,8 @@ def replay_and_save(
   print("\nStacking arrays and saving data...")
   data: dict[str, np.ndarray] = {k: np.stack(log[k], axis=0) for k in RECORD_KEYS}
   data["fps"] = np.array([output_fps], dtype=np.float32)
-  np.savez(output, **data)
+  arrays_any: dict[str, Any] = dict(data)
+  np.savez(output, **arrays_any)
   print(f"Saved tracking motion to {output}")
   print(
     f"  frames: {data['joint_pos'].shape[0]} @ {output_fps:.0f} Hz, "
@@ -185,6 +191,7 @@ def replay_and_save(
 def main(
   input: Path,
   output: Path,
+  task: str = "Mjlab-Tracking-Flat-Unitree-G1-29DOF-Mode-15",
   output_fps: float = 50.0,
   device: str = "cuda:0",
 ) -> None:
@@ -193,6 +200,9 @@ def main(
   Args:
     input: Path to the retargeted npz (qpos, fps, robot_joint_names).
     output: Path where the tracking-format npz will be written.
+    task: Registered mjlab task whose robot the motion is replayed on. The
+      motion's joints must exist in that robot; a robot trained with more
+      joints than the motion provides keeps its keyframe pose for the rest.
     output_fps: Frame rate of the exported motion. Defaults to 50 Hz to match
       the environment rate (timestep=0.005, decimation=4).
     device: Device to use for the replay simulation.
@@ -224,7 +234,7 @@ def main(
   qpos = qpos.to(device)
 
   output.parent.mkdir(parents=True, exist_ok=True)
-  replay_and_save(qpos, output_fps, joint_names, output, device)
+  replay_and_save(qpos, output_fps, joint_names, output, device, task)
 
 
 if __name__ == "__main__":

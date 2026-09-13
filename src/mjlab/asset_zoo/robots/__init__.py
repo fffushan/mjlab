@@ -1,3 +1,9 @@
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
+  X2_ACTION_SCALE as X2_ACTION_SCALE,
+)
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
+  get_x2_robot_cfg as get_x2_robot_cfg,
+)
 from mjlab.asset_zoo.robots.i2rt_yam.yam_constants import (
   YAM_ACTION_SCALE as YAM_ACTION_SCALE,
 )
