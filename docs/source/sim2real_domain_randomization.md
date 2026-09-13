@@ -76,3 +76,84 @@ Common knobs for every `dr.*` function:
 
 Source: `src/mjlab/envs/mdp/dr/`, `docs/source/randomization.rst`,
 `src/mjlab/actuator/actuator.py` (delay fields).
+
+---
+
+## G1 motor Kp/Kd bandwidth analysis (current gains)
+
+Computed from the G1 model at the knees-bent keyframe: mass-matrix diagonal
+(link inertia) + reflected rotor armature, with the gains from
+`src/mjlab/asset_zoo/robots/unitree_g1/g1_constants.py`:
+
+- Design intent: natural frequency `NATURAL_FREQ = 10 Hz` (62.83 rad/s) at the
+  rotor armature, damping ratio `DAMPING_RATIO = 2.0`.
+- Loop model per joint: `J·q'' + kd·q' + kp·q = kp·q_cmd` with
+  `J = J_link + armature`,
+  `wn = sqrt(kp/J)`, `zeta = kd/(2·sqrt(kp·J))`, and -3 dB bandwidth
+  `wbw = wn·sqrt(1-2ζ²+sqrt((1-2ζ²)²+1))`.
+
+| Joint group | Joints | kp (N·m/rad) | kd (N·m·s/rad) | ωn (Hz) | ζ | −3 dB bw (Hz) |
+|---|---|---|---|---|---|---|
+| 7520-22 | knee | 99.1 | 6.31 | 4.3 | 0.86 | 3.4 |
+| 7520-22 | hip roll | 99.1 | 6.31 | 1.9 | 0.39 | 2.7 |
+| 7520-14 | hip pitch | 40.2 | 2.56 | 1.1 | 0.22 | 1.6 |
+| 7520-14 | hip yaw / waist yaw | 40.2 | 2.56 | 2.7 / 1.9 | 0.54 / 0.37 | 3.3 / 2.6 |
+| 5020 | shoulder pitch / roll / elbow | 14.3 | 0.91 | 1.4–3.1 | 0.28–0.68 | 2.1–3.5 |
+| 4010 | wrist | 16.8 | 1.07 | 6.9–8.4 | 1.4–1.7 | 2.7–2.9 |
+| 2×5020 | ankle / waist pitch | 28.5 | 1.81 | 8.5–9.7 / 1.1 | 1.7–2.0 / 0.23 | 2.7 / 1.7 |
+
+**Result: natural frequency 0.96–9.7 Hz, closed-loop −3 dB bandwidth ≈
+1.45–3.5 Hz (mean ≈ 2.7 Hz).** The heavy joints (hip pitch, waist pitch/roll,
+shoulder pitch) sit at 1.5–2 Hz; only wrist/ankle approach the 10 Hz design
+intent, because the design uses the rotor armature only while link inertia
+dominates the big joints (e.g. hip pitch: J_link ≈ 0.85 vs armature ≈ 0.01
+kg·m²).
+
+### Headroom for Kp randomization
+
+Context: physics at 200 Hz (dt = 0.005), policy/action rate 50 Hz (decimation
+= 4).
+
+- **Numerical stability: lots of headroom.** `BuiltinPositionActuator` uses
+  MuJoCo implicit integration, stable far beyond explicit PD divergence. Even
+  4× kp leaves the fastest joint (wrist, 9.7 Hz → ~19 Hz ωn) far below the
+  200 Hz physics Nyquist (100 Hz).
+- **Practical bound is damping, not bandwidth.** Scaling only kp by `s` drops
+  ζ by `1/sqrt(s)` (heavy joints are already underdamped at ζ ≈ 0.2–0.4 and
+  become oscillatory); scaling kp and kd together keeps ζ within `sqrt(s)`
+  (≈ ±6% at s ∈ [0.7, 1.3]).
+- **Effort coupling:** kp·error generates torque; the G1 action scale is
+  `0.25·effort/stiffness`, so higher kp with fixed action magnitude means
+  smaller effective commanded torque.
+
+Recommended ranges for `dr.pd_gains` on G1:
+
+| Range | Effect on servo bandwidth | Notes |
+|---|---|---|
+| `(0.7, 1.3)` matched kp=kd | ≈ 1.3–3.9 Hz | Safe default, mild sim2real gain mismatch |
+| `(0.5, 1.5)` matched | ≈ 1.2–4.3 Hz | Wider actuator-quality spread; heavy joints dip to ζ ≈ 0.15 (oscillatory in sim — policy must learn to cope) |
+| kp-only (kd fixed) | ζ drops by √s | Only for *softer* servos (s<1); avoid s>1 alone |
+
+Bandwidth varies with configuration (mass matrix changes as the robot moves),
+so values are indicative at the home keyframe.
+
+### Wiring (tracking task)
+
+Added to `src/mjlab/tasks/tracking/tracking_env_cfg.py` events:
+
+```python
+"randomize_pd_gains": EventTermCfg(
+  mode="reset",
+  func=dr.pd_gains,
+  params={
+    "asset_cfg": SceneEntityCfg("robot"),
+    "kp_range": (0.5, 1.5),
+    "kd_range": (0.5, 1.5),
+    "operation": "scale",
+  },
+),
+```
+
+`mode="reset"` re-draws gains every episode; switch to `"startup"` for a fixed
+per-env draw across the whole run. `"scale"` multiplies the compile-time
+default gains, so repeated per-episode randomization does not accumulate.

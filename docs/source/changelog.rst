@@ -8,6 +8,11 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- The motion-tracking tasks randomize the actuator PD gains (``dr.pd_gains``)
+  per episode with matched ``kp_range``/``kd_range`` of ``(0.5, 1.5)`` in
+  ``scale`` mode, so policies train against a spread of joint servo stiffness
+  and damping for actuator sim-to-real robustness.
+
 - AgiBot X2 Ultra (flagship revision, vendor URDF release v1.3.0) joins the asset
   zoo as ``get_x2_robot_cfg``, together with the motion-tracking tasks
   ``Mjlab-Tracking-Flat-AgiBot-X2`` and its no-state-estimation variant. Actuator
