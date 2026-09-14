@@ -1,15 +1,27 @@
 """AgiBot X2 Ultra flat tracking environment configurations."""
 
+from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.asset_zoo.robots import (
   X2_ACTION_SCALE,
   get_x2_robot_cfg,
 )
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import X2_ARTICULATION
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
+
+# The 12 collision spheres per foot in the ankle-roll body.
+_FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
+
+# Index of the wrist pitch/roll actuator group in ``X2_ARTICULATION``, checked
+# against the model below so a layout change cannot silently miss it.
+_WRIST_ACTUATOR_ID = 4
 
 
 def agibot_x2_flat_tracking_env_cfg(
@@ -83,10 +95,38 @@ def agibot_x2_flat_tracking_env_cfg(
   ):
     cfg.rewards[reward_name].params["body_weights"] = body_weights
 
-  cfg.events["foot_friction"].params[
-    "asset_cfg"
-  ].geom_names = r"^(left|right)_foot[0-9]+_collision$"
+  cfg.events["foot_friction"].params["asset_cfg"].geom_names = _FOOT_GEOMS
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
+
+  if "randomize_foot_size" in cfg.events:
+    cfg.events["randomize_foot_size"].params["asset_cfg"].geom_names = _FOOT_GEOMS
+
+  # Wrist-specific derating. The vendor simulator clamps the wrist pitch/roll
+  # motors to 2.2 N.m where the vendor URDF allows 4.8, and the wrists are
+  # end-effector bodies in the termination set, so train against a much weaker
+  # wrist than nominal. This term must come after the whole-robot effort term:
+  # both write the same fields and only the last writer takes effect.
+  wrist_group = X2_ARTICULATION.actuators[_WRIST_ACTUATOR_ID]
+  assert isinstance(wrist_group, BuiltinPositionActuatorCfg)
+  assert wrist_group.effort_limit == 4.8, wrist_group.effort_limit
+  assert wrist_group.target_names_expr == (
+    ".*_wrist_pitch_joint",
+    ".*_wrist_roll_joint",
+  ), wrist_group.target_names_expr
+  if "randomize_effort_limits" in cfg.events:
+    cfg.events["randomize_effort_limits_wrist"] = EventTermCfg(
+      mode="startup",
+      func=dr.effort_limits,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", actuator_ids=[_WRIST_ACTUATOR_ID]),
+        "effort_limit_range": (0.45, 1.0),
+        "operation": "scale",
+      },
+    )
+    event_order = list(cfg.events)
+    assert event_order.index("randomize_effort_limits_wrist") > event_order.index(
+      "randomize_effort_limits"
+    )
 
   cfg.terminations["ee_body_pos"].params["body_names"] = (
     "left_ankle_roll_link",

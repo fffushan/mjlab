@@ -13,6 +13,16 @@ Added
   ``scale`` mode, so policies train against a spread of joint servo stiffness
   and damping for actuator sim-to-real robustness.
 
+- The motion-tracking tasks randomize seven more sim-to-real axes by default:
+  link mass/inertia/COM (``dr.pseudo_inertia``), joint armature, actuator effort
+  limits (weaker-only, with an extra 0.45x range on the X2 wrist group, which the
+  vendor simulator clamps to 2.2 N.m against the URDF's 4.8), joint friction and
+  damping, foot geom size, and observation delay. X2 actuator groups also carry a
+  0-2 step command delay. ``MJLAB_DR_AXES`` selects a subset at process start so a
+  trained checkpoint's sensitivity can be swept one axis at a time (``none``
+  reproduces the pre-axis set); unknown names raise. See
+  ``docs/source/sim2real_domain_randomization.md``.
+
 - AgiBot X2 Ultra (flagship revision, vendor URDF release v1.3.0) joins the asset
   zoo as ``get_x2_robot_cfg``, together with the motion-tracking tasks
   ``Mjlab-Tracking-Flat-AgiBot-X2`` and its no-state-estimation variant. Actuator

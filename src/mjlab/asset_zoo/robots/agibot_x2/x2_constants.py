@@ -69,7 +69,14 @@ def _actuator(
   target_names_expr: tuple[str, ...],
   effort_limit: float,
 ) -> BuiltinPositionActuatorCfg:
-  """Build a position actuator group from a PFP module's reflected inertia."""
+  """Build a position actuator group from a PFP module's reflected inertia.
+
+  Every group carries a command-channel delay of 0-2 physics steps (0-10 ms at
+  the 5 ms training timestep): the deployment sends position targets over ROS 2
+  at 50 Hz, so the torque the servo loop applies is derived from a target that is
+  one or two steps stale by the time it arrives. The decision period already
+  contributes a 0-20 ms hold, so this is the transport and firmware part on top.
+  """
   armature = reflected_inertia(module["rotor_inertia"], module["gear_ratio"])
   return BuiltinPositionActuatorCfg(
     target_names_expr=target_names_expr,
@@ -77,6 +84,10 @@ def _actuator(
     damping=2.0 * DAMPING_RATIO * armature * NATURAL_FREQ,
     effort_limit=effort_limit,
     armature=armature,
+    delay_min_lag=0,
+    delay_max_lag=2,
+    delay_hold_prob=0.9,  # Latency is mostly stable, with occasional jitter.
+    delay_update_period=1,
   )
 
 

@@ -160,3 +160,67 @@ policy still sees a meaningful servo-gain spread. ``mode="reset"`` re-draws
 gains every episode; switch to ``"startup"`` for a fixed per-env draw across
 the whole run. ``"scale"`` multiplies the compile-time default gains, so
 repeated per-episode randomization does not accumulate.
+
+## Wired into the tracking tasks
+
+Every tracking task (G1, G1-29DOF-mode-15, X2, each with and without state
+estimation) carries the axes below in
+``src/mjlab/tasks/tracking/tracking_env_cfg.py``. Ranges are set from the
+deployment side's measured gaps, not from taste: the parameters listed first are
+the ones that differ between the vendor simulator and this model, and matching
+them turned a policy that fell in three of three trials into one that completed
+its clip in three of three.
+
+| Axis | Event | Range | Why |
+|---|---|---|---|
+| `inertia` | `dr.pseudo_inertia` | mass 0.90–1.10x, COM ±2 cm | Link masses and inertias differ between the vendor simulator (mesh-derived, no `<inertial>` on the pelvis: 43.54 kg) and this model (URDF v1.3.0: 41.97 kg), and hardware adds payload. `pseudo_inertia` keeps mass, inertia and COM physically consistent; `dr.body_mass` alone leaves the inertia tensor stale and warns. |
+| `armature` | `dr.joint_armature` | 0.7–1.3x | Reflected rotor inertia from the PFP module table, which the shipped PD gains are derived from. Randomizing it decouples that fixed gain/inertia pair. |
+| `effort_limits` | `dr.effort_limits` | 0.75–1.0x, weaker only | The vendor simulator derates its motors below the URDF peaks (118 vs 120 N·m, and **2.2 vs 4.8 N·m at the wrist pitch/roll**), and hardware derates thermally. Weaker-only is the failure mode that matters. |
+| `effort_limits` (wrists) | `dr.effort_limits_wrist` | 0.45–1.0x | Probes exactly the vendor's wrist clamp (2.2/4.8 = 0.46x). Must be applied after the whole-robot term; the X2 config asserts that the actuator index it targets is still the wrist group. |
+| `joint_friction` / `joint_damping` | `dr.joint_friction` / `dr.joint_damping` | frictionloss 0.5–1.5x, damping 0–0.3 | The shipped models have `damping=0.0`, i.e. no viscous transmission loss at all, and nominal stiction. |
+| `foot_size` | `dr.geom_size` | 0.97–1.03x | Foot pad wear and mounting tolerance. Robot configs set the foot sphere pattern. |
+| `pd_gains` | `dr.pd_gains` | kp/kd 0.7–1.3x matched, per episode | See the G1 section above. |
+| `obs_delay` | actor `joint_pos`, `joint_vel`, `base_ang_vel` terms | 0–1 policy steps (0–20 ms) | Sensor pipeline latency, distinct from the command delay. |
+
+Command delay is not an event: it lives on the actuator group
+(``delay_min_lag``/``delay_max_lag``, 0–2 physics steps = 0–10 ms for X2), so a
+30 Hz-to-1 kHz deployment bus is modelled where it belongs. The decision period
+already holds each action for 0–20 ms, so this is the transport part on top.
+
+### Selecting axes
+
+``MJLAB_DR_AXES`` selects a subset at process start (the config is built at task
+registration, so set it before launching):
+
+```sh
+# Sweep one axis on a trained checkpoint: does it survive this alone?
+MJLAB_DR_AXES=armature uv run python scripts/evaluate_tracking_policy.py \
+  --checkpoint-file logs/rsl_rl/agibot_x2_tracking/<run>/model_29999.pt \
+  --motion-file data/qianghuo_smplx_agibot_x2_tracking.npz \
+  --task Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation --num-envs 64
+
+# The pre-axis behaviour (push, torso COM, encoder bias, foot friction only),
+# i.e. the set the currently deployed X2 policy was trained with:
+MJLAB_DR_AXES=none uv run python scripts/evaluate_tracking_policy.py ...
+```
+
+An unknown axis name raises at config build rather than silently doing nothing.
+``tests/test_tracking_dr.py`` locks the wiring in.
+
+### Ordering rules
+
+Every ``dr.*`` function samples from the *compiled* defaults, never from the
+current value, so ``operation="scale"`` cannot accumulate — but two events
+writing the same field mean *the last writer wins*. Two pairs depend on it:
+
+- ``randomize_inertia`` before ``base_com``, so the torso keeps its own wider
+  payload COM offset and the limbs keep the ±2 cm one.
+- ``randomize_effort_limits_wrist`` after ``randomize_effort_limits``.
+
+### Not covered
+
+State-estimator error cannot be randomized: training can only feed the actor a
+perfect quantity plus noise. The X2 deployment reconstructs ``base_lin_vel`` from
+the pelvis pose, so the honest fix is to not depend on it — which is why the X2
+work trains the ``-No-State-Estimation`` variant, whose actor drops
+``motion_anchor_pos_b`` and ``base_lin_vel`` while the critic keeps them.

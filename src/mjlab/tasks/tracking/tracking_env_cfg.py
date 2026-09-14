@@ -9,6 +9,9 @@ Based on https://github.com/HybridRobotics/whole_body_tracking
 Commit: f8e20c880d9c8ec7172a13d3a88a65e3a5a88448
 """
 
+import math
+import os
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -36,9 +39,47 @@ VELOCITY_RANGE = {
   "yaw": (-0.78, 0.78),
 }
 
+DR_AXES: tuple[str, ...] = (
+  "inertia",
+  "armature",
+  "effort_limits",
+  "joint_friction",
+  "joint_damping",
+  "foot_size",
+  "pd_gains",
+  "obs_delay",
+)
+"""Sim-to-real randomization axes wired into the tracking tasks.
+
+Ranges and rationale are in ``docs/source/sim2real_domain_randomization.md``.
+Every axis is on by default. ``MJLAB_DR_AXES`` selects a subset at build time so
+a trained policy's sensitivity can be swept one axis at a time, e.g.
+
+  MJLAB_DR_AXES=armature uv run python scripts/evaluate_tracking_policy.py ...
+  MJLAB_DR_AXES=none     # only the pre-existing set, for a baseline
+"""
+
+
+def selected_dr_axes() -> set[str]:
+  """Return the randomization axes enabled for this process."""
+  raw = os.environ.get("MJLAB_DR_AXES", "all").strip().lower()
+  if raw in ("", "all"):
+    return set(DR_AXES)
+  if raw == "none":
+    return set()
+  selected = {axis.strip() for axis in raw.split(",") if axis.strip()}
+  unknown = selected - set(DR_AXES)
+  if unknown:
+    raise ValueError(
+      f"MJLAB_DR_AXES has unknown axes {sorted(unknown)}; choose from {list(DR_AXES)}"
+    )
+  return selected
+
 
 def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
   """Create base tracking task configuration."""
+
+  dr_axes = selected_dr_axes()
 
   ##
   # Observations
@@ -82,6 +123,15 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "actions": ObservationTermCfg(func=mdp.last_action),
   }
+
+  if "obs_delay" in dr_axes:
+    # Sensor-pipeline latency: encoder/IMU transport and filtering delay the
+    # measurements the policy acts on (1 lag = 20 ms at the 50 Hz policy rate).
+    # This is distinct from the command delay, which is set on the actuators.
+    # Terms read from the reference motion are not delayed.
+    for term_name in ("joint_pos", "joint_vel", "base_ang_vel"):
+      actor_terms[term_name].delay_min_lag = 0
+      actor_terms[term_name].delay_max_lag = 1
 
   critic_terms = {
     "command": ObservationTermCfg(
@@ -173,6 +223,25 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       interval_range_s=(1.0, 3.0),
       params={"velocity_range": VELOCITY_RANGE},
     ),
+  }
+
+  if "inertia" in dr_axes:
+    # Physically consistent mass/inertia/COM randomization (Rucker & Wensing
+    # 2022): alpha scales mass and inertia by exp(2*alpha), t shifts the COM in
+    # the body frame. Placed before base_com so the torso keeps its own payload
+    # offset from the term below.
+    events["randomize_inertia"] = EventTermCfg(
+      mode="startup",
+      func=dr.pseudo_inertia,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        # ~0.90-1.10x mass, with inertia following by the same factor.
+        "alpha_range": (math.log(0.90) / 2.0, math.log(1.10) / 2.0),
+        "t_range": (-0.02, 0.02),  # COM shift in the body frame, m.
+      },
+    )
+
+  events |= {
     "base_com": EventTermCfg(
       mode="startup",
       func=dr.body_com_offset,
@@ -204,7 +273,83 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         "shared_random": True,  # All foot geoms share the same friction.
       },
     ),
-    "randomize_pd_gains": EventTermCfg(
+  }
+
+  ##
+  # Domain randomization (sim-to-real)
+  ##
+  # Ranges follow docs/source/sim2real_domain_randomization.md; each axis is
+  # disabled by removing it from MJLAB_DR_AXES. Order matters for terms that
+  # write the same model field: every dr.* function samples from the compiled
+  # defaults, so the last writer wins.
+
+  if "armature" in dr_axes:
+    # Reflected rotor inertia. The nominal values come from the PFP module
+    # table, and the shipped PD gains are derived from them, so randomizing the
+    # armature decouples that fixed gain/inertia relationship.
+    events["randomize_armature"] = EventTermCfg(
+      mode="startup",
+      func=dr.joint_armature,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "ranges": (0.7, 1.3),
+        "operation": "scale",
+      },
+    )
+
+  if "effort_limits" in dr_axes:
+    # Weaker-only: a policy that needs more torque than the hardware can deliver
+    # is the failure mode that matters, and the vendor simulator itself derates
+    # its motors below the URDF peaks.
+    events["randomize_effort_limits"] = EventTermCfg(
+      mode="startup",
+      func=dr.effort_limits,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "effort_limit_range": (0.75, 1.0),
+        "operation": "scale",
+      },
+    )
+
+  if "joint_friction" in dr_axes:
+    events["randomize_joint_friction"] = EventTermCfg(
+      mode="startup",
+      func=dr.joint_friction,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "ranges": (0.5, 1.5),
+        "operation": "scale",
+      },
+    )
+
+  if "joint_damping" in dr_axes:
+    # The shipped models have damping=0.0, i.e. no viscous transmission loss.
+    events["randomize_joint_damping"] = EventTermCfg(
+      mode="startup",
+      func=dr.joint_damping,
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "ranges": (0.0, 0.3),
+        "operation": "abs",
+      },
+    )
+
+  if "foot_size" in dr_axes:
+    events["randomize_foot_size"] = EventTermCfg(
+      mode="startup",
+      func=dr.geom_size,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", geom_names=()),  # Set per-robot.
+        "ranges": (0.97, 1.03),
+        "operation": "scale",
+        "shared_random": True,  # All foot geoms share the same scale.
+      },
+    )
+
+  if "pd_gains" in dr_axes:
+    # Matched kp/kd scaling (see the G1 bandwidth analysis in the DR doc): wider
+    # or kp-only ranges leave the heavy joints oscillatory.
+    events["randomize_pd_gains"] = EventTermCfg(
       mode="reset",
       func=dr.pd_gains,
       params={
@@ -213,8 +358,7 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         "kd_range": (0.7, 1.3),
         "operation": "scale",
       },
-    ),
-  }
+    )
 
   ##
   # Rewards
