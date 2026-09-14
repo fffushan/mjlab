@@ -820,8 +820,11 @@ def test_apply_nominal_overrides_records_and_preserves_terminations(diag: Any) -
   assert any(field.startswith("commands.motion") for field in fields)
   events_override = [o for o in overrides if o.field == "events"]
   assert events_override, "the events override must be recorded"
-  # The recorded "before" text is truncated, but it names a removed term.
-  assert "push_robot" in events_override[0].before
+  # The recorded "before" text is truncated, so assert on the reason, which
+  # always names every removed term.
+  assert events_override[0].before
+  assert "push_robot" in events_override[0].reason
+  assert "encoder_bias" in events_override[0].reason
   assert bool(env_cfg.terminations["time_out"].time_out)
 
 
