@@ -209,8 +209,8 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       func=dr.pd_gains,
       params={
         "asset_cfg": SceneEntityCfg("robot"),
-        "kp_range": (0.5, 1.5),
-        "kd_range": (0.5, 1.5),
+        "kp_range": (0.7, 1.3),
+        "kd_range": (0.7, 1.3),
         "operation": "scale",
       },
     ),

@@ -51,12 +51,37 @@ def agibot_x2_flat_tracking_env_cfg(
     "left_shoulder_roll_link",
     "left_elbow_link",
     "left_wrist_yaw_link",
+    "left_wrist_pitch_link",
+    "left_wrist_roll_link",
     "right_shoulder_roll_link",
     "right_elbow_link",
     "right_wrist_yaw_link",
+    "right_wrist_pitch_link",
+    "right_wrist_roll_link",
     "head_yaw_link",
     "head_pitch_link",
   )
+
+  # Wrist flexion is secondary: keep it tracked, but weight it below the main
+  # body chain so the policy prioritizes core pose and velocity tracking.
+  # The tuple aligns with ``motion_cmd.body_names``; only the wrist pitch/roll
+  # links (the newly tracked end effectors) are down-weighted.
+  secondary_weights = {
+    "left_wrist_pitch_link": 0.3,
+    "left_wrist_roll_link": 0.3,
+    "right_wrist_pitch_link": 0.3,
+    "right_wrist_roll_link": 0.3,
+  }
+  body_weights = tuple(
+    secondary_weights.get(name, 1.0) for name in motion_cmd.body_names
+  )
+  for reward_name in (
+    "motion_body_pos",
+    "motion_body_ori",
+    "motion_body_lin_vel",
+    "motion_body_ang_vel",
+  ):
+    cfg.rewards[reward_name].params["body_weights"] = body_weights
 
   cfg.events["foot_friction"].params[
     "asset_cfg"

@@ -147,13 +147,16 @@ Added to `src/mjlab/tasks/tracking/tracking_env_cfg.py` events:
   func=dr.pd_gains,
   params={
     "asset_cfg": SceneEntityCfg("robot"),
-    "kp_range": (0.5, 1.5),
-    "kd_range": (0.5, 1.5),
+    "kp_range": (0.7, 1.3),
+    "kd_range": (0.7, 1.3),
     "operation": "scale",
   },
 ),
 ```
 
-`mode="reset"` re-draws gains every episode; switch to `"startup"` for a fixed
-per-env draw across the whole run. `"scale"` multiplies the compile-time
-default gains, so repeated per-episode randomization does not accumulate.
+The wired default is the safe ``(0.7, 1.3)`` matched range (≈ 1.3–3.9 Hz on
+G1): heavy joints stay damped enough to avoid excessive oscillation while the
+policy still sees a meaningful servo-gain spread. ``mode="reset"`` re-draws
+gains every episode; switch to ``"startup"`` for a fixed per-env draw across
+the whole run. ``"scale"`` multiplies the compile-time default gains, so
+repeated per-episode randomization does not accumulate.

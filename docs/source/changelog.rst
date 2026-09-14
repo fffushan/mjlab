@@ -9,7 +9,7 @@ Added
 ^^^^^
 
 - The motion-tracking tasks randomize the actuator PD gains (``dr.pd_gains``)
-  per episode with matched ``kp_range``/``kd_range`` of ``(0.5, 1.5)`` in
+  per episode with matched ``kp_range``/``kd_range`` of ``(0.7, 1.3)`` in
   ``scale`` mode, so policies train against a spread of joint servo stiffness
   and damping for actuator sim-to-real robustness.
 
@@ -61,6 +61,15 @@ Fixed
 
 Changed
 ^^^^^^^
+
+- The AgiBot X2 tracking task now tracks the full wrist chain: the body-tracking
+  rewards previously supervised ``left/right_wrist_yaw_link`` only, so wrist
+  pitch/roll had no reward gradient and stayed passive regardless of reference
+  motion. ``body_names`` now also includes ``left/right_wrist_pitch_link`` and
+  ``left/right_wrist_roll_link``, and the four body-tracking reward terms
+  gained an optional per-body ``body_weights`` parameter; the X2 task uses it
+  to grade wrist pitch/roll at 0.3 vs 1.0 for the main body chain, so wrist
+  flexion is reproduced without competing with core pose/velocity tracking.
 
 - ``scripts/retarget_npz_to_tracking_npz.py`` takes a ``--task`` argument instead of
   hard-coding the G1 29DOF mode-15 environment, so a retargeted motion can be replayed

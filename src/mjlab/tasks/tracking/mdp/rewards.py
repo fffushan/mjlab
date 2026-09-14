@@ -23,6 +23,30 @@ def _get_body_indexes(
   ]
 
 
+def _build_body_weights(
+  body_weights: tuple[float, ...] | None,
+  command: MotionCommand,
+  body_indexes: list[int],
+  ref: torch.Tensor,
+) -> torch.Tensor:
+  """Per-body multipliers for the selected ``body_indexes``.
+
+  When ``body_weights`` is ``None`` every tracked body counts equally.
+  Otherwise the tuple must align with ``command.cfg.body_names``; it is
+  gathered at the selected indexes so a ``body_names`` subset selection still
+  applies weights correctly.
+  """
+  if body_weights is None:
+    return torch.ones(1, len(body_indexes), dtype=ref.dtype, device=ref.device)
+  if len(body_weights) != len(command.cfg.body_names):
+    raise ValueError(
+      f"body_weights ({len(body_weights)}) must align with command.body_names "
+      f"({len(command.cfg.body_names)})"
+    )
+  weights = torch.as_tensor(body_weights, dtype=ref.dtype, device=ref.device)
+  return weights[body_indexes].unsqueeze(0)
+
+
 def motion_global_anchor_position_error_exp(
   env: ManagerBasedRlEnv, command_name: str, std: float
 ) -> torch.Tensor:
@@ -46,6 +70,7 @@ def motion_relative_body_position_error_exp(
   command_name: str,
   std: float,
   body_names: tuple[str, ...] | None = None,
+  body_weights: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
   body_indexes = _get_body_indexes(command, body_names)
@@ -56,7 +81,8 @@ def motion_relative_body_position_error_exp(
     ),
     dim=-1,
   )
-  return torch.exp(-error.mean(-1) / std**2)
+  weights = _build_body_weights(body_weights, command, body_indexes, error)
+  return torch.exp(-(error * weights).mean(-1) / std**2)
 
 
 def motion_relative_body_orientation_error_exp(
@@ -64,6 +90,7 @@ def motion_relative_body_orientation_error_exp(
   command_name: str,
   std: float,
   body_names: tuple[str, ...] | None = None,
+  body_weights: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
   body_indexes = _get_body_indexes(command, body_names)
@@ -74,7 +101,8 @@ def motion_relative_body_orientation_error_exp(
     )
     ** 2
   )
-  return torch.exp(-error.mean(-1) / std**2)
+  weights = _build_body_weights(body_weights, command, body_indexes, error)
+  return torch.exp(-(error * weights).mean(-1) / std**2)
 
 
 def motion_global_body_linear_velocity_error_exp(
@@ -82,6 +110,7 @@ def motion_global_body_linear_velocity_error_exp(
   command_name: str,
   std: float,
   body_names: tuple[str, ...] | None = None,
+  body_weights: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
   body_indexes = _get_body_indexes(command, body_names)
@@ -92,7 +121,8 @@ def motion_global_body_linear_velocity_error_exp(
     ),
     dim=-1,
   )
-  return torch.exp(-error.mean(-1) / std**2)
+  weights = _build_body_weights(body_weights, command, body_indexes, error)
+  return torch.exp(-(error * weights).mean(-1) / std**2)
 
 
 def motion_global_body_angular_velocity_error_exp(
@@ -100,6 +130,7 @@ def motion_global_body_angular_velocity_error_exp(
   command_name: str,
   std: float,
   body_names: tuple[str, ...] | None = None,
+  body_weights: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
   body_indexes = _get_body_indexes(command, body_names)
@@ -110,7 +141,8 @@ def motion_global_body_angular_velocity_error_exp(
     ),
     dim=-1,
   )
-  return torch.exp(-error.mean(-1) / std**2)
+  weights = _build_body_weights(body_weights, command, body_indexes, error)
+  return torch.exp(-(error * weights).mean(-1) / std**2)
 
 
 def self_collision_cost(
