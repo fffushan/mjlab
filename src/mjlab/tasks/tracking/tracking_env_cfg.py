@@ -128,7 +128,9 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
     # Sensor-pipeline latency: encoder/IMU transport and filtering delay the
     # measurements the policy acts on (1 lag = 20 ms at the 50 Hz policy rate).
     # This is distinct from the command delay, which is set on the actuators.
-    # Terms read from the reference motion are not delayed.
+    # Terms read from the reference motion are not delayed. A whole policy step,
+    # or none: a lag has no nominal to take a percentage of, and one step is
+    # already the smallest non-zero latency there is.
     for term_name in ("joint_pos", "joint_vel", "base_ang_vel"):
       actor_terms[term_name].delay_min_lag = 0
       actor_terms[term_name].delay_max_lag = 1
@@ -235,9 +237,11 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       func=dr.pseudo_inertia,
       params={
         "asset_cfg": SceneEntityCfg("robot"),
-        # ~0.90-1.10x mass, with inertia following by the same factor.
-        "alpha_range": (math.log(0.90) / 2.0, math.log(1.10) / 2.0),
-        "t_range": (-0.02, 0.02),  # COM shift in the body frame, m.
+        # 0.95-1.05x mass, with inertia following by the same factor.
+        "alpha_range": (math.log(0.95) / 2.0, math.log(1.05) / 2.0),
+        # COM shift in the body frame, m. A translation has no nominal to take
+        # 5% of, so it is halved along with the mass range it accompanies.
+        "t_range": (-0.01, 0.01),
       },
     )
 
@@ -282,17 +286,24 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
   # disabled by removing it from MJLAB_DR_AXES. Order matters for terms that
   # write the same model field: every dr.* function samples from the compiled
   # defaults, so the last writer wins.
+  #
+  # These axes exist only here: the velocity tasks randomize nothing but the
+  # actuator PD gains (see their configs). The tracking task has to reproduce a
+  # measured hardware behaviour, so its sim-to-real ranges are held to 5% of
+  # nominal - wide enough that a policy cannot over-fit the exact model, narrow
+  # enough that it trains against roughly the machine it will be deployed on.
 
   if "armature" in dr_axes:
-    # Reflected rotor inertia. The nominal values come from the PFP module
-    # table, and the shipped PD gains are derived from them, so randomizing the
-    # armature decouples that fixed gain/inertia relationship.
+    # Reflected rotor inertia, from the PFP module table. The nominal PD gains
+    # used to be derived from it, so this axis also decoupled a fixed
+    # gain/inertia relationship; where the gains are measured hardware values
+    # instead (the X2) it probes the transmission inertia alone.
     events["randomize_armature"] = EventTermCfg(
       mode="startup",
       func=dr.joint_armature,
       params={
         "asset_cfg": SceneEntityCfg("robot"),
-        "ranges": (0.7, 1.3),
+        "ranges": (0.95, 1.05),
         "operation": "scale",
       },
     )
@@ -306,7 +317,7 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       func=dr.effort_limits,
       params={
         "asset_cfg": SceneEntityCfg("robot"),
-        "effort_limit_range": (0.75, 1.0),
+        "effort_limit_range": (0.95, 1.0),
         "operation": "scale",
       },
     )
@@ -317,19 +328,23 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       func=dr.joint_friction,
       params={
         "asset_cfg": SceneEntityCfg("robot"),
-        "ranges": (0.5, 1.5),
+        "ranges": (0.95, 1.05),
         "operation": "scale",
       },
     )
 
   if "joint_damping" in dr_axes:
-    # The shipped models have damping=0.0, i.e. no viscous transmission loss.
+    # The shipped models have damping=0.0, i.e. no viscous transmission loss, so
+    # there is no nominal to take a percentage of: the range stays absolute and
+    # is one tenth of what it was, which leaves it all but inert against the
+    # active derivative gains (0.03 against Kd 4 on an X2 hip). Robot configs
+    # should scale it with their own torque class; see X2_DAMPING_RANGES.
     events["randomize_joint_damping"] = EventTermCfg(
       mode="startup",
       func=dr.joint_damping,
       params={
         "asset_cfg": SceneEntityCfg("robot"),
-        "ranges": (0.0, 0.3),
+        "ranges": (0.0, 0.03),
         "operation": "abs",
       },
     )
@@ -340,6 +355,7 @@ def make_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
       func=dr.geom_size,
       params={
         "asset_cfg": SceneEntityCfg("robot", geom_names=()),  # Set per-robot.
+        # Already inside the 5% cap; left as it is.
         "ranges": (0.97, 1.03),
         "operation": "scale",
         "shared_random": True,  # All foot geoms share the same scale.

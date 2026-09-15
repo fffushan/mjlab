@@ -1,11 +1,13 @@
 """AgiBot X2 Ultra flat tracking environment configurations."""
 
-from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.asset_zoo.robots import (
   X2_ACTION_SCALE,
   get_x2_robot_cfg,
 )
-from mjlab.asset_zoo.robots.agibot_x2.x2_constants import X2_ARTICULATION
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
+  X2_ACTUATOR_GROUPS,
+  actuator_group_index,
+)
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -19,9 +21,21 @@ from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 # The 12 collision spheres per foot in the ankle-roll body.
 _FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
 
-# Index of the wrist pitch/roll actuator group in ``X2_ARTICULATION``, checked
-# against the model below so a layout change cannot silently miss it.
-_WRIST_ACTUATOR_ID = 4
+# Index of the wrist pitch/roll group in ``X2_ARTICULATION``, resolved by name so
+# a change to the group layout cannot silently point this at another joint.
+_WRIST_ACTUATOR_ID = actuator_group_index("wrist_pitch_roll")
+
+# The generic joint-damping range is an absolute value, not a scale, and it is
+# calibrated on a 120 N.m leg joint: even at the tracking tasks' narrowed bound
+# (0.03 N.m.s/rad) that is far too much passive drag for a 0.6 N.m head joint.
+# The X2 therefore replaces the range for *every* group, scaled to its torque
+# class; ``effort_limit / 4000`` reproduces the generic 0.03 for the legs.
+X2_DAMPING_RANGES: dict[str, tuple[float, float]] = {
+  pattern: (0.0, group.effort_limit / 4000.0)
+  for group in X2_ACTUATOR_GROUPS.values()
+  for pattern in group.target_names_expr
+  if group.effort_limit is not None
+}
 
 
 def agibot_x2_flat_tracking_env_cfg(
@@ -101,13 +115,24 @@ def agibot_x2_flat_tracking_env_cfg(
   if "randomize_foot_size" in cfg.events:
     cfg.events["randomize_foot_size"].params["asset_cfg"].geom_names = _FOOT_GEOMS
 
-  # Wrist-specific derating. The vendor simulator clamps the wrist pitch/roll
-  # motors to 2.2 N.m where the vendor URDF allows 4.8, and the wrists are
-  # end-effector bodies in the termination set, so train against a much weaker
-  # wrist than nominal. This term must come after the whole-robot effort term:
-  # both write the same fields and only the last writer takes effect.
-  wrist_group = X2_ARTICULATION.actuators[_WRIST_ACTUATOR_ID]
-  assert isinstance(wrist_group, BuiltinPositionActuatorCfg)
+  # Replace the robot-agnostic absolute joint-damping range with one scaled to
+  # each group's torque class (see X2_DAMPING_RANGES). The ranges are replaced on
+  # the generic event rather than added as a second one, so there is no ordering
+  # dependency between the two.
+  if "randomize_joint_damping" in cfg.events:
+    cfg.events["randomize_joint_damping"].params["ranges"] = X2_DAMPING_RANGES
+
+  # Wrist-specific effort derating. The vendor simulator clamps the wrist
+  # pitch/roll motors to 2.2 N.m where the vendor URDF allows 4.8, and the wrists
+  # are end-effector bodies in the termination set, so this term used to train
+  # against a 0.45-1.0x weaker wrist. The tracking task's sim-to-real ranges are
+  # now capped at 5%, which leaves it a near no-op: modelling the clamp now means
+  # changing the wrist's *nominal* effort limit to 2.2 N.m and dropping this term
+  # (open item 5.6 of docs/source/x2_gain_provenance.md). Kept as the 5% residual
+  # so the axis wiring and its ordering assertion stay in place.
+  # Must come after the whole-robot effort term: both write the same fields and
+  # only the last writer takes effect.
+  wrist_group = X2_ACTUATOR_GROUPS["wrist_pitch_roll"]
   assert wrist_group.effort_limit == 4.8, wrist_group.effort_limit
   assert wrist_group.target_names_expr == (
     ".*_wrist_pitch_joint",
@@ -119,7 +144,7 @@ def agibot_x2_flat_tracking_env_cfg(
       func=dr.effort_limits,
       params={
         "asset_cfg": SceneEntityCfg("robot", actuator_ids=[_WRIST_ACTUATOR_ID]),
-        "effort_limit_range": (0.45, 1.0),
+        "effort_limit_range": (0.95, 1.0),
         "operation": "scale",
       },
     )

@@ -97,6 +97,56 @@ Changed
 - Bumped ``rsl-rl-lib`` from 5.4.2 to 5.5.0. This update removes the ``logger_type``
   attribute of the ``rsl_rl.utils.Logger``, so code that previously checked
   ``logger.logger_type`` must instead check the type of ``logger.writer``.
+- The AgiBot X2 actuator gains are now the gains the real robot commands in its
+  native stable stand, measured from the recorded ``/aima/hal/joint/*/command``
+  messages of two hardware captures, instead of the reflected-inertia 10 Hz
+  template. The hips, knee, ankles, arms and head yaw move to the measured
+  values (hip 100/4, knee 150/5, ankle pitch 40/3, wrist pitch/roll 20/1,
+  head yaw 3.4/0.114, ...). Relative to the template these are 1.7x softer on the
+  hips and 2-6x stiffer on the ankles, elbow, wrist and head yaw. Waist yaw and
+  waist pitch/roll keep the template value because the vendor's own two tables
+  disagree by 3.75x and 7.5x on them; head pitch keeps it because the measured
+  gain contradicts the joint's 0.6 N.m effort limit.
+
+  See ``docs/source/x2_gain_provenance.md`` for the measurement chain, the four
+  other vendor gain tables in circulation, and the open evidence gaps (notably:
+  the gains are *commanded*, and nothing yet verifies the motor-side loop).
+- The X2 action scale is no longer ``0.25 * effort_limit / Kp``. It is now the
+  larger of that torque floor and a tracking floor derived from the reference
+  motion's p95 deviation from the keyframe, so a joint's gain and its action
+  parameterization are no longer coupled. This raises the action scale on six
+  groups, where a unit action consequently reaches 27-60% of the torque budget
+  (knee 33%, elbow 50%, wrist pitch/roll 60%); the other ten sit at exactly 25%.
+- The X2 keyframe is the pose the real robot is measured standing in (hip pitch
+  -0.19, knee 0.457, ankle pitch -0.267, shoulder pitch 0.4, elbow -1.2) instead
+  of an ad hoc bend, with the soles still flat on the ground. Both X2 tasks share
+  the keyframe, so the velocity task's default pose and its action scales (which
+  come from the same robot-level table) change with it; its actor and rewards are
+  otherwise untouched.
+- The tracking tasks' sim-to-real randomization ranges are capped at 5% of
+  nominal. The axes they carry exist nowhere else (the velocity tasks randomize
+  only the actuator PD gains), so they were the only place a policy could be
+  trained against an actuator markedly different from the one it runs on: the
+  armature and joint-friction scales go from +-30% and +-50% to +-5%, the effort
+  limits from 0.75-1.0x to 0.95-1.0x, and the pseudo-inertia mass range from
+  0.90-1.10x to 0.95-1.05x with its COM shift halved to +-1 cm. Two ranges have
+  no nominal to take 5% of and are documented rather than scaled: the absolute
+  passive-damping range is one tenth of what it was (0.03 N.m.s/rad on a leg
+  joint, now all but inert against a derivative gain of 4), and the discrete
+  0-1 step observation delay is unchanged. The X2 wrist effort derating drops to
+  its 5% residual, which means the vendor simulator's 2.2 N.m wrist clamp is no
+  longer trained for; modelling it now requires changing the nominal wrist
+  effort limit instead.
+- The X2 waist yaw actuator moves to the measured hardware gain (``kp 40``, ``kd 8``,
+  from 170.785/10.872) and to the reflected rotor inertia AgiBot's own Isaac actuator
+  config carries for it (0.010177520, from the 0.043260 the PFP-96 torque class
+  implied). The measured value had been held back because the vendor's own two tables
+  disagree 3.75x on that joint (40/8 standing, 150/3 posture hold); a third source
+  resolves it, since the vendor's sample policy ships 40.1792/2.5579, which is the
+  10 Hz template applied to that armature. The X2 effort limits are now pinned by a
+  test to the flagship revision's released joint ratings: the package this differs
+  from (`sonic-x2`) is built on the newer revision, whose waist is 36 N.m and wrist 6
+  rather than 48 and 4.8. See ``docs/source/x2_gain_provenance.md`` §7.
 
 Fixed
 ^^^^^
@@ -109,6 +159,17 @@ Fixed
 - ``FlatPatchSamplingCfg(patch_radius=0)`` no longer collapses every patch to the
   sub-terrain center. The edge-exclusion mask sliced ``arr[-0:]``, which is
   ``arr[0:]``, so it cleared the entire valid mask :issue:`1171`.
+- The X2 joints no longer inherit the vendored MJCF's blanket
+  ``frictionloss="0.3"``: dry friction is now per joint group, at or below 2% of
+  each joint's rated torque. The old value was 50% of ``head_pitch``'s effort
+  limit, and combined with the friction and effort-limit randomization it could
+  reach the joint's whole torque budget and lock it.
+- The X2 tracking task's joint-damping randomization is no longer an absolute
+  ``(0.0, 0.3) N.m.s/rad`` range for every joint. It scales with each group's
+  torque class (``effort_limit / 400``, which reproduces the old value for the
+  legs), because on ``head_pitch`` that absolute range was 37% of the joint's
+  own derivative-gain authority.
+
 
 Version 1.6.0 (August 8, 2026)
 ------------------------------

@@ -69,6 +69,8 @@ Table of Contents
    source/commands
    source/events
    source/randomization
+   source/sim2real_domain_randomization
+   source/x2_gain_provenance
    source/curriculum
    source/metrics
    source/recorders
