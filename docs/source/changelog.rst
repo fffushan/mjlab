@@ -31,6 +31,16 @@ Added
   ``scripts/convert_agibot_x2_to_mjcf.py`` ports a vendor release into an
   mjlab-convention MJCF (URDF body inertials, named collision geoms, mjlab IMU
   sensor names).
+- AgiBot X2 Ultra gains a flat-terrain velocity-tracking task
+  ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation`` (no-state-estimation
+  variant only: the actor observes gyro, IMU up-vector, encoders and the twist
+  command, but not base linear velocity; the critic keeps it privileged). The
+  config injects ``left_foot``/``right_foot`` sites at spec build time for the
+  foot height scan and foot slip/clearance rewards, leaving the vendored XML
+  byte-identical. It also randomizes the actuator PD gains per episode
+  (``dr.pd_gains``, matched ``kp_range``/``kd_range`` of ``(0.7, 1.3)`` in
+  ``scale`` mode) on top of the base velocity DR set; command-channel delay is
+  inherited from the X2 actuator groups.
 - New script ``scripts/record_tracking_policy_commands.py`` records the motor commands
   a tracking checkpoint issues in the training simulator: for every actuated joint it
   logs the reference frame's joint state, the actor observation, the raw and clipped

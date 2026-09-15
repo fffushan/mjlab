@@ -2,7 +2,11 @@
 
 import pytest
 
-from mjlab.asset_zoo.robots import G1_ACTION_SCALE, GO1_ACTION_SCALE
+from mjlab.asset_zoo.robots import (
+  G1_ACTION_SCALE,
+  GO1_ACTION_SCALE,
+  X2_ACTION_SCALE,
+)
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
@@ -24,6 +28,12 @@ def g1_velocity_task_ids(velocity_task_ids: list[str]) -> list[str]:
 def go1_velocity_task_ids(velocity_task_ids: list[str]) -> list[str]:
   """Get all Go1 velocity task IDs."""
   return [t for t in velocity_task_ids if "Go1" in t]
+
+
+@pytest.fixture(scope="module")
+def x2_velocity_task_ids(velocity_task_ids: list[str]) -> list[str]:
+  """Get all AgiBot X2 velocity task IDs."""
+  return [t for t in velocity_task_ids if "X2" in t]
 
 
 @pytest.fixture(scope="module")
@@ -196,4 +206,63 @@ def test_go1_velocity_has_correct_action_scale(
 
     assert joint_pos_action.scale == GO1_ACTION_SCALE, (
       f"Task {task_id} action scale mismatch, expected GO1_ACTION_SCALE"
+    )
+
+
+def test_x2_velocity_has_required_sensors(x2_velocity_task_ids: list[str]) -> None:
+  """X2 velocity tasks should have feet/ground and self collision sensors."""
+  for task_id in x2_velocity_task_ids:
+    cfg = load_env_cfg(task_id)
+
+    assert cfg.scene.sensors is not None, f"Task {task_id} has no sensors"
+
+    sensor_names = {s.name for s in cfg.scene.sensors}
+    assert "feet_ground_contact" in sensor_names, (
+      f"Task {task_id} missing feet_ground_contact sensor"
+    )
+    assert "self_collision" in sensor_names, (
+      f"Task {task_id} missing self_collision sensor"
+    )
+
+
+def test_x2_velocity_has_correct_action_scale(
+  x2_velocity_task_ids: list[str],
+) -> None:
+  """X2 velocity tasks should use X2_ACTION_SCALE."""
+  for task_id in x2_velocity_task_ids:
+    cfg = load_env_cfg(task_id)
+
+    assert "joint_pos" in cfg.actions, f"Task {task_id} missing 'joint_pos' action"
+
+    joint_pos_action = cfg.actions["joint_pos"]
+    assert isinstance(joint_pos_action, JointPositionActionCfg), (
+      f"Task {task_id} joint_pos action is not JointPositionActionCfg"
+    )
+
+    assert joint_pos_action.scale == X2_ACTION_SCALE, (
+      f"Task {task_id} action scale mismatch, expected X2_ACTION_SCALE"
+    )
+
+
+def test_x2_velocity_no_state_estimation_drops_base_lin_vel(
+  x2_velocity_task_ids: list[str],
+) -> None:
+  """X2 velocity tasks are no-SE: actor obs exclude base_lin_vel.
+
+  The critic keeps the privileged base linear velocity as a teacher signal.
+  """
+  for task_id in x2_velocity_task_ids:
+    cfg = load_env_cfg(task_id)
+
+    actor_terms = cfg.observations["actor"].terms
+    assert "base_lin_vel" not in actor_terms, (
+      f"Task {task_id} actor obs still has base_lin_vel"
+    )
+    assert "projected_gravity" in actor_terms, (
+      f"Task {task_id} actor obs missing projected_gravity"
+    )
+
+    critic_terms = cfg.observations["critic"].terms
+    assert "base_lin_vel" in critic_terms, (
+      f"Task {task_id} critic obs should keep privileged base_lin_vel"
     )
