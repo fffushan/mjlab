@@ -8,6 +8,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added three additive X2 tracking observation ablations from the selected
+  reduced-perturbation ABLATION3 baseline:
+  ``...-Projected-Gravity`` (161 actor dimensions),
+  ``...-Projected-Gravity-And-Anchor`` (167), and
+  ``...-Vendor-Velocity-Scaling`` (164 with measured gyro/joint-velocity
+  preprocessing scales). They use separate PPO experiment directories,
+  preserve the historical tasks and checkpoint, and require fresh training.
+  See ``docs/source/sim2real_domain_randomization.md`` for contracts,
+  normalization and future deployment caveats.
 - Added the X2 no-state-estimation tracking ablations
   ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR`` and
   ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations``.

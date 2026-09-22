@@ -1,5 +1,8 @@
 """AgiBot X2 Ultra flat tracking environment configurations."""
 
+from copy import deepcopy
+from typing import Literal
+
 from mjlab.asset_zoo.robots import (
   X2_ACTION_SCALE,
   get_x2_robot_cfg,
@@ -9,6 +12,7 @@ from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
   actuator_group_index,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs import mdp as env_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
@@ -36,6 +40,13 @@ X2_DAMPING_RANGES: dict[str, tuple[float, float]] = {
   for pattern in group.target_names_expr
   if group.effort_limit is not None
 }
+
+X2TrackingObservationAblation = Literal[
+  "projected_gravity",
+  "projected_gravity_anchor",
+  "vendor_velocity_scaling",
+]
+"""Actor-observation changes evaluated from the reduced-perturbation baseline."""
 
 
 def agibot_x2_flat_tracking_env_cfg(
@@ -233,5 +244,43 @@ def agibot_x2_flat_tracking_correlated_dr_env_cfg(
         axis: (lower * 0.5, upper * 0.5)
         for axis, (lower, upper) in push.params["velocity_range"].items()
       }
+
+  return cfg
+
+
+def agibot_x2_flat_tracking_observation_ablation_env_cfg(
+  ablation: X2TrackingObservationAblation,
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create a fresh actor-observation ablation from the reduced-DR baseline."""
+  cfg = agibot_x2_flat_tracking_correlated_dr_env_cfg(
+    reduced_perturbations=True, play=play
+  )
+  actor_observations = cfg.observations["actor"]
+  actor_terms = actor_observations.terms
+
+  if ablation in ("projected_gravity", "projected_gravity_anchor"):
+    anchor_orientation = actor_terms["motion_anchor_ori_b"]
+    # Deep-copy the reference term's corruption configuration before replacing
+    # its motion-dependent callable. Projected gravity is a root-body measurement.
+    projected_gravity = deepcopy(anchor_orientation)
+    projected_gravity.func = env_mdp.projected_gravity
+    projected_gravity.params = {}
+    projected_gravity.scale = 1.0
+
+    new_actor_terms = {}
+    for name, term in actor_terms.items():
+      if name == "motion_anchor_ori_b":
+        new_actor_terms["projected_gravity"] = projected_gravity
+        if ablation == "projected_gravity_anchor":
+          new_actor_terms[name] = term
+      else:
+        new_actor_terms[name] = term
+    actor_observations.terms = new_actor_terms
+  elif ablation == "vendor_velocity_scaling":
+    actor_terms["base_ang_vel"].scale = 0.25
+    actor_terms["joint_vel"].scale = 0.05
+  else:
+    raise ValueError(f"Unknown X2 tracking observation ablation: {ablation}")
 
   return cfg

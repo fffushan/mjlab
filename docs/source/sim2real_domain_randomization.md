@@ -271,7 +271,75 @@ uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Red
 Its PPO runs are written below
 ``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations``.
 
-To play either task, use its own checkpoint and the same local motion artifact:
+### Additive observation ablations from the reduced-perturbation baseline
+
+The selected ABLATION3 baseline is
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations``.
+Its associated checkpoint is
+``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/2026-09-21_18-37-07_ablation3``.
+The three tasks below are additive fresh-training configurations; the historical
+baseline, correlated-DR task, and reduced-perturbation task are unchanged.
+All use the same 31-joint robot, motion/reference/action/gains/geometry, DR
+(including correlated encoder delay), reset and push settings, rewards,
+terminations, episode settings, critic observations, PPO settings, and
+observation normalization as ABLATION3.
+
+At ``lookahead_s=0``, the actor contracts are:
+
+| Task suffix | Actor observation order | Dimensions |
+|---|---|---:|
+| ``-Projected-Gravity`` | ``command, motion_lookahead, projected_gravity, base_ang_vel, joint_pos, joint_vel, actions`` | 161 |
+| ``-Projected-Gravity-And-Anchor`` | ``command, motion_lookahead, projected_gravity, motion_anchor_ori_b, base_ang_vel, joint_pos, joint_vel, actions`` | 167 |
+| ``-Vendor-Velocity-Scaling`` | Existing 164-dim order; measured ``base_ang_vel`` scale ``0.25`` and ``joint_vel`` scale ``0.05`` | 164 |
+
+``projected_gravity`` is the measured robot root/pelvis gravity vector in the
+root body frame, independent of the motion reference and yaw. It uses the
+existing ``mdp.projected_gravity`` term and copies ABLATION3's additive
+``+/-0.05`` corruption without sharing mutable configuration. The retained
+motion-anchor orientation remains unchanged in the anchor variant. The vendor
+scales apply after noise to measured gyro and joint velocity only; command,
+reference joint velocity, and actions are not scaled.
+
+Train each task from scratch with the same motion artifact, seed, and training
+budget as ABLATION3:
+
+```sh
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Projected-Gravity \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Projected-Gravity-And-Anchor \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Vendor-Velocity-Scaling \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+The separate PPO experiment directories are
+``agibot_x2_tracking_correlated_dr_reduced_perturbations_projected_gravity``,
+``agibot_x2_tracking_correlated_dr_reduced_perturbations_projected_gravity_anchor``,
+and ``agibot_x2_tracking_correlated_dr_reduced_perturbations_vendor_velocity_scaling``.
+Play uses each task's own checkpoint and the same motion file; for example:
+
+```sh
+uv run play Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Projected-Gravity \
+  --checkpoint-file logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_projected_gravity/<run>/model_XXXXX.pt \
+  --motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+Replace the task and checkpoint directory with either of the other listed
+variants as needed. Play disables actor
+corruption and pushes, samples from the start, and retains the reduced joint
+reset range. Set ``MJLAB_DR_AXES`` to the same ``none`` or subset value for
+comparable runs; disabled axes are not recreated by these variants.
+
+All three actor and critic models retain ``obs_normalization=True``. Therefore
+Vendor-Velocity-Scaling does not test disabling normalization: normalization
+may largely cancel a constant preprocessing scale, so its measured outcome may
+be small. The existing X2 Docker adapter is strict; changed dimensions, term
+names, or scales require future controller adaptation, and a matching 164
+shape alone does not make the scaled export plug-compatible. No controller
+support is included here. These are new-training configs, not checkpoint
+conversions or automatically fine-tuned runs; do not blindly resume ABLATION3
+because changed dimensions or normalizer statistics can invalidate that run.
+
 
 ```sh
 uv run play Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR \
