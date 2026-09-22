@@ -54,6 +54,14 @@ class ObservationTermCfg(ManagerTermBaseCfg):
   """If True and update_period > 0, stagger update timing across envs to avoid
   synchronized resampling."""
 
+  delay_group: str | None = None
+  """Optional shared delay schedule name within this observation group.
+
+  Terms with the same non-None name share lag draws and update timing while keeping
+  independent delay histories. All delay settings for terms in the named group must
+  match. Names are local to an observation group.
+  """
+
   history_length: int = 0
   """Number of past observations to keep in history. 0 = no history."""
 
@@ -243,8 +251,8 @@ class ObservationManager(ManagerBase):
     for group_name, group_cfg in self._group_obs_class_term_cfgs.items():
       for term_cfg in group_cfg:
         term_cfg.func.reset(env_ids=env_ids)
+      batch_ids = None if isinstance(env_ids, slice) else env_ids
       for term_name in self._group_obs_term_names[group_name]:
-        batch_ids = None if isinstance(env_ids, slice) else env_ids
         if term_name in self._group_obs_term_delay_buffer[group_name]:
           self._group_obs_term_delay_buffer[group_name][term_name].reset(
             batch_ids=batch_ids
@@ -253,6 +261,8 @@ class ObservationManager(ManagerBase):
           self._group_obs_term_history_buffer[group_name][term_name].reset(
             batch_ids=batch_ids
           )
+      for delay_buffer in self._group_obs_delay_group_buffer[group_name].values():
+        delay_buffer.reset(batch_ids=batch_ids)
     for group_mods in self._group_obs_class_instances.values():
       for mod in group_mods.values():
         mod.reset(env_ids=env_ids)
@@ -338,6 +348,12 @@ class ObservationManager(ManagerBase):
   ) -> torch.Tensor | dict[str, torch.Tensor]:
     group_cfg = self.cfg[group_name]
     group_term_names = self._group_obs_term_names[group_name]
+    if env_ids is None:
+      for delay_buffer in self._group_obs_delay_group_buffer[group_name].values():
+        delay_buffer.append(
+          torch.zeros((self._env.num_envs, 1), device=self._env.device)
+        )
+        delay_buffer.compute()
     group_obs: dict[str, torch.Tensor] = {}
     obs_terms = zip(
       group_term_names, self._group_obs_term_cfgs[group_name], strict=False
@@ -363,7 +379,18 @@ class ObservationManager(ManagerBase):
 
       if term_cfg.delay_max_lag > 0:
         delay_buffer = self._group_obs_term_delay_buffer[group_name][term_name]
-        if env_ids is None or not delay_buffer.is_initialized:
+        if term_cfg.delay_group is not None:
+          schedule_buffer = self._group_obs_delay_group_buffer[group_name][
+            term_cfg.delay_group
+          ]
+          if env_ids is None or not delay_buffer.is_initialized:
+            delay_buffer.append(obs)
+            delay_buffer.set_lags(schedule_buffer.current_lags)
+            obs = delay_buffer.peek()
+          else:
+            delay_buffer.backfill(obs, env_ids)
+            obs = delay_buffer.peek()
+        elif env_ids is None or not delay_buffer.is_initialized:
           delay_buffer.append(obs)
           obs = delay_buffer.compute()
         else:
@@ -409,6 +436,35 @@ class ObservationManager(ManagerBase):
       return result
     return group_obs
 
+  @staticmethod
+  def _validate_delay_group(term_name: str, term_cfg: ObservationTermCfg) -> None:
+    """Validate a named delay group's identifier and delay settings."""
+    delay_group = term_cfg.delay_group
+    if not isinstance(delay_group, str) or not delay_group.strip():
+      raise ValueError(
+        f"Observation term '{term_name}' delay_group must be a non-empty string."
+      )
+    if term_cfg.delay_min_lag < 0:
+      raise ValueError(
+        f"Delay group '{delay_group}' has delay_min_lag < 0 "
+        f"for observation term '{term_name}'."
+      )
+    if term_cfg.delay_max_lag < term_cfg.delay_min_lag:
+      raise ValueError(
+        f"Delay group '{delay_group}' has delay_max_lag smaller than delay_min_lag "
+        f"for observation term '{term_name}'."
+      )
+    if not 0.0 <= term_cfg.delay_hold_prob <= 1.0:
+      raise ValueError(
+        f"Delay group '{delay_group}' has delay_hold_prob outside [0, 1] "
+        f"for observation term '{term_name}'."
+      )
+    if term_cfg.delay_update_period < 0:
+      raise ValueError(
+        f"Delay group '{delay_group}' has delay_update_period < 0 "
+        f"for observation term '{term_name}'."
+      )
+
   def _prepare_terms(self) -> None:
     self._group_obs_term_names: dict[str, list[str]] = dict()
     self._group_obs_term_dim: dict[str, list[tuple[int, ...]]] = dict()
@@ -418,6 +474,7 @@ class ObservationManager(ManagerBase):
     self._group_obs_concatenate_dim: dict[str, int] = dict()
     self._group_obs_class_instances: dict[str, dict[str, noise_model.NoiseModel]] = {}
     self._group_obs_term_delay_buffer: dict[str, dict[str, DelayBuffer]] = dict()
+    self._group_obs_delay_group_buffer: dict[str, dict[str, DelayBuffer]] = dict()
     self._group_obs_term_history_buffer: dict[str, dict[str, CircularBuffer]] = dict()
 
     for group_name, group_cfg in self.cfg.items():
@@ -436,6 +493,8 @@ class ObservationManager(ManagerBase):
       self._group_obs_class_term_cfgs[group_name] = list()
       self._group_obs_class_instances[group_name] = {}
       group_entry_delay_buffer: dict[str, DelayBuffer] = dict()
+      group_entry_delay_group_buffer: dict[str, DelayBuffer] = dict()
+      delay_group_settings: dict[str, tuple[int, int, bool, float, int, bool]] = {}
       group_entry_history_buffer: dict[str, CircularBuffer] = dict()
 
       self._group_obs_concatenate[group_name] = group_cfg.concatenate_terms
@@ -485,6 +544,24 @@ class ObservationManager(ManagerBase):
             term_cfg.noise, num_envs=self._env.num_envs, device=self._env.device
           )
 
+        if term_cfg.delay_group is not None:
+          self._validate_delay_group(term_name, term_cfg)
+          delay_settings = (
+            term_cfg.delay_min_lag,
+            term_cfg.delay_max_lag,
+            term_cfg.delay_per_env,
+            term_cfg.delay_hold_prob,
+            term_cfg.delay_update_period,
+            term_cfg.delay_per_env_phase,
+          )
+          existing_settings = delay_group_settings.get(term_cfg.delay_group)
+          if existing_settings is not None and existing_settings != delay_settings:
+            raise ValueError(
+              f"Delay group '{term_cfg.delay_group}' in observation group "
+              f"'{group_name}' has inconsistent delay settings."
+            )
+          delay_group_settings[term_cfg.delay_group] = delay_settings
+
         if term_cfg.delay_max_lag > 0:
           group_entry_delay_buffer[term_name] = DelayBuffer(
             min_lag=term_cfg.delay_min_lag,
@@ -494,7 +571,11 @@ class ObservationManager(ManagerBase):
             per_env=term_cfg.delay_per_env,
             hold_prob=term_cfg.delay_hold_prob,
             update_period=term_cfg.delay_update_period,
-            per_env_phase=term_cfg.delay_per_env_phase,
+            per_env_phase=(
+              False
+              if term_cfg.delay_group is not None
+              else term_cfg.delay_per_env_phase
+            ),
           )
 
         if term_cfg.history_length > 0:
@@ -512,4 +593,20 @@ class ObservationManager(ManagerBase):
         self._group_obs_term_dim[group_name].append(obs_dims[1:])
 
       self._group_obs_term_delay_buffer[group_name] = group_entry_delay_buffer
+      self._group_obs_delay_group_buffer[group_name] = group_entry_delay_group_buffer
+      for delay_group, delay_settings in delay_group_settings.items():
+        min_lag, max_lag, per_env, hold_prob, update_period, per_env_phase = (
+          delay_settings
+        )
+        if max_lag > 0:
+          group_entry_delay_group_buffer[delay_group] = DelayBuffer(
+            min_lag=min_lag,
+            max_lag=max_lag,
+            batch_size=self._env.num_envs,
+            device=self._env.device,
+            per_env=per_env,
+            hold_prob=hold_prob,
+            update_period=update_period,
+            per_env_phase=per_env_phase,
+          )
       self._group_obs_term_history_buffer[group_name] = group_entry_history_buffer

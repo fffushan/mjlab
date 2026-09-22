@@ -211,6 +211,95 @@ MJLAB_DR_AXES=none uv run python scripts/evaluate_tracking_policy.py ...
 An unknown axis name raises at config build rather than silently doing nothing.
 ``tests/test_tracking_dr.py`` locks the wiring in.
 
+## X2 no-state-estimation correlated-DR ablations
+
+The two X2 ablations below are new tasks; the existing
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation`` task and its trained
+checkpoints remain unchanged. They retain the NSE actor/critic term order,
+observation dimensions, action schema, rewards, nominal gains and geometry.
+They use separate log directories so checkpoints cannot overwrite one another.
+
+### Ablation 2 — correlated DR
+
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR`` changes
+only these enabled-axis knobs:
+
+- ``pd_gains`` uses ``shared_gain_scale=True`` with the existing matched
+  ``kp_range=kd_range=(0.7, 1.3)`` and ``operation="scale"``. Each joint and
+  environment still draws independently, but Kp and Kd use the same multiplier.
+- ``obs_delay`` makes actor ``joint_pos`` and ``joint_vel`` one
+  ``delay_group="encoder_packet"`` (0–1 policy steps), with
+  ``delay_hold_prob=0.9`` and ``delay_update_period=1``. ``base_ang_vel`` keeps
+  its own delay buffer, also at 0–1 steps with the same hold/update settings.
+
+Train from scratch with a local motion file:
+
+```sh
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+Its PPO runs are written below ``logs/rsl_rl/agibot_x2_tracking_correlated_dr``.
+Local resume flags (``--agent.resume``, ``--agent.load-run``, and
+``--agent.load-checkpoint``) search the selected ``experiment_name`` directory,
+not an arbitrary checkpoint path. To fine-tune a baseline checkpoint without
+copying it, you can override ``--agent.experiment-name agibot_x2_tracking`` and
+select its run/checkpoint with those flags. Use a distinct ``--agent.run-name``
+for the ablation: this creates a new timestamped run, but deliberately gives up
+the default separate experiment directory. Match the baseline motion and
+``--env.commands.motion.lookahead-s`` setting when resuming; training does not
+automatically restore lookahead from the checkpoint's saved environment config.
+
+### Ablation 3 — reduced perturbations
+
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations``
+starts from Ablation 2 and differs *only* in reset/push perturbations:
+
+- Every bound in reset ``pose_range``, reset ``velocity_range``, and
+  ``joint_position_range`` is multiplied by 0.5.
+- Every bound in push ``velocity_range`` is multiplied by 0.5 and its interval
+  is ``(4.0, 8.0)`` seconds.
+- No curriculum is enabled. The reset and push velocity dictionaries are copied
+  independently, so constructing this task cannot change the baseline or the
+  other ablation.
+
+```sh
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+Its PPO runs are written below
+``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations``.
+
+To play either task, use its own checkpoint and the same local motion artifact:
+
+```sh
+uv run play Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR \
+  --checkpoint-file logs/rsl_rl/agibot_x2_tracking_correlated_dr/<run>/model_XXXXX.pt \
+  --motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+For a fair checkpoint comparison, evaluate *all* checkpoints with the same
+``--task``, ``MJLAB_DR_AXES`` distribution, iteration count, motion file, and
+seed/number of environments. For example, using the correlated task for every
+checkpoint avoids the confound of evaluating the reduced-perturbation policy on
+its own easier reset distribution. The local evaluator below starts at frame
+zero and disables pushes for every task, while keeping observation corruption,
+delays and the remaining task DR; it therefore does not test push recovery:
+
+```sh
+MJLAB_DR_AXES=all uv run python scripts/evaluate_tracking_policy.py \
+  --task Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR \
+  --checkpoint-file <checkpoint> \
+  --motion-file data/qianghuo_smplx_agibot_x2_tracking.npz \
+  --num-envs 64
+```
+
+Play mode removes actor noise and pushes, uses start-frame sampling, and clears
+pose/velocity reset ranges; it is not an all-DR-off evaluation. Likewise,
+``MJLAB_DR_AXES=none`` removes only the listed tracking axes, leaving the
+pre-existing push, torso-COM, encoder-bias, and foot-friction terms enabled.
+
 ### Ordering rules
 
 Every ``dr.*`` function samples from the *compiled* defaults, never from the

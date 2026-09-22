@@ -190,3 +190,48 @@ def agibot_x2_flat_tracking_env_cfg(
     motion_cmd.sampling_mode = "start"
 
   return cfg
+
+
+def agibot_x2_flat_tracking_correlated_dr_env_cfg(
+  reduced_perturbations: bool = False,
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create the X2 no-state-estimation correlated-DR ablation configuration."""
+  cfg = agibot_x2_flat_tracking_env_cfg(has_state_estimation=False, play=play)
+
+  if "randomize_pd_gains" in cfg.events:
+    cfg.events["randomize_pd_gains"].params["shared_gain_scale"] = True
+
+  actor_terms = cfg.observations["actor"].terms
+  if actor_terms["joint_pos"].delay_max_lag > 0:
+    for term_name in ("joint_pos", "joint_vel"):
+      term = actor_terms[term_name]
+      term.delay_group = "encoder_packet"
+      term.delay_hold_prob = 0.9
+      term.delay_update_period = 1
+    base_ang_vel = actor_terms["base_ang_vel"]
+    base_ang_vel.delay_hold_prob = 0.9
+    base_ang_vel.delay_update_period = 1
+
+  if reduced_perturbations:
+    motion_cmd = cfg.commands["motion"]
+    assert isinstance(motion_cmd, MotionCommandCfg)
+    motion_cmd.pose_range = {
+      axis: (lower * 0.5, upper * 0.5)
+      for axis, (lower, upper) in motion_cmd.pose_range.items()
+    }
+    motion_cmd.velocity_range = {
+      axis: (lower * 0.5, upper * 0.5)
+      for axis, (lower, upper) in motion_cmd.velocity_range.items()
+    }
+    lower, upper = motion_cmd.joint_position_range
+    motion_cmd.joint_position_range = (lower * 0.5, upper * 0.5)
+    if "push_robot" in cfg.events:
+      push = cfg.events["push_robot"]
+      push.interval_range_s = (4.0, 8.0)
+      push.params["velocity_range"] = {
+        axis: (lower * 0.5, upper * 0.5)
+        for axis, (lower, upper) in push.params["velocity_range"].items()
+      }
+
+  return cfg

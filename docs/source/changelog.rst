@@ -8,6 +8,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the X2 no-state-estimation tracking ablations
+  ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR`` and
+  ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations``.
+  The first correlates Kp/Kd reset scales and joint encoder packet delay; the
+  second halves only reset/push perturbation bounds and lengthens push intervals.
+  They use independent PPO experiment directories and leave the existing X2
+  baseline task and its checkpoints unchanged. See
+  ``docs/source/sim2real_domain_randomization.md``.
+
 - The motion-tracking tasks randomize the actuator PD gains (``dr.pd_gains``)
   per episode with matched ``kp_range``/``kd_range`` of ``(0.7, 1.3)`` in
   ``scale`` mode, so policies train against a spread of joint servo stiffness
