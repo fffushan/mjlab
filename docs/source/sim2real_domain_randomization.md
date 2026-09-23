@@ -368,6 +368,82 @@ pose/velocity reset ranges; it is not an all-DR-off evaluation. Likewise,
 ``MJLAB_DR_AXES=none`` removes only the listed tracking axes, leaving the
 pre-existing push, torso-COM, encoder-bias, and foot-friction terms enabled.
 
+### Anchor ablation — pelvis anchor
+
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Pelvis-Anchor``
+is the reduced-perturbation baseline with ``commands.motion.anchor-body-name``
+changed from ``torso_link`` to ``pelvis``. Nothing else changes: same robot,
+motion, actions, rewards, terminations, DR (including the correlated encoder
+delay), reset and push bounds, episode settings, PPO settings, critic terms and
+observation dimensions. It is a fresh-training config with its own PPO
+directory, not a checkpoint conversion.
+
+The anchor is the body frame the reference is tracked in, and it is *not* the
+simulated root. The X2 root link is the pelvis: ``x2_ultra.xml`` declares the
+``floating_base_joint`` free joint on the ``pelvis`` body, and the gyro and
+velocimeter behind the ``base_ang_vel``/``base_lin_vel`` observations sit on
+site ``imu_0``, also on the pelvis. ``motion_global_root_pos`` and
+``motion_global_root_ori`` are named after the *anchor*, not the root: they are
+implemented by ``mdp.motion_global_anchor_*``. So ``torso_link`` is the only
+thing in the shipped task that is torso-based, and this ablation is the one
+switch that moves it.
+
+Moving the anchor changes exactly these quantities:
+
+| Quantity | ``torso_link`` anchor | ``pelvis`` anchor |
+|---|---|---|
+| ``motion_anchor_ori_b`` (actor) | reference torso in robot torso | reference pelvis in robot pelvis |
+| ``motion_anchor_pos_b`` (critic; absent in NSE) | torso offset | pelvis offset |
+| ``motion_relative_body_*`` rewards | bodies re-anchored on the torso | bodies re-anchored on the pelvis |
+| ``motion_global_root_*`` rewards | torso position/orientation error | base position/orientation error |
+| ``anchor_pos`` / ``anchor_ori`` terminations | torso height and tilt gates | base height and tilt gates |
+| ``error_anchor_*`` metrics, ghost visualization | torso | pelvis |
+
+Two consequences are worth expecting before comparing curves:
+
+- The reference's waist motion is no longer divided out of the relative-body
+targets, because the pelvis is upstream of the waist joints. The robot has to
+reproduce waist yaw/pitch/roll through the tracked joints instead of having the
+anchor absorb it. The body terms can therefore score lower at equal competence,
+and the ``anchor_ori`` termination no longer reacts to waist bend at all.
+- The ``anchor_pos`` threshold is unchanged (0.25 m) but now gates the base
+height (reference ≈0.65 m) rather than the torso height (≈0.80 m). Both are
+per-frame world-z gates, so this changes what is measured, not the tolerance.
+
+The trained anchor and the deployment contract are independent in one
+direction: the controller is stricter than training. ``policy_loader.cc``
+rejects any ``anchor_body_name`` other than ``torso_link``, and
+``HardwareRuntime`` builds the live anchor from the pelvis IMU plus measured
+waist joints (``ComputeX2TorsoOrientation``). A pelvis-anchor export keeps the
+same 164 actor dimensions but puts different numbers in the six anchor slots,
+so matching shapes are not plug-compatibility. Deploying this variant would
+require relaxing that check and feeding the pelvis orientation through
+directly; no controller support is included here.
+
+Train from scratch with the same motion artifact and budget as ABLATION3:
+
+```sh
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Pelvis-Anchor \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+Its PPO runs are written below
+``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_pelvis_anchor``.
+Play needs the task's own checkpoint:
+
+```sh
+uv run play Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Pelvis-Anchor \
+  --checkpoint-file logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_pelvis_anchor/<run>/model_XXXXX.pt \
+  --motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+Compare it against the reduced-perturbation baseline at the same seed,
+iteration budget, motion file and ``MJLAB_DR_AXES`` setting. Training reward is
+not the deciding metric for an anchor change either: as with the observation
+ablations above, the reward terms that the anchor weights most heavily
+(``motion_global_root_ori`` and the body velocity terms) are not the ones that
+track hardware survival.
+
 ### Ordering rules
 
 Every ``dr.*`` function samples from the *compiled* defaults, never from the

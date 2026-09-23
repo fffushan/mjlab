@@ -52,8 +52,22 @@ X2TrackingObservationAblation = Literal[
 def agibot_x2_flat_tracking_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
+  anchor_body_name: str = "torso_link",
 ) -> ManagerBasedRlEnvCfg:
-  """Create AgiBot X2 Ultra flat terrain tracking configuration."""
+  """Create AgiBot X2 Ultra flat terrain tracking configuration.
+
+  ``anchor_body_name`` selects the body frame the reference is tracked in. It
+  is *not* the simulated root: the root link is the pelvis (the free-joint body,
+  which also carries ``imu_0``). The anchor is the frame of the
+  ``motion_anchor_*`` observations, the ``motion_relative_body_*`` rewards, the
+  ``anchor_pos``/``anchor_ori`` terminations and the ``motion_global_root_*``
+  rewards, which are named after the anchor rather than the simulated root.
+
+  ``torso_link`` is the deployment contract: the ONNX metadata records it, the
+  X2 controller (``x2_docker``) reconstructs it from the pelvis IMU plus
+  measured waist joints, and its policy loader rejects any other value.
+  ``pelvis`` is the one frame the robot measures directly.
+  """
   cfg = make_tracking_env_cfg()
 
   cfg.scene.entities = {"robot": get_x2_robot_cfg()}
@@ -75,7 +89,7 @@ def agibot_x2_flat_tracking_env_cfg(
 
   motion_cmd = cfg.commands["motion"]
   assert isinstance(motion_cmd, MotionCommandCfg)
-  motion_cmd.anchor_body_name = "torso_link"
+  motion_cmd.anchor_body_name = anchor_body_name
   motion_cmd.body_names = (
     "pelvis",
     "left_hip_roll_link",
@@ -98,6 +112,11 @@ def agibot_x2_flat_tracking_env_cfg(
     "head_yaw_link",
     "head_pitch_link",
   )
+  if anchor_body_name not in motion_cmd.body_names:
+    raise ValueError(
+      f"anchor_body_name {anchor_body_name!r} must be one of the tracked "
+      f"bodies {motion_cmd.body_names}"
+    )
 
   # Wrist flexion is secondary: keep it tracked, but weight it below the main
   # body chain so the policy prioritizes core pose and velocity tracking.
@@ -206,9 +225,12 @@ def agibot_x2_flat_tracking_env_cfg(
 def agibot_x2_flat_tracking_correlated_dr_env_cfg(
   reduced_perturbations: bool = False,
   play: bool = False,
+  anchor_body_name: str = "torso_link",
 ) -> ManagerBasedRlEnvCfg:
   """Create the X2 no-state-estimation correlated-DR ablation configuration."""
-  cfg = agibot_x2_flat_tracking_env_cfg(has_state_estimation=False, play=play)
+  cfg = agibot_x2_flat_tracking_env_cfg(
+    has_state_estimation=False, play=play, anchor_body_name=anchor_body_name
+  )
 
   if "randomize_pd_gains" in cfg.events:
     cfg.events["randomize_pd_gains"].params["shared_gain_scale"] = True

@@ -8,6 +8,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the X2 anchor ablation
+  ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Pelvis-Anchor``,
+  the reduced-perturbation baseline with ``commands.motion.anchor-body-name``
+  set to ``pelvis`` (the simulated root and the frame the robot measures
+  directly) instead of ``torso_link``. Rewards, terminations, DR, reset and push
+  bounds, PPO settings, critic terms and observation dimensions are unchanged,
+  so it trains from scratch in its own PPO experiment directory. See
+  ``docs/source/sim2real_domain_randomization.md``.
+
 - Added three additive X2 tracking observation ablations from the selected
   reduced-perturbation ABLATION3 baseline:
   ``...-Projected-Gravity`` (161 actor dimensions),

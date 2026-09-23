@@ -102,3 +102,22 @@ register_mjlab_task(
   ),
   runner_cls=MotionTrackingOnPolicyRunner,
 )
+
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
+    "Reduced-Perturbations-Pelvis-Anchor"
+  ),
+  env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(
+    reduced_perturbations=True, anchor_body_name="pelvis"
+  ),
+  play_env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(
+    reduced_perturbations=True, play=True, anchor_body_name="pelvis"
+  ),
+  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
+    experiment_name=(
+      "agibot_x2_tracking_correlated_dr_reduced_perturbations_pelvis_anchor"
+    )
+  ),
+  runner_cls=MotionTrackingOnPolicyRunner,
+)
