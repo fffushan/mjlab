@@ -567,3 +567,66 @@ measured hardware values, not to a physical model, and
 policy trained with these values carries them in its ONNX metadata and the
 deployment controller commands exactly them, so a gain change invalidates older
 checkpoints rather than merely making them stale.
+
+
+## X2 velocity task — torso IMU and critic-frame ablations
+
+The shipped X2 velocity task
+(``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation``) has no anchor: it is a
+no-state-estimation velocity task whose actor reads the pelvis ``imu_0`` gyro and
+up-vector, and whose reward set is already torso-referenced (``upright``,
+``body_ang_vel`` and the ``base_com`` randomization all use ``torso_link``).
+Four variants move the *actor* onto the torso ``imu_1`` and enumerate the two
+frames the privileged *critic* can see:
+
+| Task suffix | Critic velocity signals | Critic ``projected_gravity`` | PPO directory |
+|---|---|---|---|
+| ``-Torso-IMU-Critic-Pelvis-Root`` | pelvis ``imu_0`` | root-link orientation | ``..._torso_imu_critic_pelvis_root`` |
+| ``-Torso-IMU-Critic-Pelvis-Upvector`` | pelvis ``imu_0`` | torso ``imu_1`` up-vector | ``..._torso_imu_critic_pelvis_upvector`` |
+| ``-Torso-IMU-Critic-Torso-Root`` | torso ``imu_1`` | root-link orientation | ``..._torso_imu_critic_torso_root`` |
+| ``-Torso-IMU-Critic-Torso-Upvector`` | torso ``imu_1`` | torso ``imu_1`` up-vector | ``..._torso_imu_critic_torso_upvector`` |
+
+each prefixed by ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation`` and by
+``agibot_x2_velocity_`` in the log root. ``Critic-Pelvis-Root`` differs from the
+shipped task in the actor IMU alone, so it is the clean actor contrast; the other
+three measure the critic axes under a torso actor. Observation order and widths
+are identical in all five (3-axis sensors are swapped, not added or removed),
+rewards, terminations, actions, commands, DR, terrain and PPO settings are
+unchanged, and the root stays the pelvis, so every variant is a fresh training
+run rather than a checkpoint conversion.
+
+This ablation asks a different question from the tracking one. There, the anchor
+*is* the reward frame, so a torso IMU lines the measurement up with the objective.
+Here the twist command and its velocity-tracking rewards are defined on the
+**root** (pelvis), while ``upright`` and ``body_ang_vel`` are already scored on
+``torso_link``. A torso actor therefore has to infer root angular velocity
+through the waist joints before it can serve ``track_ang_vel_z`` — but it does
+measure two penalized quantities directly, which the pelvis-IMU baseline cannot.
+Expect a real trade-off rather than an obvious win.
+
+One implementation trap is worth recording because it would have silently
+produced a degenerate experiment: the velocity config builds its critic terms as
+``{**actor_terms}``, which copies *references*, so ``base_ang_vel`` is the same
+object in the actor and critic groups. Re-pointing it by mutating
+``params["sensor_name"]`` would give both groups the last-written source and
+collapse the two axes into one. The variants therefore replace the terms
+(``dataclasses.replace``), and ``tests/test_x2_velocity_torso_imu.py`` pins both
+the distinct-object property and the full 2x2 grid. A second trap is naming: a
+``framezaxis`` whose object is the *world* body has no entity to take a prefix
+from, so the torso up-vector sensor compiles as the bare ``imu_1_upvector``,
+while the gyro and velocimeter are entity-scoped
+``robot/imu_1_ang_vel``/``robot/imu_1_lin_vel``.
+
+Train a variant from scratch, e.g. the torso-critic one:
+
+```sh
+uv run train Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Torso-IMU-Critic-Torso-Upvector
+```
+
+Its runs land under
+``logs/rsl_rl/agibot_x2_velocity_torso_imu_critic_torso_upvector``. Compare all
+five at the same seed, iteration budget and ``MJLAB_DR_AXES`` setting. The
+exported ONNX keeps the same actor width in every variant, but the ``base_ang_vel``
+values are the torso frame, so matching shapes are not semantic compatibility;
+the export metadata records the source per term
+(``observation_terms_sensor_name``/``_site``/``_body``) so the frame is explicit.

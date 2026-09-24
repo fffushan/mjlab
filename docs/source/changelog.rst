@@ -8,6 +8,20 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the X2 velocity torso-IMU ablation grid: four tasks derived from
+  ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation`` that move the actor onto
+  the torso ``imu_1`` gyro and up-vector and enumerate the two frames the
+  privileged critic can read — ``-Torso-IMU-Critic-Pelvis-Root``,
+  ``-Torso-IMU-Critic-Pelvis-Upvector``, ``-Torso-IMU-Critic-Torso-Root`` and
+  ``-Torso-IMU-Critic-Torso-Upvector``. Observation order and widths, rewards,
+  terminations, actions, commands, domain randomization, terrain and PPO settings
+  are unchanged, each variant has its own PPO directory, and the shipped task is
+  untouched, so the four are fresh runs comparable against it. The twist command
+  and its velocity rewards are root-referenced while ``upright`` and
+  ``body_ang_vel`` are torso-referenced, so a torso actor trades root-frame rate
+  observability against directly measuring what is penalized. See
+  ``docs/source/sim2real_domain_randomization.md``.
+
 - Added the X2 torso-IMU ablation
   ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Torso-IMU``,
   the reduced-perturbation baseline with the anchor still on ``torso_link`` but

@@ -7,8 +7,14 @@ from mjlab.rl import (
 )
 
 
-def agibot_x2_velocity_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
-  """Create RL runner configuration for AgiBot X2 Ultra velocity task."""
+def agibot_x2_velocity_ppo_runner_cfg(
+  experiment_name: str = "agibot_x2_velocity",
+) -> RslRlOnPolicyRunnerCfg:
+  """Create RL runner configuration for AgiBot X2 Ultra velocity task.
+
+  ``experiment_name`` defaults to the shipped task's PPO directory; task
+  variants (e.g. the torso-IMU ablations) pass their own so runs cannot collide.
+  """
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
       hidden_dims=(512, 256, 128),
@@ -39,7 +45,7 @@ def agibot_x2_velocity_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,
       max_grad_norm=1.0,
     ),
-    experiment_name="agibot_x2_velocity",
+    experiment_name=experiment_name,
     save_interval=500,
     num_steps_per_env=24,
     max_iterations=30_000,
