@@ -20,3 +20,4 @@ benchmark_results/
 **/generated/*
 
 data/*
+.pi/*
