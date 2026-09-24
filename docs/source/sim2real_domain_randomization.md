@@ -444,6 +444,81 @@ ablations above, the reward terms that the anchor weights most heavily
 (``motion_global_root_ori`` and the body velocity terms) are not the ones that
 track hardware survival.
 
+### Torso IMU — pelvis gyro vs torso gyro
+
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Torso-IMU``
+is the reduced-perturbation baseline with the anchor still on ``torso_link`` but
+the ``base_ang_vel`` (actor and critic) and the critic's ``base_lin_vel``
+observations re-pointed from the pelvis ``imu_0`` site to the torso ``imu_1``
+site. The anchor does not move, so this is the one ablation that isolates the
+*IMU source*. The three tasks in this family are:
+
+| Task | Anchor | Base gyro |
+|---|---|---|
+| ``...-Reduced-Perturbations`` (baseline) | ``torso_link`` | ``imu_0`` (pelvis) |
+| ``...-Reduced-Perturbations-Torso-IMU`` | ``torso_link`` | ``imu_1`` (``torso_link``) |
+| ``...-Reduced-Perturbations-Pelvis-Anchor`` | ``pelvis`` | ``imu_0`` (pelvis) |
+
+Only the torso-IMU task is a clean A/B against the baseline; the pelvis-anchor
+task moves both the anchor and the IMU, so comparing it against the torso-IMU
+task confounds the two changes.
+
+Moving the gyro is not a rotation of the pelvis reading. The ``imu_1`` site is
+rigidly attached to ``torso_link``, so its gyro reads the torso frame's angular
+velocity, which already contains the waist joint rates; the pelvis gyro cannot
+reproduce it without the measured waist motion. The kinematic tests in
+``tests/test_x2_tracking_torso_imu.py`` pin this: with a nonzero waist bend and
+nonzero waist joint rates the torso sensor matches MuJoCo's independent site
+kinematics and differs from the pelvis reading rotated into the torso frame,
+while with the waist joints held still the two agree up to that constant
+rotation.
+
+Nothing else changes. The root is still the pelvis free joint and the first
+tracked body is still the pelvis (only the *anchor* — the frame the reference is
+tracked in — is ``torso_link``), so ``motion_anchor_ori_b`` stays the robot torso
+orientation relative to the reference torso and no projected-gravity or extra
+quaternion term is added. Observation order and widths (164 actor / 350 critic),
+noise, scale, correlation and delay settings, every DR axis, the reset and push
+bounds, rewards, terminations, and the PPO/budget settings are unchanged. The
+actor still carries no ``base_lin_vel``: the critic keeps privileged
+``base_lin_vel``/``base_ang_vel``, and the critic's linear velocity is
+simulation-only information, not a quantity an IMU-equipped robot measures, so
+it never reaches hardware.
+
+Its PPO runs are written below
+``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_torso_imu``.
+Train from scratch and compare at the same seed, iteration budget, motion file
+and ``MJLAB_DR_AXES`` setting as the baseline:
+
+```sh
+uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Torso-IMU \
+  --env.commands.motion.motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+Play needs this task's own checkpoint:
+
+```sh
+uv run play Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Torso-IMU \
+  --checkpoint-file logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_torso_imu/<run>/model_XXXXX.pt \
+  --motion-file data/qianghuo_smplx_agibot_x2_tracking.npz
+```
+
+The exported ONNX keeps the 164-dim actor, but the three ``base_ang_vel``
+values are now the torso frame, not the pelvis frame, so matching shapes are not
+semantic compatibility. The export metadata records the source explicitly:
+``observation_terms_sensor_name``/``observation_terms_sensor_site``/
+``observation_terms_sensor_body`` give, per actor observation term, the builtin
+sensor it reads and, for site sensors, the site and its parent body —
+``robot/imu_1_ang_vel`` on ``imu_1``/``torso_link`` here, versus
+``robot/imu_ang_vel`` on ``imu_0``/``pelvis`` for the baseline. The deployment
+controller is not updated: ``policy_loader.cc`` still assumes a pelvis-frame
+``base_ang_vel`` and rejects an anchor other than ``torso_link``, and the runtime
+has no calibration to consume the torso gyro. Deploying this variant requires
+feeding the measured torso gyro (or transforming the measured pelvis gyro
+through calibrated waist joints) into ``torso_link`` axes; that calibration and
+``x2_docker`` controller support are follow-up work, so this is not a checkpoint
+conversion.
+
 ### Ordering rules
 
 Every ``dr.*`` function samples from the *compiled* defaults, never from the

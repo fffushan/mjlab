@@ -1,5 +1,6 @@
 """Shared utilities for ONNX policy export across RL tasks."""
 
+import mujoco
 import onnx
 import torch
 
@@ -29,6 +30,30 @@ def list_to_csv_str(
     return format_scalar(x)
 
   return delimiter.join(format_entry(x) for x in arr)
+
+
+def resolve_site_sensor_frame(
+  mj_model: mujoco.MjModel, sensor_name: str
+) -> tuple[str, str]:
+  """Resolve a site-backed builtin sensor to its ``(site, parent body)`` names.
+
+  A gyro/velocimeter/accelerometer reads the frame of a site rigidly attached to
+  a body, so the site names the physical location and the parent body names the
+  frame its reading is expressed in. Names are returned exactly as they appear
+  in the compiled model. Returns ``("", "")`` for a missing sensor or one that
+  is not a site sensor (e.g. a joint or subtree sensor), so a caller never
+  claims a frame it did not resolve.
+  """
+  sensor_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SENSOR, sensor_name)
+  if sensor_id < 0:
+    return "", ""
+  if mj_model.sensor_objtype[sensor_id] != mujoco.mjtObj.mjOBJ_SITE:
+    return "", ""
+  site_id = int(mj_model.sensor_objid[sensor_id])
+  site_name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_SITE, site_id) or ""
+  body_id = int(mj_model.site_bodyid[site_id])
+  body_name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+  return site_name, body_name
 
 
 def get_base_metadata(
@@ -64,10 +89,39 @@ def get_base_metadata(
   observation_term_flatten_history_dim: list = []
   observation_term_history_length: list = []
   observation_term_clip: list = []
+  # Sensor-backed actor terms (e.g. ``base_ang_vel``) additionally record which
+  # builtin sensor they read and, for site sensors, the site and its parent
+  # body. That makes the IMU body/site and the angular-velocity frame explicit
+  # in the export instead of inferring it from the term name.
+  observation_term_sensor_name: list = []
+  observation_term_sensor_site: list = []
+  observation_term_sensor_body: list = []
   observation_names = env.observation_manager.active_terms["actor"]
+
+  # Compiled body/site names carry the entity prefix (``robot/torso_link``); the
+  # rest of the metadata (``anchor_body_name``, ``body_names``) uses the bare
+  # names, so strip it here too.
+  entity_prefixes = tuple(f"{name}/" for name in env.scene.entities)
+
+  def unqualified(mj_name: str) -> str:
+    for prefix in entity_prefixes:
+      if mj_name.startswith(prefix):
+        return mj_name[len(prefix) :]
+    return mj_name
 
   for active_term in observation_names:
     cfg = env.observation_manager.get_term_cfg("actor", active_term)
+
+    sensor_name = cfg.params.get("sensor_name")
+    if isinstance(sensor_name, str):
+      site, body = resolve_site_sensor_frame(env.sim.mj_model, sensor_name)
+      observation_term_sensor_name.append(sensor_name)
+      observation_term_sensor_site.append(unqualified(site))
+      observation_term_sensor_body.append(unqualified(body))
+    else:
+      observation_term_sensor_name.append("")
+      observation_term_sensor_site.append("")
+      observation_term_sensor_body.append("")
 
     if cfg.scale is None:
       observation_term_scale.append(1.0)
@@ -99,6 +153,9 @@ def get_base_metadata(
     "observation_terms_flatten_history_dim": observation_term_flatten_history_dim,
     "observation_terms_history_length": observation_term_history_length,
     "observation_terms_clip": observation_term_clip,
+    "observation_terms_sensor_name": observation_term_sensor_name,
+    "observation_terms_sensor_site": observation_term_sensor_site,
+    "observation_terms_sensor_body": observation_term_sensor_body,
     "action_scale": joint_action._scale[0].cpu().tolist()
     if isinstance(joint_action._scale, torch.Tensor)
     else joint_action._scale,

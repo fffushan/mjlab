@@ -8,6 +8,19 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the X2 torso-IMU ablation
+  ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Torso-IMU``,
+  the reduced-perturbation baseline with the anchor still on ``torso_link`` but
+  the ``base_ang_vel`` observations (actor and critic) and the critic's
+  ``base_lin_vel`` re-pointed from the pelvis ``imu_0`` site to the torso
+  ``imu_1`` site. The observation order, widths, noise, scale, delay, all DR
+  axes, rewards, terminations, reset/push bounds and PPO settings are unchanged,
+  and the root stays the pelvis; only the IMU source moves, so it is a clean A/B
+  against the baseline and requires fresh training in its own PPO directory. The
+  ONNX export metadata now also records the per-term sensor site and body so the
+  angular-velocity frame is explicit. See
+  ``docs/source/sim2real_domain_randomization.md``.
+
 - Added the X2 anchor ablation
   ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Pelvis-Anchor``,
   the reduced-perturbation baseline with ``commands.motion.anchor-body-name``

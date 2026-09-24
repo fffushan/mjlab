@@ -18,7 +18,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.sensor import BuiltinSensorCfg, ContactMatch, ContactSensorCfg, ObjRef
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 
@@ -48,11 +48,69 @@ X2TrackingObservationAblation = Literal[
 ]
 """Actor-observation changes evaluated from the reduced-perturbation baseline."""
 
+X2TrackingImuSource = Literal["pelvis", "torso"]
+"""IMU frame the actor's base velocity observations are read from.
+
+``pelvis`` keeps the entity XML's gyro/velocimeter on site ``imu_0`` (the
+historical behavior); ``torso`` adds task-local gyro/velocimeter sensors on
+site ``imu_1`` (a child of ``torso_link``) and re-points the base angular and
+linear velocity observations at them. Site ``imu_1`` is rigidly attached to
+``torso_link``, so its gyro reads the torso frame's angular velocity, which
+already contains the waist joint rates rather than a rotation of the pelvis
+angular velocity.
+"""
+
+_TORSO_IMU_SITE = "imu_1"
+_TORSO_IMU_GYRO = "robot/imu_1_ang_vel"
+_TORSO_IMU_VELOCIMETER = "robot/imu_1_lin_vel"
+
+
+def _torso_imu_sensors() -> tuple[BuiltinSensorCfg, BuiltinSensorCfg]:
+  """Task-local torso IMU sensors, named to avoid the entity's ``imu_0`` ones."""
+  return (
+    BuiltinSensorCfg(
+      name="imu_1_ang_vel",
+      sensor_type="gyro",
+      obj=ObjRef(type="site", name=_TORSO_IMU_SITE, entity="robot"),
+    ),
+    BuiltinSensorCfg(
+      name="imu_1_lin_vel",
+      sensor_type="velocimeter",
+      obj=ObjRef(type="site", name=_TORSO_IMU_SITE, entity="robot"),
+    ),
+  )
+
+
+def _select_imu_source(
+  cfg: ManagerBasedRlEnvCfg, imu_source: X2TrackingImuSource
+) -> None:
+  """Point the base velocity observations at the selected IMU and add its sensors.
+
+  ``pelvis`` is a no-op: the observation params already name the entity XML's
+  ``robot/imu_ang_vel``/``robot/imu_lin_vel`` sensors on site ``imu_0``. ``torso``
+  adds the task-local ``imu_1`` sensors to the scene and re-points every present
+  ``base_ang_vel``/``base_lin_vel`` term in the actor and critic groups.
+  """
+  if imu_source == "pelvis":
+    return
+  assert imu_source == "torso"
+  cfg.scene.sensors = cfg.scene.sensors + _torso_imu_sensors()
+  sensor_names = {
+    "base_ang_vel": _TORSO_IMU_GYRO,
+    "base_lin_vel": _TORSO_IMU_VELOCIMETER,
+  }
+  for group_name in ("actor", "critic"):
+    terms = cfg.observations[group_name].terms
+    for term_name, sensor_name in sensor_names.items():
+      if term_name in terms:
+        terms[term_name].params["sensor_name"] = sensor_name
+
 
 def agibot_x2_flat_tracking_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
   anchor_body_name: str = "torso_link",
+  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """Create AgiBot X2 Ultra flat terrain tracking configuration.
 
@@ -67,7 +125,17 @@ def agibot_x2_flat_tracking_env_cfg(
   X2 controller (``x2_docker``) reconstructs it from the pelvis IMU plus
   measured waist joints, and its policy loader rejects any other value.
   ``pelvis`` is the one frame the robot measures directly.
+
+  ``imu_source`` selects which physical IMU the ``base_ang_vel``/``base_lin_vel``
+  observations are read from independently of the anchor; see
+  :data:`X2TrackingImuSource`.
   """
+  if imu_source not in ("pelvis", "torso"):
+    raise ValueError(
+      f"imu_source {imu_source!r} must be 'pelvis' (imu_0 on the pelvis) or "
+      f"'torso' (imu_1 on torso_link)"
+    )
+
   cfg = make_tracking_env_cfg()
 
   cfg.scene.entities = {"robot": get_x2_robot_cfg()}
@@ -205,6 +273,10 @@ def agibot_x2_flat_tracking_env_cfg(
       enable_corruption=True,
     )
 
+  # Applied after the NSE actor rebuild so the terms it re-points are the final
+  # ones, and before the play overrides, which do not touch sensor names.
+  _select_imu_source(cfg, imu_source)
+
   # Apply play mode overrides.
   if play:
     # Effectively infinite episode length.
@@ -226,10 +298,14 @@ def agibot_x2_flat_tracking_correlated_dr_env_cfg(
   reduced_perturbations: bool = False,
   play: bool = False,
   anchor_body_name: str = "torso_link",
+  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """Create the X2 no-state-estimation correlated-DR ablation configuration."""
   cfg = agibot_x2_flat_tracking_env_cfg(
-    has_state_estimation=False, play=play, anchor_body_name=anchor_body_name
+    has_state_estimation=False,
+    play=play,
+    anchor_body_name=anchor_body_name,
+    imu_source=imu_source,
   )
 
   if "randomize_pd_gains" in cfg.events:
