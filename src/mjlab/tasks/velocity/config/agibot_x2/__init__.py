@@ -1,8 +1,13 @@
 from mjlab.tasks.registry import register_mjlab_task
-from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
+from mjlab.tasks.velocity.rl import (
+  TennisRecoveryOnPolicyRunner,
+  VelocityOnPolicyRunner,
+)
 
 from .env_cfgs import agibot_x2_flat_velocity_env_cfg
 from .rl_cfg import agibot_x2_velocity_ppo_runner_cfg
+from .tennis_recovery_env_cfg import agibot_x2_tennis_recovery_env_cfg
+from .tennis_recovery_rl_cfg import agibot_x2_tennis_recovery_ppo_runner_cfg
 
 register_mjlab_task(
   task_id="Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation",
@@ -10,6 +15,23 @@ register_mjlab_task(
   play_env_cfg=agibot_x2_flat_velocity_env_cfg(play=True),
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(),
   runner_cls=VelocityOnPolicyRunner,
+)
+
+# Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
+# velocity config, replacing the twist command with the recovery-specialized
+# command and adding the paired recovery reset event. Recovery environments
+# restore a full reference state from the tennis endpoint pool and receive
+# zero velocity commands; retention environments keep the original reset
+# sequence and command distribution. The source velocity checkpoint loads
+# strictly via the narrow TennisRecoveryOnPolicyRunner (same actor/critic
+# dimensions, sensor frames, rewards, observations, actions, PD/DR).
+# See docs/source/x2_tennis_recovery.rst.
+register_mjlab_task(
+  task_id=("Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Recovery"),
+  env_cfg=agibot_x2_tennis_recovery_env_cfg(),
+  play_env_cfg=agibot_x2_tennis_recovery_env_cfg(play=True),
+  rl_cfg=agibot_x2_tennis_recovery_ppo_runner_cfg(),
+  runner_cls=TennisRecoveryOnPolicyRunner,
 )
 
 # Torso-IMU ablation grid. The actor reads the torso IMU (``imu_1``) in all four

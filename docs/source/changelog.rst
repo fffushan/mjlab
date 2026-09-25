@@ -8,6 +8,21 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the X2 tennis-end recovery fine-tuning task
+  ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Recovery``, an
+  opt-in variant of the X2 no-state-estimation velocity task that pairs a
+  full-state recovery reset event (80% of environments) with zero-velocity
+  commands, while retention environments (20%) keep the original reset
+  sequence and command distribution. The task loads tennis endpoint states
+  from ``data/tennis/*.npz``, restores joint positions/velocities, pelvis
+  world pose and world-frame linear/angular velocity, and recenters XY to the
+  environment origin while preserving reference height. The source velocity
+  checkpoint (``model_19999.pt``) loads strictly via the narrow
+  ``TennisRecoveryOnPolicyRunner`` with optional post-load LR override
+  (``initial_finetune_lr``). A bounded evaluation CLI provides deterministic
+  held-out row selection for source-vs-candidate comparison. See
+  ``docs/source/x2_tennis_recovery.rst``.
+
 - Added the X2 velocity torso-IMU ablation grid: four tasks derived from
   ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation`` that move the actor onto
   the torso ``imu_1`` gyro and up-vector and enumerate the two frames the
