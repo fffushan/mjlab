@@ -15,6 +15,16 @@ Added
   implementation smoke evidence from policy quality and hardware readiness; they
   do not launch unbounded production training or student export.
 
+- Added optional periodic checkpointing to ``distill train`` through
+  ``--checkpoint-every N``. ``0`` (the default) keeps the previous behavior of
+  writing only ``checkpoint-final.pt``; a positive ``N`` writes an atomic
+  ``checkpoint-iter-<lifetime iteration>.pt`` after every ``N`` completed
+  iterations, each one a complete resume input, and reports every checkpoint
+  written by the invocation. The cadence is recorded in the checkpoint's
+  ``resolved_config`` for audit only and is not a resume invariant, so changing
+  it never refuses a resume and a resumed run continues the lifetime filename
+  sequence.
+
 - Added model-only student evaluation to the M3 distillation CLI. ``distill
   evaluate --mode student --checkpoint PATH`` reconstructs the saved model via
   the new ``InferenceModel``/``load_inference_checkpoint`` API exported from

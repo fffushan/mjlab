@@ -35,12 +35,14 @@ from mjlab.tasks.tracking.distillation.observations import (
   PackedObservationBatch,
   pack_observations,
 )
+from mjlab.tasks.tracking.distillation.runner import DistillationRunner
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
   LabeledReplayBuffer,
 )
 from mjlab.tasks.tracking.distillation.trainer import (
   FreshTrainingData,
+  TrainerPoisonedError,
   VaeDistillationTrainer,
 )
 from mjlab.tasks.tracking.distillation.training_config import TrainingConfig
@@ -329,6 +331,7 @@ def test_cli_exposes_bounded_m3_commands(
 ) -> None:
   for command, expected in (
     ("train", "--max-iterations"),
+    ("train", "--checkpoint-every"),
     ("evaluate", "--sampling-mode"),
   ):
     code = invoke(monkeypatch, ["distill", command, "--help"])
@@ -436,6 +439,7 @@ def test_train_cli_applies_seed_before_construction_and_saves_full_provenance(
     "control_contract",
     "runtime",
     "schedule",
+    "checkpoint_every",
     "trainer",
     "replay",
     "model",
@@ -472,11 +476,13 @@ def test_train_cli_applies_seed_before_construction_and_saves_full_provenance(
     "settings": DEFAULT_MODEL_SETTINGS.to_metadata(),
     "schema": DEFAULT_SCHEMA.compatibility_metadata(),
   }
+  assert provenance["checkpoint_every"] == 0
   assert provenance["resumed_from"] is None
   assert payload["schedule"] == provenance["schedule"]
   assert report["schedule"] == provenance["schedule"]
   assert report["resolved_config"] == provenance
   assert report["resume"] is None
+  assert report["checkpoints"] == [str(output_dir / "checkpoint-final.pt")]
   assert (output_dir / "train-report.json").exists()
 
   # The checkpoint this command just wrote is evaluable without repeating any
@@ -641,6 +647,234 @@ def test_train_cli_resume_extends_budget_and_refuses_changed_settings(
   assert code == 1, (out, err)
   assert "resume refused" in err
   assert "trainer" in err
+
+
+def _train_with_tiny_cohort(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  extra: list[str],
+) -> tuple[str | int | None, str, str]:
+  """Invoke ``distill train`` on the tiny cohort with fixed stored semantics.
+
+  Only the settings under test (budget, save cadence, output directory, resume)
+  are passed through ``extra``, so a resumed run repeats the stored semantics.
+  """
+  code = invoke(
+    monkeypatch,
+    [
+      "distill",
+      "train",
+      "--manifest",
+      str(tmp_path / "configs" / "tiny_teachers.yaml"),
+      "--repo-root",
+      str(tmp_path),
+      "--teacher-id",
+      TEACHER_ID,
+      "--num-envs",
+      "2",
+      "--bootstrap-steps",
+      "1",
+      "--collection-steps",
+      "1",
+      "--replay-capacity",
+      "24",
+      "--seed",
+      "7",
+      *extra,
+    ],
+  )
+  captured = capsys.readouterr()
+  return code, captured.out, captured.err
+
+
+def test_train_cli_writes_periodic_checkpoints_and_resumes_from_intermediate(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """Periodic checkpoints are lifetime-indexed, complete, and resumable.
+
+  The cadence is recorded in ``resolved_config`` but is deliberately not a
+  resume invariant, so a resumed run may change ``--checkpoint-every`` and
+  continues from the checkpoint's lifetime iteration instead of restarting at
+  iteration zero.  The simulator/adapter boundary is mocked; the model, replay,
+  trainer, runner, checkpoint, and report are the real objects.
+  """
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls)
+
+  first_dir = tmp_path / "periodic"
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "6",
+      "--checkpoint-every",
+      "2",
+      "--output-dir",
+      str(first_dir),
+    ],
+  )
+
+  assert code == 0, err
+  report = json.loads(out)
+  assert report["iteration"] == 6
+  assert report["resolved_config"]["checkpoint_every"] == 2
+  periodic = [first_dir / f"checkpoint-iter-{step:06d}.pt" for step in (2, 4, 6)]
+  final = first_dir / "checkpoint-final.pt"
+  # Every checkpoint of this invocation is listed, with the final one included.
+  assert report["checkpoints"] == [str(path) for path in [*periodic, final]]
+  expected_provenance = torch.load(final, weights_only=True)["resolved_config"]
+  for path, step in zip(periodic, (2, 4, 6), strict=True):
+    payload = torch.load(path, weights_only=True)
+    assert payload["counters"]["iteration"] == step
+    # A periodic checkpoint is the same save with the same metadata: the
+    # provenance record and schedule match the final checkpoint exactly.
+    assert payload["resolved_config"] == expected_provenance
+    assert payload["schedule"] == report["schedule"]
+
+  # Resume from the iteration-2 checkpoint while *changing* the cadence.  The
+  # filename sequence continues the lifetime counter (5, 6) instead of
+  # restarting and colliding with the first run's files.
+  second_dir = tmp_path / "resumed"
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "6",
+      "--checkpoint-every",
+      "3",
+      "--resume",
+      str(periodic[0]),
+      "--output-dir",
+      str(second_dir),
+    ],
+  )
+
+  assert code == 0, err
+  resumed = json.loads(out)
+  assert resumed["iteration"] == 6
+  assert resumed["checkpoints"] == [
+    str(second_dir / "checkpoint-iter-000005.pt"),
+    str(second_dir / "checkpoint-iter-000006.pt"),
+    str(second_dir / "checkpoint-final.pt"),
+  ]
+  # No cadence-relative restarts: nothing is written at 3 (2 + 1 chunk).
+  assert not (second_dir / "checkpoint-iter-000003.pt").exists()
+  assert resumed["resume"]["provenance_verified"] is True
+  assert resumed["resume"]["mismatches"] == []
+  assert resumed["resume"]["budget"] == {
+    "stored_max_iterations": 6,
+    "requested_max_iterations": 6,
+    "extended": False,
+  }
+  # The run continued from the checkpoint (2) and stopped at the budget (6).
+  assert [item["iteration"] for item in resumed["iterations"]] == [2, 3, 4, 5]
+  assert resumed["resolved_config"]["checkpoint_every"] == 3
+
+
+def test_train_cli_default_checkpoint_every_writes_only_the_final_checkpoint(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """``--checkpoint-every 0`` is the default and keeps the original one save."""
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls)
+  output_dir = tmp_path / "single"
+
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "4", "--output-dir", str(output_dir)],
+  )
+
+  assert code == 0, err
+  report = json.loads(out)
+  assert report["iteration"] == 4
+  assert report["resolved_config"]["checkpoint_every"] == 0
+  assert report["checkpoints"] == [str(output_dir / "checkpoint-final.pt")]
+  assert list(output_dir.glob("checkpoint-iter-*.pt")) == []
+
+
+def test_train_cli_rejects_negative_checkpoint_every_before_construction(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A negative cadence is refused actionably, before any adapter is built."""
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls)
+  output_dir = tmp_path / "invalid"
+
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "1",
+      "--checkpoint-every=-1",
+      "--output-dir",
+      str(output_dir),
+    ],
+  )
+
+  assert code == 1
+  assert out == ""
+  assert "--checkpoint-every must be a non-negative integer" in err
+  assert "0 to disable periodic checkpoints" in err
+  assert calls == []
+  assert not output_dir.exists()
+
+
+def test_train_cli_surfaces_periodic_save_failures(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A refused periodic save aborts the run instead of being swallowed.
+
+  ``DistillationRunner.save`` is where the trainer poison gate and the atomic
+  write live, so injecting its refusal is how a checkpoint-level save failure
+  reaches the CLI.  The failure must propagate as a non-zero exit with no final
+  checkpoint and no report, not be logged and skipped.
+  """
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls)
+  output_dir = tmp_path / "failure"
+  real_save = DistillationRunner.save
+
+  def refusing_save(self, path, **kwargs):
+    if "checkpoint-iter-" in str(path):
+      raise TrainerPoisonedError("trainer is poisoned and requires a validated restore")
+    return real_save(self, path, **kwargs)
+
+  monkeypatch.setattr(DistillationRunner, "save", refusing_save)
+
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "4",
+      "--checkpoint-every",
+      "2",
+      "--output-dir",
+      str(output_dir),
+    ],
+  )
+
+  assert code == 1
+  assert out == ""
+  assert "[FAIL]" in err
+  assert "poisoned" in err
+  assert not (output_dir / "checkpoint-final.pt").exists()
+  assert list(output_dir.glob("checkpoint-iter-*.pt")) == []
+  assert not (output_dir / "train-report.json").exists()
 
 
 def test_evaluate_cli_loads_train_produced_checkpoint_without_training_flags(

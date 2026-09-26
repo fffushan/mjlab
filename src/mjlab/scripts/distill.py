@@ -49,6 +49,7 @@ from mjlab.tasks.tracking.distillation.parity import (
 )
 from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
+  LifecycleIteration,
   RunnerConfig,
 )
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
@@ -209,12 +210,16 @@ def _resolved_config(
   evaluation_sampling_mode: str,
   runner: DistillationRunner,
   resume: Path | None,
+  checkpoint_every: int,
 ) -> dict[str, Any]:
   """Complete resolved runner/trainer/runtime configuration for one run.
 
-  Everything a resume must reproduce is recorded here.  The single exception is
-  ``schedule.max_iterations``, documented as a total lifetime budget that the
-  caller may explicitly extend on resume; every other entry is compared by
+  Everything a resume must reproduce is recorded here, plus the requested save
+  cadence (``checkpoint_every``) which is audit-only: it is deliberately kept
+  out of :data:`_RESUME_INVARIANT_KEYS` so changing ``--checkpoint-every`` never
+  refuses a resume.  The one compared budget is ``schedule.max_iterations``,
+  documented as a total lifetime budget that the caller may explicitly extend
+  on resume; every other compared entry is checked by
   :func:`_check_resume_compatibility`.
   """
   teacher = cohort.teacher(teacher_id)
@@ -238,6 +243,7 @@ def _resolved_config(
       "seed_provenance": dict(seed_audit),
     },
     "schedule": _schedule_config(runner, evaluation_sampling_mode),
+    "checkpoint_every": checkpoint_every,
     "trainer": {
       "learning_rate": trainer.config.learning_rate,
       "beta": trainer.config.beta,
@@ -445,6 +451,7 @@ def _train(
   beta: float = 0.01,
   seed: int = 0,
   rollout_latent: RolloutLatent = "mean",
+  checkpoint_every: int = 0,
   output_dir: Path = Path("distillation-runs/latest"),
   resume: Path | None = None,
 ) -> int:
@@ -456,9 +463,23 @@ def _train(
   checkpoint contains replay.  ``seed`` is forwarded into environment
   construction before startup randomization, and the resolved seed, the seed
   provenance, and the complete resolved configuration are reported.
+
+  ``checkpoint_every`` is an optional periodic save cadence counted in
+  *completed* iterations.  ``0`` (the default) keeps the original behavior of
+  writing only ``checkpoint-final.pt``.  When positive, a checkpoint named from
+  the total lifetime iteration counter is written atomically every
+  ``checkpoint_every`` completed iterations, every checkpoint is a complete
+  resume input, and the report lists every checkpoint written by this
+  invocation.
   """
   runner = None
   try:
+    if checkpoint_every < 0:
+      raise ValueError(
+        f"--checkpoint-every must be a non-negative integer (got "
+        f"{checkpoint_every}); use 0 to disable periodic checkpoints and keep "
+        "only the final checkpoint"
+      )
     cohort = _resolve(manifest, repo_root)
     runner, selected, evaluation_sampling_mode = _build_runner(
       cohort=cohort,
@@ -497,6 +518,7 @@ def _train(
       evaluation_sampling_mode=evaluation_sampling_mode,
       runner=runner,
       resume=resume,
+      checkpoint_every=checkpoint_every,
     )
     resume_audit = None
     if resume is not None:
@@ -507,20 +529,40 @@ def _train(
         map_location=device,
       )
       resume_audit = _check_resume_compatibility(state, resolved_config)
-    iterations = runner.run()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_checkpoint(path: Path) -> None:
+      runner.save(
+        str(path),
+        teacher_hashes=selected.hashes,
+        control_contract=resolved_config["control_contract"],
+        resolved_config=resolved_config,
+        schedule=resolved_config["schedule"],
+      )
+
+    # The existing bounded runner is driven in chunks and its one save call is
+    # reused, so a periodic checkpoint carries the same provenance/schedule
+    # metadata as the final one and is an ordinary resume input.  Filenames use
+    # ``runner.iteration``, the total lifetime counter, so a resumed run
+    # continues the same sequence instead of colliding with earlier files.
+    iterations: list[LifecycleIteration] = []
+    checkpoints: list[Path] = []
+    while runner.iteration < max_iterations:
+      remaining = max_iterations - runner.iteration
+      chunk = remaining if checkpoint_every <= 0 else min(checkpoint_every, remaining)
+      iterations.extend(runner.run(iterations=chunk))
+      if checkpoint_every > 0:
+        periodic = output_dir / f"checkpoint-iter-{runner.iteration:06d}.pt"
+        write_checkpoint(periodic)
+        checkpoints.append(periodic)
     checkpoint = output_dir / "checkpoint-final.pt"
-    runner.save(
-      str(checkpoint),
-      teacher_hashes=selected.hashes,
-      control_contract=resolved_config["control_contract"],
-      resolved_config=resolved_config,
-      schedule=resolved_config["schedule"],
-    )
+    write_checkpoint(checkpoint)
+    checkpoints.append(checkpoint)
     payload = {
       "command": " ".join(sys.argv),
       "status": "implementation_smoke_only",
       "checkpoint": str(checkpoint),
+      "checkpoints": [str(path) for path in checkpoints],
       "iteration": runner.iteration,
       "iterations": [_iteration_report(item) for item in iterations],
       "events": runner.events,

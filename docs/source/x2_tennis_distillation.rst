@@ -44,7 +44,7 @@ or policy-quality evidence.
    # Bounded collection/training smoke; parent owns GPU execution.
    uv run distill train --manifest configs/distillation/x2_tennis.yaml \\
      --repo-root . --teacher-id tennis_000 --device cuda:0 --num-envs 4 \\
-     --max-iterations 8 --bootstrap-steps 128 --collection-steps 32 \\
+     --max-iterations 8 --checkpoint-every 4 --bootstrap-steps 128 --collection-steps 32 \\
      --updates-per-iteration 1 --teacher-probability 0 \\
      --minibatch-size 128 --accumulation-steps 15 --replay-capacity 8192 \\
      --seed 7 --rollout-latent mean \\
@@ -68,6 +68,21 @@ recorded setting a resume may change; every other entry of the checkpoint's
 ``resolved_config`` provenance is compared against the requested settings and a
 difference is refused instead of silently changing the stored schedule or
 semantics. Use a separate output directory for the resumed run.
+
+Periodic saving is opt-in. ``--checkpoint-every N`` writes
+``checkpoint-iter-<lifetime iteration>.pt`` into ``--output-dir`` after every
+``N`` completed iterations, using the same atomic save and the same provenance,
+schedule, teacher-hash, and control-contract metadata as the final checkpoint,
+so any of them is a valid ``--resume`` input. The default ``0`` keeps the
+single ``checkpoint-final.pt`` behavior, and ``checkpoint-final.pt`` is always
+written at the end. Iterations are the total lifetime counter, so a resumed run
+continues the same filename sequence rather than overwriting an earlier
+period's files, and the report lists every checkpoint written by the invocation
+(``checkpoints``, final one included) next to the final one (``checkpoint``).
+The cadence is recorded in ``resolved_config`` but is not a resume invariant:
+changing ``--checkpoint-every`` between a run and its resume is accepted, while
+every other stored semantic setting is still compared and a difference is
+refused. A negative cadence is rejected before any environment is constructed.
 
 Every ``train``/``evaluate`` invocation forwards ``--seed`` into environment
 construction, so the private environment configuration is seeded *before* MuJoCo
