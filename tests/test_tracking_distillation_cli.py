@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from tracking_distillation_fixtures import (
   write_manifest,
 )
 
+from mjlab.scripts import distill
 from mjlab.scripts.distill import PROVENANCE_VERSION, _control_metadata, main
 from mjlab.tasks.tracking.distillation.adapter import (
   DistillationSnapshot,
@@ -35,7 +37,10 @@ from mjlab.tasks.tracking.distillation.observations import (
   PackedObservationBatch,
   pack_observations,
 )
-from mjlab.tasks.tracking.distillation.runner import DistillationRunner
+from mjlab.tasks.tracking.distillation.runner import (
+  DistillationRunner,
+  LifecycleIteration,
+)
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
   LabeledReplayBuffer,
@@ -115,13 +120,14 @@ class _FakeAdapter:
 
   auto_reset = True
 
-  def __init__(self, seed: int | None) -> None:
+  def __init__(self, seed: int | None, num_envs: int = 2) -> None:
     self.schema = DEFAULT_SCHEMA
     self.teacher = _Teacher()
+    self.num_envs = num_envs
     self.reset_calls = 0
     self.step_calls = 0
     self.closed = False
-    self.current = _snapshot(0)
+    self.current = _snapshot(0, num_envs)
     self.audit = SimpleNamespace(
       seed_provenance=RuntimeSeedProvenance(
         requested_seed=seed,
@@ -137,12 +143,12 @@ class _FakeAdapter:
   def reset(self, seed: int | None = None) -> DistillationSnapshot:
     del seed
     self.reset_calls += 1
-    self.current = _snapshot(0)
+    self.current = _snapshot(0, self.num_envs)
     return self.current
 
   def step(self, action: torch.Tensor) -> DistillationStep:
     self.step_calls += 1
-    self.current = _snapshot(self.step_calls)
+    self.current = _snapshot(self.step_calls, self.num_envs)
     batch = self.current.packed.batch_size
     return DistillationStep(
       self.current,
@@ -156,16 +162,56 @@ class _FakeAdapter:
     self.closed = True
 
 
+class _BoundaryAdapter(_FakeAdapter):
+  """Fake adapter with a deterministic, per-tick mix of boundary reasons.
+
+  Ticks cycle through ``terminated``, ``generation``, and their combination, so
+  the boundary report is exercised with more than one reason while every
+  segment/generation id stays small and inspectable.
+  """
+
+  def __init__(self, seed: int | None, num_envs: int = 2) -> None:
+    super().__init__(seed, num_envs)
+    self.ticks = 0
+    self.generation = torch.zeros(num_envs, dtype=torch.int64)
+
+  def reset(self, seed: int | None = None) -> DistillationSnapshot:
+    snapshot = super().reset(seed)
+    self.ticks = 0
+    self.generation = torch.zeros(self.num_envs, dtype=torch.int64)
+    return snapshot
+
+  def step(self, action: torch.Tensor) -> DistillationStep:
+    self.ticks += 1
+    self.step_calls += 1
+    base = _snapshot(self.step_calls, self.num_envs)
+    terminated = torch.zeros(self.num_envs, dtype=torch.bool)
+    phase = self.ticks % 3
+    if phase in (0, 1):
+      terminated[0] = True
+    if phase in (0, 2):
+      self.generation[1] = self.ticks
+    self.current = replace(base, generation_id=self.generation.clone())
+    return DistillationStep(
+      self.current,
+      torch.zeros(self.num_envs),
+      terminated,
+      torch.zeros(self.num_envs, dtype=torch.bool),
+      {},
+    )
+
+
 def _install_fake_adapter(
   monkeypatch: pytest.MonkeyPatch,
   calls: list[dict],
   adapters: list | None = None,
+  adapter_type: type = _FakeAdapter,
 ) -> None:
   """Mock only the simulator/adapter boundary, recording every construction."""
 
   def factory(cohort, teacher_id: str = TEACHER_ID, **kwargs):
     calls.append({"teacher_id": teacher_id, **kwargs})
-    adapter = _FakeAdapter(kwargs.get("seed"))
+    adapter = adapter_type(kwargs.get("seed"), kwargs.get("num_envs", 2))
     if adapters is not None:
       adapters.append(adapter)
     return adapter
@@ -332,6 +378,7 @@ def test_cli_exposes_bounded_m3_commands(
   for command, expected in (
     ("train", "--max-iterations"),
     ("train", "--checkpoint-every"),
+    ("train", "--report-boundaries"),
     ("evaluate", "--sampling-mode"),
   ):
     code = invoke(monkeypatch, ["distill", command, "--help"])
@@ -799,6 +846,263 @@ def test_train_cli_default_checkpoint_every_writes_only_the_final_checkpoint(
   assert report["resolved_config"]["checkpoint_every"] == 0
   assert report["checkpoints"] == [str(output_dir / "checkpoint-final.pt")]
   assert list(output_dir.glob("checkpoint-iter-*.pt")) == []
+
+
+def _train_boundaries(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  extra: list[str],
+) -> tuple[str | int | None, str, str]:
+  """Invoke ``distill train`` with the boundary-report settings under test."""
+  code = invoke(
+    monkeypatch,
+    [
+      "distill",
+      "train",
+      "--manifest",
+      str(tmp_path / "configs" / "tiny_teachers.yaml"),
+      "--repo-root",
+      str(tmp_path),
+      "--teacher-id",
+      TEACHER_ID,
+      "--output-dir",
+      str(tmp_path / "boundary-run"),
+      "--seed",
+      "7",
+      "--updates-per-iteration",
+      "0",
+      *extra,
+    ],
+  )
+  captured = capsys.readouterr()
+  return code, captured.out, captured.err
+
+
+def _dict_nodes(value):
+  """Every mapping nested anywhere inside a decoded report."""
+  if isinstance(value, dict):
+    yield value
+    for item in value.values():
+      yield from _dict_nodes(item)
+  elif isinstance(value, list):
+    for item in value:
+      yield from _dict_nodes(item)
+
+
+_RAW_BOUNDARY_FIELDS = {
+  "env_indices",
+  "before_segment",
+  "after_segment",
+  "before_generation",
+  "after_generation",
+}
+
+
+def test_train_report_summarizes_boundaries_by_reason_without_env_arrays(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """The default report aggregates boundaries instead of embedding per-env arrays.
+
+  The adapter's tick cycle makes one iteration contain an ``explicit_reset``
+  record, a ``terminated`` record, a ``generation`` record, and a combined
+  ``terminated+generation`` record, so the reason grouping and the observed
+  ranges are asserted exactly rather than merely being present.
+  """
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls, adapter_type=_BoundaryAdapter)
+  # The order of the two calls proves each iteration is aggregated as soon as
+  # it returns, so a summary report never holds the whole run's boundary arrays.
+  order: list[str] = []
+  real_run_iteration = DistillationRunner.run_iteration
+  real_iteration_report = distill._iteration_report
+
+  def recording_run_iteration(self) -> LifecycleIteration:
+    result = real_run_iteration(self)
+    order.append(f"collect:{result.iteration}")
+    return result
+
+  def recording_iteration_report(iteration, report_boundaries) -> dict:
+    order.append(f"report:{iteration.iteration}")
+    return real_iteration_report(iteration, report_boundaries)
+
+  monkeypatch.setattr(DistillationRunner, "run_iteration", recording_run_iteration)
+  monkeypatch.setattr(
+    "mjlab.scripts.distill._iteration_report", recording_iteration_report
+  )
+
+  code, out, err = _train_boundaries(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--num-envs", "2", "--max-iterations", "2", "--collection-steps", "3"],
+  )
+
+  assert code == 0, err
+  report = json.loads(out)
+  assert order == ["collect:0", "report:0", "collect:1", "report:1"]
+  boundaries = [item["collection"]["boundaries"] for item in report["iterations"]]
+  assert boundaries[0] == {
+    "mode": "summary",
+    "ticks": 3,
+    "records": 4,
+    "env_mentions": 6,
+    "reasons": {
+      "explicit_reset": {"records": 1, "env_mentions": 2},
+      "terminated": {"records": 1, "env_mentions": 1},
+      "generation": {"records": 1, "env_mentions": 1},
+      "terminated+generation": {"records": 1, "env_mentions": 2},
+    },
+    "before_segment_range": [0, 0],
+    "after_segment_range": [0, 0],
+    "before_generation_range": [0, 2],
+    "after_generation_range": [0, 3],
+  }
+  # The second iteration keeps collecting the same adapter snapshot, so it has
+  # no explicit reset and the same per-tick reasons with the next tick values.
+  assert boundaries[1] == {
+    "mode": "summary",
+    "ticks": 3,
+    "records": 3,
+    "env_mentions": 4,
+    "reasons": {
+      "terminated": {"records": 1, "env_mentions": 1},
+      "generation": {"records": 1, "env_mentions": 1},
+      "terminated+generation": {"records": 1, "env_mentions": 2},
+    },
+    "before_segment_range": [0, 0],
+    "after_segment_range": [0, 0],
+    "before_generation_range": [0, 5],
+    "after_generation_range": [0, 6],
+  }
+  # No per-environment payload of the raw SegmentBoundary form survives.
+  assert "env_indices" not in out
+  for node in _dict_nodes(report):
+    assert not _RAW_BOUNDARY_FIELDS & set(node)
+
+
+def test_train_report_boundaries_full_keeps_the_raw_detail(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """``--report-boundaries full`` restores the per-environment detail.
+
+  The full detail is also the reference for the summary: every aggregated count
+  and range must be reproducible from the raw records, and the default report
+  must stay far smaller than the same run's full one.
+  """
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls, adapter_type=_BoundaryAdapter)
+  settings = [
+    "--num-envs",
+    "1024",
+    "--max-iterations",
+    "3",
+    "--collection-steps",
+    "6",
+  ]
+  summary_path = tmp_path / "boundary-run" / "train-report.json"
+  code, out, err = _train_boundaries(tmp_path, monkeypatch, capsys, settings)
+
+  assert code == 0, err
+  summary_report = json.loads(out)
+  assert json.loads(summary_path.read_text()) == summary_report
+  summary_size = os.path.getsize(summary_path)
+  assert summary_size == len(out.encode())
+  assert summary_size < 1_000_000
+
+  code, out, err = _train_boundaries(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [*settings, "--report-boundaries", "full"],
+  )
+
+  # The same settings and seed are repeated, so this second run produces the
+  # identical boundary sequence and its raw records are the reference for the
+  # first run's summary.
+  assert code == 0, err
+  full_report = json.loads(out)
+  assert json.loads(summary_path.read_text()) == full_report
+  full_size = os.path.getsize(summary_path)
+  # The raw form is ~1 MB for three collection-heavy iterations at 1024
+  # environments, so a default report that re-embedded the arrays would fail
+  # the bound asserted above.
+  assert full_size > 800_000 > 5 * summary_size
+  assert "env_indices" in out
+  first_records = full_report["iterations"][0]["collection"]["boundaries"]
+  # The first iteration resets, so its first record mentions every environment
+  # and stores one full-batch array for each before/after id.
+  assert first_records[0]["reason"] == "explicit_reset"
+  assert len(first_records[0]["env_indices"]) == 1024
+  iterations = zip(summary_report["iterations"], full_report["iterations"], strict=True)
+  for summary_iteration, full_iteration in iterations:
+    summary = summary_iteration["collection"]["boundaries"]
+    records = full_iteration["collection"]["boundaries"]
+    assert isinstance(records, list) and records
+    assert set(records[0]) == {"env_indices", "reason"} | _RAW_BOUNDARY_FIELDS
+    mentioned = [len(record["env_indices"]) for record in records]
+    assert min(mentioned) >= 1 and max(mentioned) <= 1024
+    # A tick record mentions only the environments that changed, yet it still
+    # stores one full-batch array per before/after id.
+    sparse = [record for record in records if len(record["env_indices"]) == 1]
+    assert sparse
+    assert all(len(record["before_segment"]) == 1024 for record in records)
+    assert all(len(record["after_generation"]) == 1024 for record in records)
+    assert len(sparse[0]["before_segment"]) == 1024
+    assert summary["records"] == len(records)
+    assert summary["env_mentions"] == sum(
+      len(record["env_indices"]) for record in records
+    )
+    reasons: dict[str, dict[str, int]] = {}
+    for record in records:
+      counts = reasons.setdefault(record["reason"], {"records": 0, "env_mentions": 0})
+      counts["records"] += 1
+      counts["env_mentions"] += len(record["env_indices"])
+    assert summary["reasons"] == reasons
+    for field, key in (
+      ("before_segment", "before_segment_range"),
+      ("after_segment", "after_segment_range"),
+      ("before_generation", "before_generation_range"),
+      ("after_generation", "after_generation_range"),
+    ):
+      mentioned = [
+        record[field][index] for record in records for index in record["env_indices"]
+      ]
+      assert summary[key] == [min(mentioned), max(mentioned)]
+
+
+def test_train_cli_rejects_unknown_report_boundaries_mode(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """An unknown boundary report mode is refused before any adapter is built."""
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls, adapter_type=_BoundaryAdapter)
+
+  code, out, err = _train_boundaries(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--num-envs",
+      "2",
+      "--max-iterations",
+      "1",
+      "--collection-steps",
+      "1",
+      "--report-boundaries",
+      "detailed",
+    ],
+  )
+
+  assert code != 0
+  assert out == ""
+  assert "report-boundaries" in err
+  assert "detailed" in err
+  assert calls == []
+  assert not (tmp_path / "boundary-run").exists()
 
 
 def test_train_cli_rejects_negative_checkpoint_every_before_construction(

@@ -49,7 +49,6 @@ from mjlab.tasks.tracking.distillation.parity import (
 )
 from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
-  LifecycleIteration,
   RunnerConfig,
 )
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
@@ -61,6 +60,7 @@ from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
 
 _COMMANDS = ("validate-teachers", "train", "evaluate")
 SamplingMode = Literal["start", "uniform"]
+ReportBoundaries = Literal["summary", "full"]
 PROVENANCE_VERSION = 1
 """Version of the ``resolved_config`` record written into checkpoints."""
 
@@ -402,7 +402,61 @@ def _build_runner(
   return runner, cohort.teacher(teacher_id), sampling_mode
 
 
-def _iteration_report(iteration) -> dict:
+def _observed_range(values: list[int]) -> list[int] | None:
+  """Inclusive ``[min, max]`` of the observed ids, or ``None`` if none."""
+  return None if not values else [min(values), max(values)]
+
+
+def _boundary_summary(collection) -> dict[str, Any]:
+  """Aggregate one iteration's boundaries instead of their per-environment arrays.
+
+  A raw boundary record carries four 4096-entry arrays (``before_segment``,
+  ``after_segment``, ``before_generation``, ``after_generation``) plus
+  ``env_indices``, so a full run's report is dominated by a payload an auditor
+  never reads element by element.  This summary keeps the auditable signal:
+  how many records and environment mentions each ``reason`` produced, and the
+  before/after segment and generation ranges observed at the mentioned
+  environments.  It is computed in one pass over the iteration's records and
+  retains no array.
+  """
+  reasons: dict[str, dict[str, int]] = {}
+  before_segment: list[int] = []
+  after_segment: list[int] = []
+  before_generation: list[int] = []
+  after_generation: list[int] = []
+  env_mentions = 0
+  for record in collection.boundaries:
+    mentions = len(record.env_indices)
+    env_mentions += mentions
+    counts = reasons.setdefault(record.reason, {"records": 0, "env_mentions": 0})
+    counts["records"] += 1
+    counts["env_mentions"] += mentions
+    for index in record.env_indices:
+      before_segment.append(record.before_segment[index])
+      after_segment.append(record.after_segment[index])
+      before_generation.append(record.before_generation[index])
+      after_generation.append(record.after_generation[index])
+  return {
+    "mode": "summary",
+    "ticks": collection.ticks,
+    "records": len(collection.boundaries),
+    "env_mentions": env_mentions,
+    "reasons": reasons,
+    "before_segment_range": _observed_range(before_segment),
+    "after_segment_range": _observed_range(after_segment),
+    "before_generation_range": _observed_range(before_generation),
+    "after_generation_range": _observed_range(after_generation),
+  }
+
+
+def _boundaries_report(collection, mode: ReportBoundaries):
+  """Boundary evidence for one iteration: compact summary, or raw detail."""
+  if mode == "full":
+    return [asdict(item) for item in collection.boundaries]
+  return _boundary_summary(collection)
+
+
+def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
   collection = iteration.collection
   return {
     "iteration": iteration.iteration,
@@ -416,7 +470,7 @@ def _iteration_report(iteration) -> dict:
       "student_steps": collection.student_steps,
       "disagreement_mean": collection.disagreement_mean,
       "diagnostics": list(collection.diagnostics),
-      "boundaries": [asdict(item) for item in collection.boundaries],
+      "boundaries": _boundaries_report(collection, report_boundaries),
       "fresh_data_samples": (
         None
         if collection.fresh_data is None
@@ -452,6 +506,7 @@ def _train(
   seed: int = 0,
   rollout_latent: RolloutLatent = "mean",
   checkpoint_every: int = 0,
+  report_boundaries: ReportBoundaries = "summary",
   output_dir: Path = Path("distillation-runs/latest"),
   resume: Path | None = None,
 ) -> int:
@@ -471,9 +526,20 @@ def _train(
   ``checkpoint_every`` completed iterations, every checkpoint is a complete
   resume input, and the report lists every checkpoint written by this
   invocation.
+
+  ``report_boundaries`` selects the boundary evidence in each iteration's
+  ``collection.boundaries``.  ``summary`` (the default) reports per-``reason``
+  record/environment-mention counts and the observed before/after segment and
+  generation ranges, and never retains a boundary's per-environment arrays;
+  ``full`` writes those arrays as before, which is roughly 2 MB per iteration
+  at 4096 environments, so it is a debugging option, not the default.
   """
   runner = None
   try:
+    if report_boundaries not in ("summary", "full"):
+      raise ValueError(
+        f"report_boundaries must be 'summary' or 'full' (got {report_boundaries!r})"
+      )
     if checkpoint_every < 0:
       raise ValueError(
         f"--checkpoint-every must be a non-negative integer (got "
@@ -545,12 +611,17 @@ def _train(
     # metadata as the final one and is an ordinary resume input.  Filenames use
     # ``runner.iteration``, the total lifetime counter, so a resumed run
     # continues the same sequence instead of colliding with earlier files.
-    iterations: list[LifecycleIteration] = []
+    # Each iteration is converted to its report form as soon as it returns, so
+    # a summary report never holds more than one iteration's boundary arrays.
+    iteration_reports: list[dict] = []
     checkpoints: list[Path] = []
     while runner.iteration < max_iterations:
       remaining = max_iterations - runner.iteration
       chunk = remaining if checkpoint_every <= 0 else min(checkpoint_every, remaining)
-      iterations.extend(runner.run(iterations=chunk))
+      for _ in range(chunk):
+        iteration_reports.append(
+          _iteration_report(runner.run_iteration(), report_boundaries)
+        )
       if checkpoint_every > 0:
         periodic = output_dir / f"checkpoint-iter-{runner.iteration:06d}.pt"
         write_checkpoint(periodic)
@@ -564,7 +635,7 @@ def _train(
       "checkpoint": str(checkpoint),
       "checkpoints": [str(path) for path in checkpoints],
       "iteration": runner.iteration,
-      "iterations": [_iteration_report(item) for item in iterations],
+      "iterations": iteration_reports,
       "events": runner.events,
       "runtime": {
         "device": device,

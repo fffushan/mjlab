@@ -95,6 +95,22 @@ counts, evaluation settings/mode/sampling/latent, teacher probability, learning
 rate, beta, accumulation, minibatch, replay capacity, schema and model settings,
 teacher id and artifact hashes, and the control contract.
 
+Boundary evidence in a ``train`` report is summarized by default. Each
+iteration's ``collection.boundaries`` is an object with ``mode: summary``, the
+iteration's ``ticks``, the number of boundary ``records`` and environment
+``env_mentions``, a ``reasons`` mapping from boundary reason (for example
+``explicit_reset``, ``terminated``, ``generation``, or a ``+``-joined
+combination) to its own record and environment-mention counts, and the observed
+before/after ``*_range`` segment and generation ids at the mentioned
+environments. The raw alternative stores one record per boundary tick, and each
+record keeps four full-batch arrays (before/after segment and generation) plus
+``env_indices``; at 4096 environments that is roughly 2 MB per iteration before
+indentation, so the raw form is opt-in with ``--report-boundaries full`` (any
+other value is refused before environment construction) and produces a large
+report. The summary is computed as each iteration finishes, so a long summary
+run never holds the whole run's boundary arrays in memory; the collector's own
+per-tick boundary representation is unchanged.
+
 Student-only evaluation is model-only: ``--mode student --checkpoint PATH``
 infers the saved schema and model settings from the checkpoint, so it accepts no
 trainer-only flags (learning rate, beta, accumulation, minibatch, replay

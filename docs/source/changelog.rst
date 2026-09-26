@@ -213,6 +213,19 @@ Fixed
 Changed
 ^^^^^^^
 
+- ``distill train`` reports no longer embed the per-environment boundary
+  arrays. Each iteration's ``collection.boundaries`` is now a compact summary
+  by default: per-``reason`` boundary-record and environment-mention counts,
+  the observed before/after segment and generation ranges, and the iteration's
+  ``ticks``/``records``/``env_mentions`` totals. A boundary record holds four
+  full-batch arrays (before/after segment and generation) plus ``env_indices``,
+  so a 4096-environment, 20-iteration ``train-report.json`` reached 211 MB and
+  the raw arrays are now written only on request with the new
+  ``--report-boundaries full`` flag (``summary`` is the default, and an unknown
+  value is refused before any environment is constructed). A summary report is
+  aggregated per iteration as collection finishes instead of buffering the
+  whole run, and every other report entry is unchanged.
+
 - ``distill evaluate`` no longer accepts the trainer-only options
   ``--learning-rate``, ``--beta``, ``--accumulation-steps``,
   ``--minibatch-size`` and ``--replay-capacity``; student evaluation is
