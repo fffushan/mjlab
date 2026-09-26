@@ -385,6 +385,34 @@ def _safe_float(v: Any) -> float | None:
 # --------------------------------------------------------------------------- #
 
 
+def recovery_reset_event_overrides(
+  schedule: EvaluationSchedule,
+  pool_directory: str,
+  last_n_frames: int = 10,
+) -> dict[str, Any]:
+  """Deterministic recovery-reset event overrides for one evaluation episode.
+
+  The endpoint window is passed explicitly: a policy trained on a wider window
+  must not be silently scored on a narrower (or wider) one, and the window also
+  decides the pool the descriptor row indices refer to.
+
+  Raises:
+    ValueError: If ``last_n_frames`` is not a positive int.
+  """
+  if isinstance(last_n_frames, bool) or not isinstance(last_n_frames, int):
+    raise ValueError("last_n_frames must be an int")
+  if last_n_frames < 1:
+    raise ValueError("last_n_frames must be positive")
+  return {
+    "pool_directory": pool_directory,
+    "split": schedule.split,
+    "seed": schedule.seed,
+    "recovery_fraction": 1.0,
+    "force_mode": "recovery",
+    "last_n_frames": last_n_frames,
+  }
+
+
 def _run_single_episode(
   descriptor: EpisodeDescriptor,
   schedule: EvaluationSchedule,
@@ -393,6 +421,7 @@ def _run_single_episode(
   device: str,
   recovery_task_id: str,
   base_task_id: str,
+  last_n_frames: int = 10,
 ) -> dict[str, Any]:
   """Run one episode in a single-env config with auto_reset=False.
 
@@ -440,11 +469,9 @@ def _run_single_episode(
   # For recovery: set pool directory, split, seed, force recovery group.
   if is_recovery:
     event_params = env_cfg.events["tennis_recovery_reset"].params
-    event_params["pool_directory"] = pool_directory
-    event_params["split"] = schedule.split
-    event_params["seed"] = schedule.seed
-    event_params["recovery_fraction"] = 1.0
-    event_params["force_mode"] = "recovery"
+    event_params.update(
+      recovery_reset_event_overrides(schedule, pool_directory, last_n_frames)
+    )
 
   env: ManagerBasedRlEnv | None = None
   try:
@@ -634,6 +661,7 @@ def run_evaluation(
   device: str = "cpu",
   output_path: str | None = None,
   candidate_checkpoint_path: str | None = None,
+  last_n_frames: int = 10,
 ) -> dict[str, Any]:
   """Run bounded evaluation and optionally compare source vs candidate.
 
@@ -655,6 +683,10 @@ def run_evaluation(
     output_path: If provided, write JSON results to this path.
     candidate_checkpoint_path: If provided, also run the candidate checkpoint
       with the same descriptors and compare.
+    last_n_frames: Endpoint window length in frames, in [1, trajectory length].
+      Must match the window the evaluated checkpoint was trained on. It selects
+      both the pool used for descriptor row indices and the reset event window,
+      so both stay consistent. Recorded in ``pool.manifest``.
 
   Returns:
     A dict with per-episode results, group summaries, manifest, and optional
@@ -665,10 +697,12 @@ def run_evaluation(
     aggregate_recovery_metrics,
   )
 
-  # Load pool to get provenance and size.
+  # Load pool to get provenance and size. The window must match the reset
+  # event window, otherwise row indices would refer to different states.
+  overrides = recovery_reset_event_overrides(schedule, pool_directory, last_n_frames)
   pool = EndpointPool.from_directory(
     pool_directory,
-    last_n_frames=10,
+    last_n_frames=overrides["last_n_frames"],
     split=schedule.split,
     seed=schedule.seed,
   )
@@ -691,6 +725,7 @@ def run_evaluation(
       device=device,
       recovery_task_id=recovery_task_id,
       base_task_id=base_task_id,
+      last_n_frames=last_n_frames,
     )
     source_results.append(result)
 
@@ -711,6 +746,7 @@ def run_evaluation(
         device=device,
         recovery_task_id=recovery_task_id,
         base_task_id=base_task_id,
+        last_n_frames=last_n_frames,
       )
       candidate_results.append(result)
     candidate_metrics = [r["metrics"] for r in candidate_results]
@@ -878,6 +914,7 @@ def _run_evaluation_cli(
   seed: int = 42,
   split: str = "validation",
   recovery_fraction: float = 0.8,
+  last_n_frames: int = 10,
   device: str = "cpu",
   output: str = "tennis_recovery_eval.json",
   candidate_checkpoint: str | None = None,
@@ -901,6 +938,8 @@ def _run_evaluation_cli(
     seed: Seed for deterministic held-out row selection.
     split: Pool split to evaluate on (train/validation/all).
     recovery_fraction: Fraction of recovery episodes.
+    last_n_frames: Endpoint window length in frames; must match the evaluated
+      checkpoint's training window (default 10).
     device: Device to run on.
     output: Output JSON path for per-episode metrics.
     candidate_checkpoint: Optional candidate checkpoint for comparison.
@@ -923,6 +962,7 @@ def _run_evaluation_cli(
     device=device,
     output_path=output,
     candidate_checkpoint_path=candidate_checkpoint,
+    last_n_frames=last_n_frames,
   )
   for s in result["source"]["group_summary"]:
     print(

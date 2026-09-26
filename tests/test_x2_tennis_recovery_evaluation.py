@@ -52,6 +52,8 @@ from mjlab.tasks.velocity.scripts.tennis_recovery_eval import (
   EvaluationSchedule,
   build_evaluation_schedule,
   format_group_summary,
+  recovery_reset_event_overrides,
+  run_evaluation,
 )
 
 FPS = 50.0
@@ -1274,3 +1276,65 @@ def test_compute_then_aggregate_end_to_end():
   assert s.num_falls == 1
   assert s.num_not_settled == 1
   assert s.median_time_to_settle_s == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint-window plumbing.
+#
+# A policy trained on a wider endpoint window must not be scored on a narrower
+# one, and the descriptor row indices come from the pool built with the *same*
+# window, so the window has to reach both the pool loader and the reset event.
+# --------------------------------------------------------------------------- #
+
+
+def _window_schedule() -> EvaluationSchedule:
+  return EvaluationSchedule(
+    num_episodes=4, episode_length=100, duration_s=2.0, fps=50.0, seed=42
+  )
+
+
+def test_recovery_reset_event_overrides_force_recovery_and_window():
+  params = recovery_reset_event_overrides(_window_schedule(), "data/tennis", 25)
+  assert params["last_n_frames"] == 25
+  assert params["force_mode"] == "recovery"
+  assert params["recovery_fraction"] == 1.0
+  assert params["pool_directory"] == "data/tennis"
+  assert params["split"] == "validation"
+  assert params["seed"] == 42
+
+
+def test_recovery_reset_event_overrides_default_window_is_ten():
+  params = recovery_reset_event_overrides(_window_schedule(), "data/tennis")
+  assert params["last_n_frames"] == 10
+
+
+@pytest.mark.parametrize("bad", [0, -1, 10.0, True])
+def test_recovery_reset_event_overrides_rejects_invalid_window(bad):
+  with pytest.raises(ValueError, match="last_n_frames must be"):
+    recovery_reset_event_overrides(_window_schedule(), "data/tennis", bad)
+
+
+def test_run_evaluation_loads_pool_with_requested_window(monkeypatch):
+  """The window must reach the pool loader, not just the reset event."""
+  seen: dict[str, object] = {}
+
+  def fake_from_directory(directory, *, last_n_frames, split, seed):
+    seen.update(
+      directory=directory, last_n_frames=last_n_frames, split=split, seed=seed
+    )
+    raise RuntimeError("pool-load-stopped")
+
+  monkeypatch.setattr(
+    "mjlab.tasks.velocity.mdp.tennis_endpoint_pool.EndpointPool.from_directory",
+    staticmethod(fake_from_directory),
+  )
+  with pytest.raises(RuntimeError, match="pool-load-stopped"):
+    run_evaluation(
+      schedule=_window_schedule(),
+      pool_directory="data/tennis",
+      checkpoint_path="policy.pt",
+      last_n_frames=25,
+    )
+  assert seen["last_n_frames"] == 25
+  assert seen["split"] == "validation"
+  assert seen["seed"] == 42

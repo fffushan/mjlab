@@ -152,8 +152,19 @@ row/seed schedules for source and candidate:
      --seed 42 \
      --split validation \
      --recovery-fraction 0.8 \
+     --last-n-frames 10 \
      --device cpu \
      --output tennis_recovery_eval.json
+
+The ``--last-n-frames`` option selects the endpoint window (number of trailing
+reference frames) used for *both* pool row selection and the recovery reset, so
+the environment and the metrics score the same states. Pass the window the
+evaluated checkpoint was trained on: a policy trained on a wider window must not
+be scored silently on a narrower one. To compare two checkpoints, evaluate each
+on its own window *and* both on a common window (descriptors are identical for a
+given schedule seed, so the same ``--seed``/``--split``/``--num-episodes`` gives
+an apples-to-apples comparison). The window is recorded in the output JSON under
+``pool.manifest.last_n_frames``.
 
 The evaluation uses sequential one-env-per-episode design with
 ``auto_reset=False``. Recovery episodes force the recovery group and assign a
