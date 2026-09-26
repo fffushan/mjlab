@@ -2,7 +2,7 @@
 
 Architecture: [beyondmimic_vae_distillation.md](beyondmimic_vae_distillation.md).
 Repository: `/home/agiuser/projects/mjlab`.
-Current status: **M1 and M2 are parent-accepted**. M2 was implemented with `lingzhi/gpt-5.6-luna` component workers under 15-minute parent supervision. The [M2 plan and acceptance record](beyondmimic_vae_m2_implementation.md) documents the gravity-first core and explicit future ablation schemas. **M3 and training are not yet authorized.**
+Current status: **M1 and M2 are parent-accepted and committed** as `cdd9a8201` and `76ca932bb`. The [M2 acceptance record](beyondmimic_vae_m2_implementation.md) documents the gravity-first core and explicit future ablation schemas. **M3 implementation and bounded validation are now authorized**, using `lingzhi/gpt-5.6-luna` serial component workers and 15-minute parent supervision under the [M3 plan](beyondmimic_vae_m3_implementation.md). Production training, M4+, diffusion, and hardware work remain separate.
 
 ## M1 acceptance record — 2026-09-26
 
@@ -148,7 +148,9 @@ Parent then inspects the actual diff and runs/consumes focused evidence. Only af
 
 Implemented and parent-validated under the [gravity-first M2 plan](beyondmimic_vae_m2_implementation.md). Final evidence: 98 focused tests plus 12 export regressions, targeted lint/type checks, original real-teacher parity, and additional normalizer/replay/state probes. The default is the named 68-dimensional encoder, 99-dimensional gravity-conditioned decoder observation, and 32-dimensional latent. Explicit schema modes also prepare anchor-only and gravity-plus-anchor conditioning, without training ablations or changing the default. Controlled normalizers, explicit loss reductions, sampled/mean inference, and bounded raw labeled replay are present. No collection/training runner is included.
 
-### M3: one-teacher closed-loop DAgger — not yet authorized
+### M3: one-teacher closed-loop DAgger — authorized for implementation
+
+Follow the [bounded M3 plan](beyondmimic_vae_m3_implementation.md), including exclusive component ownership, runtime resource gates, and independent parent acceptance.
 
 Integrate with the existing single-motion environment before adding multi-motion commands. Establish the deterministic teacher rollout baseline and physical sensor frames. Snapshot before stepping, use executed previous actions, retain valid pre-failure labels, handle auto-reset and motion-end segments, and implement optional teacher bootstrap/mixing followed by student-only collection. Add resumable checkpoints, logging, evaluation, and bounded resource-configurable smoke runs. Large training runs need a separately specified device/environment/iteration budget.
 

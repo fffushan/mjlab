@@ -1,10 +1,42 @@
-"""Teacher foundation and pure M2 latent-policy core APIs.
+"""Teacher, bounded M3 lifecycle, and pure latent-policy core APIs.
 
 M1 provides manifest/contract validation and frozen teacher inference. M2 adds
-schema-driven packing, the conditional VAE/loss, and bounded raw replay; none
-of these APIs constructs a simulator or training runner.
+schema-driven packing, the conditional VAE/loss, and bounded raw replay. M3
+adds opt-in collection, training, checkpoint, runner, and evaluation APIs.
 """
 
+from mjlab.tasks.tracking.distillation.adapter import (
+  AssetFrameAudit,
+  DistillationEnvironmentAdapter,
+  DistillationSnapshot,
+  DistillationStep,
+  LiveContractAudit,
+  audit_live_asset,
+  make_distillation_adapter,
+  validate_live_contract,
+)
+from mjlab.tasks.tracking.distillation.checkpoint import (
+  CHECKPOINT_VERSION,
+  CheckpointValidationError,
+  InferenceModel,
+  LifecycleState,
+  load_checkpoint,
+  load_inference_checkpoint,
+  save_checkpoint,
+)
+from mjlab.tasks.tracking.distillation.collector import (
+  CollectionConfig,
+  CollectionNumericalError,
+  CollectionResult,
+  DAggerCollector,
+  EvaluationMode,
+  EvaluationResult,
+  EvaluationSegment,
+  RolloutLatent,
+  SegmentBoundary,
+  collect_dagger,
+  evaluate_distillation,
+)
 from mjlab.tasks.tracking.distillation.config import (
   CohortContract,
   DistillationError,
@@ -15,6 +47,12 @@ from mjlab.tasks.tracking.distillation.config import (
   UnsupportedTeacherError,
   load_manifest,
   resolve_cohort,
+)
+from mjlab.tasks.tracking.distillation.environment import (
+  SegmentMotionCommand,
+  SegmentMotionCommandCfg,
+  build_distillation_environment,
+  make_segment_motion_cfg,
 )
 from mjlab.tasks.tracking.distillation.model import (
   VAE,
@@ -38,6 +76,12 @@ from mjlab.tasks.tracking.distillation.observations import (
   pack_feature_snapshot,
   pack_observations,
 )
+from mjlab.tasks.tracking.distillation.runner import (
+  DistillationRunner,
+  LifecycleIteration,
+  RunnerConfig,
+  RunnerValidationError,
+)
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
   LabeledReplayBuffer,
@@ -51,6 +95,17 @@ from mjlab.tasks.tracking.distillation.teachers import (
   build_frozen_teacher,
   load_frozen_teacher,
 )
+from mjlab.tasks.tracking.distillation.trainer import (
+  DistillationTrainer,
+  FreshTrainingData,
+  SupervisedVAETrainer,
+  TrainerNumericalError,
+  TrainerState,
+  TrainerValidationError,
+  TrainingUpdate,
+  VaeDistillationTrainer,
+)
+from mjlab.tasks.tracking.distillation.training_config import TrainingConfig
 from mjlab.tasks.tracking.distillation.vae_config import (
   ACTION_DIM,
   CONDITIONING_DIMS,
@@ -72,6 +127,13 @@ from mjlab.tasks.tracking.distillation.vae_config import (
 
 __all__ = [
   "ACTION_DIM",
+  "CHECKPOINT_VERSION",
+  "AssetFrameAudit",
+  "CheckpointValidationError",
+  "LifecycleState",
+  "CollectionConfig",
+  "CollectionNumericalError",
+  "CollectionResult",
   "CONDITIONING_DIMS",
   "CohortContract",
   "ConditionalVAE",
@@ -79,17 +141,30 @@ __all__ = [
   "DEFAULT_JOINT_ORDER",
   "DEFAULT_MODEL_SETTINGS",
   "DEFAULT_SCHEMA",
+  "DAggerCollector",
   "DecoderMode",
+  "DistillationEnvironmentAdapter",
   "DistillationError",
+  "DistillationRunner",
+  "DistillationSnapshot",
+  "DistillationStep",
+  "EvaluationMode",
+  "EvaluationResult",
+  "EvaluationSegment",
+  "LifecycleIteration",
   "DistillationVAE",
+  "DistillationTrainer",
   "FeatureSnapshot",
   "FeatureSpec",
   "FrameIdentity",
+  "FreshTrainingData",
   "FrozenTeacher",
+  "InferenceModel",
   "JOINT_DIM",
   "LATENT_DIM",
   "LabeledReplayBatch",
   "LabeledReplayBuffer",
+  "LiveContractAudit",
   "Manifest",
   "MissingValidationDependencyError",
   "ModelSettings",
@@ -100,9 +175,15 @@ __all__ = [
   "REFERENCE_DIM",
   "ReplayBatch",
   "ReplayBuffer",
+  "RolloutLatent",
+  "RunnerConfig",
+  "RunnerValidationError",
   "ReplayValidationError",
   "ResolvedTeacher",
   "RunningNormalizer",
+  "SegmentMotionCommand",
+  "SegmentMotionCommandCfg",
+  "SegmentBoundary",
   "StudentNormalizer",
   "TeacherBank",
   "TeacherEntry",
@@ -111,16 +192,34 @@ __all__ = [
   "VAEModelConfig",
   "VaeLoss",
   "VaeOutput",
+  "VaeDistillationTrainer",
+  "TrainingConfig",
   "VaeSchema",
+  "DistillationTrainer",
+  "SupervisedVAETrainer",
+  "TrainerNumericalError",
+  "TrainerState",
+  "TrainerValidationError",
+  "TrainingUpdate",
+  "audit_live_asset",
+  "build_distillation_environment",
   "build_frozen_teacher",
   "compute_vae_loss",
+  "collect_dagger",
+  "evaluate_distillation",
   "load_frozen_teacher",
   "load_manifest",
+  "load_checkpoint",
+  "load_inference_checkpoint",
+  "save_checkpoint",
+  "make_distillation_adapter",
   "make_schema",
+  "make_segment_motion_cfg",
   "pack_feature_snapshot",
   "pack_observations",
   "reconstruction_kl_loss",
   "resolve_cohort",
   "schema_for_mode",
+  "validate_live_contract",
   "vae_loss",
 ]

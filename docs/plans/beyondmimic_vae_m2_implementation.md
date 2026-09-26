@@ -1,6 +1,6 @@
 # BeyondMimic M2: gravity-first latent policy core
 
-Status: **implemented and parent-accepted on 2026-09-26** after one scoped correction pass. M3 and training remain unauthorized; see the acceptance record below.
+Status: **implemented and parent-accepted on 2026-09-26** after one scoped correction pass; subsequently committed at the user's request as `76ca932bb43cf8a9418a28a0695138cd72418d02`. The M2 contract below records its CPU-only scope. M3 is now separately authorized under the [M3 implementation plan](beyondmimic_vae_m3_implementation.md).
 Repository: `/home/agiuser/projects/mjlab`.
 Worker model: **`lingzhi/gpt-5.6-luna`**. Parent supervises every 15 minutes and owns acceptance.
 Depends on the accepted [M1 teacher foundation](beyondmimic_vae_implementation.md).
@@ -137,4 +137,4 @@ Final **parent-executed** checks:
 
 Primary modules: `vae_config.py`, `observations.py`, `model.py`, `storage.py` under `src/mjlab/tasks/tracking/distillation/`. Usage, including binding `cohort.actions.joint_names`, is in `docs/source/x2_tennis_distillation.rst`.
 
-M2 is accepted as a **pure tensor/model/replay core**, not a trained policy. No ablation training, simulator rollout, GPU/remote/hardware job, student export or M3 runner was executed. Physical sensor frames, live snapshot timing/action alignment and closed-loop performance remain M3/later gates. M2 changes remain uncommitted; only M1 was explicitly committed at the user's request.
+M2 is accepted as a **pure tensor/model/replay core**, not a trained policy. No ablation training, simulator rollout, GPU/remote/hardware job, student export or M3 runner was executed. Physical sensor frames, live snapshot timing/action alignment and closed-loop performance remain M3/later gates. At M2 acceptance, its changes remained uncommitted and only M1 had been explicitly committed. The user subsequently requested and received the M2-only commit `76ca932bb43cf8a9418a28a0695138cd72418d02`; unrelated tools work and the separate discussion document were excluded. M3 has since been separately authorized under its linked plan.

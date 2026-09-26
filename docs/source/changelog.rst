@@ -8,6 +8,30 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the bounded M3 native single-teacher distillation lifecycle: segment-aware
+  collection, pure VAE updates, atomic checkpoint/resume, and ``distill train`` /
+  ``distill evaluate`` commands for the existing 50 Hz X2 ``tennis_000`` contract.
+  The commands record resource/configuration provenance and distinguish bounded
+  implementation smoke evidence from policy quality and hardware readiness; they
+  do not launch unbounded production training or student export.
+
+- Added model-only student evaluation to the M3 distillation CLI. ``distill
+  evaluate --mode student --checkpoint PATH`` reconstructs the saved model via
+  the new ``InferenceModel``/``load_inference_checkpoint`` API exported from
+  ``mjlab.tasks.tracking.distillation``, infers the saved schema and model
+  settings, and validates teacher hashes, control contract, and weight
+  shape/dtype/finiteness without requiring the checkpoint's optimizer, replay
+  buffer, training batch settings, or collector RNG. ``train`` and ``evaluate``
+  now also report the requested seed, the resolved seed the environment factory
+  applied before startup randomization, and the complete resolved
+  runner/trainer/runtime configuration that is stored in the checkpoint.
+
+- Documented specialist versus general tracking teachers, multimodal control,
+  and the role of latent diffusion in
+  ``docs/plans/beyondmimic_general_tracker_and_diffusion.md``. The discussion
+  retains specialist supervision for the current experiment and does not
+  authorize new training.
+
 - Added the M2 gravity-first latent policy core for BeyondMimic distillation:
   versioned named observation schemas (68/99/32/31 by default, with explicit
   102/105 anchor ablation layouts), pure packing, separate explicit student
@@ -162,6 +186,12 @@ Added
 Fixed
 ^^^^^
 
+- ``distill evaluate --mode student`` can now load a checkpoint produced by
+  ``distill train``. It previously rebuilt a default student and a
+  training-shaped trainer/replay, so loading a train-produced checkpoint failed
+  on the saved trainer configuration and then, even with matching settings, on
+  the saved collector RNG.
+
 - ``play.py`` and ``evaluate.py`` now restore ``lookahead_s`` from the saved
   ``params/env.yaml``, so watching or evaluating a checkpoint trained with
   lookahead works without manually repeating the flag. The saved YAML uses
@@ -172,6 +202,19 @@ Fixed
 
 Changed
 ^^^^^^^
+
+- ``distill evaluate`` no longer accepts the trainer-only options
+  ``--learning-rate``, ``--beta``, ``--accumulation-steps``,
+  ``--minibatch-size`` and ``--replay-capacity``; student evaluation is
+  model-only and infers those settings from the checkpoint, so keeping the flags
+  would have silently ignored them.
+
+- ``distill train``/``evaluate`` forward ``--seed`` into environment
+  construction, so the private environment configuration is seeded before MuJoCo
+  startup randomization instead of relying on a post-construction global seed.
+  A resume now compares the checkpoint's stored ``resolved_config`` provenance
+  against the requested settings and refuses a mismatch, while still allowing
+  the explicitly requested total-budget extension of ``--max-iterations``.
 
 - The AgiBot X2 tracking task now tracks the full wrist chain: the body-tracking
   rewards previously supervised ``left/right_wrist_yaw_link`` only, so wrist

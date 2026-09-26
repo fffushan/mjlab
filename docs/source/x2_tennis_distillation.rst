@@ -1,5 +1,5 @@
-X2 Tennis Distillation Teacher Foundation and Latent Core (M1/M2)
-===============================================================
+X2 Tennis Distillation Teacher Foundation and Latent Core (M1/M2/M3)
+=======================================================================
 
 Overview
 --------
@@ -12,11 +12,97 @@ design proposal lives in ``docs/plans/beyondmimic_vae_distillation.md`` and the
 milestone contracts live in ``docs/plans/beyondmimic_vae_implementation.md`` and
 ``docs/plans/beyondmimic_vae_m2_implementation.md``.
 
-**M1 implements teacher loading and validation only. M2 implements the pure
-student data/model core only.** There is no train command, simulator adapter,
-DAgger collection, rollout, or student export; those remain later milestones.
-The ``distill`` CLI deliberately exposes only the ``validate-teachers``
-subcommand.
+**M1 validates teachers, M2 provides the pure tensor core, and M3 adds a
+bounded native single-teacher collector, trainer, checkpoint lifecycle, and
+``distill train``/``distill evaluate`` commands.** M3 remains an implementation
+and smoke-validation surface: it does not claim policy quality, production
+training, hardware readiness, student export, diffusion, or multi-motion
+collection. The selected live environment is the existing 50 Hz X2 tracking
+task, with ``tennis_000`` as the only collection teacher.
+
+M3 bounded lifecycle usage
+---------------------------
+
+The new commands use the trusted native Luna adapter and preserve the saved
+teacher control/observation contract. Defaults are bounded (one iteration and
+32 collection steps on CPU), so invoking ``train`` does not launch a production
+run. ``--max-iterations`` is a total lifetime budget, including after
+``--resume``; a resumed simulator is intentionally reset and bootstrap is not
+repeated when replay is present. Reports record the selected teacher, motion,
+50 Hz control cadence, model defaults (learning rate ``5e-4`` and KL beta
+``0.01``), resource overrides, and whether evidence is implementation/smoke
+or policy-quality evidence.
+
+.. code-block:: bash
+
+   # Teacher-only baseline; parent-owned live command (bounded to 512 steps).
+   uv run distill evaluate --manifest configs/distillation/x2_tennis.yaml \\
+     --repo-root . --teacher-id tennis_000 --device cuda:0 --num-envs 4 \\
+     --mode teacher --steps 512 --seed 7 --sampling-mode start \\
+     --report /tmp/mjlab-m3-live-validation/teacher-start.json
+
+   # Bounded collection/training smoke; parent owns GPU execution.
+   uv run distill train --manifest configs/distillation/x2_tennis.yaml \\
+     --repo-root . --teacher-id tennis_000 --device cuda:0 --num-envs 4 \\
+     --max-iterations 8 --bootstrap-steps 128 --collection-steps 32 \\
+     --updates-per-iteration 1 --teacher-probability 0 \\
+     --minibatch-size 128 --accumulation-steps 15 --replay-capacity 8192 \\
+     --seed 7 --rollout-latent mean \\
+     --output-dir /tmp/mjlab-m3-live-validation/smoke
+
+   # Student-only evaluation of a train-produced checkpoint; model-only, so no
+   # trainer setting has to be repeated on the command line.
+   uv run distill evaluate --manifest configs/distillation/x2_tennis.yaml \\
+     --repo-root . --teacher-id tennis_000 --device cuda:0 --num-envs 4 \\
+     --mode student --checkpoint /tmp/mjlab-m3-live-validation/smoke/checkpoint-final.pt \\
+     --steps 512 --seed 7 --sampling-mode start \\
+     --report /tmp/mjlab-m3-live-validation/student-start.json
+
+For a resumed run, repeat the semantic, trainer, and resource settings (teacher
+id, device, ``--num-envs``, seed, bootstrap/collection/update counts, teacher
+probability, evaluation settings, learning rate, beta, accumulation, minibatch,
+and replay capacity) and pass the resulting ``checkpoint-final.pt`` as
+``--resume``. ``--max-iterations`` is the total lifetime budget, so extending it
+(for example ``10`` for two iterations after an eight-iteration smoke) is the one
+recorded setting a resume may change; every other entry of the checkpoint's
+``resolved_config`` provenance is compared against the requested settings and a
+difference is refused instead of silently changing the stored schedule or
+semantics. Use a separate output directory for the resumed run.
+
+Every ``train``/``evaluate`` invocation forwards ``--seed`` into environment
+construction, so the private environment configuration is seeded *before* MuJoCo
+startup randomization instead of relying on a post-construction global seed.
+The machine-readable report records the requested seed, the resolved seed that
+the environment factory reported applying, its provenance, and (for ``train``)
+the complete resolved runner/trainer/runtime configuration that is also stored
+in the checkpoint: device, ``num_envs``, seed, bootstrap/collection/update
+counts, evaluation settings/mode/sampling/latent, teacher probability, learning
+rate, beta, accumulation, minibatch, replay capacity, schema and model settings,
+teacher id and artifact hashes, and the control contract.
+
+Student-only evaluation is model-only: ``--mode student --checkpoint PATH``
+infers the saved schema and model settings from the checkpoint, so it accepts no
+trainer-only flags (learning rate, beta, accumulation, minibatch, replay
+capacity) and does not require the checkpoint's optimizer, replay buffer, or
+collector RNG. The report echoes the inferred model identity and the
+checkpoint's stored provenance. ``InferenceModel`` and
+``load_inference_checkpoint`` are exported from
+``mjlab.tasks.tracking.distillation``.
+
+Evaluation metric frames are explicit. ``tracking_root_relative_pose_error``
+subtracts only the root translation and keeps world axes, so a root yaw
+difference between the reference and the robot contributes to it: it is
+root-centered WORLD-axis pose error, not heading-invariant articulation error,
+and it must not be read as joint-space tracking fidelity. Heading is reported
+separately as ``tracking_heading_error``/``tracking_heading_yaw_error``, the
+wrapped root-relative yaw delta, while ``tracking_global_body_pose_error`` keeps
+the world-frame translation.
+
+Live commands are resource-gated parent validation, not evidence produced by
+CPU tests or this documentation change. Evaluation outcomes distinguish
+reference completion, failure, timeout, teleport/timer boundaries, and step
+caps; a missing live completion flag is reported conservatively rather than as
+zero completion.
 
 Selected cohort
 ---------------

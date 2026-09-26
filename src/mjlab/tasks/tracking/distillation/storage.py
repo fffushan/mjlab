@@ -18,6 +18,7 @@ Empty insertion is a validated no-op.  Sampling an empty buffer raises
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import torch
 
@@ -292,6 +293,160 @@ class LabeledReplayBuffer:
     self._next = (self._next + batch.batch_size) % self.capacity
 
   add = insert
+
+  def state_dict(self) -> dict[str, Any]:
+    """Return a detached, version-neutral snapshot of the ring storage.
+
+    The ring layout and write cursor are retained so restoring a checkpoint
+    preserves FIFO order and subsequent sampling/insertion behavior.  Callers
+    must treat the returned tensors as owned copies.
+    """
+    storage = None
+    if self._storage is not None:
+      storage = {name: value.detach().clone() for name, value in self._storage.items()}
+    return {
+      "capacity": self.capacity,
+      "schema": self.schema.compatibility_metadata(),
+      "device": None if self._device is None else str(self._device),
+      "dtype": None if self._dtype is None else str(self._dtype).replace("torch.", ""),
+      "size": self._size,
+      "next": self._next,
+      "storage": storage,
+    }
+
+  def _validated_state_storage(
+    self, state: Mapping[str, Any]
+  ) -> tuple[
+    int, int, dict[str, torch.Tensor] | None, torch.device | None, torch.dtype | None
+  ]:
+    """Validate checkpoint replay state without changing this buffer."""
+    required = {"capacity", "schema", "device", "dtype", "size", "next", "storage"}
+    if set(state) != required:
+      raise ReplayValidationError("replay state has missing or unknown fields")
+    if state["capacity"] != self.capacity:
+      raise ReplayValidationError("replay capacity does not match checkpoint")
+    if state["schema"] != self.schema.compatibility_metadata():
+      raise ReplayValidationError("replay schema does not match checkpoint")
+    size, next_index = state["size"], state["next"]
+    if (
+      not isinstance(size, int)
+      or isinstance(size, bool)
+      or not 0 <= size <= self.capacity
+      or not isinstance(next_index, int)
+      or isinstance(next_index, bool)
+      or not 0 <= next_index < self.capacity
+    ):
+      raise ReplayValidationError("replay size or ring cursor is invalid")
+    raw_device = state["device"]
+    raw_dtype = state["dtype"]
+    if raw_device is not None and not isinstance(raw_device, str):
+      raise ReplayValidationError("replay device metadata is invalid")
+    if raw_dtype is not None and not isinstance(raw_dtype, str):
+      raise ReplayValidationError("replay dtype metadata is invalid")
+    device = _canonical_device(raw_device) if raw_device is not None else None
+    try:
+      dtype = getattr(torch, raw_dtype) if raw_dtype is not None else None
+    except AttributeError as exc:
+      raise ReplayValidationError("replay dtype metadata is invalid") from exc
+    if dtype is not None and not dtype.is_floating_point:
+      raise ReplayValidationError("replay dtype metadata is not floating point")
+    raw_storage = state["storage"]
+    if raw_storage is None:
+      if size != 0:
+        raise ReplayValidationError("non-empty replay state has no storage")
+      return size, next_index, None, device, dtype
+    if not isinstance(raw_storage, Mapping) or set(raw_storage) != set(
+      (
+        "reference",
+        "conditioning",
+        "teacher_action",
+        "motion_id",
+        "teacher_id",
+        "reference_frame",
+        "episode_id",
+        "collector_iteration",
+      )
+    ):
+      raise ReplayValidationError("replay storage fields are invalid")
+    validated: dict[str, torch.Tensor] = {}
+    widths = {
+      "reference": self.schema.reference_dim,
+      "conditioning": self.schema.conditioning_dim,
+      "teacher_action": self.schema.action_dim,
+    }
+    for name, value in raw_storage.items():
+      if not isinstance(value, torch.Tensor):
+        raise ReplayValidationError(f"replay storage field {name!r} is not a tensor")
+      expected_shape = (
+        (self.capacity, widths[name]) if name in widths else (self.capacity,)
+      )
+      if tuple(value.shape) != expected_shape:
+        raise ReplayValidationError(f"replay storage field {name!r} has invalid shape")
+      if name in widths:
+        active = torch.arange(size, device=value.device)
+        start = (next_index - size) % self.capacity
+        active = (active + start) % self.capacity
+        if (
+          not value.is_floating_point()
+          or not torch.isfinite(value[active]).all().item()
+        ):
+          raise ReplayValidationError(f"replay storage field {name!r} is invalid")
+        if dtype is not None and value.dtype != dtype:
+          raise ReplayValidationError("replay storage dtype does not match metadata")
+      elif value.dtype != torch.int64:
+        raise ReplayValidationError(f"replay storage field {name!r} must be int64")
+      if device is not None and value.device != device:
+        raise ReplayValidationError("replay storage device does not match metadata")
+      validated[name] = value.detach().clone()
+    if device is None:
+      device = validated["reference"].device
+    if dtype is None:
+      dtype = validated["reference"].dtype
+    return size, next_index, validated, device, dtype
+
+  def load_state_dict(self, state: Mapping[str, Any]) -> None:
+    """Restore a validated ring snapshot atomically."""
+    if not isinstance(state, Mapping):
+      raise ReplayValidationError("replay state must be a mapping")
+    size, next_index, storage, device, dtype = self._validated_state_storage(state)
+    if self._device is not None and device is not None and self._device != device:
+      raise ReplayValidationError("checkpoint replay device does not match buffer")
+    if self._dtype is not None and dtype is not None and self._dtype != dtype:
+      raise ReplayValidationError("checkpoint replay dtype does not match buffer")
+    # All checks above complete before any live field is changed.
+    self._device = device
+    self._dtype = dtype
+    self._size = size
+    self._next = next_index
+    self._storage = storage
+
+  def rebase_segment_ids(self, collector_iteration: int, base: int) -> int:
+    """Add ``base`` to segment IDs from one owned collection iteration.
+
+    This narrow resume API lets a restarted simulator use a fresh segment-ID
+    namespace without changing insertion or sampling semantics.  It returns
+    the number of records changed and performs no operation on an empty ring.
+    """
+    if (
+      not isinstance(collector_iteration, int)
+      or isinstance(collector_iteration, bool)
+      or not isinstance(base, int)
+      or isinstance(base, bool)
+      or base < 0
+    ):
+      raise ReplayValidationError("segment rebase arguments are invalid")
+    if self._storage is None or self._size == 0 or base == 0:
+      return 0
+    start = (self._next - self._size) % self.capacity
+    logical = torch.arange(self._size, device=self._device)
+    physical = (logical + start) % self.capacity
+    selected_iterations = self._storage["collector_iteration"][physical]
+    mask = selected_iterations == collector_iteration
+    if not bool(mask.any().item()):
+      return 0
+    targets = physical[mask]
+    self._storage["episode_id"][targets] += base
+    return int(mask.sum().item())
 
   def sample(
     self,

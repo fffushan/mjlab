@@ -1,8 +1,10 @@
 # BeyondMimic VAE distillation: proposed architecture
 
-Status: M1 teacher foundation and the [gravity-first latent core (M2)](beyondmimic_vae_m2_implementation.md) are implemented and parent-validated. M2 was delivered by `lingzhi/gpt-5.6-luna`; gravity is the default with explicit opt-in anchor/combined schemas. DAgger/training and later milestones remain planned and unauthorized. See [implementation plan and acceptance records](beyondmimic_vae_implementation.md).
+Status: M1 and M2 are parent-accepted and committed (`cdd9a8201`, `76ca932bb`). The [single-teacher M3 implementation](beyondmimic_vae_m3_implementation.md) is now authorized with `lingzhi/gpt-5.6-luna`, serial ownership, and parent-supervised bounded validation. Gravity remains the default with explicit opt-in anchor/combined schemas. M4, production training, diffusion, and hardware work remain outside current authority. See [implementation plan and acceptance records](beyondmimic_vae_implementation.md).
 Scope: reproduce the conditional-VAE/DAgger stage using existing mjlab tracking teachers; retain a clean interface for later state–latent diffusion.
 Source: `/home/agiuser/Documents/beyondmimic.pdf`, main pp. 18–21 and Fig. 7, supplementary S3/S4 and Table S6.
+
+Related discussion: [general trackers, multimodality, and latent diffusion](beyondmimic_general_tracker_and_diffusion.md) records why we retain specialist teachers now, how a general tracker could be trained, and why tracking does not replace motion planning.
 
 ## Initial teacher cohort selected by the user
 
