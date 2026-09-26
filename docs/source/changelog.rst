@@ -8,6 +8,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the M2 gravity-first latent policy core for BeyondMimic distillation:
+  versioned named observation schemas (68/99/32/31 by default, with explicit
+  102/105 anchor ablation layouts), pure packing, separate explicit student
+  normalizers, conditional VAE mean/sampled inference, exact reconstruction/KL
+  loss, and bounded raw labeled replay. The core is CPU-testable and does not
+  add simulator collection, DAgger, training, rollout, or student export;
+  physical sensor frames and validated cohort joint order remain caller-owned
+  future work. See ``docs/source/x2_tennis_distillation.rst``.
+
 - Added the first milestone of the BeyondMimic-style VAE distillation work: a
   typed, versioned teacher manifest (``configs/distillation/x2_tennis.yaml``)
   with compatibility validation, a frozen actor-only ``FrozenTeacher``/

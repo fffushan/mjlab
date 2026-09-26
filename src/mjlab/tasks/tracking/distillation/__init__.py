@@ -1,8 +1,8 @@
-"""Teacher foundation for BeyondMimic-style VAE distillation.
+"""Teacher foundation and pure M2 latent-policy core APIs.
 
-M1 provides the manifest/contract validation and the frozen teacher inference
-bank. ``parity`` is intentionally not re-exported: it imports ONNX Runtime
-lazily, and this package is imported eagerly with ``mjlab.tasks``.
+M1 provides manifest/contract validation and frozen teacher inference. M2 adds
+schema-driven packing, the conditional VAE/loss, and bounded raw replay; none
+of these APIs constructs a simulator or training runner.
 """
 
 from mjlab.tasks.tracking.distillation.config import (
@@ -16,25 +16,111 @@ from mjlab.tasks.tracking.distillation.config import (
   load_manifest,
   resolve_cohort,
 )
+from mjlab.tasks.tracking.distillation.model import (
+  VAE,
+  ConditionalVAE,
+  ControlledNormalizer,
+  DistillationVAE,
+  ModelValidationError,
+  RunningNormalizer,
+  StudentNormalizer,
+  VaeLoss,
+  VaeOutput,
+  compute_vae_loss,
+  reconstruction_kl_loss,
+  vae_loss,
+)
+from mjlab.tasks.tracking.distillation.observations import (
+  FeatureSnapshot,
+  ObservationSnapshot,
+  ObservationValidationError,
+  PackedObservationBatch,
+  pack_feature_snapshot,
+  pack_observations,
+)
+from mjlab.tasks.tracking.distillation.storage import (
+  LabeledReplayBatch,
+  LabeledReplayBuffer,
+  ReplayBatch,
+  ReplayBuffer,
+  ReplayValidationError,
+)
 from mjlab.tasks.tracking.distillation.teachers import (
   FrozenTeacher,
   TeacherBank,
   build_frozen_teacher,
   load_frozen_teacher,
 )
+from mjlab.tasks.tracking.distillation.vae_config import (
+  ACTION_DIM,
+  CONDITIONING_DIMS,
+  DEFAULT_JOINT_ORDER,
+  DEFAULT_MODEL_SETTINGS,
+  DEFAULT_SCHEMA,
+  JOINT_DIM,
+  LATENT_DIM,
+  REFERENCE_DIM,
+  DecoderMode,
+  FeatureSpec,
+  FrameIdentity,
+  ModelSettings,
+  VAEModelConfig,
+  VaeSchema,
+  make_schema,
+  schema_for_mode,
+)
 
 __all__ = [
+  "ACTION_DIM",
+  "CONDITIONING_DIMS",
   "CohortContract",
+  "ConditionalVAE",
+  "ControlledNormalizer",
+  "DEFAULT_JOINT_ORDER",
+  "DEFAULT_MODEL_SETTINGS",
+  "DEFAULT_SCHEMA",
+  "DecoderMode",
   "DistillationError",
+  "DistillationVAE",
+  "FeatureSnapshot",
+  "FeatureSpec",
+  "FrameIdentity",
   "FrozenTeacher",
+  "JOINT_DIM",
+  "LATENT_DIM",
+  "LabeledReplayBatch",
+  "LabeledReplayBuffer",
   "Manifest",
   "MissingValidationDependencyError",
+  "ModelSettings",
+  "ModelValidationError",
+  "ObservationSnapshot",
+  "ObservationValidationError",
+  "PackedObservationBatch",
+  "REFERENCE_DIM",
+  "ReplayBatch",
+  "ReplayBuffer",
+  "ReplayValidationError",
   "ResolvedTeacher",
+  "RunningNormalizer",
+  "StudentNormalizer",
   "TeacherBank",
   "TeacherEntry",
   "UnsupportedTeacherError",
+  "VAE",
+  "VAEModelConfig",
+  "VaeLoss",
+  "VaeOutput",
+  "VaeSchema",
   "build_frozen_teacher",
+  "compute_vae_loss",
   "load_frozen_teacher",
   "load_manifest",
+  "make_schema",
+  "pack_feature_snapshot",
+  "pack_observations",
+  "reconstruction_kl_loss",
   "resolve_cohort",
+  "schema_for_mode",
+  "vae_loss",
 ]

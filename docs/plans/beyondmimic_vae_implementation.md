@@ -2,7 +2,7 @@
 
 Architecture: [beyondmimic_vae_distillation.md](beyondmimic_vae_distillation.md).
 Repository: `/home/agiuser/projects/mjlab`.
-Current implementation authority: **milestone M1 only**, delegated to `ds-oc/deepseek-flash`; the parent reviews and accepts it before moving to another milestone. Later milestones are a dependency plan, not permission to start training or implement the entire roadmap autonomously.
+Current status: **M1 and M2 are parent-accepted**. M2 was implemented with `lingzhi/gpt-5.6-luna` component workers under 15-minute parent supervision. The [M2 plan and acceptance record](beyondmimic_vae_m2_implementation.md) documents the gravity-first core and explicit future ablation schemas. **M3 and training are not yet authorized.**
 
 ## M1 acceptance record — 2026-09-26
 
@@ -16,7 +16,7 @@ Final parent-run evidence:
 - Real-cohort validation from `/tmp`, using `uv run --project /home/agiuser/projects/mjlab distill validate-teachers --manifest configs/distillation/x2_tennis.yaml --repo-root /home/agiuser/projects/mjlab`: both teachers pass, 64 samples each, unchanged `atol=rtol=1e-5`.
 - Maximum action differences: `tennis_000` **9.5367431640625e-7**, `tennis_001` **1.5497207641601562e-6**. Exported actor weights/mean and embedded reference q/dq match their selected source artifacts exactly. Source artifact hashes remain unchanged across parent review and the correction pass.
 
-Usage is documented in `docs/source/x2_tennis_distillation.rst`; the cohort manifest is `configs/distillation/x2_tennis.yaml`. Physical sensor-frame resolution, body-reference subset matching, and closed-loop rollout quality are **not** established by M1 numerical parity. No VAE, DAgger runner, training run, or hardware deployment is included. The broader project remains at the M2 dependency boundary; do not start it automatically. No changes were committed, and unrelated `tools/` work was preserved.
+Usage is documented in `docs/source/x2_tennis_distillation.rst`; the cohort manifest is `configs/distillation/x2_tennis.yaml`. Physical sensor-frame resolution, body-reference subset matching, and closed-loop rollout quality are **not** established by M1 numerical parity. No VAE, DAgger runner, training run, or hardware deployment is included. At M1 acceptance, the broader project remained at the M2 dependency boundary. M2 has since been separately implemented and accepted under the plan linked above; M3 and training remain unauthorized. No changes were committed, and unrelated `tools/` work was preserved.
 
 ## Goal and fixed inputs
 
@@ -36,14 +36,14 @@ Each run now has original `params/env.yaml` and `params/agent.yaml`. The corresp
 | Milestone | Deliverable | Depends on | Acceptance gate |
 | --- | --- | --- | --- |
 | **M1: teacher foundation** | Manifest/contract validation, frozen TeacherBank, CPU inference-parity command and tests | Existing artifacts | Both real teachers load; PyTorch actions match original ONNX; routing/normalizers/contracts are tested |
-| **M2: latent policy core** | Named reference/proprioception views, conditional VAE, normalizers, loss, bounded labeled replay | M1 | Shape/gradient/loss tests; 68 reference, 99 proprioception, 32 latent, 31 actions; no reference bypass |
+| **M2: latent policy core** | Named reference/decoder-conditioning views, conditional VAE, normalizers, loss, bounded labeled replay | M1 | Gravity default: 68 reference, 99 conditioning, 32 latent, 31 actions, no reference bypass; explicit opt-in anchor/combined schemas; CPU gradient/loss/storage tests |
 | **M3: single-teacher DAgger** | Collector/runner, checkpoint/resume, first-class train/evaluate CLI for `tennis_000` | M2 | Correct observation/action/reset alignment; deterministic teacher rollout baseline; bounded smoke training; student-only evaluation |
 | **M4: shared two-motion controller** | Motion library, multi-motion command, teacher routing and balanced replay/collection | M3 | No clip-boundary leakage; both teachers correctly routed; per-motion evaluation of one shared student |
 | **M5: reproduction and deployment package** | Verified symmetry augmentation, complete evaluation, separate ONNX encoder/decoder and metadata | M4 | PyTorch/ONNX parity, latent-use tests, CPU inference budget, sim2sim validation; hardware requires separate authorization |
 
 Diffusion collection/training/guidance is a later project phase. Freeze the accepted VAE, normalization, schema, and latent convention before collecting its sequence dataset.
 
-## M1: current implementation contract
+## M1: accepted implementation contract (historical)
 
 ### Why this is one bounded implementation seam
 
@@ -142,13 +142,13 @@ A working, documented validation command successfully loads and numerically veri
 
 Parent then inspects the actual diff and runs/consumes focused evidence. Only after parent acceptance may the milestone be called complete. On infrastructure/provider/tool failure, report the exact run failure and partial edits; do not switch models or execution protocols silently.
 
-## Later milestone contracts (not delegated now)
+## M2 and later milestone contracts
 
-### M2: latent policy core
+### M2: latent policy core — accepted
 
-Implement the named 68-dimensional encoder and 99-dimensional proprioceptive schema, preserving shared measurement timing/noise for overlap with the teacher. Add the 32-dimensional Gaussian latent, paper-size encoder/decoder, explicit loss reductions, sampled/mean inference, and bounded replay storing inputs plus teacher labels rather than stale latents. Test Gaussian KL, gradients, normalization, data ownership, and reference isolation. No simulator-training run is part of pure core tests.
+Implemented and parent-validated under the [gravity-first M2 plan](beyondmimic_vae_m2_implementation.md). Final evidence: 98 focused tests plus 12 export regressions, targeted lint/type checks, original real-teacher parity, and additional normalizer/replay/state probes. The default is the named 68-dimensional encoder, 99-dimensional gravity-conditioned decoder observation, and 32-dimensional latent. Explicit schema modes also prepare anchor-only and gravity-plus-anchor conditioning, without training ablations or changing the default. Controlled normalizers, explicit loss reductions, sampled/mean inference, and bounded raw labeled replay are present. No collection/training runner is included.
 
-### M3: one-teacher closed-loop DAgger
+### M3: one-teacher closed-loop DAgger — not yet authorized
 
 Integrate with the existing single-motion environment before adding multi-motion commands. Establish the deterministic teacher rollout baseline and physical sensor frames. Snapshot before stepping, use executed previous actions, retain valid pre-failure labels, handle auto-reset and motion-end segments, and implement optional teacher bootstrap/mixing followed by student-only collection. Add resumable checkpoints, logging, evaluation, and bounded resource-configurable smoke runs. Large training runs need a separately specified device/environment/iteration budget.
 

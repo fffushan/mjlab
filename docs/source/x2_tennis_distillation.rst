@@ -1,18 +1,22 @@
-X2 Tennis Distillation Teacher Foundation (M1)
-==============================================
+X2 Tennis Distillation Teacher Foundation and Latent Core (M1/M2)
+===============================================================
 
 Overview
 --------
 
-This page documents the first milestone of the BeyondMimic-style conditional
-VAE distillation effort: freezing and validating the two selected 50 Hz AgiBot
-X2 tennis tracking teachers before any student network is trained. The design
-proposal lives in ``docs/plans/beyondmimic_vae_distillation.md`` and the
-milestone contract in ``docs/plans/beyondmimic_vae_implementation.md``.
+This page documents the first two milestones of the BeyondMimic-style
+conditional VAE distillation effort: freezing and validating the two selected
+50 Hz AgiBot X2 tennis tracking teachers, then adding a pure tensor core for
+schema packing, conditional VAE inference/loss, and bounded raw replay. The
+design proposal lives in ``docs/plans/beyondmimic_vae_distillation.md`` and the
+milestone contracts live in ``docs/plans/beyondmimic_vae_implementation.md`` and
+``docs/plans/beyondmimic_vae_m2_implementation.md``.
 
-**M1 implements teacher loading and validation only.** There is no train
-command, no VAE, no DAgger collection, and no rollout in this milestone; the
-``distill`` CLI deliberately exposes a single ``validate-teachers`` subcommand.
+**M1 implements teacher loading and validation only. M2 implements the pure
+student data/model core only.** There is no train command, simulator adapter,
+DAgger collection, rollout, or student export; those remain later milestones.
+The ``distill`` CLI deliberately exposes only the ``validate-teachers``
+subcommand.
 
 Selected cohort
 ---------------
@@ -182,8 +186,88 @@ a surrounding ``.train()`` call cannot re-enable normalizer updates, labeling
 raises if the actor is forced back into train mode, and labeling never samples
 PPO exploration noise or applies action clipping.
 
-Scope limits of M1
-------------------
+M2 pure latent core
+--------------------
+
+The M2 APIs are simulator-independent and consume one already captured,
+named snapshot. The caller is responsible for aligning all fields to the same
+observation time, supplying the validated cohort joint order (the default
+``joint_00`` through ``joint_30`` names are explicit placeholders), and using
+the actually executed normalized previous action. M2 does not query the
+simulator, add noise, advance delays/history, or mutate snapshots.
+
+``ObservationSnapshot`` and ``pack_observations`` in
+``mjlab.tasks.tracking.distillation.observations`` produce a
+``PackedObservationBatch``. The default ``DecoderMode.GRAVITY`` schema is
+reference/conditioning/latent/action width ``68/99/32/31``. Its decoder
+conditioning is gyro (3), relative joint position (31), joint velocity (31),
+and previous action (31), plus projected root gravity (3); reference q/dq and
+teacher/motion IDs are not decoder inputs. ``DecoderMode.ANCHOR`` and
+``DecoderMode.GRAVITY_ANCHOR`` are explicit opt-in schemas with conditioning
+widths 102 and 105. They are distinct schema identities and are not trained by
+this milestone. Every schema records ordered fields, dimensions, joint order,
+frames, and ``declared_unverified`` physical-frame status.
+
+``ConditionalVAE`` (aliases ``DistillationVAE``/``VAE``) exposes
+``encode``, ``decode``, deterministic ``mean_inference``, and explicit
+``sampled_inference``/``forward(sample=..., noise=...)``. It owns separate
+``StudentNormalizer`` instances for reference and conditioning features;
+statistics change only through explicit ``update`` and can be ``freeze``d for
+evaluation/export. Before the first update, normalization is a documented
+zero-mean/unit-scale identity; it does not increment count or moments. After an
+update, population variance plus the persisted epsilon is used. ``vae_loss``
+returns total, summed-per-joint
+reconstruction, and summed-over-latent Gaussian KL terms with default
+``beta=0.01``. ``LabeledReplayBuffer`` stores detached raw packed tensors,
+fixed teacher actions, and integer routing metadata in a bounded FIFO ring;
+its sampling is uniform and reproducible with a supplied ``torch.Generator``.
+No cached latent, optimizer, trajectory, or simulator state is stored.
+
+The M2 assembler therefore expects the M3 caller to provide overlapping
+teacher/student measurements from the same snapshot and to obtain fixed labels
+from a frozen M1 ``TeacherBank``. M2 does not implement collection, DAgger,
+Adam training, checkpoint/optimizer management, or policy export. M1 teacher
+parity remains the source of truth for the preserved 164-dimensional teacher
+input and is independent of the student's 68-dimensional reference encoder.
+
+To bind the pure core to the already validated teacher joint order, reuse the
+``cohort`` loaded above. Given an aligned ``ObservationSnapshot`` named
+``snapshot``:
+
+.. code-block:: python
+
+   import torch
+   from mjlab.tasks.tracking.distillation import (
+       ConditionalVAE, make_schema, pack_observations,
+   )
+
+   schema = make_schema("gravity", joint_order=cohort.actions.joint_names)
+   packed = pack_observations(snapshot, schema)
+   student = ConditionalVAE(schema=schema)
+
+   # Update statistics only at an explicit training-data boundary.
+   student.reference_normalizer.update(packed.reference)
+   student.conditioning_normalizer.update(packed.conditioning)
+   student.reference_normalizer.freeze()
+   student.conditioning_normalizer.freeze()
+   student.eval()
+   with torch.no_grad():
+       actions = student.mean_inference(packed.reference, packed.conditioning)
+
+This constructs an **untrained** network and demonstrates the API only; these
+outputs are not a policy ready to execute. The M1 cohort already supplies the
+validated joint order. A future live adapter must bind its tensors to that
+order rather than relying on the pure core's placeholder names.
+
+Physical sensor/site mapping is intentionally unresolved: root gravity, gyro,
+and anchor frames are declared contract identities, not verified hardware
+frames. Synthetic integration tests use placeholder feature values only and
+must not be read as closed-loop or deployment evidence. A future caller must
+verify the physical frame mapping and observation timing.
+
+Scope limits of M1 and M2
+--------------------------
+
 
 * Numerical parity is measured on random/statistically placed observations
   through the actor. It verifies the export and the checkpoint/normalizer
@@ -197,8 +281,13 @@ Scope limits of M1
 * Parity inputs require the saved observation normalizer statistics; a
   non-normalized actor is rejected explicitly instead of being probed with an
   arbitrary input scale.
-* Training, collection, evaluation rollouts, and export of student networks are
-  later milestones and are not implemented here.
+* M2 schema metadata preserves declared frame names but does not verify
+  physical IMU/site frames; this requires later asset and hardware evidence.
+* The default joint order in the pure core is an explicit placeholder until a
+  caller supplies the validated X2 cohort order. Synthetic tests do not claim
+  physical frame or closed-loop fidelity.
+* M2 has no collection, training runner, rollout, checkpoint/resume, or student
+  ONNX export. Training and deployment are later milestones.
 
 Tests
 -----

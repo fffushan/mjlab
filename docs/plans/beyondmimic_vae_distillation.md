@@ -1,6 +1,6 @@
 # BeyondMimic VAE distillation: proposed architecture
 
-Status: architecture design; the teacher-loading foundation (M1) is implemented and parent-validated. VAE/DAgger training and later milestones remain planned. See [implementation plan and acceptance record](beyondmimic_vae_implementation.md).
+Status: M1 teacher foundation and the [gravity-first latent core (M2)](beyondmimic_vae_m2_implementation.md) are implemented and parent-validated. M2 was delivered by `lingzhi/gpt-5.6-luna`; gravity is the default with explicit opt-in anchor/combined schemas. DAgger/training and later milestones remain planned and unauthorized. See [implementation plan and acceptance records](beyondmimic_vae_implementation.md).
 Scope: reproduce the conditional-VAE/DAgger stage using existing mjlab tracking teachers; retain a clean interface for later state–latent diffusion.
 Source: `/home/agiuser/Documents/beyondmimic.pdf`, main pp. 18–21 and Fig. 7, supplementary S3/S4 and Table S6.
 
@@ -47,6 +47,8 @@ proprio:       root projected gravity(3) + teacher-compatible gyro(3)
 decoder:       [latent(32), proprio(99)] -> [2048, 1024, 512] -> action(31)
 ```
 
+This is the **default gravity mode**. M2 exposes named, versioned `anchor` and `gravity_anchor` schema choices for future controlled ablations: decoder conditioning is 102 or 105 dimensions respectively (134/137 including the latent). Encoder input stays 68 for all modes. These alternatives are reference-conditioned decoder interfaces, not interchangeable proprioceptive measurements or runtime switches on an existing checkpoint. No ablation training is authorized now.
+
 Projected gravity is a new student proprioceptive input, not a modification to the frozen teachers' 164-dimensional inputs. Verify its deployment frame/availability and the gyro frame before freezing the schema. Retain no-state-estimation operation: omit anchor position and linear velocity. Start with equal motion weights; prove one-teacher behavior using `tennis_000`, then include `tennis_001` in shared training. The first student is intended to cover both clips, not to train two separate VAEs.
 
 ## 1. Goal and boundaries
@@ -61,7 +63,7 @@ reference joint states + anchor error --> Encoder --> z (32)
 current deployable proprioception ----------------> Decoder --> action
 ```
 
-Later, diffusion replaces the encoder as the source of `z`. No reference, motion ID, teacher ID, or teacher-only state may bypass the latent bottleneck into the decoder.
+Later, diffusion replaces the encoder as the source of `z`. **In the default gravity mode**, no reference, motion ID, teacher ID, or teacher-only state may bypass the latent bottleneck into the decoder. Explicit anchor-conditioned ablation modes relax only the anchor-error restriction and must declare that they require a reference orientation/error source in addition to the latent; they are not drop-in reference-free diffusion decoders. Motion/teacher IDs and reference q/dq remain excluded from every decoder mode.
 
 Out of scope initially: diffusion training/guidance, new PPO teachers, arbitrary cross-robot distillation, recurrent teachers, asynchronous/distributed collection, and hardware execution. Rewards remain useful evaluation signals but do not define a PPO/value loss in this stage.
 
