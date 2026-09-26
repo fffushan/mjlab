@@ -21,6 +21,7 @@ from mjlab.utils.lab_api.math import (
   sample_uniform,
   yaw_quat,
 )
+from mjlab.utils.os import load_saved_yaml
 from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 if TYPE_CHECKING:
@@ -759,28 +760,8 @@ def load_saved_lookahead_s(
 def _load_saved_env_yaml(path: Path) -> dict:
   """Load a saved ``env.yaml`` artifact produced by ``dump_yaml``.
 
-  The artifact is an ``asdict`` dump and contains tags that ``yaml.safe_load``
-  rejects (e.g. ``!!python/tuple`` for ranges and ``!!python/name`` for
-  observation functions). A SafeLoader subclass handles those tags without
-  executing arbitrary Python.
+  Delegates to :func:`mjlab.utils.os.load_saved_yaml`, which handles the
+  ``asdict`` tags (e.g. ``!!python/tuple``, ``!!python/name``) that
+  ``yaml.safe_load`` rejects without executing arbitrary Python.
   """
-  import yaml
-
-  class _SavedEnvLoader(yaml.SafeLoader):
-    pass
-
-  def _python_tag_constructor(
-    loader: yaml.Loader, tag_suffix: str, node: yaml.Node
-  ) -> object:
-    del tag_suffix
-    if isinstance(node, yaml.SequenceNode):
-      return tuple(loader.construct_sequence(node))
-    if isinstance(node, yaml.MappingNode):
-      return loader.construct_mapping(node)
-    return loader.construct_scalar(node)  # pyright: ignore[reportArgumentType]
-
-  _SavedEnvLoader.add_multi_constructor(
-    "tag:yaml.org,2002:python/", _python_tag_constructor
-  )
-  with path.open() as file:
-    return yaml.load(file, Loader=_SavedEnvLoader) or {}
+  return load_saved_yaml(path)

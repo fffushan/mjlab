@@ -71,6 +71,7 @@ Table of Contents
    source/randomization
    source/sim2real_domain_randomization
    source/x2_tennis_recovery
+   source/x2_tennis_distillation
    source/x2_gain_provenance
    source/curriculum
    source/metrics

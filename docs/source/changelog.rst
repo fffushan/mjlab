@@ -8,6 +8,19 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the first milestone of the BeyondMimic-style VAE distillation work: a
+  typed, versioned teacher manifest (``configs/distillation/x2_tennis.yaml``)
+  with compatibility validation, a frozen actor-only ``FrozenTeacher``/
+  ``TeacherBank`` with per-teacher checkpoint normalizers and deterministic
+  batched routing, and a first-class CPU ``uv run distill validate-teachers``
+  command that checks native actions against the original ONNX exports for both
+  selected 50 Hz X2 tennis teachers (plus export/checkpoint association and
+  embedded reference arrays). The safe saved-configuration loader used by
+  ``load_saved_lookahead_s`` moved to ``mjlab.utils.os.load_saved_yaml`` and now
+  keeps ``!!python/name`` callables as qualified-name strings; training,
+  collection, and student export are later milestones. See
+  ``docs/source/x2_tennis_distillation.rst``.
+
 - Added the X2 tennis-end recovery fine-tuning task
   ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Recovery``, an
   opt-in variant of the X2 no-state-estimation velocity task that pairs a

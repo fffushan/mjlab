@@ -1,0 +1,25 @@
+# Selected 50 Hz AgiBot X2 tennis tracking teachers used as the distillation
+# cohort. Paths are relative to the repository root, which the `distill`
+# CLI resolves from `--repo-root` (default: the current working directory).
+#
+# The saved `params/env.yaml` files still record the original remote motion
+# paths; `motion` selects the local reference and must name the same clip.
+version: 1
+name: x2-tennis-teachers
+robot: agibot_x2
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations
+teachers:
+  - id: tennis_000
+    checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/model_29999.pt
+    motion: data/tennis/single_000_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/env.yaml
+    agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/agent.yaml
+    onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/2026-09-23_21-24-56.onnx
+    sampling_weight: 1.0
+  - id: tennis_001
+    checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/model_29999.pt
+    motion: data/tennis/single_001_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/env.yaml
+    agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/agent.yaml
+    onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/2026-09-23_19-28-08.onnx
+    sampling_weight: 1.0

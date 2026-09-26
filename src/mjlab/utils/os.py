@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
+from urllib.parse import unquote
 
 import yaml
 
@@ -18,6 +19,43 @@ def dump_yaml(filename: Path, data: Dict, sort_keys: bool = False) -> None:
   filename.parent.mkdir(parents=True, exist_ok=True)
   with open(filename, "w") as f:
     yaml.dump(data, f, sort_keys=sort_keys)
+
+
+def load_saved_yaml(path: Path) -> dict[str, Any]:
+  """Load a configuration artifact produced by ``dump_yaml``.
+
+  Such an artifact is an ``asdict`` dump and contains tags that
+  ``yaml.safe_load`` rejects (e.g. ``!!python/tuple`` for ranges and
+  ``!!python/name`` for observation functions). A ``SafeLoader`` subclass
+  handles those tags without executing arbitrary Python: ``python/tuple``
+  becomes a tuple, ``python/name`` becomes the qualified name string that the
+  tag recorded, and other ``python/*`` tags become plain containers/scalars.
+  """
+
+  class _SavedConfigLoader(yaml.SafeLoader):
+    pass
+
+  def _python_tag_constructor(
+    loader: yaml.Loader, tag_suffix: str, node: yaml.Node
+  ) -> object:
+    if isinstance(node, yaml.SequenceNode):
+      return tuple(loader.construct_sequence(node))
+    if isinstance(node, yaml.MappingNode):
+      return loader.construct_mapping(node)
+    value = loader.construct_scalar(node)  # pyright: ignore[reportArgumentType]
+    # ``asdict`` writes callables as ``!!python/name:<qualified name> ''``, so
+    # the name lives in the tag while the scalar is empty. Keep the name as
+    # data instead of losing it; importing it is never necessary.
+    name_prefix = "name:"
+    if not value and tag_suffix.startswith(name_prefix):
+      return unquote(tag_suffix[len(name_prefix) :])
+    return value
+
+  _SavedConfigLoader.add_multi_constructor(
+    "tag:yaml.org,2002:python/", _python_tag_constructor
+  )
+  with path.open() as file:
+    return yaml.load(file, Loader=_SavedConfigLoader) or {}
 
 
 def get_checkpoint_path(
