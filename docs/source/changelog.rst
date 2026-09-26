@@ -25,6 +25,14 @@ Added
   it never refuses a resume and a resumed run continues the lifetime filename
   sequence.
 
+- Added optional progress reporting to ``distill train`` through
+  ``--progress-every N``. A positive ``N`` writes a flushed ``[progress]`` line
+  to stderr every ``N`` completed iterations with the lifetime iteration,
+  collected samples, last update loss, disagreement, elapsed time, measured
+  seconds per iteration, and a projected ETA. ``0`` (the default) keeps the
+  previous silent behavior. Progress is written to stderr so that stdout
+  remains exactly the machine-readable JSON report.
+
 - Added model-only student evaluation to the M3 distillation CLI. ``distill
   evaluate --mode student --checkpoint PATH`` reconstructs the saved model via
   the new ``InferenceModel``/``load_inference_checkpoint`` API exported from

@@ -1441,3 +1441,62 @@ def test_environment_factory_applies_forwarded_seed_before_construction(
   motion_cfg = first.cfg.commands["motion"]
   assert isinstance(motion_cfg, SegmentMotionCommandCfg)
   assert motion_cfg.motion_file == str(resolved.teacher(TEACHER_ID).entry.motion)
+
+
+def test_train_progress_lines_are_opt_in_and_keep_stdout_json(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """``--progress-every`` reports on stderr; stdout stays the JSON report.
+
+  Progress must never contaminate stdout, because stdout is the
+  machine-readable report that callers and tests parse with ``json.loads``.
+  """
+  _resolved_cohort(tmp_path)
+  _install_fake_adapter(monkeypatch, [])
+
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "4", "--progress-every", "2"],
+  )
+
+  assert code == 0, err
+  # stdout is still exactly the JSON report, despite the progress output.
+  assert json.loads(out)["iteration"] == 4
+  assert "[progress]" not in out
+  lines = [line for line in err.splitlines() if line.startswith("[progress]")]
+  assert lines[0].startswith("[progress] starting at iteration 0/4")
+  assert [line.split()[2] for line in lines[1:]] == ["2/4", "4/4"]
+  assert "s/iter this run" in lines[-1]
+  assert "eta=" in lines[-1]
+  assert "loss=" in lines[-1] and "disagreement=" in lines[-1]
+
+  # The default remains silent.
+  silent_dir = tmp_path / "silent"
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "2", "--output-dir", str(silent_dir)],
+  )
+  assert code == 0, err
+  assert "[progress]" not in err
+  assert json.loads(out)["iteration"] == 2
+
+
+def test_train_rejects_negative_progress_every(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A negative progress cadence is refused before any adapter is built."""
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls)
+
+  code, _out, err = _train_with_tiny_cohort(
+    tmp_path, monkeypatch, capsys, ["--progress-every", "-1"]
+  )
+
+  assert code not in (0, None)
+  assert "--progress-every" in err
+  assert calls == []

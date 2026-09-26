@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -506,6 +507,7 @@ def _train(
   seed: int = 0,
   rollout_latent: RolloutLatent = "mean",
   checkpoint_every: int = 0,
+  progress_every: int = 0,
   report_boundaries: ReportBoundaries = "summary",
   output_dir: Path = Path("distillation-runs/latest"),
   resume: Path | None = None,
@@ -527,6 +529,15 @@ def _train(
   resume input, and the report lists every checkpoint written by this
   invocation.
 
+  ``progress_every`` writes a flushed ``[progress]`` line to **stderr** every
+  ``N`` completed iterations, reporting the lifetime iteration, collected
+  samples, last update loss, teacher/student disagreement, elapsed time,
+  seconds per iteration for this invocation, and a projected ETA.  ``0`` (the
+  default) keeps the original silent behavior.  Progress deliberately goes to
+  stderr so that stdout stays exactly the machine-readable JSON report that
+  callers and tests parse; a long run is otherwise observable only through its
+  periodic checkpoints.
+
   ``report_boundaries`` selects the boundary evidence in each iteration's
   ``collection.boundaries``.  ``summary`` (the default) reports per-``reason``
   record/environment-mention counts and the observed before/after segment and
@@ -545,6 +556,11 @@ def _train(
         f"--checkpoint-every must be a non-negative integer (got "
         f"{checkpoint_every}); use 0 to disable periodic checkpoints and keep "
         "only the final checkpoint"
+      )
+    if progress_every < 0:
+      raise ValueError(
+        f"--progress-every must be a non-negative integer (got {progress_every}); "
+        "use 0 to disable progress output"
       )
     cohort = _resolve(manifest, repo_root)
     runner, selected, evaluation_sampling_mode = _build_runner(
@@ -615,6 +631,15 @@ def _train(
     # a summary report never holds more than one iteration's boundary arrays.
     iteration_reports: list[dict] = []
     checkpoints: list[Path] = []
+    progress_started = time.monotonic()
+    iterations_this_run = 0
+    if progress_every > 0:
+      print(
+        f"[progress] starting at iteration {runner.iteration}/{max_iterations} "
+        f"device={device} num_envs={num_envs} progress_every={progress_every}",
+        file=sys.stderr,
+        flush=True,
+      )
     while runner.iteration < max_iterations:
       remaining = max_iterations - runner.iteration
       chunk = remaining if checkpoint_every <= 0 else min(checkpoint_every, remaining)
@@ -622,6 +647,30 @@ def _train(
         iteration_reports.append(
           _iteration_report(runner.run_iteration(), report_boundaries)
         )
+        iterations_this_run += 1
+        if progress_every > 0 and (
+          runner.iteration % progress_every == 0 or runner.iteration >= max_iterations
+        ):
+          latest = iteration_reports[-1]
+          collection = latest.get("collection") or {}
+          updates = latest.get("updates") or []
+          raw_loss = updates[-1].get("total_loss") if updates else None
+          raw_disagreement = collection.get("disagreement_mean")
+          loss_text = "n/a" if raw_loss is None else f"{raw_loss:.4f}"
+          disagreement_text = (
+            "n/a" if raw_disagreement is None else f"{raw_disagreement:.4f}"
+          )
+          elapsed = time.monotonic() - progress_started
+          per_iteration = elapsed / max(iterations_this_run, 1)
+          eta_hours = per_iteration * (max_iterations - runner.iteration) / 3600.0
+          print(
+            f"[progress] iter {runner.iteration}/{max_iterations} "
+            f"samples={collection.get('samples')} loss={loss_text} "
+            f"disagreement={disagreement_text} elapsed={elapsed:.1f}s "
+            f"({per_iteration:.2f} s/iter this run) eta={eta_hours:.2f}h",
+            file=sys.stderr,
+            flush=True,
+          )
       if checkpoint_every > 0:
         periodic = output_dir / f"checkpoint-iter-{runner.iteration:06d}.pt"
         write_checkpoint(periodic)
