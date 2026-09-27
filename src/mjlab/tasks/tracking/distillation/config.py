@@ -35,7 +35,22 @@ _REFERENCE_FPS_RTOL = 1e-4
 _ACTOR_STATE_DICT_PREFIXES = ("mlp.", "obs_normalizer.", "distribution.")
 _SUPPORTED_ACTOR_CLASS = "MLPModel"
 _SUPPORTED_DISTRIBUTION_CLASS = "GaussianDistribution"
-_EXCLUDED_ENV_FIELDS = ("commands.motion.motion_file",)
+_EXCLUDED_ENV_FIELDS = (
+  "commands.motion.motion_file",
+  # TEMPORARY (quick hack, superseded by the flexibility plan in
+  # docs/plans/beyondmimic_vae_flexible_teacher_cohorts.md): a teacher trained
+  # with the standing-start tracking task variant records its reset options here,
+  # and those keys exist only in its saved config.  They describe how the teacher
+  # was trained and never reach the student: the cohort environment is built from
+  # the registry task and a teacher's saved config is only ever a checked
+  # reference (see environment.py), while student resets come from
+  # --reset-policy.  Excluding these two keys lets such a teacher join a cohort
+  # with the plain-task teachers.  They are singled out rather than the whole
+  # commands.motion subtree, so anchor/body/cadence fields inside it are still
+  # compared, and every other saved field remains a hard equality requirement.
+  "commands.motion.standing_start_prob",
+  "commands.motion.standing_start_window_frames",
+)
 """Saved environment fields excluded from cross-teacher equality.
 
 Every other saved environment field must agree between teachers, so a cohort
@@ -1341,8 +1356,18 @@ def _require_equal_saved_configs(teachers: tuple[ResolvedTeacher, ...]) -> None:
 
 
 def _without_excluded_env_fields(env_config: Mapping[str, Any]) -> dict[str, Any]:
+  """Drop every excluded field path from a deep copy of a saved env config."""
   pruned = copy.deepcopy(dict(env_config))
-  pruned["commands"]["motion"].pop("motion_file", None)
+  for dotted in _EXCLUDED_ENV_FIELDS:
+    *parents, leaf = dotted.split(".")
+    node: dict[str, Any] = pruned
+    for parent in parents:
+      child = node.get(parent)
+      if not isinstance(child, dict):
+        break
+      node = child
+    else:
+      node.pop(leaf, None)
   return pruned
 
 

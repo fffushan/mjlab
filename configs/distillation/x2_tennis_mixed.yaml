@@ -1,0 +1,51 @@
+# TEMPORARY mixed cohort (quick hack) — tennis_000, tennis_001 and tennis_002_ss.
+#
+# Why a separate file instead of adding the entry to `x2_tennis.yaml`: the cohort
+# identity records `manifest_sha256`, and strict resume/evaluation compares it
+# (`require_same_cohort`). Editing a manifest therefore invalidates resume and
+# evaluation of every cohort already trained from it, even when the edit only adds
+# an entry that a given selection does not use. A 10000-iteration two-teacher run
+# is training from `x2_tennis.yaml`, so that file stays byte-identical.
+#
+# The reason these teachers could not previously share a manifest is the saved
+# environment equality check: the standing-start teacher records
+# `commands.motion.standing_start_prob` / `standing_start_window_frames`, which the
+# plain-task teachers lack, and any key present in only one configuration is
+# refused. Those two paths are now in `_EXCLUDED_ENV_FIELDS` (see the comment
+# there); they describe how the teacher was trained and never reach the student.
+# This is a quick hack with a proper replacement designed in
+# docs/plans/beyondmimic_vae_flexible_teacher_cohorts.md (Stage 1: scope the check
+# to the selection and to contract-bearing paths, rather than a fixed list).
+#
+# `name` is deliberately distinct from `x2-tennis-teachers`: the manifest name is
+# part of the common cohort contract, so a mixed cohort must not be resumable as
+# the two-teacher one.
+version: 1
+name: x2-tennis-teachers-mixed
+robot: agibot_x2
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations
+teachers:
+  - id: tennis_000
+    checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/model_29999.pt
+    motion: data/tennis/single_000_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/env.yaml
+    agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/agent.yaml
+    onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/2026-09-23_21-24-56.onnx
+    sampling_weight: 1.0
+  - id: tennis_001
+    checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/model_29999.pt
+    motion: data/tennis/single_001_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/env.yaml
+    agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/agent.yaml
+    onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/2026-09-23_19-28-08.onnx
+    sampling_weight: 1.0
+  # Frozen copy of a still-training run; see
+  # logs/distillation/teachers/tennis_002_ss/PROVENANCE.md for source, iteration
+  # and digests. Frozen because the source run re-exports its ONNX on every save.
+  - id: tennis_002_ss
+    checkpoint: logs/distillation/teachers/tennis_002_ss/model_16500.pt
+    motion: data/tennis/single_002_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_002_ss/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_002_ss/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_002_ss/model_16500.onnx
+    sampling_weight: 1.0

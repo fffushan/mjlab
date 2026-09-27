@@ -184,7 +184,11 @@ def test_resolve_cohort_matches_selected_teacher_contract(tmp_path: Path) -> Non
   assert contract.fps == 50.0
   assert contract.anchor_body_name == "torso_link"
   assert contract.body_names == ("pelvis", "torso_link")
-  assert contract.excluded_env_fields == ("commands.motion.motion_file",)
+  assert contract.excluded_env_fields == (
+    "commands.motion.motion_file",
+    "commands.motion.standing_start_prob",
+    "commands.motion.standing_start_window_frames",
+  )
 
   teacher = contract.teacher("tiny_000")
   assert teacher.reference.frames == 6
@@ -276,6 +280,47 @@ def test_resolve_cohort_rejects_differing_saved_environments(tmp_path: Path) -> 
 
   with pytest.raises(DistillationError, match="different saved environment"):
     resolve_cohort(load_manifest(manifest, tmp_path))
+
+
+def add_standing_start_options(env_config: Path) -> None:
+  """Add the standing-start reset options a variant-task teacher records.
+
+  Mirrors the real difference between a `-Standing-Start` task teacher and a
+  plain-task teacher: two extra keys under `commands.motion`, nothing else.
+  """
+  lines = env_config.read_text().splitlines(keepends=True)
+  annotated: list[str] = []
+  for line in lines:
+    annotated.append(line)
+    if line.strip().startswith("motion_file:"):
+      indent = line[: len(line) - len(line.lstrip())]
+      annotated.append(f"{indent}standing_start_prob: 0.3\n")
+      annotated.append(f"{indent}standing_start_window_frames: 25\n")
+  env_config.write_text("".join(annotated))
+
+
+def test_resolve_cohort_accepts_a_standing_start_variant_teacher(
+  tmp_path: Path,
+) -> None:
+  """Temporary hack: a standing-start variant teacher may join a plain cohort.
+
+  The two standing-start reset options describe how the teacher was trained and
+  never reach the student, so they are excluded from cross-teacher equality.
+  Every other saved field stays a hard equality requirement, which
+  ``test_resolve_cohort_rejects_differing_saved_environments`` still checks.
+  """
+  plain = write_teacher(tmp_path, "tiny_000", seed=0)
+  variant = write_teacher(tmp_path, "tiny_002_ss", seed=2)
+  add_standing_start_options(variant.env_config)
+  manifest = write_manifest(
+    tmp_path / "configs" / "mixed.yaml", [plain, variant], root=tmp_path
+  )
+
+  contract = resolve_cohort(load_manifest(manifest, tmp_path))
+
+  assert contract.teacher_ids == ("tiny_000", "tiny_002_ss")
+  assert "commands.motion.standing_start_prob" in contract.excluded_env_fields
+  assert "commands.motion.standing_start_window_frames" in contract.excluded_env_fields
 
 
 def test_resolve_cohort_rejects_recurrent_teacher(tmp_path: Path) -> None:
