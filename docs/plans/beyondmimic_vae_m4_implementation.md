@@ -460,6 +460,14 @@ training, GUI, GPU run, or hardware validation is included in this acceptance.
 Repository HEAD remains `5cb756eed94b5a2353a1b8b4aa93b65f0f160b7a`; M4 changes are
 uncommitted. This is not a claim that all repository-wide checks are green.
 
+**Post-acceptance commit (added later, 2026-09-27):** the accepted M4 working tree
+was committed as `433a5391934a481d3c0d0ee538be7d8f6022e251` ("Add M4 shared
+multi-teacher VAE distillation cohort", 29 files, +15067/-636). The statements
+above describe the acceptance as it was recorded and are kept verbatim for that
+reason; where they say "uncommitted", that is now historical. Re-running the
+focused gates on the committed snapshot reproduced the same results, including
+the two inherited exceptions below. No push was performed.
+
 ### Implemented and reviewed
 
 All five serial DeepSeek Flash components delivered candidates; a fresh read-only
