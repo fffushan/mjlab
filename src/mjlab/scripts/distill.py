@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Mapping
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -127,6 +129,17 @@ def _print_help(stream) -> None:
   )
   print(file=stream)
   print("Run 'distill <COMMAND> --help' for command-specific options.", file=stream)
+
+
+def _default_train_output_dir(task_id: str | None) -> Path:
+  """Choose a unique, human-readable default directory for a training run."""
+  if task_id:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip("-.")
+  else:
+    name = ""
+  if not name:
+    name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+  return Path("logs") / "distillation" / name
 
 
 def _write_report(payload: dict, report: Path | None) -> str:
@@ -526,10 +539,10 @@ def _train(
   beta: float = 0.01,
   seed: int = 0,
   rollout_latent: RolloutLatent = "mean",
-  checkpoint_every: int = 0,
-  progress_every: int = 0,
+  checkpoint_every: int = 500,
+  progress_every: int = 10,
   report_boundaries: ReportBoundaries = "summary",
-  output_dir: Path = Path("distillation-runs/latest"),
+  output_dir: Path | None = None,
   resume: Path | None = None,
 ) -> int:
   """Run a bounded native single-teacher collect/update lifecycle.
@@ -541,22 +554,26 @@ def _train(
   construction before startup randomization, and the resolved seed, the seed
   provenance, and the complete resolved configuration are reported.
 
-  ``checkpoint_every`` is an optional periodic save cadence counted in
-  *completed* iterations.  ``0`` (the default) keeps the original behavior of
-  writing only ``checkpoint-final.pt``.  When positive, a checkpoint named from
-  the total lifetime iteration counter is written atomically every
-  ``checkpoint_every`` completed iterations, every checkpoint is a complete
-  resume input, and the report lists every checkpoint written by this
-  invocation.
+  ``checkpoint_every`` is a periodic save cadence counted in *completed*
+  iterations.  ``0`` disables periodic checkpoints and keeps only the final
+  ``checkpoint-final.pt``.  When positive, a checkpoint named from the total
+  lifetime iteration counter is written atomically every ``checkpoint_every``
+  completed iterations, every checkpoint is a complete resume input, and the
+  report lists every checkpoint written by this invocation.
+
+  The default cadence is 500.  ``progress_every`` defaults to 10 and writes
+  flushed progress lines to stderr.  When ``output_dir`` is omitted, the run is
+  stored under ``logs/distillation/<task-id>/`` when ``task_id`` is supplied,
+  otherwise under ``logs/distillation/<UTC timestamp>/``.
 
   ``progress_every`` writes a flushed ``[progress]`` line to **stderr** every
   ``N`` completed iterations, reporting the lifetime iteration, collected
   samples, last update loss, teacher/student disagreement, elapsed time,
-  seconds per iteration for this invocation, and a projected ETA.  ``0`` (the
-  default) keeps the original silent behavior.  Progress deliberately goes to
-  stderr so that stdout stays exactly the machine-readable JSON report that
-  callers and tests parse; a long run is otherwise observable only through its
-  periodic checkpoints.
+  seconds per iteration for this invocation, and a projected ETA.  ``0``
+  disables progress output.  Progress deliberately goes to stderr so that
+  stdout stays exactly the machine-readable JSON report that callers and tests
+  parse; a long run is otherwise observable only through its periodic
+  checkpoints.
 
   ``report_boundaries`` selects the boundary evidence in each iteration's
   ``collection.boundaries``.  ``summary`` (the default) reports per-``reason``
@@ -631,6 +648,8 @@ def _train(
         map_location=device,
       )
       resume_audit = _check_resume_compatibility(state, resolved_config)
+    if output_dir is None:
+      output_dir = _default_train_output_dir(task_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def write_checkpoint(path: Path) -> None:

@@ -523,13 +523,16 @@ def test_train_cli_applies_seed_before_construction_and_saves_full_provenance(
     "settings": DEFAULT_MODEL_SETTINGS.to_metadata(),
     "schema": DEFAULT_SCHEMA.compatibility_metadata(),
   }
-  assert provenance["checkpoint_every"] == 0
+  assert provenance["checkpoint_every"] == 500
   assert provenance["resumed_from"] is None
   assert payload["schedule"] == provenance["schedule"]
   assert report["schedule"] == provenance["schedule"]
   assert report["resolved_config"] == provenance
   assert report["resume"] is None
-  assert report["checkpoints"] == [str(output_dir / "checkpoint-final.pt")]
+  assert report["checkpoints"] == [
+    str(output_dir / "checkpoint-iter-000002.pt"),
+    str(output_dir / "checkpoint-final.pt"),
+  ]
   assert (output_dir / "train-report.json").exists()
 
   # The checkpoint this command just wrote is evaluable without repeating any
@@ -824,10 +827,42 @@ def test_train_cli_writes_periodic_checkpoints_and_resumes_from_intermediate(
   assert resumed["resolved_config"]["checkpoint_every"] == 3
 
 
-def test_train_cli_default_checkpoint_every_writes_only_the_final_checkpoint(
+def test_train_cli_default_output_and_cadences(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-  """``--checkpoint-every 0`` is the default and keeps the original one save."""
+  """Defaults create a named log directory with periodic/progress cadences."""
+  _resolved_cohort(tmp_path)
+  _install_fake_adapter(monkeypatch, [])
+  monkeypatch.chdir(tmp_path)
+
+  code, out, err = _train_with_tiny_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--task-id", "tiny-task", "--max-iterations", "2"],
+  )
+
+  assert code == 0, err
+  output_dir = Path("logs") / "distillation" / "tiny-task"
+  report = json.loads(out)
+  assert report["resolved_config"]["checkpoint_every"] == 500
+  assert report["checkpoints"] == [
+    str(output_dir / "checkpoint-iter-000002.pt"),
+    str(output_dir / "checkpoint-final.pt"),
+  ]
+  assert (output_dir / "train-report.json").exists()
+  lines = [line for line in err.splitlines() if line.startswith("[progress]")]
+  assert lines[0].startswith("[progress] starting at iteration 0/2")
+  assert lines[-1].startswith("[progress] iter 2/2")
+  timestamp_dir = distill._default_train_output_dir(None)
+  assert timestamp_dir.parent == Path("logs") / "distillation"
+  assert len(timestamp_dir.name) == 16 and timestamp_dir.name.endswith("Z")
+
+
+def test_train_cli_zero_checkpoint_every_writes_only_the_final_checkpoint(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """``--checkpoint-every 0`` disables periodic saves and keeps one final save."""
   _resolved_cohort(tmp_path)
   calls: list[dict] = []
   _install_fake_adapter(monkeypatch, calls)
@@ -837,7 +872,14 @@ def test_train_cli_default_checkpoint_every_writes_only_the_final_checkpoint(
     tmp_path,
     monkeypatch,
     capsys,
-    ["--max-iterations", "4", "--output-dir", str(output_dir)],
+    [
+      "--max-iterations",
+      "4",
+      "--checkpoint-every",
+      "0",
+      "--output-dir",
+      str(output_dir),
+    ],
   )
 
   assert code == 0, err
@@ -1472,13 +1514,13 @@ def test_train_progress_lines_are_opt_in_and_keep_stdout_json(
   assert "eta=" in lines[-1]
   assert "loss=" in lines[-1] and "disagreement=" in lines[-1]
 
-  # The default remains silent.
+  # An explicit zero disables progress output.
   silent_dir = tmp_path / "silent"
   code, out, err = _train_with_tiny_cohort(
     tmp_path,
     monkeypatch,
     capsys,
-    ["--max-iterations", "2", "--output-dir", str(silent_dir)],
+    ["--max-iterations", "2", "--progress-every", "0", "--output-dir", str(silent_dir)],
   )
   assert code == 0, err
   assert "[progress]" not in err

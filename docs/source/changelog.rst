@@ -26,23 +26,25 @@ Added
   implementation smoke evidence from policy quality and hardware readiness; they
   do not launch unbounded production training or student export.
 
-- Added optional periodic checkpointing to ``distill train`` through
-  ``--checkpoint-every N``. ``0`` (the default) keeps the previous behavior of
-  writing only ``checkpoint-final.pt``; a positive ``N`` writes an atomic
+- Added periodic checkpointing to ``distill train`` through
+  ``--checkpoint-every N``. The default cadence is 500 completed iterations;
+  ``0`` disables periodic saves. Positive ``N`` writes an atomic
   ``checkpoint-iter-<lifetime iteration>.pt`` after every ``N`` completed
   iterations, each one a complete resume input, and reports every checkpoint
   written by the invocation. The cadence is recorded in the checkpoint's
   ``resolved_config`` for audit only and is not a resume invariant, so changing
   it never refuses a resume and a resumed run continues the lifetime filename
-  sequence.
+  sequence. Training now defaults to ``logs/distillation/<task-id>/`` when
+  ``--task-id`` is supplied, or a UTC timestamp directory below
+  ``logs/distillation/`` otherwise.
 
-- Added optional progress reporting to ``distill train`` through
-  ``--progress-every N``. A positive ``N`` writes a flushed ``[progress]`` line
-  to stderr every ``N`` completed iterations with the lifetime iteration,
-  collected samples, last update loss, disagreement, elapsed time, measured
-  seconds per iteration, and a projected ETA. ``0`` (the default) keeps the
-  previous silent behavior. Progress is written to stderr so that stdout
-  remains exactly the machine-readable JSON report.
+- Added progress reporting to ``distill train`` through ``--progress-every N``.
+  The default cadence is 10 completed iterations; ``0`` disables it. A positive
+  ``N`` writes a flushed ``[progress]`` line to stderr every ``N`` completed
+  iterations with the lifetime iteration, collected samples, last update loss,
+  disagreement, elapsed time, measured seconds per iteration, and projected
+  ETA. Progress is written to stderr so stdout remains exactly the
+  machine-readable JSON report; launchers can capture stderr as ``train.log``.
 
 - Added model-only student evaluation to the M3 distillation CLI. ``distill
   evaluate --mode student --checkpoint PATH`` reconstructs the saved model via

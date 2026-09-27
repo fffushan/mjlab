@@ -69,20 +69,31 @@ recorded setting a resume may change; every other entry of the checkpoint's
 difference is refused instead of silently changing the stored schedule or
 semantics. Use a separate output directory for the resumed run.
 
-Periodic saving is opt-in. ``--checkpoint-every N`` writes
-``checkpoint-iter-<lifetime iteration>.pt`` into ``--output-dir`` after every
-``N`` completed iterations, using the same atomic save and the same provenance,
-schedule, teacher-hash, and control-contract metadata as the final checkpoint,
-so any of them is a valid ``--resume`` input. The default ``0`` keeps the
-single ``checkpoint-final.pt`` behavior, and ``checkpoint-final.pt`` is always
-written at the end. Iterations are the total lifetime counter, so a resumed run
-continues the same filename sequence rather than overwriting an earlier
-period's files, and the report lists every checkpoint written by the invocation
+Periodic saving defaults to every 500 completed iterations. ``--checkpoint-every
+N`` writes ``checkpoint-iter-<lifetime iteration>.pt`` into ``--output-dir``
+after every ``N`` completed iterations, using the same atomic save and the same
+provenance, schedule, teacher-hash, and control-contract metadata as the final
+checkpoint, so any of them is a valid ``--resume`` input. ``--checkpoint-every
+0`` disables periodic saves, while ``checkpoint-final.pt`` is always written at
+the end. Iterations are the total lifetime counter, so a resumed run continues
+the same filename sequence rather than overwriting an earlier period's files,
+and the report lists every checkpoint written by the invocation
 (``checkpoints``, final one included) next to the final one (``checkpoint``).
 The cadence is recorded in ``resolved_config`` but is not a resume invariant:
 changing ``--checkpoint-every`` between a run and its resume is accepted, while
 every other stored semantic setting is still compared and a difference is
 refused. A negative cadence is rejected before any environment is constructed.
+
+When ``--output-dir`` is omitted, training writes to
+``logs/distillation/<task-id>/`` when ``--task-id`` is supplied. Otherwise it
+uses a UTC timestamp directory under ``logs/distillation/``. This prevents the
+default output from colliding with the repository's test artifacts; use an
+explicit directory when intentionally resuming or grouping multiple runs.
+Progress reporting defaults to every 10 completed iterations. ``--progress-every
+N`` writes flushed ``[progress]`` lines to stderr; ``--progress-every 0``
+disables them. The progress stream is separate from the JSON report and should
+be redirected to ``train.log`` by a launcher when a persistent text log is
+desired.
 
 Every ``train``/``evaluate`` invocation forwards ``--seed`` into environment
 construction, so the private environment configuration is seeded *before* MuJoCo
