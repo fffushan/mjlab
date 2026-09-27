@@ -271,6 +271,29 @@ uv run train Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Red
 Its PPO runs are written below
 ``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations``.
 
+### Standing-start initialization (Ablation 3 fork)
+
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Standing-Start``
+is Ablation 3 plus one initialization change: with probability 0.3, an episode
+whose sampled start frame lies in the motion's first 25 frames (capped at bin
+0's extent) initializes the robot in the entity's default standing pose —
+default joint positions, zero joint and root velocities, root upright at the
+default height with the reference root xy and a yaw aligned to the reference
+anchor — with the usual reset perturbations applied on top. The reference
+tables and the motion clock are untouched, so the policy must track into the
+motion from standing.
+
+Why: the deployed controller holds ``JOINT_DEFAULT`` (the exported policy
+default pose) before engaging the tracking policy, and tennis motions start
+in a guard pose ~1.6 rad from standing (joint-space L2, max single-joint gap
+0.71 rad at a hip roll). Reference-frame initialization never shows the
+policy that transition; this knob makes ~30% of leading-window starts exercise
+it. ``sampling_mode == "start"`` (play/eval) never inserts, so evaluation
+methodology is unchanged; ``standing_start`` is logged as a command metric.
+
+PPO runs are written below
+``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_standing_start``.
+
 ### Additive observation ablations from the reduced-perturbation baseline
 
 The selected ABLATION3 baseline is

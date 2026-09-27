@@ -5,6 +5,7 @@ from .env_cfgs import (
   agibot_x2_flat_tracking_correlated_dr_env_cfg,
   agibot_x2_flat_tracking_env_cfg,
   agibot_x2_flat_tracking_observation_ablation_env_cfg,
+  agibot_x2_flat_tracking_standing_start_env_cfg,
 )
 from .rl_cfg import agibot_x2_tracking_ppo_runner_cfg
 
@@ -48,6 +49,21 @@ register_mjlab_task(
   ),
   runner_cls=MotionTrackingOnPolicyRunner,
 )
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
+    "Reduced-Perturbations-Standing-Start"
+  ),
+  env_cfg=agibot_x2_flat_tracking_standing_start_env_cfg(),
+  play_env_cfg=agibot_x2_flat_tracking_standing_start_env_cfg(play=True),
+  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
+    experiment_name=(
+      "agibot_x2_tracking_correlated_dr_reduced_perturbations_standing_start"
+    )
+  ),
+  runner_cls=MotionTrackingOnPolicyRunner,
+)
+
 register_mjlab_task(
   task_id=(
     "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"

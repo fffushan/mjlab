@@ -346,6 +346,37 @@ def agibot_x2_flat_tracking_correlated_dr_env_cfg(
   return cfg
 
 
+def agibot_x2_flat_tracking_standing_start_env_cfg(
+  play: bool = False,
+  anchor_body_name: str = "torso_link",
+  imu_source: X2TrackingImuSource = "pelvis",
+) -> ManagerBasedRlEnvCfg:
+  """Reduced-perturbation tracking cfg with standing-pose episode starts.
+
+  Fork of the reduced-perturbation correlated-DR configuration that
+  additionally initializes a fraction of leading-window episode starts in the
+  entity's default standing pose
+  (:data:`MotionCommandCfg.standing_start_prob`). The robot's motion starts
+  from the standing pose the deployed controller holds before engaging the
+  policy (``JOINT_DEFAULT`` with ``pose_source: policy_metadata``), so the
+  policy must learn the standing -> motion-first-frame transition; training
+  against perturbed reference frames alone never shows it. The play
+  configuration keeps the insert disabled: ``sampling_mode == "start"`` is
+  the deterministic reference-frame initialization contract used by play and
+  evaluation.
+  """
+  cfg = agibot_x2_flat_tracking_correlated_dr_env_cfg(
+    reduced_perturbations=True,
+    play=play,
+    anchor_body_name=anchor_body_name,
+    imu_source=imu_source,
+  )
+  motion_cmd = cfg.commands["motion"]
+  assert isinstance(motion_cmd, MotionCommandCfg)
+  motion_cmd.standing_start_prob = 0.0 if play else 0.3
+  return cfg
+
+
 def agibot_x2_flat_tracking_observation_ablation_env_cfg(
   ablation: X2TrackingObservationAblation,
   play: bool = False,

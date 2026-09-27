@@ -149,6 +149,14 @@ class MotionCommand(CommandTerm):
     self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["standing_start"] = torch.zeros(self.num_envs, device=self.device)
+
+    # Precomputed per-frame bin index for the standing-start eligibility window
+    # (bin 0 covers frames [0, ceil(time_step_total / bin_count))).
+    bin_0_frame_count = math.ceil(self.motion.time_step_total / self.bin_count)
+    self._standing_start_window = min(
+      self.cfg.standing_start_window_frames, bin_0_frame_count
+    )
 
     self._ghost_model = None
     self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
@@ -402,6 +410,36 @@ class MotionCommand(CommandTerm):
     root_lin_vel = self.body_lin_vel_w[env_ids, 0].clone()
     root_ang_vel = self.body_ang_vel_w[env_ids, 0].clone()
 
+    joint_pos = self.joint_pos[env_ids].clone()
+    joint_vel = self.joint_vel[env_ids]
+
+    # Standing-start insert: replace the initial robot state with the entity's
+    # default (standing) pose for a fraction of episodes whose sampled frame is
+    # in the leading window. This trains the standing -> motion-first-frame
+    # transition that real deployment performs (the controller holds
+    # JOINT_DEFAULT = the exported policy default pose before RL engages), but
+    # which perturbed-reference-frame initialization never shows the policy.
+    # The reference tables and the motion clock are untouched: the policy must
+    # track into the motion from standing.
+    standing_mask = self._select_standing_start_envs(env_ids)
+    if bool(standing_mask.any()):
+      default_root_z = (
+        self.robot.data.default_root_state[env_ids, 2]
+        + self._env.scene.env_origins[env_ids, 2]
+      )
+      default_joint_pos = self.robot.data.default_joint_pos[env_ids]
+
+      # Standing pose: default joints, zero velocities, root keeps the
+      # reference xy (where the motion starts) but stands upright at the
+      # default height, yaw-aligned to the reference ANCHOR body — the same
+      # yaw-only alignment the deployed controller applies at engagement.
+      root_pos[standing_mask, 2] = default_root_z[standing_mask]
+      root_ori[standing_mask] = yaw_quat(self.anchor_quat_w[env_ids][standing_mask])
+      root_lin_vel[standing_mask] = 0.0
+      root_ang_vel[standing_mask] = 0.0
+      joint_pos[standing_mask] = default_joint_pos[standing_mask]
+      joint_vel[standing_mask] = 0.0
+
     range_list = [
       self.cfg.pose_range.get(key, (0.0, 0.0))
       for key in ["x", "y", "z", "roll", "pitch", "yaw"]
@@ -426,9 +464,6 @@ class MotionCommand(CommandTerm):
     root_lin_vel += rand_samples[:, :3]
     root_ang_vel += rand_samples[:, 3:]
 
-    joint_pos = self.joint_pos[env_ids].clone()
-    joint_vel = self.joint_vel[env_ids]
-
     joint_pos += sample_uniform(
       lower=self.cfg.joint_position_range[0],
       upper=self.cfg.joint_position_range[1],
@@ -446,6 +481,37 @@ class MotionCommand(CommandTerm):
       joint_vel,
     )
     self._pending_forward = True
+
+  def _select_standing_start_envs(self, env_ids: torch.Tensor) -> torch.Tensor:
+    """Relative boolean mask over ``env_ids`` for standing-pose initialization.
+
+    Eligible envs are those whose freshly sampled frame lies in the leading
+    standing-start window (the first ``standing_start_window_frames`` frames,
+    capped at bin 0's extent). Each eligible env independently hits the insert
+    with probability ``standing_start_prob``. ``sampling_mode == "start"`` is
+    exempt: it is the deterministic reference-frame initialization contract
+    used by play and evaluation, not a training randomization surface.
+    """
+    mask = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+    self.metrics["standing_start"][env_ids] = 0.0
+    if (
+      self.cfg.standing_start_prob <= 0.0
+      or self.cfg.sampling_mode == "start"
+      or self._standing_start_window <= 0
+    ):
+      return mask
+
+    sampled_frames = self.time_steps[env_ids]
+    eligible = sampled_frames < self._standing_start_window
+    if not bool(eligible.any()):
+      return mask
+
+    hits = (
+      torch.rand(int(eligible.sum()), device=self.device) < self.cfg.standing_start_prob
+    )
+    mask[eligible] = hits
+    self.metrics["standing_start"][env_ids[mask]] = 1.0
+    return mask
 
   def update_relative_body_poses(self) -> None:
     """Recompute ``body_pos_relative_w`` and ``body_quat_relative_w``.
@@ -726,6 +792,25 @@ class MotionCommandCfg(CommandTermCfg):
   adaptive_uniform_ratio: float = 0.1
   adaptive_alpha: float = 0.001
   sampling_mode: Literal["adaptive", "uniform", "start", "weighted"] = "adaptive"
+  standing_start_prob: float = 0.0
+  """Probability of initializing an eligible env in the entity default pose.
+
+  Eligible envs are those whose sampled start frame lies in the leading
+  ``standing_start_window_frames`` frames of the motion (capped at bin 0's
+  extent). On a hit, the robot's initial state is the entity's default
+  (standing) pose — default joint positions, zero joint/root velocities, root
+  upright at the default height with the reference root xy and a yaw aligned
+  to the reference anchor — with the usual pose/velocity/joint perturbations
+  applied on top. The reference tables and motion clock are untouched.
+
+  This trains the standing -> motion-start transition that real deployment
+  performs (the controller holds the exported default pose before engaging
+  the policy) but which perturbed-reference initialization never shows the
+  policy. ``sampling_mode == "start"`` (the deterministic play/eval
+  initialization contract) never inserts, regardless of this value.
+  """
+  standing_start_window_frames: int = 25
+  """Number of leading frames eligible for the standing-start insert."""
   init_weight_s: float = 0.0
   """Exponential decay timescale (seconds) for ``weighted`` init-frame sampling.
 
