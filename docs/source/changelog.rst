@@ -8,6 +8,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the audited ``distill export`` VAE deployment seam. Version-2 bundles
+  contain matching encoder/decoder ONNX graphs, frozen exact normalizers, a
+  frame-major float32 motion table, full-precision action metadata, explicit
+  sensor/anchor provenance, relative paths, and SHA-256 content identities.
+  Export refuses malformed source/schema data and refuses to manufacture
+  physical evidence from ``declared_unverified`` tensor metadata. See
+  ``docs/source/x2_vae_export_contract.rst``.
+
+
 - Added ``distill play``: interactive playback of a checkpointed distillation
   student in the existing Viser (default) or native viewers. It reuses the
   audited evaluation environment contract (no ``play=True`` overrides, explicit

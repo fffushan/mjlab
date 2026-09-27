@@ -54,6 +54,15 @@ from mjlab.tasks.tracking.distillation.environment import (
   build_distillation_environment,
   make_segment_motion_cfg,
 )
+from mjlab.tasks.tracking.distillation.export import (
+  BUNDLE_FORMAT,
+  BUNDLE_VERSION,
+  ExportResult,
+  ExportValidationError,
+  export_bundle,
+  make_export_audit,
+  validate_export_parity,
+)
 from mjlab.tasks.tracking.distillation.model import (
   VAE,
   ConditionalVAE,
@@ -140,6 +149,8 @@ __all__ = [
   "CollectionNumericalError",
   "CollectionResult",
   "CONDITIONING_DIMS",
+  "BUNDLE_FORMAT",
+  "BUNDLE_VERSION",
   "CohortContract",
   "ConditionalVAE",
   "ControlledNormalizer",
@@ -157,6 +168,8 @@ __all__ = [
   "DistillationStep",
   "EvaluationMode",
   "EvaluationResult",
+  "ExportResult",
+  "ExportValidationError",
   "EvaluationSegment",
   "LifecycleIteration",
   "DistillationVAE",
@@ -214,6 +227,7 @@ __all__ = [
   "compute_vae_loss",
   "collect_dagger",
   "discover_distillation_checkpoints",
+  "export_bundle",
   "evaluate_distillation",
   "load_frozen_teacher",
   "load_manifest",
@@ -225,9 +239,11 @@ __all__ = [
   "make_segment_motion_cfg",
   "pack_feature_snapshot",
   "pack_observations",
+  "make_export_audit",
   "reconstruction_kl_loss",
   "resolve_cohort",
   "schema_for_mode",
+  "validate_export_parity",
   "validate_live_contract",
   "vae_loss",
 ]

@@ -44,6 +44,10 @@ from mjlab.tasks.tracking.distillation.config import (
   load_manifest,
   resolve_cohort,
 )
+from mjlab.tasks.tracking.distillation.export import (
+  ExportValidationError,
+  export_bundle,
+)
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
 from mjlab.tasks.tracking.distillation.parity import (
   DEFAULT_ATOL,
@@ -68,7 +72,7 @@ from mjlab.tasks.tracking.distillation.trainer import (
 )
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
 
-_COMMANDS = ("validate-teachers", "train", "evaluate", "play")
+_COMMANDS = ("validate-teachers", "train", "evaluate", "play", "export")
 SamplingMode = Literal["start", "uniform"]
 ReportBoundaries = Literal["summary", "full"]
 PlayViewer = Literal["viser", "native", "auto"]
@@ -102,6 +106,10 @@ def _print_help(stream) -> None:
   print("  evaluate           Run bounded teacher/student evaluation.", file=stream)
   print(
     "  play               Play a checkpointed student in a Viser/native viewer.",
+    file=stream,
+  )
+  print(
+    "  export              Export an audited checkpoint into a v2 VAE bundle.",
     file=stream,
   )
   print(file=stream)
@@ -1048,6 +1056,38 @@ def _play(
       adapter.close()
 
 
+def _export(
+  checkpoint: Path,
+  manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
+  repo_root: Path = Path("."),
+  teacher_id: str = "tennis_000",
+  output_dir: Path = Path("rl_model"),
+  asset_audit: Path | None = None,
+) -> int:
+  """Export a saved gravity VAE after an explicit physical asset audit."""
+  if asset_audit is None:
+    print(
+      "[FAIL] --asset-audit is required; tensor schema is not physical frame evidence",
+      file=sys.stderr,
+    )
+    return 1
+  try:
+    result = export_bundle(
+      checkpoint,
+      manifest,
+      teacher_id,
+      output_dir,
+      repo_root=repo_root,
+      asset_audit=asset_audit,
+    )
+  except (ExportValidationError, DistillationError, CheckpointValidationError) as exc:
+    print(f"[FAIL] {exc}", file=sys.stderr)
+    return 1
+  print(json.dumps(result.report, indent=2, sort_keys=True))
+  print(f"[OK] wrote audited VAE bundle {result.descriptor.parent}", file=sys.stderr)
+  return 0
+
+
 def _validate_teachers(
   manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
   repo_root: Path = Path("."),
@@ -1117,6 +1157,7 @@ def main() -> None:
     "train": _train,
     "evaluate": _evaluate,
     "play": _play,
+    "export": _export,
   }
   raise SystemExit(
     tyro.cli(
