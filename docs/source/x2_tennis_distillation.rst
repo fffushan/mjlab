@@ -120,6 +120,14 @@ checkpoint's stored provenance. ``InferenceModel`` and
 ``load_inference_checkpoint`` are exported from
 ``mjlab.tasks.tracking.distillation``.
 
+Because ``control_contract['motion']`` stores an absolute path, an
+inference-only load also accepts a relocated, byte-identical motion artifact:
+the move is permitted only when the supplied teacher hashes (which include the
+motion digest) match the checkpoint and every other contract field agrees
+exactly, and the stored provenance is returned unchanged. A missing or
+different hash, or any other contract difference, is still rejected, and the
+strict training-resume path (``load_checkpoint``) never uses this relaxation.
+
 Evaluation metric frames are explicit. ``tracking_root_relative_pose_error``
 subtracts only the root translation and keeps world axes, so a root yaw
 difference between the reference and the robot contributes to it: it is
@@ -134,6 +142,90 @@ CPU tests or this documentation change. Evaluation outcomes distinguish
 reference completion, failure, timeout, teleport/timer boundaries, and step
 caps; a missing live completion flag is reported conservatively rather than as
 zero completion.
+
+Interactive playback (``distill play``)
+---------------------------------------
+
+``distill play`` reuses the same audited environment and the existing Viser or
+native viewers to inspect a checkpointed student without any training
+machinery: it constructs no trainer, optimizer, replay buffer, collector, or PPO
+runner, and the student is reconstructed model-only with
+``load_inference_checkpoint`` and evaluated with deterministic mean-latent
+inference (no latent sampling, no normalizer update). One environment and
+``--sampling-mode start`` are the defaults.
+
+The checkpoint is loaded *before* the simulator is built, so a missing or
+incompatible artifact never constructs an environment, and the saved schema is
+what the live packing is built from. That means a checkpoint trained with the
+``anchor`` or ``gravity_anchor`` decoder packs correctly instead of being
+rejected for disagreeing with a default gravity schema; the adapter still
+validates the live joint order, teacher sensors/action, and control cadence
+against the saved contract. After the sampling override and before the first
+viewer action, play performs one audited seeded reset (the environment
+constructor does not reset, and unlike the PPO path there is no vector-env
+wrapper doing it).
+
+.. code-block:: bash
+
+   uv run distill play --manifest configs/distillation/x2_tennis.yaml \\
+     --repo-root . --teacher-id tennis_000 --device cuda:0 --num-envs 1 \\
+     --checkpoint /tmp/mjlab-m3-live-validation/smoke/checkpoint-final.pt \\
+     --sampling-mode start --viewer viser --seed 7
+
+``--viewer viser`` (the default) serves the browser viewer; ``--viewer native``
+uses MuJoCo's passive viewer, and ``--viewer auto`` picks native when
+``DISPLAY``/``WAYLAND_DISPLAY`` is set and Viser otherwise. The Viser viewer's
+Checkpoints tab discovers this run's ``checkpoint-iter-<lifetime>.pt`` and
+``checkpoint-final.pt`` artifacts directly (the PPO ``model_<N>.pt`` sort key
+does not apply) and every hot swap goes through the same model-only validation
+as the initial load, including the live schema, so an incompatible artifact is
+refused instead of being installed or mis-packed. A rejected swap leaves the
+running policy and the viewer intact.
+
+Playback environment semantics
+------------------------------
+
+The play surface deliberately does **not** load the registered task's
+``play=True`` configuration. That PPO play preset disables actor corruption,
+removes the push event, clears the reset pose/velocity ranges, sets ``start``
+sampling, and makes episodes effectively infinite. Those overrides contradict
+the saved teacher contract (for example the live actor corruption setting is
+asserted against the saved one), so playback keeps the training-time contract —
+actor corruption, reset perturbations, the push event, and finite episodes —
+and the only sampling control is the explicit ``--sampling-mode
+{start,uniform}`` override on the private command copy, exactly as bounded
+evaluation applies it. Playback therefore reproduces the noisy, reset-prone
+observations the student was normalized against, and the reference ghost shown
+in the viewer is the NPZ reference, not a teacher-policy rollout.
+
+The viewer's motion scrubber (``Start Here`` and the paused frame slider) edits
+the live command/reference state after ``env.reset`` has cached observations.
+Viser runs GUI callbacks on a worker thread, so the frame write and the
+observation refresh are queued to the viewer's main loop rather than mutating
+live tensors from the callback.  ``Start Here`` captures the environment, the
+frame, and the ``all envs`` selection at click time, so a later environment
+switch cannot retarget the queued reset; ``all envs`` resets every environment
+and ignores the captured one.
+
+On the main loop the cache is refreshed through the public scoped
+``ObservationManager.refresh(env_ids, baseline=...)`` hook: the edited
+environments are re-read at the current instant and their history/delay buffers
+are backfilled, while every other environment keeps the observation row it had
+*before* the GUI action.  A partial ``Start Here`` resets only the captured
+environment, so the viewer snapshots the pre-reset cache with
+``ObservationManager.cached_observations()`` first and passes it as the
+``baseline``; otherwise ``env.reset``'s whole-batch recompute (and its
+resampled raw noise) would leak into the untouched environments.  The baseline
+is an owned clone, so an intervening reset or buffer reuse cannot change it;
+``all envs`` refreshes every environment normally.  The first action after
+scrubbing therefore sees the scrubbed state, no extra history tick or lag draw
+is added anywhere, and ``env.obs_buf`` stays in agreement with the manager
+cache.
+
+The global noise RNG may still advance when the edited rows are recomputed on an
+explicit GUI action; the untouched observable rows and their history/delay
+timelines do not change.  This recompute runs only on an explicit user action,
+never on a normal render.
 
 Selected cohort
 ---------------

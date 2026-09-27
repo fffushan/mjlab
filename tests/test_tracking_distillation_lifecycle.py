@@ -775,3 +775,108 @@ def test_poisoned_trainer_save_is_refused_and_cleared_only_by_valid_restore(
   assert trainer.is_healthy
   trainer.assert_healthy()
   assert torch.isfinite(next(trainer.model.parameters())).all().item()
+
+
+def test_inference_loader_allows_relocated_motion_but_resume_stays_strict(
+  tmp_path,
+) -> None:
+  """A relocated, byte-identical motion is permitted for inference only.
+
+  ``control_contract['motion']`` records an absolute path.  Moving the run to a
+  different checkout changes only that path; matching teacher hashes (which
+  include the motion digest) prove the content is identical, so model-only
+  inference may proceed.  Missing/foreign hashes and every other contract field
+  still reject, and the strict training-resume path never relaxes.
+  """
+  trainer = make_trainer()
+  stored_contract = {
+    "teacher_id": "tennis_000",
+    "control_hz": 50.0,
+    "motion": "/home/fushan/mjlab/data/tennis/tennis_000_tracking.npz",
+  }
+  hashes = {"motion": "motion-digest", "checkpoint": "actor-digest", "onnx": "onnx"}
+  path = tmp_path / "state.pt"
+  save_checkpoint(
+    path,
+    trainer,
+    trainer.replay,
+    teacher_hashes=hashes,
+    control_contract=stored_contract,
+  )
+  relocated = {
+    **stored_contract,
+    "motion": "/home/agiuser/projects/mjlab/data/tennis/tennis_000_tracking.npz",
+  }
+
+  # Original path: unchanged behavior, stored provenance is returned verbatim.
+  original = load_inference_checkpoint(
+    path,
+    expected_teacher_hashes=hashes,
+    expected_control_contract=stored_contract,
+  )
+  assert original.control_contract == stored_contract
+  assert original.teacher_hashes == hashes
+
+  # Relocated identical content: accepted, and the stored provenance is kept.
+  moved = load_inference_checkpoint(
+    path,
+    expected_teacher_hashes=hashes,
+    expected_control_contract=relocated,
+  )
+  assert moved.control_contract == stored_contract
+  assert moved.teacher_hashes == hashes
+
+  # Missing verification: without matching hashes the move cannot be proven.
+  with pytest.raises(CheckpointValidationError, match="motion"):
+    load_inference_checkpoint(path, expected_control_contract=relocated)
+
+  # Changed content: a differing motion digest is a hash mismatch, not a move.
+  with pytest.raises(CheckpointValidationError, match="hashes"):
+    load_inference_checkpoint(
+      path,
+      expected_teacher_hashes={**hashes, "motion": "other-digest"},
+      expected_control_contract=relocated,
+    )
+
+  # No motion entry on either side is never evidence either.
+  no_motion = tmp_path / "no-motion.pt"
+  save_checkpoint(
+    no_motion,
+    trainer,
+    trainer.replay,
+    teacher_hashes={"checkpoint": "actor-digest"},
+    control_contract=stored_contract,
+  )
+  with pytest.raises(CheckpointValidationError, match="motion"):
+    load_inference_checkpoint(
+      no_motion,
+      expected_teacher_hashes={"checkpoint": "actor-digest"},
+      expected_control_contract=relocated,
+    )
+
+  # Semantic mismatch: a relocated path cannot smuggle a changed field.
+  with pytest.raises(CheckpointValidationError, match="control contract"):
+    load_inference_checkpoint(
+      path,
+      expected_teacher_hashes=hashes,
+      expected_control_contract={**relocated, "control_hz": 30.0},
+    )
+
+  # Training resume does not use the relaxation and stays byte-for-byte strict.
+  restored = make_trainer()
+  with pytest.raises(CheckpointValidationError, match="control contract"):
+    load_checkpoint(
+      path,
+      restored,
+      restored.replay,
+      expected_teacher_hashes=hashes,
+      expected_control_contract=relocated,
+    )
+  state = load_checkpoint(
+    path,
+    restored,
+    restored.replay,
+    expected_teacher_hashes=hashes,
+    expected_control_contract=stored_contract,
+  )
+  assert state.control_contract == stored_contract

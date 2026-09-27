@@ -172,7 +172,7 @@ class ViserPlayViewer(BaseViewer):
           env.command_manager.create_gui(
             self._server,
             lambda: self._scene.env_idx,
-            on_change=self._scene.request_update,
+            on_change=self._on_command_gui_change,
             request_action=self.request_action,
           )
 
@@ -280,7 +280,12 @@ class ViserPlayViewer(BaseViewer):
     payload: Optional[Any],
   ) -> bool:
     if isinstance(payload, dict) and payload.get("type") == "gui_reset":
-      self._handle_gui_reset(payload.get("all_envs", False))
+      self._handle_gui_reset(
+        payload.get("all_envs", False), payload.get("frame"), payload.get("env_idx")
+      )
+      return True
+    if isinstance(payload, dict) and payload.get("type") == "motion_scrub":
+      self._handle_motion_scrub(payload.get("env_idx"), payload.get("frame"))
       return True
     if action != ViewerAction.FETCH_CHECKPOINT:
       return False
@@ -308,7 +313,18 @@ class ViserPlayViewer(BaseViewer):
 
     if name != self._ckpt_mgr.current_name:
       print(f"[INFO]: Loading {name}...")
-      self.policy = self._ckpt_mgr.load_checkpoint(name)
+      try:
+        new_policy = self._ckpt_mgr.load_checkpoint(name)
+      except Exception as exc:
+        # A loader failure must not kill the viewer.  This callback returns a
+        # new policy, so a rejected artifact never replaces the running one and
+        # the dropdown is restored to the installed name.  A generic loader
+        # that mutates captured state in place (PPO runners) is not rolled back
+        # here; only the returned policy is transactional.
+        print(f"[ERROR]: Checkpoint {name} rejected: {exc}")
+        self._restore_checkpoint_selection()
+        return True
+      self.policy = new_policy
       self._ckpt_mgr.current_name = name
       self._ckpt_updating = True
       cur = next(
@@ -321,25 +337,111 @@ class ViserPlayViewer(BaseViewer):
       print(f"[INFO]: Loaded {name}")
     return True
 
-  def _handle_gui_reset(self, all_envs: bool) -> None:
-    """Reset environment(s) and apply GUI-selected command state."""
+  def _restore_checkpoint_selection(self) -> None:
+    """Point the dropdown back at the installed checkpoint after a rejected swap."""
+    manager = self._ckpt_mgr
+    if manager is None:
+      return
+    self._ckpt_user_event.clear()
+    cur = next(
+      (
+        lbl
+        for lbl in self._ckpt_dropdown.options
+        if lbl.startswith(manager.current_name)
+      ),
+      manager.current_name,
+    )
+    self._ckpt_dropdown.value = cur
+    self._ckpt_user_event.set()
+
+  def _handle_gui_reset(
+    self, all_envs: bool, frame: int | None = None, env_idx: int | None = None
+  ) -> None:
+    """Reset environment(s) and apply GUI-selected command state.
+
+    ``frame`` and ``env_idx`` are the click-time values captured by the command
+    GUI callback.  ``env_idx`` is honored only for a single-environment reset,
+    where it is authoritative over the current viewer selection; direct calls
+    without it fall back to ``self._scene.env_idx``.  ``all_envs=True`` still
+    resets every environment and ignores ``env_idx``.
+    """
     env = self.env.unwrapped
     if all_envs:
       env_ids = torch.arange(env.num_envs, dtype=torch.int64, device=env.device)
+      baseline = None
     else:
-      env_ids = torch.tensor(
-        [self._scene.env_idx], dtype=torch.int64, device=env.device
-      )
+      selected = int(self._scene.env_idx if env_idx is None else env_idx)
+      env_ids = torch.tensor([selected], dtype=torch.int64, device=env.device)
+      # ``env.reset`` recomputes the *whole* observation cache (and resamples
+      # raw noise for every env), so snapshot the pre-reset rows now and let
+      # the refresh restore the untouched environments afterwards.
+      baseline = env.observation_manager.cached_observations()
 
     with self._sim_lock:
       env.reset(env_ids=env_ids)
-      if env.command_manager.apply_gui_reset(env_ids):
+      if env.command_manager.apply_gui_reset(env_ids, frame):
         env.scene.write_data_to_sim()
         env.sim.forward()
         env.sim.sense()
+        # ``env.reset`` already computed and cached observations, but
+        # ``apply_gui_reset`` then rewrote the robot/reference state.  Refresh
+        # the cache for the scrubbed envs so the first action after "Start
+        # Here" sees the scrubbed state, while the untouched envs keep the
+        # rows they had before the reset.
+        self._refresh_observations(env, env_ids, baseline=baseline)
 
     self._pending_update_reasons.add(UpdateReason.ACTION)
     self._sync_ui_state()
+
+  def _handle_motion_scrub(self, env_idx: int | None, frame: int | None) -> None:
+    """Apply a queued frame-slider edit on the main loop, then refresh.
+
+    Both the command timeline write and the observation recompute happen here,
+    on the viewer's main loop thread, rather than in the Viser GUI callback.
+    """
+    env = self.env.unwrapped
+    resolved_idx = int(self._scene.env_idx if env_idx is None else env_idx)
+    if frame is not None:
+      env.command_manager.apply_gui_scrub(resolved_idx, int(frame))
+    env_ids = torch.tensor([resolved_idx], dtype=torch.int64, device=env.device)
+    with self._sim_lock:
+      self._refresh_observations(env, env_ids)
+    self._scene.request_update()
+
+  def _refresh_observations(
+    self,
+    env: Any,
+    env_ids: torch.Tensor,
+    baseline: dict[str, Any] | None = None,
+  ) -> None:
+    """Splice a scoped observation refresh after a live command GUI edit.
+
+    ``ObservationManager.refresh`` re-reads the edited envs at the current
+    instant and backfills only their history/delay buffers; every other env's
+    cached row is returned unchanged, so an edit affects exactly the edited
+    environments and no extra history tick or lag draw is added anywhere.
+    ``baseline`` is the pre-reset cache snapshot for a partial ``env.reset``
+    transaction (``None`` for an immediate refresh and for an all-env edit).
+    """
+    merged = env.observation_manager.refresh(env_ids, baseline=baseline)
+    # Keep the environment's published buffer in agreement with the cache.
+    if getattr(env, "obs_buf", None) is not None:
+      env.obs_buf = merged
+
+  def _on_command_gui_change(self) -> None:
+    """Queue an observation refresh for a command GUI edit.
+
+    Viser invokes GUI callbacks on a worker thread, so this method only
+    enqueues an action; the main loop performs the recompute.  The selected
+    environment is captured in the payload so a later environment switch does
+    not retarget the edit.
+    """
+    self._actions.append(
+      (
+        ViewerAction.CUSTOM,
+        {"type": "motion_scrub", "env_idx": self._scene.env_idx, "frame": None},
+      )
+    )
 
   @override
   def _process_actions(self) -> None:

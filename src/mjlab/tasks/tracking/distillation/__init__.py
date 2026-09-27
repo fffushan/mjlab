@@ -76,6 +76,11 @@ from mjlab.tasks.tracking.distillation.observations import (
   pack_feature_snapshot,
   pack_observations,
 )
+from mjlab.tasks.tracking.distillation.playback import (
+  DistillationPlayEnvironment,
+  DistillationPlayPolicy,
+  discover_distillation_checkpoints,
+)
 from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
   LifecycleIteration,
@@ -145,6 +150,8 @@ __all__ = [
   "DecoderMode",
   "DistillationEnvironmentAdapter",
   "DistillationError",
+  "DistillationPlayEnvironment",
+  "DistillationPlayPolicy",
   "DistillationRunner",
   "DistillationSnapshot",
   "DistillationStep",
@@ -206,6 +213,7 @@ __all__ = [
   "build_frozen_teacher",
   "compute_vae_loss",
   "collect_dagger",
+  "discover_distillation_checkpoints",
   "evaluate_distillation",
   "load_frozen_teacher",
   "load_manifest",

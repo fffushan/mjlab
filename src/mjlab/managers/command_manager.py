@@ -86,11 +86,24 @@ class CommandTerm(ManagerTermBase):
   def on_viewer_pause(self, paused: bool) -> None:
     """Called when the viewer pause state changes."""
 
-  def apply_gui_reset(self, env_ids: torch.Tensor) -> bool:
+  def apply_gui_reset(self, env_ids: torch.Tensor, frame: int | None = None) -> bool:
     """Apply GUI-selected state as an env reset override.
 
-    Returns True if this term wrote state to sim.
+    ``frame`` is the scrubber value captured when the viewer's main loop
+    processed the action; when it is ``None`` a term may fall back to its own
+    live GUI handle.  Returns True if this term wrote state to sim.
     """
+    del frame
+    return False
+
+  def apply_gui_scrub(self, env_idx: int, frame: int) -> bool:
+    """Apply one queued frame-slider move to a single environment.
+
+    Called on the viewer's main loop, never from a GUI worker thread, so a
+    command term may mutate its timeline here safely.  Returns True if this
+    term applied the frame.
+    """
+    del env_idx, frame
     return False
 
   @property
@@ -231,11 +244,18 @@ class CommandManager(ManagerBase):
     for term in self._terms.values():
       term.on_viewer_pause(paused)
 
-  def apply_gui_reset(self, env_ids: torch.Tensor) -> bool:
+  def apply_gui_reset(self, env_ids: torch.Tensor, frame: int | None = None) -> bool:
     """Apply GUI-selected state from all terms. Returns True if any applied."""
     applied = False
     for term in self._terms.values():
-      applied |= term.apply_gui_reset(env_ids)
+      applied |= term.apply_gui_reset(env_ids, frame)
+    return applied
+
+  def apply_gui_scrub(self, env_idx: int, frame: int) -> bool:
+    """Apply a queued frame-slider move from all terms on the main loop."""
+    applied = False
+    for term in self._terms.values():
+      applied |= term.apply_gui_scrub(env_idx, frame)
     return applied
 
   def create_debug_vis_gui(
@@ -340,7 +360,12 @@ class NullCommandManager:
   def on_viewer_pause(self, paused: bool) -> None:
     pass
 
-  def apply_gui_reset(self, env_ids: torch.Tensor) -> bool:
+  def apply_gui_reset(self, env_ids: torch.Tensor, frame: int | None = None) -> bool:
+    del env_ids, frame
+    return False
+
+  def apply_gui_scrub(self, env_idx: int, frame: int) -> bool:
+    del env_idx, frame
     return False
 
   def create_debug_vis_gui(

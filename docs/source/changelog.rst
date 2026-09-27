@@ -8,6 +8,17 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added ``distill play``: interactive playback of a checkpointed distillation
+  student in the existing Viser (default) or native viewers. It reuses the
+  audited evaluation environment contract (no ``play=True`` overrides, explicit
+  ``--sampling-mode {start,uniform}``), loads the checkpoint model-only before
+  building the simulator, packs with the checkpoint's saved schema, performs one
+  audited seeded reset before the first viewer action, and decodes the
+  deterministic mean latent with no trainer, optimizer, replay buffer, or PPO
+  runner. The Viser Checkpoints tab discovers ``checkpoint-iter-<N>.pt`` and
+  ``checkpoint-final.pt`` and validates every load, refusing an incompatible
+  swap. See ``docs/source/x2_tennis_distillation.rst``.
+
 - Added the bounded M3 native single-teacher distillation lifecycle: segment-aware
   collection, pure VAE updates, atomic checkpoint/resume, and ``distill train`` /
   ``distill evaluate`` commands for the existing 50 Hz X2 ``tennis_000`` contract.
@@ -203,6 +214,27 @@ Added
 
 Fixed
 ^^^^^
+
+- Viser motion scrubbing now aligns the first policy action after ``Start Here``
+  (or a paused frame-slider move) with the edited command state. The
+  observation cache is refreshed through a scoped
+  ``ObservationManager.refresh(env_ids, baseline=...)`` hook that splices the
+  recomputed rows for the edited environments only, so unedited environments
+  keep their cached rows and their history/delay timelines (no extra tick or lag
+  draw). ``Start Here`` captures the environment/frame/selection at click time
+  and snapshots the pre-reset cache with
+  ``ObservationManager.cached_observations()``, so a partial reset cannot leak
+  its whole-batch recompute (and resampled raw noise) into the untouched
+  environments; the all-env path refreshes everyone normally. The frame write
+  and refresh are queued to the viewer's main loop instead of running on Viser's
+  GUI worker thread, and a rejected checkpoint swap keeps the viewer alive
+  without installing the returned policy (a loader that mutates captured state
+  in place is not rolled back).
+
+- ``load_inference_checkpoint`` now accepts a relocated, byte-identical
+  reference motion: a changed ``control_contract['motion']`` path is allowed
+  only when the supplied teacher hashes (including the motion digest) match and
+  every other contract field agrees. Strict training resume is unchanged.
 
 - ``distill evaluate --mode student`` can now load a checkpoint produced by
   ``distill train``. It previously rebuilt a default student and a

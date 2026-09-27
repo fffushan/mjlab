@@ -10,6 +10,8 @@ inferred from the checkpoint instead of being repeated on the command line.
 from __future__ import annotations
 
 import json
+import math
+import os
 import sys
 import time
 from collections.abc import Mapping
@@ -48,6 +50,11 @@ from mjlab.tasks.tracking.distillation.parity import (
   DEFAULT_SEED,
   validate_teachers,
 )
+from mjlab.tasks.tracking.distillation.playback import (
+  DistillationPlayEnvironment,
+  DistillationPlayPolicy,
+  discover_distillation_checkpoints,
+)
 from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
   RunnerConfig,
@@ -59,9 +66,10 @@ from mjlab.tasks.tracking.distillation.trainer import (
 )
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
 
-_COMMANDS = ("validate-teachers", "train", "evaluate")
+_COMMANDS = ("validate-teachers", "train", "evaluate", "play")
 SamplingMode = Literal["start", "uniform"]
 ReportBoundaries = Literal["summary", "full"]
+PlayViewer = Literal["viser", "native", "auto"]
 PROVENANCE_VERSION = 1
 """Version of the ``resolved_config`` record written into checkpoints."""
 
@@ -90,6 +98,10 @@ def _print_help(stream) -> None:
   )
   print("  train              Run a bounded single-teacher M3 lifecycle.", file=stream)
   print("  evaluate           Run bounded teacher/student evaluation.", file=stream)
+  print(
+    "  play               Play a checkpointed student in a Viser/native viewer.",
+    file=stream,
+  )
   print(file=stream)
   print("Notes:", file=stream)
   print(
@@ -105,6 +117,14 @@ def _print_help(stream) -> None:
     file=stream,
   )
   print("  --checkpoint and takes no trainer-only flags.", file=stream)
+  print(
+    "  'play' reuses the evaluate environment contract (no play-mode overrides)",
+    file=stream,
+  )
+  print(
+    "  and decodes the mean latent; it constructs no trainer, replay, or runner.",
+    file=stream,
+  )
   print(file=stream)
   print("Run 'distill <COMMAND> --help' for command-specific options.", file=stream)
 
@@ -839,6 +859,176 @@ def _evaluate(
       adapter.close()
 
 
+def _resolve_play_viewer(viewer: str) -> str:
+  """Resolve ``auto`` to native when a display is present, otherwise Viser."""
+  if viewer != "auto":
+    return viewer
+  has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+  return "native" if has_display else "viser"
+
+
+def _playback_checkpoint_manager(
+  checkpoint: Path,
+  cohort,
+  teacher_id: str,
+  adapter,
+  device: str,
+):
+  """Build a Viser checkpoint manager that discovers and validates swaps.
+
+  Discovery uses the distillation naming scheme, and every load (including a
+  hot swap) goes through :func:`load_inference_checkpoint` with the live
+  schema, teacher hashes, and control contract, so an incompatible artifact is
+  rejected instead of silently replacing the running policy.  The live schema
+  is the one the initialized environment packs with, so a swap whose saved
+  schema differs is refused rather than mis-packed.
+  """
+  from mjlab.viewer.viser.viewer import CheckpointManager, format_time_ago
+
+  directory = checkpoint.parent
+  expected = {
+    "expected_schema": adapter.schema,
+    "expected_teacher_hashes": cohort.teacher(teacher_id).hashes,
+    "expected_control_contract": _control_metadata(cohort, teacher_id),
+  }
+
+  def fetch_available() -> list[tuple[str, str]]:
+    discovered = discover_distillation_checkpoints(directory)
+    if checkpoint not in discovered:
+      discovered = [checkpoint, *discovered]
+    now = time.time()
+    return [
+      (path.name, format_time_ago(int(now - path.stat().st_mtime)))
+      for path in discovered
+    ]
+
+  def load(name: str):
+    inference = load_inference_checkpoint(directory / name, device=device, **expected)
+    return DistillationPlayPolicy(inference.model)
+
+  return CheckpointManager(
+    current_name=checkpoint.name,
+    fetch_available=fetch_available,
+    load_checkpoint=load,
+  )
+
+
+def _play(
+  manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
+  repo_root: Path = Path("."),
+  teacher_id: str = "tennis_000",
+  task_id: str | None = None,
+  device: str = "cpu",
+  num_envs: int = 1,
+  checkpoint: Path | None = None,
+  seed: int = 0,
+  sampling_mode: SamplingMode = "start",
+  viewer: PlayViewer = "viser",
+  frame_rate: float = 60.0,
+) -> int:
+  """Play a checkpointed student interactively in the shared viewers.
+
+  The environment is the same audited native contract ``distill evaluate``
+  builds: the registered task is loaded *without* its ``play=True`` overrides,
+  so actor corruption, resets, and episode length stay those the teacher was
+  trained under, while ``--sampling-mode`` gives an explicit start/uniform
+  reference-frame override on the private command copy.  The saved student is
+  reconstructed model-only (no optimizer, replay, trainer, or PPO runner) and
+  decoded with deterministic mean-latent inference.  ``--viewer viser``
+  (default) serves the browser viewer; ``native`` uses MuJoCo's passive viewer.
+
+  The checkpoint is loaded *before* the simulator is built, so a missing or
+  incompatible artifact never constructs an environment, and the saved schema
+  is what the live packing is built from.  One audited seeded reset runs after
+  the sampling override and before the first viewer action (the environment
+  constructor does not reset, and unlike the PPO path there is no vector-env
+  wrapper doing it).
+  """
+  adapter = None
+  try:
+    if sampling_mode not in ("start", "uniform"):
+      raise ValueError("sampling_mode must be 'start' or 'uniform'")
+    if viewer not in ("viser", "native", "auto"):
+      raise ValueError("viewer must be 'viser', 'native', or 'auto'")
+    if checkpoint is None:
+      raise ValueError("playback requires --checkpoint")
+    if num_envs <= 0:
+      raise ValueError("num_envs must be a positive integer")
+    if not math.isfinite(frame_rate) or frame_rate <= 0.0:
+      raise ValueError("frame_rate must be finite and positive")
+    cohort = _resolve(manifest, repo_root)
+    teacher = cohort.teacher(teacher_id)
+    # Early model-only load: cheap, validates teacher identity and the control
+    # contract, and yields the SAVED schema the live packing must reproduce
+    # (the saved settings imply the trained architecture, not a default one).
+    inference = load_inference_checkpoint(
+      checkpoint,
+      device=device,
+      expected_teacher_hashes=teacher.hashes,
+      expected_control_contract=_control_metadata(cohort, teacher_id),
+    )
+    # The adapter re-checks the live joint order, teacher sensors/action, and
+    # timing against the saved contract; passing the saved schema is what makes
+    # an anchor/gravity_anchor checkpoint pack correctly instead of being
+    # rejected for disagreeing with a default gravity schema.
+    adapter = make_distillation_adapter(
+      cohort,
+      teacher_id,
+      task_id=task_id,
+      num_envs=num_envs,
+      device=device,
+      schema=inference.schema,
+      seed=seed,
+    )
+    seed_audit = _seed_audit(adapter)
+    _require_requested_seed_applied(seed, seed_audit)
+    # Playback-only sampling override on the private command copy; the live
+    # contract was already validated against the saved teacher.
+    motion = adapter.env.command_manager.get_term("motion")
+    motion.cfg.sampling_mode = sampling_mode
+    # One audited seeded reset after the sampling override and before the first
+    # viewer action, so the first policy action reads reset state.
+    adapter.reset(seed=seed)
+    env = DistillationPlayEnvironment(adapter)
+    policy = DistillationPlayPolicy(inference.model)
+    checkpoint_manager = _playback_checkpoint_manager(
+      checkpoint, cohort, teacher_id, adapter, device
+    )
+    resolved_viewer = _resolve_play_viewer(viewer)
+    print(
+      f"[INFO]: Playing {checkpoint.name} as {teacher_id} on {resolved_viewer} "
+      f"(device={device}, num_envs={num_envs}, sampling_mode={sampling_mode}, "
+      f"mean latent)",
+      file=sys.stderr,
+      flush=True,
+    )
+    if resolved_viewer == "native":
+      from mjlab.viewer import NativeMujocoViewer
+
+      NativeMujocoViewer(env, policy, frame_rate=frame_rate).run()
+    else:
+      from mjlab.viewer import ViserPlayViewer
+
+      ViserPlayViewer(
+        env,
+        policy,
+        frame_rate=frame_rate,
+        checkpoint_manager=checkpoint_manager,
+      ).run()
+    return 0
+  except (
+    DistillationError,
+    CheckpointValidationError,
+    ValueError,
+    RuntimeError,
+  ) as exc:
+    print(f"[FAIL] {exc}", file=sys.stderr)
+    return 1
+  finally:
+    if adapter is not None:
+      adapter.close()
+
+
 def _validate_teachers(
   manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
   repo_root: Path = Path("."),
@@ -907,6 +1097,7 @@ def main() -> None:
     "validate-teachers": _validate_teachers,
     "train": _train,
     "evaluate": _evaluate,
+    "play": _play,
   }
   raise SystemExit(
     tyro.cli(

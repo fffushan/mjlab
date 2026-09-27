@@ -604,7 +604,14 @@ class MotionCommand(CommandTerm):
     on_change: Callable[[], None] | None = None,
     request_action: Callable[[str, Any], None] | None = None,
   ) -> None:
-    """Create motion scrubber controls in the Viser viewer."""
+    """Create motion scrubber controls in the Viser viewer.
+
+    Viser runs these callbacks on a worker thread, so when the viewer supplies
+    a ``request_action`` hook the frame write and the observation refresh are
+    queued for the viewer's main loop instead of mutating live command state
+    from the callback.  Without a hook (a bare GUI host) the slider keeps the
+    original direct-write behavior.
+    """
     max_frame = int(self.motion.time_step_total) - 1
 
     with server.gui.add_folder(name.capitalize()):
@@ -619,9 +626,16 @@ class MotionCommand(CommandTerm):
       @scrubber.on_update
       def _(_) -> None:
         idx = get_env_idx()
-        self.time_steps[idx] = int(scrubber.value)
-        if on_change is not None:
-          on_change()
+        frame = int(scrubber.value)
+        if request_action is not None:
+          request_action(
+            "CUSTOM",
+            {"type": "motion_scrub", "env_idx": idx, "frame": frame},
+          )
+        else:
+          self.time_steps[idx] = frame
+          if on_change is not None:
+            on_change()
 
       all_envs_cb = server.gui.add_checkbox("All envs", initial_value=True)
       start_btn = server.gui.add_button("Start Here")
@@ -629,9 +643,17 @@ class MotionCommand(CommandTerm):
       @start_btn.on_click
       def _(_) -> None:
         if request_action is not None:
+          # Capture the environment, frame, and selection at click time; the
+          # main loop applies exactly these values instead of re-reading
+          # mutable GUI/selection state later.
           request_action(
             "CUSTOM",
-            {"type": "gui_reset", "all_envs": all_envs_cb.value},
+            {
+              "type": "gui_reset",
+              "all_envs": bool(all_envs_cb.value),
+              "frame": int(scrubber.value),
+              "env_idx": get_env_idx(),
+            },
           )
 
     self._scrubber_handles = (scrubber, all_envs_cb, start_btn)
@@ -646,11 +668,24 @@ class MotionCommand(CommandTerm):
     if hasattr(self, "_scrubber_handles"):
       self._set_scrubber_disabled(not paused)
 
-  def apply_gui_reset(self, env_ids: torch.Tensor) -> bool:
+  def apply_gui_scrub(self, env_idx: int, frame: int) -> bool:
+    """Apply one queued frame-slider move to a single environment.
+
+    Runs on the viewer's main loop, so the command timeline is only mutated in
+    the same thread that steps the simulator.
+    """
     if not hasattr(self, "_scrubber_handles"):
       return False
-    frame = int(self._scrubber_handles[0].value)
-    self.reset_to_frame(env_ids, frame)
+    self.time_steps[int(env_idx)] = int(frame)
+    return True
+
+  def apply_gui_reset(self, env_ids: torch.Tensor, frame: int | None = None) -> bool:
+    if not hasattr(self, "_scrubber_handles"):
+      return False
+    # ``frame`` is the click-time scrubber value captured by the GUI callback;
+    # a bare GUI host without a viewer action queue falls back to the handle.
+    selected = int(self._scrubber_handles[0].value) if frame is None else int(frame)
+    self.reset_to_frame(env_ids, selected)
     # reset_to_frame writes qpos/qvel; forward so update_relative_body_poses
     # reads the scrubbed pose instead of the stale pre-scrub kinematics.
     self._env.sim.forward()

@@ -1,7 +1,8 @@
 """Tests for command manager."""
 
 from dataclasses import dataclass
-from unittest.mock import Mock
+from typing import Any
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -177,3 +178,110 @@ def test_motion_command_timer_resample_triggers_forward():
   cmd._env.sim.forward.reset_mock()
   MotionCommand._update_command(cmd, env_ids=None)
   cmd._env.sim.forward.assert_not_called()
+
+
+def _motion_gui_harness(request_action, on_change):
+  """Build a mocked Viser server and extract the motion scrubber callbacks."""
+  server = MagicMock()
+  cmd = MagicMock()
+  cmd.motion.time_step_total = 10  # max frame index is then 9
+  MotionCommand.create_gui(
+    cmd,
+    "motion",
+    server,
+    lambda: 1,
+    on_change=on_change,
+    request_action=request_action,
+  )
+  scrubber = server.gui.add_slider.return_value
+  start_button = server.gui.add_button.return_value
+  all_envs = server.gui.add_checkbox.return_value
+  return (
+    cmd,
+    scrubber,
+    scrubber.on_update.call_args[0][0],
+    all_envs,
+    start_button.on_click.call_args[0][0],
+  )
+
+
+def test_motion_command_slider_queues_when_a_viewer_hook_is_present():
+  """The Viser callback runs off-thread, so it must only enqueue the edit."""
+  queued: list[tuple[str, Any]] = []
+  changed: list[None] = []
+  cmd, scrubber, on_frame, _, _ = _motion_gui_harness(
+    lambda name, payload: queued.append((name, payload)),
+    lambda: changed.append(None),
+  )
+  scrubber.value = 7
+
+  on_frame(None)
+
+  assert queued == [("CUSTOM", {"type": "motion_scrub", "env_idx": 1, "frame": 7})]
+  cmd.time_steps.__setitem__.assert_not_called()
+  assert changed == []
+
+
+def test_motion_command_start_here_queues_the_click_frame():
+  queued: list[tuple[str, Any]] = []
+  cmd, scrubber, _, all_envs, on_start = _motion_gui_harness(
+    lambda name, payload: queued.append((name, payload)), None
+  )
+  scrubber.value = 4
+  all_envs.value = False
+
+  on_start(None)
+
+  # The environment is captured with the frame, so a later selection change
+  # cannot retarget the queued reset.
+  assert queued == [
+    ("CUSTOM", {"type": "gui_reset", "all_envs": False, "frame": 4, "env_idx": 1})
+  ]
+  cmd.reset_to_frame.assert_not_called()
+
+
+def test_motion_command_slider_writes_directly_without_a_viewer_hook():
+  """A bare GUI host keeps the original synchronous write behavior."""
+  changed: list[None] = []
+  cmd, scrubber, on_frame, _, _ = _motion_gui_harness(
+    None, lambda: changed.append(None)
+  )
+  scrubber.value = 5
+
+  on_frame(None)
+
+  cmd.time_steps.__setitem__.assert_called_once_with(1, 5)
+  assert changed == [None]
+
+
+def test_motion_command_applies_a_queued_scrub_to_one_env():
+  cmd = Mock()
+  cmd._scrubber_handles = (Mock(value=0),)
+  cmd.time_steps = MagicMock()
+
+  assert MotionCommand.apply_gui_scrub(cmd, 2, 8) is True
+
+  cmd.time_steps.__setitem__.assert_called_once_with(2, 8)
+
+
+def test_motion_command_gui_reset_prefers_the_captured_frame():
+  """The click-time frame wins over the live (mutable) scrubber handle."""
+  calls: list[Any] = []
+  cmd = Mock()
+  cmd._scrubber_handles = (Mock(value=5),)
+  cmd.reset_to_frame = lambda ids, frame: calls.append(frame)
+  cmd._env.sim.forward = lambda: calls.append("forward")
+  cmd.update_relative_body_poses = lambda: calls.append("poses")
+
+  assert MotionCommand.apply_gui_reset(cmd, torch.tensor([0]), 3) is True
+  assert calls == [3, "forward", "poses"]
+
+  # Without a captured frame the live handle remains the fallback.
+  calls.clear()
+  assert MotionCommand.apply_gui_reset(cmd, torch.tensor([0])) is True
+  assert calls == [5, "forward", "poses"]
+
+
+def test_command_manager_gui_scrub_defaults_to_false(counter_env):
+  """A term without a scrubber reports no application instead of raising."""
+  assert counter_env.command_manager.apply_gui_scrub(0, 3) is False

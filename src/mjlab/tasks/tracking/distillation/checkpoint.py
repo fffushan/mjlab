@@ -144,6 +144,41 @@ def _model_settings(metadata: Any) -> ModelSettings:
     ) from exc
 
 
+def _check_inference_control_contract(
+  stored: Mapping[str, Any],
+  expected: Mapping[str, Any],
+  *,
+  motion_hashes_verified: bool,
+) -> None:
+  """Compare an inference control contract, allowing a relocated motion artifact.
+
+  ``control_contract['motion']`` records the absolute path of the reference file
+  a checkpoint was produced from.  An inference-only load may run from a
+  byte-identical copy at a different path, which changes only that entry.  The
+  relocation is accepted only when the caller supplied teacher hashes that
+  matched the checkpoint and include the motion artifact: that digest is the
+  evidence the reference content is identical, and every other contract field
+  must still agree exactly.  Training resume (:func:`load_checkpoint`) does not
+  use this relaxation and stays byte-for-byte strict.
+  """
+  if stored == expected:
+    return
+  only_motion_differs = (
+    set(stored) == set(expected)
+    and "motion" in stored
+    and "motion" in expected
+    and all(stored[key] == expected[key] for key in stored if key != "motion")
+  )
+  if only_motion_differs and motion_hashes_verified:
+    return
+  if only_motion_differs:
+    raise CheckpointValidationError(
+      "control contract motion path differs from the checkpoint and the motion "
+      "content identity was not verified by a matching motion artifact hash"
+    )
+  raise CheckpointValidationError("control contract does not match checkpoint")
+
+
 def _trainer_config(trainer: VaeDistillationTrainer) -> dict[str, Any]:
   config = trainer.config
   return {
@@ -580,15 +615,27 @@ def load_inference_checkpoint(
       "checkpoint schema does not match the expected schema"
     )
   hashes = _hashes(payload["teacher_hashes"], "checkpoint teacher_hashes")
-  if expected_teacher_hashes is not None and hashes != _hashes(
-    expected_teacher_hashes, "expected_teacher_hashes"
-  ):
+  expected_hashes = (
+    None
+    if expected_teacher_hashes is None
+    else _hashes(expected_teacher_hashes, "expected_teacher_hashes")
+  )
+  if expected_hashes is not None and hashes != expected_hashes:
     raise CheckpointValidationError("teacher artifact hashes do not match checkpoint")
   contract = _mapping(payload["control_contract"], "checkpoint control_contract")
-  if expected_control_contract is not None and contract != _mapping(
-    expected_control_contract, "expected_control_contract"
-  ):
-    raise CheckpointValidationError("control contract does not match checkpoint")
+  if expected_control_contract is not None:
+    _check_inference_control_contract(
+      contract,
+      _mapping(expected_control_contract, "expected_control_contract"),
+      # A matching motion digest is only evidence when both the checkpoint and
+      # the caller actually recorded one.  A missing entry cannot prove that a
+      # relocated path holds identical content, so it never authorizes a move.
+      motion_hashes_verified=(
+        expected_hashes is not None
+        and "motion" in hashes
+        and "motion" in expected_hashes
+      ),
+    )
   model_state = payload["model"]
   if not isinstance(model_state, Mapping):
     raise CheckpointValidationError("checkpoint model state is invalid")

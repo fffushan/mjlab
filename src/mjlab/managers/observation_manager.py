@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 import torch
@@ -118,6 +118,45 @@ class ObservationGroupCfg:
   """If True, check each observation term individually to identify NaN source.
   If False, check only the final concatenated output (faster but less informative).
   Only applies when nan_policy != 'disabled'."""
+
+
+def _splice_observation_rows(
+  previous: Any,
+  recomputed: Any,
+  env_ids: torch.Tensor,
+) -> Any:
+  """Keep ``previous`` rows outside ``env_ids`` and take the recomputed rows.
+
+  Recurse through non-concatenated observation groups (nested term dicts).  A
+  missing or shape-mismatched previous entry falls back to the recomputed value
+  rather than guessing, and a ``None`` previous cache (nothing computed yet)
+  means the whole recomputed buffer is used.
+  """
+  if previous is None:
+    return recomputed
+  if isinstance(recomputed, dict) and isinstance(previous, dict):
+    return {
+      name: _splice_observation_rows(previous.get(name), value, env_ids)
+      for name, value in recomputed.items()
+    }
+  if (
+    not isinstance(recomputed, torch.Tensor)
+    or not isinstance(previous, torch.Tensor)
+    or previous.shape != recomputed.shape
+  ):
+    return recomputed
+  merged = previous.clone()
+  merged[env_ids] = recomputed[env_ids]
+  return merged
+
+
+def _clone_observation_buffer(value: Any) -> Any:
+  """Return an owned copy of a nested observation buffer (dicts and tensors)."""
+  if isinstance(value, dict):
+    return {name: _clone_observation_buffer(item) for name, item in value.items()}
+  if isinstance(value, torch.Tensor):
+    return value.clone()
+  return value
 
 
 class ObservationManager(ManagerBase):
@@ -267,6 +306,64 @@ class ObservationManager(ManagerBase):
       for mod in group_mods.values():
         mod.reset(env_ids=env_ids)
     return {}
+
+  def cached_observations(
+    self,
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]] | None:
+    """Return an owned snapshot of the current cache, or ``None`` when cold.
+
+    The tensors are clones, so a later recompute, reset, or in-place buffer
+    reuse cannot change the snapshot (history terms otherwise alias circular
+    buffer storage).  Pass it back to :meth:`refresh` as ``baseline`` to
+    preserve rows outside ``env_ids`` exactly as they were before an
+    intervening ``env.reset``.
+    """
+    if self._obs_buffer is None:
+      return None
+    return _clone_observation_buffer(self._obs_buffer)
+
+  def refresh(
+    self,
+    env_ids: torch.Tensor,
+    baseline: dict[str, torch.Tensor | dict[str, torch.Tensor]] | None = None,
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Recompute the cached observation rows for ``env_ids`` only.
+
+    A live GUI edit (motion scrubbing) rewrites simulator/command state after
+    the last cached observation was computed.  ``compute(update_history=True,
+    env_ids=...)`` re-reads the terms at the current instant and backfills only
+    those envs' history/delay buffers (the reset path), but it returns freshly
+    recomputed rows for *every* environment, so a raw noisy term would change
+    the unedited envs' cached observations too.  This hook splices the
+    recomputed rows for ``env_ids`` into the unedited rows and leaves every
+    other env's cached row byte-identical.  History/delay buffers are still
+    updated only for ``env_ids`` (no extra tick, no extra lag draw for the
+    others).
+
+    ``baseline`` chooses which unedited rows are preserved: by default the
+    current cache (an immediate refresh), or a snapshot from
+    :meth:`cached_observations` taken before an intervening ``env.reset``, so a
+    partial reset plus command edit does not leak the reset's whole-batch
+    recompute — and its resampled raw noise — into the untouched environments.
+
+    Callers run this only on an explicit user action, never on a render.  The
+    global noise RNG may advance while the edited rows are recomputed; the
+    untouched observable rows and their history/delay timelines do not change.
+    It returns the merged buffer, which is also installed as the cache so the
+    next ``compute()`` returns it unchanged; the caller keeps the
+    environment's ``obs_buf`` in agreement.
+    """
+    if (
+      not isinstance(env_ids, torch.Tensor)
+      or env_ids.ndim != 1
+      or env_ids.dtype not in (torch.int32, torch.int64)
+    ):
+      raise ValueError("refresh env_ids must be a rank-1 integer tensor")
+    previous = self._obs_buffer if baseline is None else baseline
+    recomputed = self.compute(update_history=True, env_ids=env_ids)
+    merged = _splice_observation_rows(previous, recomputed, env_ids)
+    self._obs_buffer = merged
+    return merged
 
   def _check_and_handle_nans(
     self, tensor: torch.Tensor, context: str, policy: str
