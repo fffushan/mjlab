@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import IntEnum
 from typing import Any
 
 import numpy as np
@@ -45,6 +46,7 @@ from mjlab.tasks.tracking.distillation.observations import (
   PackedObservationBatch,
   pack_observations,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.distillation.teachers import (
   FrozenTeacher,
   TeacherBank,
@@ -56,6 +58,14 @@ from mjlab.tasks.tracking.distillation.vae_config import (
   make_schema,
 )
 from mjlab.utils.lab_api.math import euler_xyz_from_quat
+
+
+class InitializationKind(IntEnum):
+  """Per-segment reset provenance carried in enabled replay rows."""
+
+  UNKNOWN = 0
+  REFERENCE = 1
+  STANDING = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +128,7 @@ class LiveContractAudit:
   additional_gravity_policy: str
   semantic_overrides: tuple[str, ...] = ()
   seed_provenance: RuntimeSeedProvenance | None = None
+  reset_policy: ResetPolicy = ResetPolicy()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +186,7 @@ class MultiMotionLiveContractAudit:
   additional_gravity_policy: str
   semantic_overrides: tuple[str, ...] = ()
   seed_provenance: RuntimeSeedProvenance | None = None
+  reset_policy: ResetPolicy = ResetPolicy()
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +210,9 @@ class DistillationSnapshot:
   segment_id: torch.Tensor
   generation_id: torch.Tensor
   teacher_codes: torch.Tensor | None = None
+  initialization_kind: torch.Tensor | None = None
+  segment_initial_reference_frame: torch.Tensor | None = None
+  segment_age: torch.Tensor | None = None
   metrics: PhysicalTrackingMetrics | None = None
   boundary_events: ReferenceBoundaryEvents | None = None
 
@@ -213,6 +228,30 @@ class DistillationSnapshot:
       raise ValueError(
         "teacher_code must be an integer; -1 marks a batch with no single teacher"
       )
+    provenance = (
+      self.initialization_kind,
+      self.segment_initial_reference_frame,
+      self.segment_age,
+    )
+    if any(value is not None for value in provenance) and not all(
+      value is not None for value in provenance
+    ):
+      raise ValueError("snapshot provenance fields must be supplied together")
+    for name, value in zip(
+      ("initialization_kind", "segment_initial_reference_frame", "segment_age"),
+      provenance,
+      strict=True,
+    ):
+      if value is None:
+        continue
+      if value.shape != (batch,) or value.dtype != torch.int64:
+        raise ValueError(f"{name} must be an int64 tensor with shape [{batch}]")
+      if bool((value < 0).any().item()):
+        raise ValueError(f"{name} must be non-negative")
+    if self.initialization_kind is not None and bool(
+      (self.initialization_kind > int(InitializationKind.STANDING)).any().item()
+    ):
+      raise ValueError("initialization_kind contains an unsupported value")
     codes = self.teacher_codes
     if codes is None:
       return
@@ -973,6 +1012,7 @@ def validate_multi_motion_live_contract(
     ),
     semantic_overrides=tuple(getattr(env.cfg, "_distillation_semantic_overrides", ())),
     seed_provenance=getattr(env.cfg, "_distillation_seed_provenance", None),
+    reset_policy=getattr(env.cfg, "_distillation_reset_policy", ResetPolicy()),
   )
 
 
@@ -1030,6 +1070,7 @@ def validate_live_contract(
     ),
     semantic_overrides=tuple(getattr(env.cfg, "_distillation_semantic_overrides", ())),
     seed_provenance=getattr(env.cfg, "_distillation_seed_provenance", None),
+    reset_policy=getattr(env.cfg, "_distillation_reset_policy", ResetPolicy()),
   )
 
 
@@ -1106,6 +1147,9 @@ def _capture_snapshot(
   teacher_code: int,
   motion_id: torch.Tensor,
   teacher_codes: torch.Tensor | None,
+  initialization_kind: torch.Tensor | None = None,
+  segment_initial_reference_frame: torch.Tensor | None = None,
+  segment_age: torch.Tensor | None = None,
 ) -> DistillationSnapshot:
   """Capture one owned snapshot from the observation manager cache.
 
@@ -1151,6 +1195,15 @@ def _capture_snapshot(
     segment_id=command.segment_ids.detach().clone(),
     generation_id=command.generation_ids.detach().clone(),
     teacher_codes=None if teacher_codes is None else teacher_codes.detach().clone(),
+    initialization_kind=(
+      None if initialization_kind is None else initialization_kind.detach().clone()
+    ),
+    segment_initial_reference_frame=(
+      None
+      if segment_initial_reference_frame is None
+      else segment_initial_reference_frame.detach().clone()
+    ),
+    segment_age=None if segment_age is None else segment_age.detach().clone(),
     metrics=_capture_physical_metrics(command),
   )
 
@@ -1292,6 +1345,11 @@ class MultiMotionDistillationAdapter:
       env, cohort, self.teacher_ids
     )
     self._slices = _term_slices(cohort)
+    self._provenance_segment: torch.Tensor | None = None
+    self._provenance_generation: torch.Tensor | None = None
+    self._provenance_kind: torch.Tensor | None = None
+    self._provenance_frame: torch.Tensor | None = None
+    self._provenance_age: torch.Tensor | None = None
 
   @property
   def library(self) -> MotionLibrary:
@@ -1303,7 +1361,59 @@ class MultiMotionDistillationAdapter:
     """Ordered motion-id to teacher-code mapping of this adapted cohort."""
     return {clip.motion_id: clip.teacher_code for clip in self.library.clips}
 
-  def snapshot(self) -> DistillationSnapshot:
+  def _provenance_state(
+    self,
+    command: MultiMotionCommand,
+    *,
+    after_step: bool = False,
+    force_start: bool = False,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Track segment provenance independently of mutable post-reset state."""
+    segment = command.segment_ids.detach().clone().to(dtype=torch.int64)
+    generation = command.generation_ids.detach().clone().to(dtype=torch.int64)
+    changed = force_start or self._provenance_segment is None
+    if not changed:
+      assert self._provenance_segment is not None
+      assert self._provenance_generation is not None
+      changed = bool(
+        (
+          (segment != self._provenance_segment)
+          | (generation != self._provenance_generation)
+        ).any()
+      )
+    if changed:
+      metric_values = getattr(command, "metrics", None)
+      metric = (
+        metric_values.get("standing_start") if isinstance(metric_values, dict) else None
+      )
+      if isinstance(metric, torch.Tensor) and metric.shape == segment.shape:
+        kind = torch.where(
+          metric > 0.5,
+          torch.full_like(segment, int(InitializationKind.STANDING)),
+          torch.full_like(segment, int(InitializationKind.REFERENCE)),
+        )
+      else:
+        kind = torch.full_like(segment, int(InitializationKind.UNKNOWN))
+      self._provenance_segment = segment.clone()
+      self._provenance_generation = generation.clone()
+      self._provenance_kind = kind
+      self._provenance_frame = command.time_steps.detach().clone().to(dtype=torch.int64)
+      self._provenance_age = torch.zeros_like(segment)
+    elif after_step:
+      assert self._provenance_age is not None
+      self._provenance_age = self._provenance_age + 1
+    assert self._provenance_kind is not None
+    assert self._provenance_frame is not None
+    assert self._provenance_age is not None
+    return (
+      self._provenance_kind.clone(),
+      self._provenance_frame.clone(),
+      self._provenance_age.clone(),
+    )
+
+  def snapshot(
+    self, *, after_step: bool = False, force_start: bool = False
+  ) -> DistillationSnapshot:
     """Capture one owned snapshot with validated per-row routing metadata."""
     command = _require_multi_motion_command(self.env)
     motion_id = command.motion_ids.detach().clone().to(dtype=torch.long)
@@ -1323,6 +1433,9 @@ class MultiMotionDistillationAdapter:
         "per-row teacher codes disagree with the reference library's "
         "motion-to-teacher mapping; rows would be labeled by the wrong teacher"
       )
+    initialization_kind, initial_frame, age = self._provenance_state(
+      command, after_step=after_step, force_start=force_start
+    )
     return _capture_snapshot(
       self.env,
       cohort=self.cohort,
@@ -1333,12 +1446,18 @@ class MultiMotionDistillationAdapter:
       teacher_code=_MIXED_TEACHER_CODE,
       motion_id=motion_id,
       teacher_codes=teacher_codes,
+      initialization_kind=initialization_kind,
+      segment_initial_reference_frame=initial_frame,
+      segment_age=age,
     )
 
   def reset(self, seed: int | None = None) -> DistillationSnapshot:
     """Reset the simulator and return the owned post-reset snapshot."""
     self.env.reset(seed=seed)
-    return replace(self.snapshot(), boundary_events=_consume_boundary_events(self.env))
+    return replace(
+      self.snapshot(force_start=True),
+      boundary_events=_consume_boundary_events(self.env),
+    )
 
   def step(self, action: torch.Tensor) -> DistillationStep:
     """Execute one normalized action and return the post-step snapshot."""
@@ -1349,7 +1468,7 @@ class MultiMotionDistillationAdapter:
     if events is not None:
       events = events.with_step_outcome(terminated)
     return DistillationStep(
-      snapshot=self.snapshot(),
+      snapshot=self.snapshot(after_step=True),
       reward=reward.detach().clone(),
       terminated=terminated.detach().clone(),
       time_outs=time_outs.detach().clone(),
@@ -1403,6 +1522,7 @@ def make_multi_teacher_distillation_adapter(
   render_mode: str | None = None,
   schema: VaeSchema | None = None,
   seed: int | None = None,
+  reset_policy: ResetPolicy | None = None,
 ) -> MultiMotionDistillationAdapter:
   """Build one mixed-slot env, audit every selected clip, and adapt it.
 
@@ -1420,6 +1540,7 @@ def make_multi_teacher_distillation_adapter(
     device=device,
     render_mode=render_mode,
     seed=seed,
+    reset_policy=reset_policy,
   )
   try:
     bank = build_cohort_teacher_bank(cohort, device=device)
@@ -1438,6 +1559,7 @@ __all__ = [
   "DistillationEnvironmentAdapter",
   "DistillationSnapshot",
   "DistillationStep",
+  "InitializationKind",
   "LiveContractAudit",
   "MultiMotionAssetAudit",
   "MultiMotionDistillationAdapter",

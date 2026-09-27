@@ -45,6 +45,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
   CohortIdentity,
   CohortMember,
   ReplayPolicy,
+  ResetProvenance,
   require_member_matches,
   require_same_cohort,
   require_same_replay_policy,
@@ -63,6 +64,7 @@ from mjlab.tasks.tracking.distillation.vae_config import ModelSettings, VaeSchem
 
 CHECKPOINT_VERSION = 1
 COHORT_CHECKPOINT_VERSION = 2
+STANDING_COHORT_CHECKPOINT_VERSION = 3
 _CHECKPOINT_KIND = "mjlab-m3-distillation"
 _COHORT_CHECKPOINT_KIND = "mjlab-m4-cohort-distillation"
 _KIND_DESCRIPTIONS = {
@@ -117,6 +119,7 @@ class CohortLifecycleState:
   resolved_config: dict[str, Any]
   cohort: CohortIdentity
   replay_policy: ReplayPolicy
+  reset_provenance: ResetProvenance | None = None
   resume_restarts_simulator: bool = True
 
 
@@ -161,6 +164,8 @@ class CohortMemberInference:
   schedule: dict[str, Any]
   resolved_config: dict[str, Any]
   relocated_artifact_roles: tuple[str, ...] = ()
+  reset_provenance: ResetProvenance | None = None
+  evaluation_reset_profile: str | None = None
 
   @property
   def teacher_ids(self) -> tuple[str, ...]:
@@ -328,6 +333,40 @@ def _validate_rng_state(value: Any, name: str) -> torch.Tensor:
   return state
 
 
+def _adapter_reset_rng_state(collector: DAggerCollector | None) -> torch.Tensor | None:
+  """Read the enabled command's owned CPU RNG without coupling v1/v2 paths."""
+  if collector is None:
+    return None
+  adapter = collector.adapter
+  env = getattr(adapter, "env", None)
+  manager = getattr(env, "command_manager", None)
+  get_term = getattr(manager, "get_term", None)
+  if not callable(get_term):
+    return None
+  command = get_term("motion")
+  getter = getattr(command, "reset_rng_state", None)
+  if not callable(getter):
+    return None
+  return _validate_rng_state(getter(), "reset RNG state")
+
+
+def _install_reset_rng_state(
+  collector: DAggerCollector | None, state: torch.Tensor
+) -> None:
+  if collector is None:
+    raise CheckpointValidationError("v3 reset RNG requires a live collector")
+  adapter = collector.adapter
+  env = getattr(adapter, "env", None)
+  manager = getattr(env, "command_manager", None)
+  command = manager.get_term("motion") if manager is not None else None
+  setter = getattr(command, "set_reset_rng_state", None)
+  if not callable(setter):
+    raise CheckpointValidationError(
+      "v3 reset RNG requires a multi-motion command exposing set_reset_rng_state"
+    )
+  setter(state)
+
+
 def _require_envelope(
   payload: Any, *, kind: str, version: int, other_kind: str, other_loader: str
 ) -> None:
@@ -357,8 +396,8 @@ def _payload(
   schedule: Mapping[str, Any],
   resolved_config: Mapping[str, Any],
   collector: DAggerCollector | None,
+  reset_rng_state: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-  """The trainer/model/replay/RNG half shared by both checkpoint versions."""
   if trainer.replay is not replay:
     raise CheckpointValidationError(
       "trainer and replay must be the same ownership instance"
@@ -377,6 +416,8 @@ def _payload(
   }
   if collector is not None:
     rng["collector"] = collector.generator_state()
+  if reset_rng_state is not None:
+    rng["reset"] = _validate_rng_state(reset_rng_state, "reset RNG state")
   return {
     "schema": trainer.model.schema_metadata,
     "model_settings": trainer.model.settings.to_metadata(),
@@ -413,8 +454,8 @@ def _single_teacher_payload(
   teacher_hashes: Mapping[str, str],
   control_contract: Mapping[str, Any],
   collector: DAggerCollector | None,
+  reset_rng_state: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-  """The version-1 payload: shared state plus the single-teacher identity."""
   payload = _payload(
     trainer,
     replay,
@@ -422,6 +463,7 @@ def _single_teacher_payload(
     schedule=schedule,
     resolved_config=resolved_config,
     collector=collector,
+    reset_rng_state=reset_rng_state,
   )
   payload["kind"] = _CHECKPOINT_KIND
   payload["version"] = CHECKPOINT_VERSION
@@ -460,6 +502,7 @@ def _validate_state_payload(
   version: int,
   identity_fields: frozenset[str],
   collector: DAggerCollector | None,
+  require_reset_rng: bool = False,
 ) -> dict[str, Any]:
   """Validate the trainer/model/replay/RNG half shared by both versions."""
   other_kind = _COHORT_CHECKPOINT_KIND if kind == _CHECKPOINT_KIND else _CHECKPOINT_KIND
@@ -545,9 +588,12 @@ def _validate_state_payload(
       "checkpoint normalization identities are duplicated"
     )
   rng = payload["rng"]
-  if not isinstance(rng, Mapping) or set(rng) != (
-    {"global_cpu", "trainer"} | ({"collector"} if collector is not None else set())
-  ):
+  expected_rng_fields = (
+    {"global_cpu", "trainer"}
+    | ({"collector"} if collector is not None else set())
+    | ({"reset"} if require_reset_rng else set())
+  )
+  if not isinstance(rng, Mapping) or set(rng) != expected_rng_fields:
     raise CheckpointValidationError(
       "checkpoint RNG streams do not match live components"
     )
@@ -570,9 +616,11 @@ def _validate_state_payload(
     clean_rng["collector"] = _validate_rng_state(
       rng["collector"], "collector RNG state"
     )
+  if require_reset_rng:
+    clean_rng["reset"] = _validate_rng_state(rng["reset"], "reset RNG state")
+  # The public, storage-independent validation seam: no replay implementation's
+  # private ring layout is read here.
   try:
-    # The public, storage-independent validation seam: no replay implementation's
-    # private ring layout is read here.
     replay.validate_state(payload["replay"])
   except ReplayValidationError as exc:
     raise CheckpointValidationError(str(exc)) from exc
@@ -621,8 +669,9 @@ def _validate_cohort_payload(
   replay: ReplayBufferProtocol,
   *,
   expected_cohort: CohortIdentity,
+  expected_reset_provenance: ResetProvenance | None,
   collector: DAggerCollector | None,
-) -> tuple[dict[str, Any], ReplayPolicy]:
+) -> tuple[dict[str, Any], ReplayPolicy, ResetProvenance | None]:
   """Validate one multi-teacher cohort checkpoint before any mutation.
 
   The stored cohort record and its digest, the recorded replay partition policy
@@ -636,18 +685,61 @@ def _validate_cohort_payload(
     raise CheckpointValidationError(
       "a strict cohort resume needs the live CohortIdentity to compare against"
     )
-  # The M4 replay layout is required before anything else is inspected, so a
-  # version-2 checkpoint is never reported against a buffer it cannot use.
+  # Version 3 is the same cohort envelope with an enabled reset contract.
+  checkpoint_version = payload.get("version") if isinstance(payload, Mapping) else None
+  enabled = checkpoint_version == STANDING_COHORT_CHECKPOINT_VERSION
+  if enabled and expected_reset_provenance is None:
+    raise CheckpointValidationError(
+      "version-3 standing cohort requires expected reset provenance for strict resume"
+    )
   live_policy = _live_replay_policy(replay)
   clean = _validate_state_payload(
     payload,
     trainer,
     replay,
     kind=_COHORT_CHECKPOINT_KIND,
-    version=COHORT_CHECKPOINT_VERSION,
-    identity_fields=_COHORT_IDENTITY_FIELDS,
+    version=STANDING_COHORT_CHECKPOINT_VERSION
+    if enabled
+    else COHORT_CHECKPOINT_VERSION,
+    identity_fields=_COHORT_IDENTITY_FIELDS
+    | ({"reset_provenance"} if enabled else set()),
     collector=collector,
+    require_reset_rng=enabled,
   )
+  reset_provenance: ResetProvenance | None = None
+  if enabled:
+    try:
+      reset_provenance = ResetProvenance.from_dict(
+        clean["reset_provenance"], "checkpoint reset_provenance"
+      )
+    except (KeyError, CohortContractError) as exc:
+      raise CheckpointValidationError(
+        f"checkpoint reset provenance is invalid: {exc}"
+      ) from exc
+    if expected_reset_provenance is None:
+      raise CheckpointValidationError(
+        "version-3 standing cohort requires expected reset provenance for strict resume"
+      )
+    if reset_provenance.as_dict() != expected_reset_provenance.as_dict():
+      raise CheckpointValidationError(
+        "standing reset policy/version/provenance does not match checkpoint"
+      )
+    replay_state = clean.get("replay")
+    if (
+      not isinstance(replay_state, Mapping)
+      or replay_state.get("layout") != reset_provenance.replay_layout
+    ):
+      raise CheckpointValidationError(
+        "version-3 checkpoint replay provenance layout does not match reset contract"
+      )
+  elif (
+    expected_reset_provenance is not None
+    and expected_reset_provenance.reset_policy.enabled
+  ):
+    raise CheckpointValidationError(
+      "version-2 cohort checkpoint cannot be resumed with standing resets enabled; "
+      "use a version-3 checkpoint"
+    )
   try:
     stored = CohortIdentity.from_dict(clean["cohort"], "checkpoint cohort")
   except CohortContractError as exc:
@@ -682,7 +774,7 @@ def _validate_cohort_payload(
     raise CheckpointValidationError(
       "checkpoint schema joint order disagrees with its cohort contract"
     )
-  return clean, stored_policy
+  return clean, stored_policy, reset_provenance
 
 
 def _restore_state(
@@ -715,6 +807,7 @@ def _restore_state(
   old_rng = trainer.generator_states()
   old_global = _global_rng_state()
   old_collector = None if collector is None else collector.generator_state()
+  old_reset = _adapter_reset_rng_state(collector)
   try:
     trainer.model.load_state_dict(clean["model"], strict=True)
     trainer.optimizer.load_state_dict(clean["optimizer"])
@@ -728,6 +821,8 @@ def _restore_state(
     torch.random.set_rng_state(clean["rng"]["global_cpu"])
     if collector is not None:
       collector.set_generator_state(clean["rng"]["collector"])
+    if "reset" in clean["rng"]:
+      _install_reset_rng_state(collector, clean["rng"]["reset"])
     # Clear post-step poison only as the last step of a fully validated
     # restore.  A failure here rolls the model/optimizer/replay/RNG back and
     # therefore leaves both the previous state and the poison intact.
@@ -744,6 +839,8 @@ def _restore_state(
     torch.random.set_rng_state(old_global)
     if collector is not None and old_collector is not None:
       collector.set_generator_state(old_collector)
+    if old_reset is not None:
+      _install_reset_rng_state(collector, old_reset)
     raise CheckpointValidationError(
       f"checkpoint restore failed before completion: {exc}"
     ) from exc
@@ -792,8 +889,9 @@ def save_cohort_checkpoint(
   schedule: Mapping[str, Any] | None = None,
   resolved_config: Mapping[str, Any] | None = None,
   collector: DAggerCollector | None = None,
+  reset_provenance: ResetProvenance | None = None,
 ) -> Path:
-  """Atomically save a version-2 multi-teacher cohort checkpoint.
+  """Atomically save a version-2 or enabled version-3 cohort checkpoint.
 
   The checkpoint records the ordered cohort identity (member digests, clip
   extents, audited body mapping, common contract, slot/phase policy, replay
@@ -803,6 +901,17 @@ def save_cohort_checkpoint(
   are refused before any file is created.
   """
   trainer.assert_healthy()
+  if reset_provenance is not None and not isinstance(reset_provenance, ResetProvenance):
+    raise CheckpointValidationError("reset_provenance must be a ResetProvenance")
+  reset_rng_state = (
+    _adapter_reset_rng_state(collector) if reset_provenance is not None else None
+  )
+  if reset_provenance is not None and reset_rng_state is None:
+    raise CheckpointValidationError(
+      "enabled v3 cohort save requires a multi-motion command reset RNG state"
+    )
+  if reset_provenance is not None and not reset_provenance.reset_policy.enabled:
+    raise CheckpointValidationError("v3 cohort save requires standing-mixture policy")
   if not isinstance(cohort, CohortIdentity):
     raise CheckpointValidationError(
       "save_cohort_checkpoint needs the live CohortIdentity to record"
@@ -820,6 +929,13 @@ def save_cohort_checkpoint(
       "the trained model's schema joint order disagrees with the cohort's saved "
       "joint order"
     )
+  if reset_provenance is not None:
+    replay_state = replay.state_dict()
+    if replay_state.get("layout") != reset_provenance.replay_layout:
+      raise CheckpointValidationError(
+        "enabled v3 cohort requires replay provenance layout "
+        f"{reset_provenance.replay_layout!r}"
+      )
   payload = _payload(
     trainer,
     replay,
@@ -827,12 +943,19 @@ def save_cohort_checkpoint(
     schedule=schedule or {},
     resolved_config=resolved_config or {},
     collector=collector,
+    reset_rng_state=reset_rng_state,
   )
   payload["kind"] = _COHORT_CHECKPOINT_KIND
-  payload["version"] = COHORT_CHECKPOINT_VERSION
+  payload["version"] = (
+    STANDING_COHORT_CHECKPOINT_VERSION
+    if reset_provenance is not None
+    else COHORT_CHECKPOINT_VERSION
+  )
   payload["cohort"] = cohort.as_dict()
   payload["cohort_digest"] = cohort.digest()
   payload["replay_policy"] = policy.as_dict()
+  if reset_provenance is not None:
+    payload["reset_provenance"] = reset_provenance.as_dict()
   return _atomic_save(payload, Path(path))
 
 
@@ -984,6 +1107,7 @@ def load_cohort_checkpoint(
   replay: ReplayBufferProtocol,
   *,
   expected_cohort: CohortIdentity,
+  expected_reset_provenance: ResetProvenance | None = None,
   collector: DAggerCollector | None = None,
   map_location: str | torch.device = "cpu",
 ) -> CohortLifecycleState:
@@ -995,11 +1119,12 @@ def load_cohort_checkpoint(
   resource/seed settings differ.  A version-1 checkpoint is never converted.
   """
   payload = _load_payload(path, map_location)
-  clean, policy = _validate_cohort_payload(
+  clean, policy, reset_provenance = _validate_cohort_payload(
     payload,
     trainer,
     replay,
     expected_cohort=expected_cohort,
+    expected_reset_provenance=expected_reset_provenance,
     collector=collector,
   )
   stored = CohortIdentity.from_dict(clean["cohort"], "checkpoint cohort")
@@ -1010,6 +1135,7 @@ def load_cohort_checkpoint(
     resolved_config=dict(clean["resolved_config"]),
     cohort=stored,
     replay_policy=policy,
+    reset_provenance=reset_provenance,
     resume_restarts_simulator=True,
   )
 
@@ -1101,6 +1227,22 @@ def load_inference_checkpoint(
   )
 
 
+def _validate_evaluation_reset_profile(profile: str | None) -> str | None:
+  if profile is None:
+    return None
+  allowed = {
+    "reference-start",
+    "reference-uniform",
+    "standing-start",
+    "standing-window",
+  }
+  if profile not in allowed:
+    raise CheckpointValidationError(
+      f"unknown evaluation reset profile {profile!r}; expected one of {sorted(allowed)}"
+    )
+  return profile
+
+
 def load_cohort_member_inference(
   path: str | os.PathLike[str],
   cohort: CohortContract,
@@ -1108,6 +1250,7 @@ def load_cohort_member_inference(
   *,
   device: str | torch.device = "cpu",
   expected_schema: VaeSchema | Mapping[str, Any] | None = None,
+  reset_profile: str | None = None,
 ) -> CohortMemberInference:
   """Load one checked member of a saved version-2 cohort for inference only.
 
@@ -1125,19 +1268,32 @@ def load_cohort_member_inference(
   the same checkpoint for another member returns identical model parameters.
   """
   payload = _load_payload(path, "cpu")
-  _require_envelope(
-    payload,
-    kind=_COHORT_CHECKPOINT_KIND,
-    version=COHORT_CHECKPOINT_VERSION,
-    other_kind=_CHECKPOINT_KIND,
-    other_loader="load_inference_checkpoint",
-  )
+  checkpoint_version = payload.get("version") if isinstance(payload, Mapping) else None
+  enabled = checkpoint_version == STANDING_COHORT_CHECKPOINT_VERSION
+  if isinstance(payload, Mapping) and payload.get("kind") == _CHECKPOINT_KIND:
+    raise CheckpointValidationError(
+      "checkpoint is a version-1 single-teacher artifact; read it with "
+      "load_inference_checkpoint instead"
+    )
+  if not isinstance(payload, Mapping) or payload.get("kind") != _COHORT_CHECKPOINT_KIND:
+    raise CheckpointValidationError(
+      "checkpoint is not a cohort artifact; use load_inference_checkpoint for version 1"
+    )
+  if checkpoint_version not in (
+    COHORT_CHECKPOINT_VERSION,
+    STANDING_COHORT_CHECKPOINT_VERSION,
+  ):
+    raise CheckpointValidationError("unsupported cohort checkpoint version")
+  _validate_evaluation_reset_profile(reset_profile)
   required = {
     "cohort",
     "cohort_digest",
     "replay_policy",
     *_INFERENCE_FIELDS,
   }
+  if enabled:
+    required.add("reset_provenance")
+    required.add("replay")
   missing = required - set(payload)
   if missing:
     raise CheckpointValidationError(
@@ -1166,6 +1322,16 @@ def load_cohort_member_inference(
     raise CheckpointValidationError(
       "checkpoint cohort record and replay policy describe different replay partitions"
     )
+  reset_provenance = None
+  if enabled:
+    try:
+      reset_provenance = ResetProvenance.from_dict(
+        payload["reset_provenance"], "checkpoint reset_provenance"
+      )
+    except CohortContractError as exc:
+      raise CheckpointValidationError(
+        f"checkpoint reset provenance is invalid: {exc}"
+      ) from exc
   try:
     member = require_member_matches(stored, cohort, teacher_id)
   except CohortContractError as exc:
@@ -1204,15 +1370,19 @@ def load_cohort_member_inference(
     schedule=schedule,
     resolved_config=resolved_config,
     relocated_artifact_roles=relocated,
+    reset_provenance=reset_provenance,
+    evaluation_reset_profile=reset_profile,
   )
 
 
 __all__ = [
   "CHECKPOINT_VERSION",
   "COHORT_CHECKPOINT_VERSION",
+  "STANDING_COHORT_CHECKPOINT_VERSION",
   "CheckpointValidationError",
   "CohortLifecycleState",
   "CohortMemberInference",
+  "ResetProvenance",
   "InferenceModel",
   "LifecycleState",
   "load_checkpoint",

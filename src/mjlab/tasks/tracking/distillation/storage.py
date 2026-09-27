@@ -56,6 +56,42 @@ class LabeledReplayBatch:
   reference_frame: torch.Tensor
   episode_id: torch.Tensor
   collector_iteration: torch.Tensor
+  # Optional standing-start provenance.  All three fields are required together
+  # for the enabled layout; ``None`` preserves the legacy M3/M4 constructor and
+  # storage layout exactly.
+  initialization_kind: torch.Tensor | None = None
+  segment_initial_reference_frame: torch.Tensor | None = None
+  segment_age: torch.Tensor | None = None
+
+  @property
+  def has_provenance(self) -> bool:
+    """Whether this batch uses the versioned standing-start layout."""
+    fields = (
+      self.initialization_kind,
+      self.segment_initial_reference_frame,
+      self.segment_age,
+    )
+    if any(field is not None for field in fields) and not all(
+      field is not None for field in fields
+    ):
+      raise ReplayValidationError(
+        "provenance fields must be supplied together; missing enabled-path metadata "
+        "cannot be inferred from a legacy batch"
+      )
+    return fields[0] is not None
+
+  def provenance(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Return the owned provenance tensors, or ``None`` for legacy data."""
+    if not self.has_provenance:
+      return None
+    assert self.initialization_kind is not None
+    assert self.segment_initial_reference_frame is not None
+    assert self.segment_age is not None
+    return (
+      self.initialization_kind,
+      self.segment_initial_reference_frame,
+      self.segment_age,
+    )
 
   @property
   def reference(self) -> torch.Tensor:
@@ -186,6 +222,28 @@ def _require_metadata(name: str, value: object, batch_size: int) -> torch.Tensor
   return tensor
 
 
+def _provenance_fields() -> tuple[str, ...]:
+  return (
+    "initialization_kind",
+    "segment_initial_reference_frame",
+    "segment_age",
+  )
+
+
+def _layout_fields(provenance_enabled: bool) -> tuple[str, ...]:
+  base = (
+    "reference",
+    "conditioning",
+    "teacher_action",
+    "motion_id",
+    "teacher_id",
+    "reference_frame",
+    "episode_id",
+    "collector_iteration",
+  )
+  return base + (_provenance_fields() if provenance_enabled else ())
+
+
 def validate_replay_batch(
   batch: LabeledReplayBatch,
   schema: VaeSchema,
@@ -222,10 +280,23 @@ def validate_replay_batch(
     ("episode_id", batch.episode_id),
     ("collector_iteration", batch.collector_iteration),
   )
+  metadata_tensors: list[torch.Tensor] = []
+  provenance = batch.provenance()
+  if provenance is not None:
+    for name, value in zip(_provenance_fields(), provenance, strict=True):
+      tensor = _require_metadata(name, value, batch_size)
+      if name == "initialization_kind":
+        if bool((tensor < 0).any().item()) or bool((tensor > 2).any().item()):
+          raise ReplayValidationError(
+            "initialization_kind must use 0 (unknown), 1 (reference), or 2 (standing)"
+          )
+      elif bool((tensor < 0).any().item()):
+        raise ReplayValidationError(f"{name} must be non-negative")
+    metadata_tensors.extend(provenance)
+
   metadata_tensors = [
     _require_metadata(name, value, batch_size) for name, value in metadata
-  ]
-
+  ] + metadata_tensors
   tensors = [reference, conditioning, teacher_action, *metadata_tensors]
   expected_device = tensors[0].device
   expected_dtype = tensors[0].dtype
@@ -297,6 +368,7 @@ class LabeledReplayBuffer:
     self._size = 0
     self._next = 0
     self._storage: dict[str, torch.Tensor] | None = None
+    self._provenance_enabled: bool | None = None
 
   @property
   def size(self) -> int:
@@ -319,6 +391,16 @@ class LabeledReplayBuffer:
 
   def validate_batch(self, batch: LabeledReplayBatch) -> None:
     """Validate an insertion request without changing this buffer."""
+    has_provenance = batch.has_provenance
+    if (
+      self._provenance_enabled is not None
+      and has_provenance != self._provenance_enabled
+    ):
+      expected = "enabled" if self._provenance_enabled else "legacy"
+      raise ReplayValidationError(
+        f"replay layout is {expected}; provenance metadata cannot be mixed with "
+        "the established layout"
+      )
     validate_replay_batch(batch, self.schema, device=self._device, dtype=self._dtype)
 
   def _owned_batch(self, batch: LabeledReplayBatch) -> dict[str, torch.Tensor]:
@@ -332,6 +414,16 @@ class LabeledReplayBuffer:
       "reference_frame": batch.reference_frame.detach().clone(),
       "episode_id": batch.episode_id.detach().clone(),
       "collector_iteration": batch.collector_iteration.detach().clone(),
+      **(
+        {
+          name: value.detach().clone()
+          for name, value in zip(
+            _provenance_fields(), batch.provenance() or (), strict=True
+          )
+        }
+        if batch.has_provenance
+        else {}
+      ),
     }
 
   def insert(self, batch: LabeledReplayBatch) -> None:
@@ -348,6 +440,8 @@ class LabeledReplayBuffer:
       self._device = _canonical_device(batch.device)
     if self._dtype is None:
       self._dtype = batch.dtype
+    if self._provenance_enabled is None:
+      self._provenance_enabled = batch.has_provenance
     owned = self._owned_batch(batch)
     if batch.batch_size >= self.capacity:
       owned = {name: value[-self.capacity :] for name, value in owned.items()}
@@ -394,17 +488,28 @@ class LabeledReplayBuffer:
       "size": self._size,
       "next": self._next,
       "storage": storage,
+      **({"layout": "provenance-v1"} if self._provenance_enabled else {}),
     }
 
   def _validated_state_storage(
     self, state: Mapping[str, Any]
   ) -> tuple[
-    int, int, dict[str, torch.Tensor] | None, torch.device | None, torch.dtype | None
+    int,
+    int,
+    dict[str, torch.Tensor] | None,
+    torch.device | None,
+    torch.dtype | None,
+    bool,
   ]:
     """Validate checkpoint replay state without changing this buffer."""
-    required = {"capacity", "schema", "device", "dtype", "size", "next", "storage"}
+    enabled = state.get("layout") == "provenance-v1"
+    required = {"capacity", "schema", "device", "dtype", "size", "next", "storage"} | (
+      {"layout"} if enabled else set()
+    )
     if set(state) != required:
       raise ReplayValidationError("replay state has missing or unknown fields")
+    if self._provenance_enabled is not None and enabled != self._provenance_enabled:
+      raise ReplayValidationError("replay checkpoint layout does not match buffer")
     if state["capacity"] != self.capacity:
       raise ReplayValidationError("replay capacity does not match checkpoint")
     if state["schema"] != self.schema.compatibility_metadata():
@@ -436,18 +541,9 @@ class LabeledReplayBuffer:
     if raw_storage is None:
       if size != 0:
         raise ReplayValidationError("non-empty replay state has no storage")
-      return size, next_index, None, device, dtype
+      return size, next_index, None, device, dtype, enabled
     if not isinstance(raw_storage, Mapping) or set(raw_storage) != set(
-      (
-        "reference",
-        "conditioning",
-        "teacher_action",
-        "motion_id",
-        "teacher_id",
-        "reference_frame",
-        "episode_id",
-        "collector_iteration",
-      )
+      _layout_fields(enabled)
     ):
       raise ReplayValidationError("replay storage fields are invalid")
     validated: dict[str, torch.Tensor] = {}
@@ -484,13 +580,15 @@ class LabeledReplayBuffer:
       device = validated["reference"].device
     if dtype is None:
       dtype = validated["reference"].dtype
-    return size, next_index, validated, device, dtype
+    return size, next_index, validated, device, dtype, enabled
 
   def load_state_dict(self, state: Mapping[str, Any]) -> None:
     """Restore a validated ring snapshot atomically."""
     if not isinstance(state, Mapping):
       raise ReplayValidationError("replay state must be a mapping")
-    size, next_index, storage, device, dtype = self._validated_state_storage(state)
+    size, next_index, storage, device, dtype, enabled = self._validated_state_storage(
+      state
+    )
     if self._device is not None and device is not None and self._device != device:
       raise ReplayValidationError("checkpoint replay device does not match buffer")
     if self._dtype is not None and dtype is not None and self._dtype != dtype:
@@ -498,6 +596,7 @@ class LabeledReplayBuffer:
     # All checks above complete before any live field is changed.
     self._device = device
     self._dtype = dtype
+    self._provenance_enabled = enabled
     self._size = size
     self._next = next_index
     self._storage = storage
@@ -610,6 +709,11 @@ class LabeledReplayBuffer:
       reference_frame=selected["reference_frame"],
       episode_id=selected["episode_id"],
       collector_iteration=selected["collector_iteration"],
+      **(
+        {name: selected[name] for name in _provenance_fields()}
+        if self._provenance_enabled
+        else {}
+      ),
     )
 
 

@@ -155,6 +155,15 @@ from mjlab.tasks.tracking.distillation.playback import (
   DistillationPlayPolicy,
   discover_distillation_checkpoints,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import (
+  ResetPolicy,
+  ResetPolicyError,
+  ResetPolicyKind,
+  ResetSample,
+  effective_windows,
+  make_reset_policy,
+  sample_reset_policy,
+)
 from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
   LifecycleIteration,
@@ -331,6 +340,13 @@ __all__ = [
   "ReplayNotReadyError",
   "ReplayPolicy",
   "ReplayValidationError",
+  "ResetPolicy",
+  "ResetPolicyError",
+  "ResetPolicyKind",
+  "ResetSample",
+  "effective_windows",
+  "make_reset_policy",
+  "sample_reset_policy",
   "require_member_matches",
   "require_same_cohort",
   "require_same_replay_policy",

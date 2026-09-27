@@ -22,7 +22,11 @@ from mjlab.tasks.tracking.distillation.checkpoint import (
   save_checkpoint,
   save_cohort_checkpoint,
 )
-from mjlab.tasks.tracking.distillation.cohort_contract import CohortIdentity
+from mjlab.tasks.tracking.distillation.cohort_contract import (
+  CohortIdentity,
+  ResetProvenance,
+  reset_provenance_from_adapter,
+)
 from mjlab.tasks.tracking.distillation.collector import (
   CollectionConfig,
   CollectionResult,
@@ -316,14 +320,24 @@ class DistillationRunner:
     *,
     resolved_config: Mapping[str, Any] | None = None,
     schedule: Mapping[str, Any] | None = None,
+    reset_provenance: ResetProvenance | None = None,
   ) -> None:
-    """Persist one version-2 checkpoint of a multi-teacher cohort run.
+    """Persist one version-2 or enabled version-3 cohort checkpoint.
 
     ``cohort`` is the live identity of the cohort this runner is training, so
     the record is built from the adapted environment and replay buffer rather
     than from a caller-supplied summary.
     """
     self.trainer.assert_healthy()
+    if reset_provenance is None:
+      command = getattr(
+        getattr(self.collector.adapter, "env", None), "command_manager", None
+      )
+      get_term = getattr(command, "get_term", None)
+      motion = get_term("motion") if callable(get_term) else None
+      policy = getattr(motion, "reset_policy", None)
+      if getattr(policy, "enabled", False):
+        reset_provenance = reset_provenance_from_adapter(self.collector.adapter)
     save_cohort_checkpoint(
       path,
       self.trainer,
@@ -336,6 +350,7 @@ class DistillationRunner:
       schedule=schedule or {"max_iterations": self.config.max_iterations},
       resolved_config=resolved_config or {},
       collector=self.collector,
+      reset_provenance=reset_provenance,
     )
     self.events.append(
       {
@@ -350,6 +365,7 @@ class DistillationRunner:
     path: str,
     cohort: CohortIdentity,
     *,
+    reset_provenance: ResetProvenance | None = None,
     map_location: str | torch.device = "cpu",
   ) -> CohortLifecycleState:
     """Strictly resume a version-2 cohort run and restart the simulator.
@@ -360,11 +376,21 @@ class DistillationRunner:
     retained in *all* replay partitions, so resumed records can never collide
     with the records the restarted simulator regenerates.
     """
+    if reset_provenance is None:
+      command = getattr(
+        getattr(self.collector.adapter, "env", None), "command_manager", None
+      )
+      get_term = getattr(command, "get_term", None)
+      motion = get_term("motion") if callable(get_term) else None
+      policy = getattr(motion, "reset_policy", None)
+      if getattr(policy, "enabled", False):
+        reset_provenance = reset_provenance_from_adapter(self.collector.adapter)
     state = load_cohort_checkpoint(
       path,
       self.trainer,
       self.replay,
       expected_cohort=cohort,
+      expected_reset_provenance=reset_provenance,
       collector=self.collector,
       map_location=map_location,
     )

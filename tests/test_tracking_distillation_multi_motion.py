@@ -12,13 +12,14 @@ import contextlib
 import io
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 import torch
 from tracking_distillation_fixtures import build_tiny_cohort, write_reference_clip
 
+from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 from mjlab.tasks.tracking.distillation.environment import (
   build_multi_motion_environment,
@@ -38,6 +39,7 @@ from mjlab.tasks.tracking.distillation.multi_motion import (
   plan_multi_motion,
   stratified_slot_allocation,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.mdp.commands import MotionCommandCfg
 from mjlab.utils.lab_api.string import resolve_matching_names
 
@@ -203,6 +205,7 @@ def make_command(
   phase_policy: PhasePolicy = "start",
   lookahead_s: float = 0.0,
   standing_start_prob: float = 0.0,
+  reset_policy: ResetPolicy | None = None,
   robot_bodies: tuple[str, ...] = ROBOT_BODIES,
   body_names: tuple[str, ...] = TRACKED_BODIES,
   anchor_body_name: str | None = None,
@@ -215,6 +218,7 @@ def make_command(
     resampling_time_range=(1.0e9, 1.0e9),
     sampling_mode=phase_policy,
     standing_start_prob=standing_start_prob,
+    reset_policy=reset_policy or ResetPolicy(),
     lookahead_s=lookahead_s,
     # Deterministic reset writes: no pose/velocity/joint perturbation, so the
     # written reference state can be compared exactly.
@@ -572,7 +576,7 @@ def test_reset_to_frame_is_clip_local(
 # Refusals and configuration contract.
 
 
-def test_unimplemented_policies_and_standing_start_are_refused(
+def test_unimplemented_policies_and_standing_override_contract(
   tmp_path: Path,
 ) -> None:
   library = make_library(tmp_path)
@@ -580,8 +584,8 @@ def test_unimplemented_policies_and_standing_start_are_refused(
   for policy in ("adaptive", "weighted"):
     with pytest.raises(MultiMotionError, match="multi-motion phase sampling supports"):
       make_command(library, slots, phase_policy=cast(PhasePolicy, policy))
-  with pytest.raises(MultiMotionError, match="standing-start initialization"):
-    make_command(library, slots, standing_start_prob=0.3)
+  command, _ = make_command(library, slots, standing_start_prob=0.3)
+  assert command.reset_policy.kind == "reference"
   with pytest.raises(MultiMotionError, match="compiled robot has 3"):
     make_command(library, slots, robot_bodies=ROBOT_BODIES[:3])
   with pytest.raises(MultiMotionError, match="slot allocation teachers"):
@@ -904,11 +908,50 @@ def test_factory_validates_before_constructing_an_environment(tiny_cohort) -> No
     build_multi_motion_environment(tiny_cohort, ("tiny_000",), num_envs=0)
   with pytest.raises(ValueError, match="seed"):
     build_multi_motion_environment(tiny_cohort, ("tiny_000",), num_envs=2, seed=True)
-  # The saved standing-start experiment is refused rather than silently disabled.
-  with pytest.raises(ValueError, match="standing_start_prob"):
+  # A registered standing-start YAML is data only; the private reset policy
+  # controls whether standing is enabled and records any source override.
+
+
+def test_factory_applies_private_reset_policy_to_registered_standing_task(
+  tiny_cohort, monkeypatch
+) -> None:
+  cfg = load_env_cfg(STANDING_START_TASK)
+  cast(Any, cfg.commands["motion"]).standing_start_prob = 0.3
+  monkeypatch.setattr("mjlab.tasks.registry.load_env_cfg", lambda task_id: cfg)
+
+  class _BuiltEnvironment:
+    def __init__(self, cfg, *, device, render_mode=None) -> None:
+      del device, render_mode
+      self.cfg = cfg
+
+  monkeypatch.setattr("mjlab.envs.ManagerBasedRlEnv", _BuiltEnvironment)
+  policy = ResetPolicy(
+    kind="standing-mixture",
+    standing_start_fraction=1.0,
+    standing_start_window_frames=7,
+    standing_start_frame_zero_fraction=1.0,
+  )
+  with pytest.raises(ValueError, match="validated ResetPolicy"):
     build_multi_motion_environment(
       tiny_cohort,
       ("tiny_000", "tiny_001"),
-      num_envs=2,
       task_id=STANDING_START_TASK,
+      num_envs=2,
+      reset_policy=cast(Any, object()),
     )
+
+  env = build_multi_motion_environment(
+    tiny_cohort,
+    ("tiny_000", "tiny_001"),
+    task_id=STANDING_START_TASK,
+    num_envs=2,
+    reset_policy=policy,
+  )
+  motion = cast(Any, env.cfg.commands["motion"])
+  env_cfg = cast(Any, env.cfg)
+  assert motion.standing_start_prob == 0.0
+  assert env_cfg._distillation_reset_policy is policy
+  assert any(
+    "standing_start_prob" in override
+    for override in env_cfg._distillation_semantic_overrides
+  )

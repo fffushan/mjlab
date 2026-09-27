@@ -38,6 +38,7 @@ from mjlab.tasks.tracking.distillation.checkpoint import (
 from mjlab.tasks.tracking.distillation.cohort_contract import (
   CohortContractError,
   CohortIdentity,
+  ResetProvenance,
   build_cohort_identity,
   cohort_identity_from_adapter,
   require_same_cohort,
@@ -61,6 +62,7 @@ from mjlab.tasks.tracking.distillation.observations import (
   ObservationSnapshot,
   pack_observations,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import make_reset_policy
 from mjlab.tasks.tracking.distillation.runner import DistillationRunner, RunnerConfig
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
@@ -248,6 +250,70 @@ def make_cohort_trainer(
   return trainer, identity
 
 
+def make_reset_provenance(plan: MultiMotionPlan) -> ResetProvenance:
+  return ResetProvenance(
+    reset_policy=make_reset_policy(
+      kind="standing-mixture",
+      standing_start_fraction=0.25,
+      standing_start_window_frames=25,
+      standing_start_frame_zero_fraction=0.5,
+    ),
+    effective_windows=tuple(min(25, clip.frames) for clip in plan.library.clips),
+    boundary_semantics={
+      "full_reset": "sample standing/reference once per affected row",
+      "timer_resample": "reference-state teleport; no standing mixture",
+      "reference_wrap": "reference-state teleport; no standing mixture",
+      "reset_to_frame": "explicit reference-state teleport; no standing mixture",
+    },
+    standing_pose={
+      "joint_position": [0.0] * ACTION_DIM,
+      "root_height": 0.9,
+      "yaw_alignment": "upright yaw from selected reference anchor quaternion",
+      "joint_order": [f"joint_{index}" for index in range(ACTION_DIM)],
+    },
+    perturbations={
+      "pose_range": [0.0] * 12,
+      "velocity_range": [0.0] * 12,
+      "joint_position_range": [-0.05, 0.05],
+    },
+    provenance={
+      "command_type": "FakeMultiMotionCommand",
+      "entity_name": "robot",
+      "standing_pose_source": "robot.data.default_joint_pos/default_root_state",
+      "yaw_source": "reference anchor quaternion",
+    },
+  )
+
+
+def make_v3_trainer(
+  schema: Any,
+  plan: MultiMotionPlan,
+  body_selection: BodySelection,
+  real_cohort: CohortContract,
+) -> tuple[VaeDistillationTrainer, CohortIdentity, FakeMultiAdapter, DAggerCollector]:
+  adapter = FakeMultiAdapter(real_cohort, plan, body_selection, schema)
+  replay = make_replay(schema, plan)
+  batch = make_batch(schema, plan)
+  batch = replace(
+    batch,
+    initialization_kind=torch.tensor([1, 2], dtype=torch.int64),
+    segment_initial_reference_frame=torch.zeros(2, dtype=torch.int64),
+    segment_age=torch.zeros(2, dtype=torch.int64),
+  )
+  replay.insert(batch)
+  torch.manual_seed(3)
+  model = ConditionalVAE(schema, ModelSettings(hidden_dims=(8, 8)))
+  trainer = VaeDistillationTrainer(
+    model,
+    replay,
+    TrainingConfig(accumulation_steps=1, minibatch_size=2),
+    seed=11,
+  )
+  collector = DAggerCollector(adapter, make_bank(), model, replay)
+  identity = make_identity(real_cohort, plan, replay, body_selection)
+  return trainer, identity, adapter, collector
+
+
 def make_architecture(obs_dim: int = OBS_WIDTH) -> ActorArchitecture:
   return ActorArchitecture(
     class_name="MLPModel",
@@ -278,6 +344,17 @@ def make_bank(seeds: tuple[int, ...] = (0, 5)) -> TeacherBank:
     ],
     device="cpu",
   )
+
+
+class FakeResetCommand:
+  def __init__(self) -> None:
+    self._generator = torch.Generator(device="cpu").manual_seed(41)
+
+  def reset_rng_state(self) -> torch.Tensor:
+    return self._generator.get_state().clone()
+
+  def set_reset_rng_state(self, state: torch.Tensor) -> None:
+    self._generator.set_state(state.clone())
 
 
 class FakeMultiAdapter:
@@ -314,7 +391,14 @@ class FakeMultiAdapter:
         applied_before_construction=True,
       ),
     )
-    self.env = SimpleNamespace(device=torch.device("cpu"), num_envs=rows)
+    self.reset_command = FakeResetCommand()
+    self.env = SimpleNamespace(
+      device=torch.device("cpu"),
+      num_envs=rows,
+      command_manager=SimpleNamespace(
+        get_term=lambda name: self.reset_command if name == "motion" else None
+      ),
+    )
     self.schema = schema
     self.rows = rows
     self.reset_calls = 0
@@ -919,6 +1003,97 @@ def test_cohort_checkpoint_round_trips_and_keeps_a_deterministic_next_update(
     trainer.model.parameters(), restored.model.parameters(), strict=True
   ):
     torch.testing.assert_close(left, right, atol=1e-7, rtol=1e-7)
+
+
+def test_enabled_standing_cohort_checkpoint_is_v3_and_round_trips_reset_state(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  trainer, identity, adapter, collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  provenance = make_reset_provenance(plan)
+  path = tmp_path / "standing-v3.pt"
+  before_reset = adapter.reset_command.reset_rng_state()
+  save_cohort_checkpoint(
+    path,
+    trainer,
+    trainer.replay,
+    cohort=identity,
+    reset_provenance=provenance,
+    collector=collector,
+  )
+  payload = torch.load(path, weights_only=True)
+  assert payload["version"] == 3
+  assert payload["reset_provenance"] == provenance.as_dict()
+  selected = load_cohort_member_inference(
+    path,
+    real_cohort,
+    "tennis_000",
+    reset_profile="standing-window",
+  )
+  assert selected.reset_provenance == provenance
+  assert selected.evaluation_reset_profile == "standing-window"
+
+  restored, restored_identity, restored_adapter, restored_collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  restored_adapter.reset_command.set_reset_rng_state(torch.Generator().get_state())
+  state = load_cohort_checkpoint(
+    path,
+    restored,
+    restored.replay,
+    expected_cohort=restored_identity,
+    expected_reset_provenance=provenance,
+    collector=restored_collector,
+  )
+  assert state.reset_provenance == provenance
+  assert torch.equal(restored_adapter.reset_command.reset_rng_state(), before_reset)
+
+
+def test_v3_standing_policy_mismatch_and_v2_migration_refuse_without_mutation(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  trainer, identity, _adapter, collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  provenance = make_reset_provenance(plan)
+  path = tmp_path / "standing-v3.pt"
+  save_cohort_checkpoint(
+    path,
+    trainer,
+    trainer.replay,
+    cohort=identity,
+    reset_provenance=provenance,
+    collector=collector,
+  )
+  before = capture_state(trainer, trainer.replay, collector)
+  changed = replace(
+    provenance,
+    reset_policy=make_reset_policy(
+      kind="standing-mixture", standing_start_fraction=0.5
+    ),
+  )
+  with pytest.raises(CheckpointValidationError, match="policy/version/provenance"):
+    load_cohort_checkpoint(
+      path,
+      trainer,
+      trainer.replay,
+      expected_cohort=identity,
+      expected_reset_provenance=changed,
+      collector=collector,
+    )
+  assert_state_unchanged(trainer, trainer.replay, collector, before)
+
+  with pytest.raises(CheckpointValidationError, match="expected reset provenance"):
+    load_cohort_checkpoint(path, trainer, trainer.replay, expected_cohort=identity)
 
 
 def test_version_one_and_version_two_loaders_refuse_each_other(

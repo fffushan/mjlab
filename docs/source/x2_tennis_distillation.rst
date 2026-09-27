@@ -26,6 +26,10 @@ do not claim policy quality, production training, hardware readiness,
 diffusion, or multi-motion deployment qualification. Single-teacher defaults and
 version-1 artifacts are preserved unchanged.
 
+A standing-start extension is documented below. It is opt-in on the cohort path;
+ordinary M3/M4 reference-start behavior remains the default and is not inferred from
+saved teacher configuration.
+
 M3 bounded lifecycle usage
 ---------------------------
 
@@ -315,6 +319,175 @@ never converted into each other, and each loader names the loader that fits.
 Periodic checkpointing (default every 500 completed iterations) and flushed
 ``[progress]`` stderr lines (default every 10 iterations) behave exactly as in
 M3, and stdout remains the machine-readable JSON report.
+
+Standing-start distillation (opt-in)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Real deployment engages the robot from its standing pose. Reference-frame-only
+initialization never presents the student with the transition from that pose into
+a selected tennis motion, so it cannot train or validate that transition. The
+standing-start extension adds that collection and student-evaluation surface
+without changing the VAE architecture, observation features, objective,
+normalizers, teacher/student mixing schedule, or 50 Hz control timing.
+
+Training reset policy
+~~~~~~~~~~~~~~~~~~~~~
+
+The extension is selected explicitly on the shared cohort path. The following is
+the exact singleton-cohort spelling; the comma is required because the shared
+Tyro configuration parses ``--teacher-ids`` as a Python literal tuple:
+
+.. code-block:: bash
+
+   uv run distill train --manifest configs/distillation/x2_tennis.yaml \\
+     --repo-root . --teacher-ids "('tennis_000',)" \\
+     --reset-policy standing-mixture \\
+     --standing-start-fraction 0.25 \\
+     --standing-start-window-frames 25 \\
+     --standing-start-frame-zero-fraction 0.5 \\
+     --num-envs 4 --device cpu --max-iterations 4 \\
+     --collection-steps 8 --bootstrap-steps 8 --minibatch-size 32 \\
+     --replay-capacity 256 --seed 7 --output-dir logs/distillation/standing-smoke
+
+The training options and their CLI defaults are:
+
+* ``--reset-policy reference`` (the default), which preserves the reference-only
+  reset path and its RNG consumption exactly;
+* ``--standing-start-fraction 0.25``;
+* ``--standing-start-window-frames 25``; and
+* ``--standing-start-frame-zero-fraction 0.5``.
+
+The latter three are **proposed starting hyperparameters, not tuned values**.
+Their defaults have no standing effect while ``--reset-policy reference`` is in
+use. Enabling standing resets on the singular M3 path is refused; use the
+singleton tuple above (and omit ``--teacher-id``). With no new options, the
+legacy reset sampling, checkpoint format, and evaluation behavior remain
+unchanged.
+
+For each row undergoing an eligible full environment reset, the enabled policy
+first chooses standing with probability ``standing_start_fraction``. A reference
+row samples uniformly over its whole assigned clip and uses the reference pose.
+A standing row uses the robot's default standing joints and height, reference
+root ``x/y`` at the selected frame, upright yaw from that frame's reference
+anchor quaternion, and zero velocities before the existing reset perturbations
+and joint clipping are applied. It does not prepend standing frames, interpolate
+poses, hold phase, or add assistance. Initial resets, termination/timeout resets,
+resumed simulator resets, and explicit full row resets are eligible; timer
+resamples, natural reference wraps, and ``reset_to_frame`` remain reference-state
+teleports and do not manufacture standing starts.
+
+For a clip with ``F_i`` frames, the effective standing window is
+``W_i = min(standing_start_window_frames, F_i)``. The non-frame-zero standing
+branch samples uniformly from local frames ``0`` through ``W_i - 1``; frame zero
+is therefore included in that branch. If ``a`` is
+``standing_start_frame_zero_fraction``, the realized frame-zero probability
+conditional on a standing reset is
+``a + (1 - a) / W_i``, not ``a`` alone. With the defaults this is
+``0.5 + 0.5 / W_i`` (and it is 1.0 for a one-frame clip). Reports retain the
+realized per-clip reset/frame-zero counts. The configured standing fraction is
+a fraction of eligible full resets, not a fraction of replay rows or gradient
+updates.
+
+Teacher qualification remains a manual, standalone user activity. This pipeline
+uses the selected frozen teachers to label the actual student-visited states,
+but it does not run a teacher transition rollout, impose a success threshold,
+create a teacher-quality certificate, retrain a teacher, or gate training on
+teacher competence.
+
+Standing student evaluation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Standing profiles are student-only checks. They do not qualify teachers, and
+``--reset-profile`` is rejected for ``--mode teacher`` and ``--mode both``.
+The profile option is available on both ``evaluate`` and ``evaluate-cohort``;
+when it is present, omit ``--sampling-mode``. The exact command forms are:
+
+.. code-block:: bash
+
+   uv run distill evaluate --manifest configs/distillation/x2_tennis.yaml \\
+     --repo-root . --teacher-id tennis_000 \\
+     --checkpoint <version-3-standing-checkpoint> --mode student \\
+     --reset-profile standing-start --steps 512 --seed 7
+
+   uv run distill evaluate-cohort \\
+     --manifest configs/distillation/x2_tennis.yaml --repo-root . \\
+     --teacher-ids "('tennis_000','tennis_001')" \\
+     --checkpoint <version-3-standing-checkpoint> --mode student \\
+     --reset-profile standing-window --steps 512 --seed 7 \\
+     --report /tmp/standing-window.json
+
+The four checked student profiles are:
+
+.. list-table:: Student reset profiles
+   :header-rows: 1
+
+   * - Profile
+     - Physical initialization
+     - Reference frame selection
+     - CLI spelling
+   * - Reference-start
+     - Reference pose
+     - Frame 0
+     - no profile; ``--sampling-mode start``
+   * - Reference-uniform
+     - Reference pose
+     - Uniform over the whole clip
+     - no profile; ``--sampling-mode uniform``
+   * - Standing-start
+     - Standing pose
+     - Frame 0
+     - ``--reset-profile standing-start``
+   * - Standing-window
+     - Standing pose
+     - Uniform over frames ``0 .. min(25, F_i)-1``
+     - ``--reset-profile standing-window``
+
+The standing window is a reset-selection window, not a convergence guarantee,
+grace period, or step cap. Each trial starts with a full environment reset and is
+attributed to the segment initialized there. A later reference wrap or timer
+teleport is not another standing trial. Reports retain initial frame/pose
+provenance, reset perturbations, raw segment and outcome counts, and tracking and
+action metrics. ``reference_complete`` and ``failure`` are the known-outcome
+denominator for completion/failure rates. Timeouts, timer resamples, reference
+teleports, explicit resets, and step caps are censored outcomes and remain in
+separate counts; they are not silently treated as completion or failure. Thus a
+completion rate over completed-or-failed segments is not a rate over every
+initiated trial. Normalizers are frozen and evaluation creates no replay or
+optimizer state.
+
+Standing checkpoint compatibility
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reference-only M4 checkpoints stay version 2; enabled standing runs write
+version-3 cohort checkpoints containing the reset policy, effective per-clip
+windows, standing pose and perturbation provenance, reset RNG, and provenance-v1
+replay metadata. The compatibility matrix is:
+
+.. list-table:: Standing-start checkpoint compatibility
+   :header-rows: 1
+
+   * - Input
+     - Required behavior
+   * - Version-1 legacy training, inference, or export
+     - Unchanged.
+   * - Version-2 reference-only M4 resume or inference
+     - Unchanged; no standing semantics are inferred.
+   * - Version-2 resume with standing enabled
+     - Reject strict resume with a policy/version error; start a new
+       version-3 run. There is no v2-to-v3 resume migration.
+   * - Version-3 same-policy resume
+     - Restore the durable reset/replay/model state and reset RNG, then
+       explicitly restart the simulator with a new segment namespace.
+   * - Version-3 changed policy, window, fractions, pose, or perturbations
+     - Reject before partial restore.
+   * - Version-3 checked member inference
+     - Preserve trained reset provenance and allow an explicit evaluation-only profile.
+   * - Version-2 or version-3 cohort export
+     - Explicitly unsupported; version-1 single-teacher export remains unchanged.
+
+A standing checkpoint is not evidence of transition competence. This is
+simulation-only implementation and evaluation work: it makes no policy-quality,
+convergence, sim2sim, hardware-readiness, or deployment claim.
 
 Limitations
 ^^^^^^^^^^^

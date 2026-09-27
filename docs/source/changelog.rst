@@ -8,6 +8,27 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added opt-in standing-start distillation for the shared cohort path. Real
+  deployment engages from standing, whereas reference-frame-only initialization
+  never trains or validates that transition. ``distill train`` accepts
+  ``--reset-policy standing-mixture`` with configurable
+  ``--standing-start-fraction`` (default ``0.25``),
+  ``--standing-start-window-frames`` (default ``25``), and
+  ``--standing-start-frame-zero-fraction`` (default ``0.5``); the reference
+  policy remains the exact default. A singleton cohort uses the Python-literal
+  spelling ``--teacher-ids "('tennis_000',)"``. Standing resets use a
+  clip-local ``min(25, F_i)`` window and report the realized frame-zero rate
+  ``a + (1-a)/W_i`` rather than treating ``a`` as that rate. Fractions are
+  proposed starting hyperparameters, not tuned values. Teacher qualification is
+  deliberately a manual standalone activity and is not a pipeline gate.
+  Student-only ``standing-start`` and ``standing-window`` evaluation profiles
+  retain explicit censoring and completed-or-failed denominators. Enabled runs
+  use version-3 cohort checkpoints; version-2 reference-only runs remain
+  unchanged, cannot be resumed with standing enabled, and version-2/version-3
+  cohort export remains unsupported. This work is simulation-only and makes no
+  policy-quality, sim2sim, or hardware claim. See
+  ``docs/source/x2_tennis_distillation.rst``.
+
 - Added the M4 shared multi-teacher distillation cohort. ``distill train
   --teacher-ids "('tennis_000','tennis_001')"`` trains **one shared conditional
   VAE** over both 50 Hz tennis clips in **one** vectorized simulator: rows keep
@@ -286,6 +307,15 @@ Added
 
 Changed
 ^^^^^^^
+
+- ``distill train`` now exposes standing-start options without changing the
+  legacy reference-only default. Standing options require the cohort path,
+  including the singleton tuple form, and their resolved reset provenance is
+  persisted only in version-3 standing cohort checkpoints. ``distill evaluate``
+  and ``distill evaluate-cohort`` accept the student-only
+  ``--reset-profile standing-start|standing-window`` profiles; explicit
+  ``--sampling-mode`` is not combined with these profiles. Teacher and both-mode
+  transition evaluations remain intentionally unsupported.
 
 - ``distill train --teacher-id`` now defaults to ``None`` so the plural
   ``--teacher-ids`` selection can be unambiguously distinguished from it. The

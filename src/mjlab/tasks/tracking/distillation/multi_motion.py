@@ -18,8 +18,8 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import torch
@@ -34,7 +34,17 @@ from mjlab.tasks.tracking.distillation.motion_library import (
   MotionClipSpec,
   MotionLibrary,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import (
+  ResetPolicy,
+  sample_reset_policy,
+)
 from mjlab.tasks.tracking.mdp.commands import MotionCommandCfg, MotionLoader
+from mjlab.utils.lab_api.math import (
+  quat_from_euler_xyz,
+  quat_mul,
+  sample_uniform,
+  yaw_quat,
+)
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
@@ -278,7 +288,10 @@ def plan_multi_motion(
 
 
 def make_multi_motion_cfg(
-  cfg: MotionCommandCfg, plan: MultiMotionPlan
+  cfg: MotionCommandCfg,
+  plan: MultiMotionPlan,
+  *,
+  reset_policy: ResetPolicy | None = None,
 ) -> MultiMotionCommandCfg:
   """Copy a trusted registered motion config into the opt-in multi config.
 
@@ -295,6 +308,7 @@ def make_multi_motion_cfg(
     **values,
     library=plan.library,
     slots=plan.slots,
+    reset_policy=reset_policy or ResetPolicy(),
   )
 
 
@@ -307,6 +321,9 @@ class MultiMotionCommandCfg(SegmentMotionCommandCfg):
 
   slots: MotionSlotAllocation
   """Pinned per-row clip assignment and its requested weights."""
+
+  reset_policy: ResetPolicy = field(default_factory=ResetPolicy)
+  """Distillation-owned policy for full environment reset initialization."""
 
   def build(self, env: ManagerBasedRlEnv) -> MultiMotionCommand:
     return MultiMotionCommand(self, env)
@@ -413,6 +430,10 @@ class MultiMotionCommand(SegmentMotionCommand):
     self._ghost_model = None
     self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
     self._pending_forward = False
+    self._pending_reset_frame_ids = torch.empty(0, dtype=torch.long, device=self.device)
+    self._reset_generator = torch.Generator(device="cpu")
+    seed = getattr(getattr(env, "cfg", None), "seed", None)
+    self._reset_generator.manual_seed(0 if seed is None else int(seed))
     self._init_boundary_bookkeeping()
 
   # Public row metadata.
@@ -565,12 +586,116 @@ class MultiMotionCommand(SegmentMotionCommand):
       "weighted phase sampling is refused for multi-motion; use 'uniform' or 'start'"
     )
 
-  def _select_standing_start_envs(self, env_ids: torch.Tensor) -> torch.Tensor:
-    """Return an all-False mask: mixed slots never insert the standing pose.
+  @property
+  def reset_policy(self) -> ResetPolicy:
+    """Resolved policy used only for full environment reset rows."""
+    return cast(MultiMotionCommandCfg, self.cfg).reset_policy
 
-    ``standing_start_prob`` must be zero for a multi-motion build, so no row is
-    initialized from the entity default pose.
+  def reset_rng_state(self) -> torch.Tensor:
+    """Return the owned CPU reset RNG state for lifecycle persistence."""
+    return self._reset_generator.get_state().clone()
+
+  def set_reset_rng_state(self, state: torch.Tensor) -> None:
+    """Restore a previously captured owned CPU reset RNG state."""
+    if not isinstance(state, torch.Tensor) or state.device.type != "cpu":
+      raise MultiMotionError("reset RNG state must be a CPU tensor")
+    if state.dtype != torch.uint8 or state.ndim != 1:
+      raise MultiMotionError("reset RNG state must be a one-dimensional uint8 tensor")
+    try:
+      self._reset_generator.set_state(state.detach().clone())
+    except RuntimeError as exc:
+      raise MultiMotionError("invalid reset RNG state") from exc
+
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    """Apply standing mixture only to full reset rows.
+
+    Timer resamples and natural wraps deliberately delegate to the inherited
+    reference teleport path.  The disabled policy delegates every full reset
+    too, preserving its reference sampler and RNG consumption exactly.
     """
+    reset_ids = env_ids[torch.isin(env_ids, self._reset_resample_ids)]
+    if not self.reset_policy.enabled or reset_ids.numel() == 0:
+      super()._resample_command(env_ids)
+      return
+    other_ids = env_ids[~torch.isin(env_ids, reset_ids)]
+    if other_ids.numel():
+      super()._resample_command(other_ids)
+    self._record_event(reset_ids, "reset")
+    self._mark_boundary(reset_ids)
+    self._resample_full_reset_command(reset_ids)
+
+  def _resample_full_reset_command(self, env_ids: torch.Tensor) -> None:
+    """Sample and write one standing/reference decision per full-reset row."""
+    sample = sample_reset_policy(
+      self.reset_policy,
+      self.row_lengths[env_ids].detach().cpu(),
+      self._reset_generator,
+    )
+    frames = sample.frame.to(device=self.device)
+    standing_mask = sample.kind.to(device=self.device)
+    self.time_steps[env_ids] = frames
+    self._pending_reset_frame_ids = env_ids.detach().clone()
+    self.metrics["standing_start"][env_ids] = standing_mask.to(torch.float32)
+
+    root_pos = self.body_pos_w[env_ids, 0].clone()
+    root_ori = self.body_quat_w[env_ids, 0].clone()
+    root_lin_vel = self.body_lin_vel_w[env_ids, 0].clone()
+    root_ang_vel = self.body_ang_vel_w[env_ids, 0].clone()
+    joint_pos = self.joint_pos[env_ids].clone()
+    joint_vel = self.joint_vel[env_ids].clone()
+
+    if bool(standing_mask.any()):
+      default_root_z = (
+        self.robot.data.default_root_state[env_ids, 2]
+        + self._env.scene.env_origins[env_ids, 2]
+      )
+      default_joint_pos = self.robot.data.default_joint_pos[env_ids]
+      root_pos[standing_mask, 2] = default_root_z[standing_mask]
+      root_ori[standing_mask] = yaw_quat(self.anchor_quat_w[env_ids][standing_mask])
+      root_lin_vel[standing_mask] = 0.0
+      root_ang_vel[standing_mask] = 0.0
+      joint_pos[standing_mask] = default_joint_pos[standing_mask]
+      joint_vel[standing_mask] = 0.0
+
+    range_list = [
+      self.cfg.pose_range.get(key, (0.0, 0.0))
+      for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+    ]
+    ranges = torch.tensor(range_list, device=self.device)
+    rand_samples = sample_uniform(
+      ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
+    )
+    root_pos += rand_samples[:, 0:3]
+    root_ori = quat_mul(
+      quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]),
+      root_ori,
+    )
+    range_list = [
+      self.cfg.velocity_range.get(key, (0.0, 0.0))
+      for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+    ]
+    ranges = torch.tensor(range_list, device=self.device)
+    rand_samples = sample_uniform(
+      ranges[:, 0],
+      ranges[:, 1],
+      (len(env_ids), 6),
+      device=self.device,
+    )
+    root_lin_vel += rand_samples[:, :3]
+    root_ang_vel += rand_samples[:, 3:]
+    joint_pos += sample_uniform(
+      lower=self.cfg.joint_position_range[0],
+      upper=self.cfg.joint_position_range[1],
+      size=joint_pos.shape,
+      device=joint_pos.device,  # type: ignore[arg-type]
+    )
+    self._write_reference_state_to_sim(
+      env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel
+    )
+    self._pending_forward = True
+
+  def _select_standing_start_envs(self, env_ids: torch.Tensor) -> torch.Tensor:
+    """Disable the inherited PPO eligibility hook for every command path."""
     self.metrics["standing_start"][env_ids] = 0.0
     return torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
 
@@ -580,14 +705,14 @@ class MultiMotionCommand(SegmentMotionCommand):
       candidate = torch.arange(self.num_envs, device=self.device)
     else:
       candidate = env_ids
-    self._wrap_resample_ids = candidate[
-      self.time_steps[candidate] + 1 >= self.row_lengths[candidate]
+    pending = candidate[torch.isin(candidate, self._pending_reset_frame_ids)]
+    advance = candidate[~torch.isin(candidate, pending)]
+    self._wrap_resample_ids = advance[
+      self.time_steps[advance] + 1 >= self.row_lengths[advance]
     ]
     try:
-      if env_ids is None:
-        self.time_steps += 1
-      else:
-        self.time_steps[env_ids] += 1
+      if advance.numel():
+        self.time_steps[advance] += 1
       wrap_ids = torch.where(self.time_steps >= self.row_lengths)[0]
       if wrap_ids.numel() > 0:
         self._resample_command(wrap_ids)
@@ -600,6 +725,9 @@ class MultiMotionCommand(SegmentMotionCommand):
         self._env.sim.forward()
       self.update_relative_body_poses()
     finally:
+      self._pending_reset_frame_ids = torch.empty(
+        0, dtype=torch.long, device=self.device
+      )
       self._wrap_resample_ids = torch.empty(0, dtype=torch.long, device=self.device)
 
   def reset_to_frame(self, env_ids: torch.Tensor, frame: int) -> None:
@@ -629,15 +757,14 @@ class MultiMotionCommand(SegmentMotionCommand):
       raise MultiMotionError("multi-motion config needs a MotionLibrary")
     if not isinstance(cfg.slots, MotionSlotAllocation):
       raise MultiMotionError("multi-motion config needs a MotionSlotAllocation")
+    if not isinstance(cfg.reset_policy, ResetPolicy):
+      raise MultiMotionError(
+        "multi-motion reset_policy must be a validated ResetPolicy"
+      )
     if cfg.sampling_mode not in _PHASE_POLICIES:
       raise MultiMotionError(
         f"multi-motion phase sampling supports {list(_PHASE_POLICIES)}, got "
         f"{cfg.sampling_mode!r}"
-      )
-    if cfg.standing_start_prob != 0.0:
-      raise MultiMotionError(
-        "standing-start initialization is not implemented for mixed clip slots; "
-        f"build with standing_start_prob=0.0, got {cfg.standing_start_prob!r}"
       )
     library_teachers = tuple(clip.teacher_id for clip in cfg.library.clips)
     if library_teachers != cfg.slots.teacher_ids:

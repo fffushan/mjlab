@@ -34,10 +34,18 @@ from mjlab.tasks.tracking.distillation.multi_motion import (
   MotionSlotAllocation,
   PhasePolicy,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import (
+  ResetPolicy,
+  ResetPolicyError,
+  effective_windows,
+)
 from mjlab.tasks.tracking.distillation.storage import ReplayBufferProtocol
 
 COHORT_CONTRACT_VERSION = 1
 """Schema version of the persisted cohort identity."""
+
+RESET_PROVENANCE_VERSION = 3
+"""Checkpoint contract version for enabled standing-start provenance."""
 
 COHORT_ARTIFACT_ROLES = ("checkpoint", "motion", "env_config", "agent_config", "onnx")
 """Manifest artifact roles every cohort member must record a digest for."""
@@ -144,6 +152,174 @@ def _require_float_tuple(value: object, where: str) -> tuple[float, ...]:
     raise CohortContractError(f"{where} must be a list of numbers")
   return tuple(
     _require_float(item, f"{where}[{index}]") for index, item in enumerate(value)
+  )
+
+
+def _plain_reset_record(value: object, where: str = "reset record") -> dict[str, Any]:
+  """Copy nested JSON-like metadata while rejecting executable values."""
+  if not isinstance(value, Mapping):
+    raise CohortContractError(f"{where} must be a mapping")
+  result: dict[str, Any] = {}
+  for key, item in value.items():
+    if not isinstance(key, str):
+      raise CohortContractError(f"{where} keys must be strings")
+    if isinstance(item, Mapping):
+      result[key] = _plain_reset_record(item, f"{where}.{key}")
+    elif isinstance(item, (list, tuple)):
+      result[key] = [
+        _plain_reset_record(part, f"{where}.{key}")
+        if isinstance(part, Mapping)
+        else part
+        for part in item
+      ]
+    elif item is None or isinstance(item, (str, int, float, bool)):
+      if isinstance(item, float) and not math.isfinite(item):
+        raise CohortContractError(f"{where}.{key} must be finite")
+      result[key] = item
+    else:
+      raise CohortContractError(f"{where}.{key} contains unsupported {type(item)!r}")
+  return result
+
+
+@dataclass(frozen=True, slots=True)
+class ResetProvenance:
+  """Canonical resolved standing-reset contract persisted by v3 checkpoints."""
+
+  reset_policy: ResetPolicy
+  effective_windows: tuple[int, ...]
+  boundary_semantics: dict[str, str]
+  standing_pose: dict[str, Any]
+  perturbations: dict[str, Any]
+  provenance: dict[str, str]
+  replay_layout: str = "provenance-v1"
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.reset_policy, ResetPolicy) or not self.reset_policy.enabled:
+      raise CohortContractError(
+        "v3 reset provenance requires an enabled standing-mixture ResetPolicy"
+      )
+    if any(
+      isinstance(value, bool) or not isinstance(value, int) or value <= 0
+      for value in self.effective_windows
+    ):
+      raise CohortContractError("effective reset windows must be positive integers")
+    if self.replay_layout != "provenance-v1":
+      raise CohortContractError(
+        "standing reset checkpoints require the provenance-v1 replay layout"
+      )
+    _plain_reset_record(self.standing_pose, "standing_pose")
+    _plain_reset_record(self.perturbations, "perturbations")
+    _plain_reset_record(self.as_dict(), "reset_provenance")
+
+  @property
+  def version(self) -> int:
+    return RESET_PROVENANCE_VERSION
+
+  def as_dict(self) -> dict[str, Any]:
+    return {
+      "version": RESET_PROVENANCE_VERSION,
+      "reset_policy": self.reset_policy.as_dict(),
+      "effective_windows": list(self.effective_windows),
+      "boundary_semantics": dict(self.boundary_semantics),
+      "standing_pose": dict(self.standing_pose),
+      "perturbations": dict(self.perturbations),
+      "provenance": dict(self.provenance),
+      "replay_layout": self.replay_layout,
+    }
+
+  def digest(self) -> str:
+    return hashlib.sha256(canonical_json(self.as_dict()).encode("utf-8")).hexdigest()
+
+  @classmethod
+  def from_dict(
+    cls, payload: object, where: str = "reset_provenance"
+  ) -> "ResetProvenance":
+    raw = _require_keys(
+      payload,
+      (
+        "version",
+        "reset_policy",
+        "effective_windows",
+        "boundary_semantics",
+        "standing_pose",
+        "perturbations",
+        "provenance",
+        "replay_layout",
+      ),
+      where,
+    )
+    version = _require_int(raw["version"], f"{where}.version", minimum=1)
+    if version != RESET_PROVENANCE_VERSION:
+      raise CohortContractError(
+        f"{where} version {version} is not supported; expected {RESET_PROVENANCE_VERSION}"
+      )
+    try:
+      policy = ResetPolicy.from_dict(raw["reset_policy"])
+    except ResetPolicyError as exc:
+      raise CohortContractError(f"{where}.reset_policy is invalid: {exc}") from exc
+    return cls(
+      policy,
+      _require_int_tuple(
+        raw["effective_windows"], f"{where}.effective_windows", minimum=1
+      ),
+      _require_str_mapping(raw["boundary_semantics"], f"{where}.boundary_semantics"),
+      _plain_reset_record(raw["standing_pose"], f"{where}.standing_pose"),
+      _plain_reset_record(raw["perturbations"], f"{where}.perturbations"),
+      _require_str_mapping(raw["provenance"], f"{where}.provenance"),
+      _require_str(raw["replay_layout"], f"{where}.replay_layout"),
+    )
+
+
+def reset_provenance_from_adapter(adapter: Any) -> ResetProvenance:
+  """Resolve the command's standing contract into canonical plain data."""
+  command = adapter.env.command_manager.get_term("motion")
+  policy = getattr(command, "reset_policy", None)
+  if not isinstance(policy, ResetPolicy) or not policy.enabled:
+    raise CohortContractError(
+      "the adapted command does not have enabled standing resets"
+    )
+  lengths = tuple(int(clip.frames) for clip in command.library.clips)
+  windows = tuple(int(value) for value in effective_windows(policy, lengths).tolist())
+  cfg = command.cfg
+  robot = command.robot
+  default_joints = robot.data.default_joint_pos[0].detach().cpu().flatten().tolist()
+  default_height = float(robot.data.default_root_state[0, 2].detach().cpu().item())
+
+  def _ranges(name: str) -> list[float]:
+    value = getattr(cfg, name)
+    if isinstance(value, Mapping):
+      keys = ("x", "y", "z", "roll", "pitch", "yaw")
+      return [float(item) for key in keys for item in value.get(key, (0.0, 0.0))]
+    return [float(item) for item in value]
+
+  return ResetProvenance(
+    reset_policy=policy,
+    effective_windows=windows,
+    boundary_semantics={
+      "full_reset": "sample standing/reference once per affected row",
+      "timer_resample": "reference-state teleport; no standing mixture",
+      "reference_wrap": "reference-state teleport; no standing mixture",
+      "reset_to_frame": "explicit reference-state teleport; no standing mixture",
+    },
+    standing_pose={
+      "joint_position": [float(item) for item in default_joints],
+      "root_height": default_height,
+      "yaw_alignment": "upright yaw from selected reference anchor quaternion",
+      "joint_order": list(
+        getattr(cfg, "joint_names", getattr(robot.data, "joint_names", ()))
+      ),
+    },
+    perturbations={
+      "pose_range": _ranges("pose_range"),
+      "velocity_range": _ranges("velocity_range"),
+      "joint_position_range": [float(item) for item in cfg.joint_position_range],
+    },
+    provenance={
+      "command_type": type(command).__qualname__,
+      "entity_name": str(getattr(cfg, "entity_name", "")),
+      "standing_pose_source": "robot.data.default_joint_pos/default_root_state",
+      "yaw_source": "reference anchor quaternion",
+    },
   )
 
 
@@ -1211,7 +1387,8 @@ __all__ = [
   "COHORT_ARTIFACT_ROLES",
   "COHORT_CONTRACT_VERSION",
   "FIFO_REPLAY_KIND",
-  "PHASE_POLICIES",
+  "RESET_PROVENANCE_VERSION",
+  "ResetProvenance",
   "CohortCommon",
   "CohortContractError",
   "CohortIdentity",
@@ -1222,7 +1399,7 @@ __all__ = [
   "build_cohort_identity",
   "canonical_json",
   "cohort_identity_from_adapter",
-  "require_member_matches",
+  "reset_provenance_from_adapter",
   "require_same_cohort",
   "require_same_replay_policy",
 ]

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.mdp.commands import MotionCommand, MotionCommandCfg
 
 if TYPE_CHECKING:
@@ -441,6 +442,7 @@ def build_multi_motion_environment(
   device: str = "cpu",
   render_mode: str | None = None,
   seed: int | None = None,
+  reset_policy: ResetPolicy | None = None,
 ) -> ManagerBasedRlEnv:
   """Build one environment whose rows are pinned to different reference clips.
 
@@ -467,6 +469,10 @@ def build_multi_motion_environment(
     plan_multi_motion,
   )
 
+  if reset_policy is None:
+    reset_policy = ResetPolicy()
+  if not isinstance(reset_policy, ResetPolicy):
+    raise ValueError("reset_policy must be a validated ResetPolicy")
   if phase_policy not in ("uniform", "start"):
     raise ValueError(f"phase_policy must be 'uniform' or 'start', got {phase_policy!r}")
   selected_task = task_id or cohort.manifest.base_task
@@ -485,11 +491,9 @@ def build_multi_motion_environment(
     raise ValueError(f"registered task {selected_task!r} has no motion command")
   if isinstance(motion_cfg, MultiMotionCommandCfg):
     raise ValueError("registered task already declares a multi-motion command")
-  if motion_cfg.standing_start_prob != 0.0:
-    raise ValueError(
-      "multi-motion build requires standing_start_prob == 0.0; the registered "
-      f"task sets {motion_cfg.standing_start_prob!r}"
-    )
+  standing_override = motion_cfg.standing_start_prob
+  if standing_override != 0.0:
+    motion_cfg.standing_start_prob = 0.0
 
   slot_generator = (
     None if validated_seed is None else torch.Generator().manual_seed(validated_seed)
@@ -513,10 +517,18 @@ def build_multi_motion_environment(
       "private multi-motion config: commands.motion.sampling_mode: "
       f"{motion_cfg.sampling_mode!r} -> {plan.phase_policy!r}"
     )
-  cfg.commands["motion"] = make_multi_motion_cfg(motion_cfg, plan)
+  if standing_override != 0.0:
+    semantic_overrides.append(
+      "private reset policy override: commands.motion.standing_start_prob: "
+      f"{standing_override!r} -> 0.0"
+    )
+  cfg.commands["motion"] = make_multi_motion_cfg(
+    motion_cfg, plan, reset_policy=reset_policy
+  )
 
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=render_mode)
   env.cfg.__dict__["_distillation_semantic_overrides"] = tuple(semantic_overrides)
+  env.cfg.__dict__["_distillation_reset_policy"] = reset_policy
   env.cfg.__dict__["_distillation_seed_provenance"] = RuntimeSeedProvenance(
     requested_seed=validated_seed,
     effective_seed=env.cfg.seed,

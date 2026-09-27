@@ -27,6 +27,7 @@ import tyro
 
 import mjlab
 from mjlab.tasks.tracking.distillation.adapter import (
+  InitializationKind,
   MultiMotionDistillationAdapter,
   make_distillation_adapter,
   make_multi_teacher_distillation_adapter,
@@ -35,6 +36,7 @@ from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuf
 from mjlab.tasks.tracking.distillation.checkpoint import (
   CHECKPOINT_VERSION,
   COHORT_CHECKPOINT_VERSION,
+  STANDING_COHORT_CHECKPOINT_VERSION,
   CheckpointValidationError,
   CohortLifecycleState,
   CohortMemberInference,
@@ -80,6 +82,11 @@ from mjlab.tasks.tracking.distillation.playback import (
   DistillationPlayPolicy,
   discover_distillation_checkpoints,
 )
+from mjlab.tasks.tracking.distillation.reset_policy import (
+  ResetPolicy,
+  ResetPolicyKind,
+  make_reset_policy,
+)
 from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
   RunnerConfig,
@@ -100,6 +107,22 @@ _COMMANDS = (
   "export",
 )
 SamplingMode = Literal["start", "uniform"]
+ResetProfile = Literal["standing-start", "standing-window"]
+ResetPerturbations = Literal["configured", "clean"]
+"""Reset-perturbation handling for a standing evaluation profile.
+
+``configured`` keeps the task's own pose/velocity/joint-position randomization,
+which is what training sees.  ``clean`` zeroes those reset ranges so the
+standing entry is measured without startup randomization.  Neither choice
+disables sensor noise, observation delay, actuator randomization, or domain
+randomization events: those are properties of the task, not of the reset.
+"""
+_STANDING_EVALUATION_WINDOW_FRAMES = 25
+"""Early-window frames for the standing evaluation profiles.
+
+Matches :data:`MotionCommandCfg.standing_start_window_frames`, so a standing
+profile asks about the same transition window the training mixture targets.
+"""
 CohortEvaluationMode = Literal["teacher", "student", "both"]
 ReportBoundaries = Literal["summary", "full"]
 PlayViewer = Literal["viser", "native", "auto"]
@@ -250,12 +273,24 @@ def _checkpoint_version(path: Path) -> int | None:
   version = payload.get("version")
   if isinstance(version, bool) or not isinstance(version, int):
     return None
-  return version if version in (CHECKPOINT_VERSION, COHORT_CHECKPOINT_VERSION) else None
+  return (
+    version
+    if version
+    in (
+      CHECKPOINT_VERSION,
+      COHORT_CHECKPOINT_VERSION,
+      STANDING_COHORT_CHECKPOINT_VERSION,
+    )
+    else None
+  )
 
 
 def _is_cohort_checkpoint(path: Path) -> bool:
   """True when the checkpoint is a version-2 multi-teacher cohort artifact."""
-  return _checkpoint_version(Path(path)) == COHORT_CHECKPOINT_VERSION
+  return _checkpoint_version(Path(path)) in (
+    COHORT_CHECKPOINT_VERSION,
+    STANDING_COHORT_CHECKPOINT_VERSION,
+  )
 
 
 def _load_member_inference(
@@ -265,6 +300,7 @@ def _load_member_inference(
   *,
   device: str,
   expected_schema=None,
+  reset_profile: str | None = None,
 ):
   """Load one checked member of a saved M4 cohort for inference only.
 
@@ -280,6 +316,7 @@ def _load_member_inference(
     teacher_id,
     device=device,
     expected_schema=expected_schema,
+    reset_profile=reset_profile,
   )
 
 
@@ -329,6 +366,95 @@ def _control_metadata(cohort, teacher_id: str) -> dict:
     "motion": str(selected.entry.motion),
     "task": cohort.manifest.base_task,
   }
+
+
+def _reset_policy(
+  *,
+  reset_policy: ResetPolicyKind,
+  standing_start_fraction: float,
+  standing_start_window_frames: int,
+  standing_start_frame_zero_fraction: float,
+) -> ResetPolicy:
+  """Validate standing options before resolving artifacts or building a scene."""
+  return make_reset_policy(
+    kind=reset_policy,
+    standing_start_fraction=standing_start_fraction,
+    standing_start_window_frames=standing_start_window_frames,
+    standing_start_frame_zero_fraction=standing_start_frame_zero_fraction,
+  )
+
+
+def _reset_options_requested(policy: ResetPolicy) -> bool:
+  """Whether CLI values opt into new reset semantics."""
+  return policy != ResetPolicy()
+
+
+def _evaluation_reset_policy(profile: ResetProfile, window_frames: int) -> ResetPolicy:
+  """Build the singleton standing profile through the training reset contract."""
+  return _reset_policy(
+    reset_policy="standing-mixture",
+    standing_start_fraction=1.0,
+    standing_start_window_frames=window_frames,
+    standing_start_frame_zero_fraction=1.0 if profile == "standing-start" else 0.0,
+  )
+
+
+def _apply_reset_perturbations(live: Any, mode: ResetPerturbations) -> None:
+  """Apply the reset-perturbation choice to one private live command config.
+
+  ``clean`` zeroes the reset pose, velocity, and joint-position ranges.  It
+  changes only the private evaluation copy of the command; the saved task and
+  the teacher's own configuration are untouched, and the standing branch it
+  measures is otherwise identical.  A private zeroed range is written as a
+  zero-width range rather than by deleting the key, so the config keeps the
+  same keys the audit compares.
+  """
+  if mode == "configured":
+    return
+  cfg = live.cfg
+  cfg.pose_range = {axis: (0.0, 0.0) for axis in cfg.pose_range}
+  if not cfg.pose_range:
+    cfg.pose_range = {axis: (0.0, 0.0) for axis in ("x", "y", "z", "roll", "pitch")}
+  cfg.velocity_range = {axis: (0.0, 0.0) for axis in cfg.velocity_range}
+  cfg.joint_position_range = (0.0, 0.0)
+
+
+def _reset_provenance_report(live: Any, mode: ResetPerturbations) -> dict[str, Any]:
+  """Report the resolved reset perturbations of one live standing command.
+
+  Read from the live command after the choice was applied, so the report states
+  what the rollout actually used.  ``clean`` is reported only when every reset
+  range is exactly zero; a partially zeroed range would otherwise read as a
+  clean start when it is not.
+  """
+  cfg = live.cfg
+  pose_range = {
+    axis: [float(bounds[0]), float(bounds[1])]
+    for axis, bounds in cfg.pose_range.items()
+  }
+  velocity_range = {
+    axis: [float(bounds[0]), float(bounds[1])]
+    for axis, bounds in cfg.velocity_range.items()
+  }
+  joint_range = [
+    float(cfg.joint_position_range[0]),
+    float(cfg.joint_position_range[1]),
+  ]
+  all_ranges = [*pose_range.values(), *velocity_range.values(), joint_range]
+  return {
+    "mode": mode,
+    "clean": all(bounds[0] == 0.0 and bounds[1] == 0.0 for bounds in all_ranges),
+    "pose_range": pose_range,
+    "velocity_range": velocity_range,
+    "joint_position_range": joint_range,
+    "scope": (
+      "reset initialization only; sensor noise, observation delay, actuator "
+      "randomization and domain randomization events are unchanged"
+    ),
+  }
+
+
+_REFERENCE_RESET_POLICY = ResetPolicy()
 
 
 def _seed_audit(adapter) -> dict[str, Any]:
@@ -646,6 +772,7 @@ def _build_cohort_runner(
   evaluate_every: int,
   evaluation_steps: int,
   rollout_latent: RolloutLatent,
+  reset_policy: ResetPolicy,
 ):
   """Build the M4 shared-student cohort run: one adapter, bank, and replay.
 
@@ -701,6 +828,7 @@ def _build_cohort_runner(
     num_envs=num_envs,
     device=device,
     seed=seed,
+    reset_policy=reset_policy,
   )
   try:
     # Model initialization only: environment startup randomization is seeded by
@@ -776,6 +904,11 @@ def _cohort_resolved_config(
     "cohort_digest": identity.digest(),
     "mapping_digest": identity.mapping_digest,
     "phase_policy": identity.slots.phase_policy,
+    "reset_policy": getattr(
+      adapter.env.command_manager.get_term("motion"),
+      "reset_policy",
+      ResetPolicy(),
+    ).as_dict(),
     "task": adapter.cohort.manifest.base_task,
     "task_id": task_id,
     "runtime": {
@@ -1021,6 +1154,7 @@ def _train_single(
   checkpoint_every: int = 500,
   progress_every: int = 10,
   report_boundaries: ReportBoundaries = "summary",
+  reset_policy: ResetPolicy = _REFERENCE_RESET_POLICY,
   output_dir: Path | None = None,
   resume: Path | None = None,
 ) -> int:
@@ -1171,6 +1305,7 @@ def _train_cohort(
   report_boundaries: ReportBoundaries,
   output_dir: Path | None,
   resume: Path | None,
+  reset_policy: ResetPolicy,
 ) -> int:
   """Run the bounded shared-student M4 cohort collect/update lifecycle.
 
@@ -1210,6 +1345,7 @@ def _train_cohort(
       evaluate_every=evaluate_every,
       evaluation_steps=evaluation_steps,
       rollout_latent=rollout_latent,
+      reset_policy=reset_policy,
     )
     seed_audit = _seed_audit(adapter)
     _require_requested_seed_applied(seed, seed_audit)
@@ -1342,6 +1478,10 @@ def _train(
   checkpoint_every: int = 500,
   progress_every: int = 10,
   report_boundaries: ReportBoundaries = "summary",
+  reset_policy: ResetPolicyKind = "reference",
+  standing_start_fraction: float = 0.25,
+  standing_start_window_frames: int = 25,
+  standing_start_frame_zero_fraction: float = 0.5,
   output_dir: Path | None = None,
   resume: Path | None = None,
 ) -> int:
@@ -1394,12 +1534,28 @@ def _train(
   ``full`` writes those arrays as before, which is roughly 2 MB per iteration
   at 4096 environments, so it is a debugging option, not the default.
   """
+  try:
+    resolved_reset_policy = _reset_policy(
+      reset_policy=reset_policy,
+      standing_start_fraction=standing_start_fraction,
+      standing_start_window_frames=standing_start_window_frames,
+      standing_start_frame_zero_fraction=standing_start_frame_zero_fraction,
+    )
+  except ValueError as exc:
+    return _fail(exc)
   if teacher_ids and teacher_id is not None:
     return _fail(
       ValueError(
         "--teacher-id and --teacher-ids are mutually exclusive: pass exactly one "
         f"selection (got teacher_id={teacher_id!r} and "
         f"teacher_ids={list(teacher_ids)!r})"
+      )
+    )
+  if not teacher_ids and _reset_options_requested(resolved_reset_policy):
+    return _fail(
+      ValueError(
+        "standing reset options require the cohort path; use singleton cohort "
+        "syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
       )
     )
   if teacher_ids:
@@ -1429,6 +1585,7 @@ def _train(
       report_boundaries=report_boundaries,
       output_dir=output_dir,
       resume=resume,
+      reset_policy=resolved_reset_policy,
     )
   return _train_single(
     manifest=manifest,
@@ -1485,6 +1642,8 @@ def _evaluate(
   steps: int = 512,
   seed: int = 0,
   sampling_mode: SamplingMode = "start",
+  reset_profile: ResetProfile | None = None,
+  reset_perturbations: ResetPerturbations = "configured",
   rollout_latent: RolloutLatent = "mean",
   report: Path | None = None,
 ) -> int:
@@ -1515,8 +1674,32 @@ def _evaluate(
       raise ValueError("sampling_mode must be 'start' or 'uniform'")
     if mode not in ("teacher", "student"):
       raise ValueError("mode must be 'teacher' or 'student'")
+    if reset_profile is not None:
+      if mode != "student":
+        raise ValueError(
+          "standing reset profiles are available only for --mode student"
+        )
+      if sampling_mode != "start":
+        raise ValueError(
+          "--reset-profile conflicts with explicit --sampling-mode; omit the phase "
+          "option when selecting a standing profile"
+        )
+    elif reset_perturbations != "configured":
+      raise ValueError(
+        "--reset-perturbations applies only to a standing --reset-profile; "
+        "omit it or select a profile"
+      )
     if mode == "student" and checkpoint is None:
       raise ValueError("student evaluation requires --checkpoint")
+    if (
+      reset_profile is not None
+      and checkpoint is not None
+      and _checkpoint_version(checkpoint) != STANDING_COHORT_CHECKPOINT_VERSION
+    ):
+      raise DistillationError(
+        "--reset-profile requires a version-3 standing cohort checkpoint; "
+        "legacy version-1 inference does not carry checked cohort provenance"
+      )
     cohort = _resolve(manifest, repo_root)
     member = None
     if mode == "student":
@@ -1524,15 +1707,35 @@ def _evaluate(
       if _is_cohort_checkpoint(checkpoint):
         # A v2 member is loaded before the simulator because its saved schema is
         # what the live packing must be built from.
-        member = _load_member_inference(checkpoint, cohort, teacher_id, device=device)
-    adapter = make_distillation_adapter(
-      cohort,
-      teacher_id,
-      task_id=task_id,
-      num_envs=num_envs,
-      device=device,
-      schema=None if member is None else member.schema,
-      seed=seed,
+        member = _load_member_inference(
+          checkpoint, cohort, teacher_id, device=device, reset_profile=reset_profile
+        )
+    adapter = (
+      make_multi_teacher_distillation_adapter(
+        cohort,
+        (teacher_id,),
+        phase_policy="start",
+        task_id=task_id,
+        num_envs=num_envs,
+        device=device,
+        schema=None if member is None else member.schema,
+        seed=seed,
+        reset_policy=_evaluation_reset_policy(
+          reset_profile, _STANDING_EVALUATION_WINDOW_FRAMES
+        )
+        if reset_profile is not None
+        else None,
+      )
+      if reset_profile is not None
+      else make_distillation_adapter(
+        cohort,
+        teacher_id,
+        task_id=task_id,
+        num_envs=num_envs,
+        device=device,
+        schema=None if member is None else member.schema,
+        seed=seed,
+      )
     )
     seed_audit = _seed_audit(adapter)
     _require_requested_seed_applied(seed, seed_audit)
@@ -1540,6 +1743,10 @@ def _evaluate(
     # validate_live_contract has already checked the saved semantic contract.
     motion = adapter.env.command_manager.get_term("motion")
     motion.cfg.sampling_mode = sampling_mode
+    if reset_profile is not None:
+      # Applied before the first reset, so every reset in this rollout uses the
+      # selected perturbation mode rather than only the later ones.
+      _apply_reset_perturbations(motion, reset_perturbations)
     student = None
     inference = None
     if mode == "student":
@@ -1559,15 +1766,20 @@ def _evaluate(
         else member
       )
       student = inference.model
+    teacher_source = getattr(adapter, "teacher", getattr(adapter, "bank", None))
+    if teacher_source is None:
+      raise DistillationError("evaluation adapter exposes no teacher bank")
     result = evaluate_distillation(
       adapter,
-      adapter.teacher,
+      teacher_source,
       student,
       mode=mode,
       steps=steps,
       rollout_latent=rollout_latent,
       seed=seed,
       control_period_s=cohort.control.control_period_s,
+      standing_trials=reset_profile is not None,
+      trial_window_steps=_STANDING_EVALUATION_WINDOW_FRAMES,
     )
     if member is not None:
       # The pinned adapter has local ID zero. Expose the saved cohort identity
@@ -1585,6 +1797,15 @@ def _evaluate(
       "status": "evaluation",
       "mode": mode,
       "sampling_mode": sampling_mode,
+      "reset_profile": reset_profile,
+      "reset_window_frames": (
+        None if reset_profile is None else _STANDING_EVALUATION_WINDOW_FRAMES
+      ),
+      "reset_perturbations": (
+        None
+        if reset_profile is None
+        else _reset_provenance_report(motion, reset_perturbations)
+      ),
       "checkpoint": None if checkpoint is None else str(checkpoint),
       "checkpoint_version": (
         None if checkpoint is None else _checkpoint_version(checkpoint)
@@ -1695,6 +1916,67 @@ def _combine_outcomes(
   }
 
 
+def _trial_provenance_summary(result: EvaluationResult) -> dict[str, Any] | None:
+  """Bounded per-motion provenance for the trials one evaluation produced.
+
+  A cohort report otherwise keeps only aggregates, so a reader could not see
+  which initialization kind and which initial reference frame the trials
+  actually used.  This reports counts only - never per-segment arrays - and
+  returns ``None`` for a reference profile, whose reports stay unchanged.
+  """
+  if result.trial_window_steps is None:
+    return None
+  per_motion: dict[str, dict[str, Any]] = {}
+  for segment in result.segments:
+    if segment.motion_id is None or not segment.is_trial:
+      continue
+    entry = per_motion.setdefault(
+      str(segment.motion_id),
+      {
+        "trials": 0,
+        "initialization_kind_counts": {},
+        "initial_reference_frame_counts": {},
+        "start_reason_counts": {},
+        "continuation_segments": 0,
+      },
+    )
+    entry["trials"] += 1
+    kind = (
+      "unreported"
+      if segment.initialization_kind is None
+      else InitializationKind(segment.initialization_kind).name.lower()
+    )
+    entry["initialization_kind_counts"][kind] = (
+      entry["initialization_kind_counts"].get(kind, 0) + 1
+    )
+    frame = (
+      "unreported"
+      if segment.segment_initial_reference_frame is None
+      else str(segment.segment_initial_reference_frame)
+    )
+    entry["initial_reference_frame_counts"][frame] = (
+      entry["initial_reference_frame_counts"].get(frame, 0) + 1
+    )
+    reason = segment.start_reason or "unavailable"
+    entry["start_reason_counts"][reason] = (
+      entry["start_reason_counts"].get(reason, 0) + 1
+    )
+  for segment in result.segments:
+    if segment.motion_id is None or segment.is_trial:
+      continue
+    entry = per_motion.get(str(segment.motion_id))
+    if entry is not None:
+      entry["continuation_segments"] += 1
+  return {
+    "trial_window_steps": result.trial_window_steps,
+    "per_motion": per_motion,
+    "note": (
+      "counts only; a continuation segment is a reference-wrap or timer teleport "
+      "inside a trial and never a new trial"
+    ),
+  }
+
+
 def _cohort_mode_report(result: EvaluationResult) -> dict[str, Any]:
   """One bounded per-mode result: total metrics plus per-motion aggregates.
 
@@ -1714,6 +1996,7 @@ def _cohort_mode_report(result: EvaluationResult) -> dict[str, Any]:
     "metrics": dict(result.metrics),
     "segments": len(result.segments),
     "per_motion": [item.as_dict() for item in stats],
+    "trial_provenance": _trial_provenance_summary(result),
     "per_motion_censoring": {
       str(item.motion_id): {
         "segments": item.segments,
@@ -1755,6 +2038,17 @@ def _rekey_mode_report(
   entry["motion_id"] = motion_id
   entry["teacher_code"] = teacher_code
   report["settings"] = {**report.get("settings", {}), "motion_ids": [motion_id]}
+  # The trial provenance map is built from the pinned environment's own local
+  # ids, so it needs the same rewrite: leaving it keyed by a local id would
+  # attribute this member's trials to whichever member holds that local id.
+  provenance = report.get("trial_provenance")
+  if isinstance(provenance, dict):
+    per_motion = provenance.get("per_motion")
+    if isinstance(per_motion, dict) and local_key in per_motion:
+      report["trial_provenance"] = {
+        **provenance,
+        "per_motion": {str(motion_id): per_motion[local_key]},
+      }
   report["per_motion_censoring"] = {
     str(motion_id): {
       **censoring,
@@ -1777,6 +2071,8 @@ def _evaluate_cohort(
   steps: int = 512,
   seed: int = 0,
   sampling_mode: SamplingMode = "start",
+  reset_profile: ResetProfile | None = None,
+  reset_perturbations: ResetPerturbations = "configured",
   rollout_latent: RolloutLatent = "mean",
   report: Path | None = None,
 ) -> int:
@@ -1823,6 +2119,22 @@ def _evaluate_cohort(
       raise ValueError("sampling_mode must be 'start' or 'uniform'")
     if mode not in ("teacher", "student", "both"):
       raise ValueError("mode must be 'teacher', 'student', or 'both'")
+    if reset_profile is not None:
+      if mode != "student":
+        raise ValueError(
+          "standing reset profiles are available only for --mode student; "
+          "teacher/both transition evaluation is not scheduled"
+        )
+      if sampling_mode != "start":
+        raise ValueError(
+          "--reset-profile conflicts with explicit --sampling-mode; omit the "
+          "phase option when selecting a standing profile"
+        )
+    elif reset_perturbations != "configured":
+      raise ValueError(
+        "--reset-perturbations applies only to a standing --reset-profile; "
+        "omit it or select a profile"
+      )
     if mode in ("student", "both") and checkpoint is None:
       raise ValueError("student cohort evaluation requires --checkpoint")
     if num_envs <= 0:
@@ -1860,7 +2172,16 @@ def _evaluate_cohort(
           f"checkpoint; {checkpoint} is not one. Use 'distill evaluate' for a "
           "version-1 single-teacher checkpoint"
         )
-      member = _load_member_inference(checkpoint, cohort, selected[0], device=device)
+      if (
+        reset_profile is not None
+        and _checkpoint_version(checkpoint) != STANDING_COHORT_CHECKPOINT_VERSION
+      ):
+        raise DistillationError(
+          "--reset-profile requires a version-3 standing cohort checkpoint"
+        )
+      member = _load_member_inference(
+        checkpoint, cohort, selected[0], device=device, reset_profile=reset_profile
+      )
       if member.relocated_artifact_roles:
         print(
           "[INFO] accepted relocated inference artifacts by content digest: "
@@ -1920,14 +2241,30 @@ def _evaluate_cohort(
         try:
           # A fresh identically seeded adapter per mode: the next mode (and the
           # next motion) never inherits this rollout's simulator state.
-          adapter = make_distillation_adapter(
-            cohort,
-            teacher_id,
-            task_id=task_id,
-            num_envs=num_envs,
-            device=device,
-            schema=schema,
-            seed=seed,
+          adapter = (
+            make_multi_teacher_distillation_adapter(
+              cohort,
+              (teacher_id,),
+              phase_policy="start",
+              task_id=task_id,
+              num_envs=num_envs,
+              device=device,
+              schema=schema,
+              seed=seed,
+              reset_policy=_evaluation_reset_policy(
+                reset_profile, _STANDING_EVALUATION_WINDOW_FRAMES
+              ),
+            )
+            if reset_profile is not None
+            else make_distillation_adapter(
+              cohort,
+              teacher_id,
+              task_id=task_id,
+              num_envs=num_envs,
+              device=device,
+              schema=schema,
+              seed=seed,
+            )
           )
           seed_audit = _seed_audit(adapter)
           _require_requested_seed_applied(seed, seed_audit)
@@ -1946,15 +2283,28 @@ def _evaluate_cohort(
           entry["runtime"] = resolved_runtime
           live = adapter.env.command_manager.get_term("motion")
           live.cfg.sampling_mode = sampling_mode
+          if reset_profile is not None:
+            # One pinned environment per mode; the choice is applied before the
+            # first reset and reported from this pinned command copy afterwards,
+            # because each pinned adapter is its own private config copy.
+            _apply_reset_perturbations(live, reset_perturbations)
+            entry["reset_perturbations"] = _reset_provenance_report(
+              live, reset_perturbations
+            )
+          teacher_source = getattr(adapter, "teacher", getattr(adapter, "bank", None))
+          if teacher_source is None:
+            raise DistillationError("evaluation adapter exposes no teacher bank")
           result = evaluate_distillation(
             adapter,
-            adapter.teacher,
+            teacher_source,
             None if current == "teacher" else student,
             mode=current,
             steps=steps,
             rollout_latent=rollout_latent,
             seed=seed,
             control_period_s=cohort.control.control_period_s,
+            standing_trials=reset_profile is not None,
+            trial_window_steps=_STANDING_EVALUATION_WINDOW_FRAMES,
           )
           entry["reports"][current] = _rekey_mode_report(
             _cohort_mode_report(result),
@@ -2018,6 +2368,10 @@ def _evaluate_cohort(
       "status": "cohort_evaluation",
       "mode": mode,
       "sampling_mode": sampling_mode,
+      "reset_profile": reset_profile,
+      "reset_window_frames": (
+        None if reset_profile is None else _STANDING_EVALUATION_WINDOW_FRAMES
+      ),
       "checkpoint": None if checkpoint is None else str(checkpoint),
       "checkpoint_version": (
         None if checkpoint is None else _checkpoint_version(checkpoint)

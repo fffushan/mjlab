@@ -14,6 +14,7 @@ no optimizer, normalizer update, checkpoint, or CLI lifecycle.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
@@ -97,6 +98,7 @@ class CollectionConfig:
   seed: int = 0
   collector_iteration: int = 0
   rng_mode: RngMode = "per_call"
+  standing_window_frames: int = 25
 
   def __post_init__(self) -> None:
     if (
@@ -109,6 +111,12 @@ class CollectionConfig:
       raise ValueError("rollout_latent must be 'mean' or 'sampled'")
     if self.rng_mode not in ("per_call", "persistent"):
       raise ValueError("rng_mode must be 'per_call' or 'persistent'")
+    if (
+      not isinstance(self.standing_window_frames, int)
+      or isinstance(self.standing_window_frames, bool)
+      or self.standing_window_frames <= 0
+    ):
+      raise ValueError("standing_window_frames must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +173,8 @@ class MotionCollectionStats:
   reference_frames_observed: int
   reference_frame_min: int | None
   reference_frame_max: int | None
+  initialization_samples: dict[str, int] = field(default_factory=dict)
+  early_transition_samples: dict[str, int] = field(default_factory=dict)
 
   def as_dict(self) -> dict[str, Any]:
     """Plain-data form for run reports and per-motion CLI aggregation."""
@@ -181,6 +191,8 @@ class MotionCollectionStats:
       "reference_frames_observed": self.reference_frames_observed,
       "reference_frame_min": self.reference_frame_min,
       "reference_frame_max": self.reference_frame_max,
+      "initialization_samples": dict(self.initialization_samples),
+      "early_transition_samples": dict(self.early_transition_samples),
     }
 
 
@@ -204,6 +216,8 @@ class CollectionResult:
   diagnostics: tuple[str, ...] = ()
   fresh_data: FreshTrainingData | None = None
   motion_stats: tuple[MotionCollectionStats, ...] = ()
+  eligible_resets: dict[int, int] = field(default_factory=dict)
+  initialization_resets: dict[int, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +244,102 @@ class EvaluationSegment:
   """Motion id of the snapshot that started this segment, not the post-reset one."""
   teacher_code: int | None = None
   """Frozen-teacher code that labeled this segment's starting state."""
+  initialization_kind: int | None = None
+  segment_initial_reference_frame: int | None = None
+  segment_age: int = 0
+  """Steps executed in this segment at its final recorded sample.
+
+  Collection provenance counts steps since a segment began, so for a whole
+  segment record this equals ``steps``.  It is retained instead of dropped so a
+  reader can cross-check a segment against the sample-level provenance that
+  produced it, rather than inferring an age from a frame index.
+  """
+  is_trial: bool = False
+  """Whether this segment is a deployment-style trial.
+
+  Set only for standing-reset evaluation profiles, where a trial is a segment
+  that a full environment reset started (including each row's first segment).
+  A later reference-wrap teleport is a continuation of the same rollout and is
+  never a new trial.  Every other profile leaves this ``False`` and keeps the
+  existing every-segment accounting unchanged.
+  """
+  start_reason: str | None = None
+  """Boundary reason that started this segment, when the command reported one."""
+
+
+def _reason_is_full_reset(reason: str | None) -> bool:
+  """Return whether a command boundary reason is a full environment reset.
+
+  ``ReferenceBoundaryEvents.reasons`` joins several causes with ``+``, so the
+  tokens are compared individually.  Only the exact ``reset`` token is a
+  deployment start: ``timer_resampled``, ``reference_completed`` and
+  ``reset_to_frame`` are reference teleports that keep the rollout running.
+  """
+  if reason is None:
+    return False
+  return "reset" in reason.split("+")
+
+
+def standing_trial_buckets(
+  segments: Sequence[EvaluationSegment], window_steps: int
+) -> dict[str, int]:
+  """Partition standing trials into mutually exclusive early-window buckets.
+
+  Every trial lands in exactly one bucket, so the counts sum to ``trials`` and
+  no trial can be silently dropped or double counted:
+
+  * ``failures_within_window``: failed after at most ``window_steps`` steps.
+  * ``failures_after_window``: failed after more than ``window_steps`` steps.
+  * ``survived_window``: executed at least ``window_steps`` steps without
+    failing inside the window (including a later failure, timeout or step cap).
+  * ``short_clip_completions``: reached its reference end without failing in
+    fewer than ``window_steps`` steps, which a short clip makes unavoidable.
+  * ``censored``: ended before the window without failing or completing, for
+    example a timeout, step cap, teleport, or timer resample.
+
+  Trials are the segments a full reset started.  Continuation segments are not
+  trials and are counted separately by the caller.
+  """
+  if window_steps <= 0:
+    raise ValueError("window_steps must be positive")
+  trials = [segment for segment in segments if segment.is_trial]
+  counts = {
+    "trials": len(trials),
+    "window_steps": window_steps,
+    "failures_within_window": 0,
+    "failures_after_window": 0,
+    "survived_window": 0,
+    "short_clip_completions": 0,
+    "censored": 0,
+  }
+  for segment in trials:
+    steps = segment.steps
+    if segment.failed:
+      if steps <= window_steps:
+        counts["failures_within_window"] += 1
+      else:
+        counts["failures_after_window"] += 1
+    elif steps >= window_steps:
+      counts["survived_window"] += 1
+    elif segment.outcome == "reference_complete":
+      counts["short_clip_completions"] += 1
+    else:
+      counts["censored"] += 1
+  bucketed = sum(
+    counts[name]
+    for name in (
+      "failures_within_window",
+      "failures_after_window",
+      "survived_window",
+      "short_clip_completions",
+      "censored",
+    )
+  )
+  if bucketed != counts["trials"]:
+    raise ValueError(
+      f"standing trial buckets {bucketed} do not cover {counts['trials']} trials"
+    )
+  return counts
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,10 +361,14 @@ class MotionEvaluationStats:
   completion_known_segments: int
   completion_rate: float | None
   failure_rate: float | None
+  trial_counts: dict[str, int] | None = None
+  """Early-window buckets over this motion's trials, standing profiles only."""
+  continuation_segments: int | None = None
+  """Non-trial segments for this motion: reference-wrap/timer continuations."""
 
   def as_dict(self) -> dict[str, Any]:
     """Plain-data form for per-motion evaluation reports."""
-    return {
+    payload = {
       "motion_id": self.motion_id,
       "teacher_code": self.teacher_code,
       "segments": self.segments,
@@ -265,6 +379,13 @@ class MotionEvaluationStats:
       "completion_rate": self.completion_rate,
       "failure_rate": self.failure_rate,
     }
+    # Trial accounting is added only for standing profiles, so a reference
+    # report keeps exactly the fields it had before this contract existed.
+    if self.trial_counts is not None:
+      payload["trial_counts"] = dict(self.trial_counts)
+    if self.continuation_segments is not None:
+      payload["continuation_segments"] = self.continuation_segments
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +398,13 @@ class EvaluationResult:
   segments: tuple[EvaluationSegment, ...]
   metrics: dict[str, float]
   settings: dict[str, Any] = field(default_factory=dict)
+  trial_window_steps: int | None = None
+  """Standing-profile early-window length, or ``None`` for reference runs.
+
+  A value marks the run as a standing-reset profile: only segments a full reset
+  started are trials, and per-motion aggregates report the early-window buckets
+  over those trials plus the wrap/timer continuation segments separately.
+  """
 
   @property
   def per_motion(self) -> tuple[MotionEvaluationStats, ...]:
@@ -287,7 +415,11 @@ class EvaluationResult:
         continue
       grouped.setdefault(segment.motion_id, []).append(segment)
     return tuple(
-      _motion_evaluation_stats(motion_id, grouped[motion_id])
+      _motion_evaluation_stats(
+        motion_id,
+        grouped[motion_id],
+        trial_window_steps=self.trial_window_steps,
+      )
       for motion_id in sorted(grouped)
     )
 
@@ -368,6 +500,20 @@ def _concat_batches(batches: list[LabeledReplayBatch]) -> LabeledReplayBatch | N
     torch.cat([batch.conditioning for batch in batches], dim=0),
     schema,
   )
+  provenance = [batch.provenance() for batch in batches]
+  if any(value is not None for value in provenance) and not all(
+    value is not None for value in provenance
+  ):
+    raise ValueError("cannot concatenate legacy and provenance replay batches")
+  provenance_kwargs: dict[str, torch.Tensor] = {}
+  if provenance[0] is not None:
+    assert all(value is not None for value in provenance)
+    for index, name in enumerate(
+      ("initialization_kind", "segment_initial_reference_frame", "segment_age")
+    ):
+      provenance_kwargs[name] = torch.cat(
+        [value[index] for value in provenance if value is not None], dim=0
+      )
   return LabeledReplayBatch(
     observations=observations,
     teacher_action=torch.cat([batch.teacher_action for batch in batches], dim=0),
@@ -378,6 +524,7 @@ def _concat_batches(batches: list[LabeledReplayBatch]) -> LabeledReplayBatch | N
     collector_iteration=torch.cat(
       [batch.collector_iteration for batch in batches], dim=0
     ),
+    **provenance_kwargs,
   )
 
 
@@ -469,13 +616,36 @@ class _MotionRecord:
   frames: set[int] = field(default_factory=set)
   frame_min: int | None = None
   frame_max: int | None = None
+  initialization_samples: dict[str, int] = field(default_factory=dict)
+  early_transition_samples: dict[str, int] = field(default_factory=dict)
 
-  def observe_tick(self, frames: torch.Tensor) -> None:
+  def observe_tick(
+    self,
+    frames: torch.Tensor,
+    *,
+    initialization_kind: torch.Tensor | None = None,
+    segment_age: torch.Tensor | None = None,
+    early_window_frames: int = 25,
+  ) -> None:
     self.frames.update(int(value) for value in torch.unique(frames).tolist())
     lowest = int(frames.min().item())
     highest = int(frames.max().item())
     self.frame_min = lowest if self.frame_min is None else min(self.frame_min, lowest)
     self.frame_max = highest if self.frame_max is None else max(self.frame_max, highest)
+    if initialization_kind is not None:
+      names = {0: "unknown", 1: "reference", 2: "standing"}
+      for kind in torch.unique(initialization_kind).tolist():
+        label = names.get(int(kind), "unknown")
+        rows = initialization_kind == kind
+        count = int(rows.sum().item())
+        self.initialization_samples[label] = (
+          self.initialization_samples.get(label, 0) + count
+        )
+        if segment_age is not None:
+          early = rows & (segment_age < early_window_frames)
+          self.early_transition_samples[label] = self.early_transition_samples.get(
+            label, 0
+          ) + int(early.sum().item())
 
   def build(self, motion_id: int) -> MotionCollectionStats:
     return MotionCollectionStats(
@@ -495,6 +665,8 @@ class _MotionRecord:
       reference_frames_observed=len(self.frames),
       reference_frame_min=self.frame_min,
       reference_frame_max=self.frame_max,
+      initialization_samples=dict(self.initialization_samples),
+      early_transition_samples=dict(self.early_transition_samples),
     )
 
 
@@ -506,6 +678,7 @@ def _observe_motion_tick(
   teacher_rows: torch.Tensor,
   disagreement: torch.Tensor,
   bank: TeacherBank | None,
+  early_window_frames: int = 25,
 ) -> None:
   """Account one tick's rows under the motion their PRE-step snapshot named.
 
@@ -534,7 +707,16 @@ def _observe_motion_tick(
     record.student_steps += int((~teacher_rows[rows]).sum().item())
     record.disagreement_sum += float(disagreement[rows].sum().item())
     record.disagreement_rows += int(rows.sum().item())
-    record.observe_tick(reference_frame[rows])
+    record.observe_tick(
+      reference_frame[rows],
+      initialization_kind=(
+        None
+        if snapshot.initialization_kind is None
+        else snapshot.initialization_kind[rows]
+      ),
+      segment_age=None if snapshot.segment_age is None else snapshot.segment_age[rows],
+      early_window_frames=early_window_frames,
+    )
 
 
 def _observe_boundary(
@@ -708,6 +890,18 @@ def _replay_batch(
   def metadata(value: torch.Tensor) -> torch.Tensor:
     return value.detach().clone().to(dtype=torch.int64)
 
+  provenance = snapshot.initialization_kind
+  provenance_kwargs: dict[str, torch.Tensor] = {}
+  if provenance is not None:
+    assert snapshot.segment_initial_reference_frame is not None
+    assert snapshot.segment_age is not None
+    provenance_kwargs = {
+      "initialization_kind": metadata(provenance),
+      "segment_initial_reference_frame": metadata(
+        snapshot.segment_initial_reference_frame
+      ),
+      "segment_age": metadata(snapshot.segment_age),
+    }
   return LabeledReplayBatch(
     observations=snapshot.packed,
     teacher_action=teacher_action.detach().clone(),
@@ -718,6 +912,7 @@ def _replay_batch(
     collector_iteration=torch.full(
       (batch,), collector_iteration, dtype=torch.int64, device=teacher_action.device
     ),
+    **provenance_kwargs,
   )
 
 
@@ -813,7 +1008,13 @@ class DAggerCollector:
       diagnostics.append("explicit_reset")
     snapshot = self._snapshot
     assert snapshot is not None
+    if did_reset and snapshot.initialization_kind is not None:
+      diagnostics.append(
+        "standing reset fraction applies to eligible resets, not replay or gradient updates"
+      )
     ticks = samples = teacher_steps = student_steps = 0
+    eligible_resets: dict[int, int] = {}
+    initialization_resets: dict[int, dict[str, int]] = {}
     if did_reset:
       try:
         segment, generation = _ids(snapshot)
@@ -829,6 +1030,18 @@ class DAggerCollector:
             snapshot.motion_id, int(snapshot.teacher_code)
           )
         reset_codes = tuple(int(value) for value in reset_codes_tensor.tolist())
+        if snapshot.initialization_kind is not None:
+          for motion, kind in zip(
+            snapshot.motion_id.tolist(),
+            snapshot.initialization_kind.tolist(),
+            strict=True,
+          ):
+            label = {1: "reference", 2: "standing"}.get(int(kind), "unknown")
+            eligible_resets[int(motion)] = eligible_resets.get(int(motion), 0) + 1
+            counts = initialization_resets.setdefault(
+              int(motion), {"reference": 0, "standing": 0, "unknown": 0}
+            )
+            counts[label] += 1
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
@@ -904,6 +1117,7 @@ class DAggerCollector:
           teacher_rows=use_teacher,
           disagreement=row_disagreement,
           bank=self.bank,
+          early_window_frames=config.standing_window_frames,
         )
       except Exception as exc:
         self._invalidate_on_failure(exc)
@@ -956,6 +1170,8 @@ class DAggerCollector:
       tuple(diagnostics),
       fresh_data,
       _build_motion_stats(records),
+      eligible_resets,
+      initialization_resets,
     )
 
 
@@ -1132,6 +1348,8 @@ def evaluate_distillation(
   rollout_latent: RolloutLatent = "mean",
   seed: int = 0,
   control_period_s: float | None = None,
+  standing_trials: bool = False,
+  trial_window_steps: int = 25,
 ) -> EvaluationResult:
   """Run bounded evaluation with explicit per-segment censoring semantics.
 
@@ -1143,6 +1361,14 @@ def evaluate_distillation(
   producer attributes to a newer generation is a boundary recorded inside the
   step, not evidence about the pre-step segment.  Teleports/timer resamples and
   step caps are censored outcomes.
+
+  ``standing_trials`` selects the standing-profile accounting.  It marks as a
+  trial every segment a full environment reset started, including each row's
+  first segment, and reports the early-window failure/survival buckets over
+  those trials.  A later reference-wrap or timer teleport is a continuation of
+  the same rollout: it is still evaluated and counted, but it can never enter a
+  trial denominator.  The default keeps the pre-existing every-segment
+  accounting byte-identical for reference profiles.
   """
   _require_auto_reset(adapter)
   if mode not in ("teacher", "student"):
@@ -1153,6 +1379,10 @@ def evaluate_distillation(
     raise ValueError("rollout_latent must be 'mean' or 'sampled'")
   if mode == "student" and student is None:
     raise ValueError("student mode requires a student model")
+  if not isinstance(trial_window_steps, int) or isinstance(trial_window_steps, bool):
+    raise ValueError("trial_window_steps must be an integer")
+  if standing_trials and trial_window_steps <= 0:
+    raise ValueError("trial_window_steps must be positive for standing trials")
   period = _adapter_control_period(adapter, control_period_s)
   generator = torch.Generator(device="cpu").manual_seed(seed)
   was_training = None if student is None else student.training
@@ -1165,8 +1395,11 @@ def evaluate_distillation(
     outcomes: dict[tuple[int, int, int], str] = {}
     completion_availability: dict[tuple[int, int, int], bool | None] = {}
     completion_reasons: dict[tuple[int, int, int], str | None] = {}
+    rows_started: set[int] = set()
 
-    def start_segments(value: DistillationSnapshot) -> None:
+    def start_segments(
+      value: DistillationSnapshot, reasons: Mapping[int, str | None] | None = None
+    ) -> None:
       codes = _row_teacher_codes(value)
       for index in range(batch):
         key = (
@@ -1174,6 +1407,8 @@ def evaluate_distillation(
           int(value.segment_id[index].item()),
           int(value.generation_id[index].item()),
         )
+        reason = None if reasons is None else reasons.get(index)
+        first_for_row = index not in rows_started
         # Identity is recorded when the segment first appears, so a segment is
         # always attributed to the motion and teacher that started it, never to
         # the state a boundary resampled the row into.
@@ -1193,8 +1428,22 @@ def evaluate_distillation(
             "teacher_code": int(
               value.teacher_code if codes is None else codes[index].item()
             ),
+            "initialization_kind": (
+              None
+              if value.initialization_kind is None
+              else int(value.initialization_kind[index].item())
+            ),
+            "segment_initial_reference_frame": (
+              None
+              if value.segment_initial_reference_frame is None
+              else int(value.segment_initial_reference_frame[index].item())
+            ),
+            "start_reason": reason,
+            "is_trial": standing_trials
+            and (first_for_row or _reason_is_full_reset(reason)),
           },
         )
+        rows_started.add(index)
 
     start_segments(snapshot)
     total_steps = 0
@@ -1263,6 +1512,7 @@ def evaluate_distillation(
             record["metric_counts"][name] = record["metric_counts"].get(name, 0) + 1
       terminated = _as_bool_vector("terminated", step.terminated, batch)
       time_outs = _as_bool_vector("time_outs", step.time_outs, batch)
+      next_reasons: dict[int, str | None] = {}
       for index in range(batch):
         old_key = (
           index,
@@ -1277,6 +1527,10 @@ def evaluate_distillation(
         changed = old_key != new_key
         event = _event_at(step.events, index, batch)
         event_available = None if event is None else event.available
+        # Recorded for every row, so a segment that appears right after this
+        # step is classified by the boundary that actually started it instead
+        # of by a frame index.
+        next_reasons[index] = None if event is None else event.reason
         # A completion attributed to a newer generation belongs to a boundary
         # after the pre-step segment (a reset/timer resample whose freshly
         # sampled frame wrapped in the same step), so it cannot complete the
@@ -1302,7 +1556,7 @@ def evaluate_distillation(
           completion_availability.setdefault(old_key, completion_known)
           completion_reasons.setdefault(old_key, outcome_reason)
       snapshot = next_snapshot
-      start_segments(snapshot)
+      start_segments(next_snapshot, next_reasons)
       total_steps += 1
 
     for key, record in records.items():
@@ -1348,6 +1602,15 @@ def evaluate_distillation(
           completion_reasons.get((index, segment_id, generation_id)),
           record["motion_id"],
           record["teacher_code"],
+          record["initialization_kind"],
+          record["segment_initial_reference_frame"],
+          # Steps this segment executed at its final sample, which equals
+          # ``steps``; see ``EvaluationSegment.segment_age``.  It is not the
+          # collection-side "age since the segment began at this sample", and
+          # reporting a constant here would misdescribe the record.
+          count,
+          bool(record["is_trial"]),
+          record["start_reason"],
         )
       )
 
@@ -1399,6 +1662,34 @@ def evaluate_distillation(
       values = [item.metrics[name] for item in segments if name in item.metrics]
       if values:
         all_metrics[name] = sum(values) / len(values)
+    if standing_trials:
+      trials = standing_trial_buckets(segments, trial_window_steps)
+      all_metrics["trials"] = float(trials["trials"])
+      all_metrics["trial_window_steps"] = float(trials["window_steps"])
+      for name in (
+        "failures_within_window",
+        "failures_after_window",
+        "survived_window",
+        "short_clip_completions",
+        "censored",
+      ):
+        all_metrics[f"trial_{name}"] = float(trials[name])
+      trial_total = trials["trials"]
+      all_metrics["trial_failure_rate"] = (
+        (trials["failures_within_window"] + trials["failures_after_window"])
+        / trial_total
+        if trial_total
+        else 0.0
+      )
+      all_metrics["trial_failed_within_window_rate"] = (
+        trials["failures_within_window"] / trial_total if trial_total else 0.0
+      )
+      all_metrics["trial_survived_window_rate"] = (
+        trials["survived_window"] / trial_total if trial_total else 0.0
+      )
+      all_metrics["continuation_segments"] = float(
+        sum(not item.is_trial for item in segments)
+      )
     aligned_time = (
       snapshot.metrics.aligned_time if snapshot.metrics is not None else None
     )
@@ -1424,7 +1715,26 @@ def evaluate_distillation(
         "motion_ids": sorted(
           {item.motion_id for item in segments if item.motion_id is not None}
         ),
+        **(
+          {
+            # Stated in the artifact itself, because a 1/N trial survival
+            # rate is not a completion rate and a wrap is not a new trial.
+            "trial_semantics": (
+              "a trial is a segment a full environment reset started, including "
+              "each row's first segment; reference-wrap and timer teleports are "
+              "continuations reported separately and never enter a trial "
+              "denominator"
+            ),
+            "trial_window_steps": trial_window_steps,
+            "trial_buckets": (
+              "failure/survival buckets are mutually exclusive and sum to trials"
+            ),
+          }
+          if standing_trials
+          else {}
+        ),
       },
+      trial_window_steps if standing_trials else None,
     )
   finally:
     if student is not None and was_training is not None:
@@ -1432,9 +1742,18 @@ def evaluate_distillation(
 
 
 def _motion_evaluation_stats(
-  motion_id: int, segments: list[EvaluationSegment]
+  motion_id: int,
+  segments: list[EvaluationSegment],
+  *,
+  trial_window_steps: int | None = None,
 ) -> MotionEvaluationStats:
-  """Aggregate the segments that started in one motion."""
+  """Aggregate the segments that started in one motion.
+
+  With ``trial_window_steps`` set (a standing profile), the existing aggregate
+  still covers every segment, and the early-window buckets are computed over
+  this motion's trials only, with the non-trial continuation segments counted
+  separately.  Trial denominators never include a wrap/timer continuation.
+  """
   outcomes: dict[str, int] = {}
   totals: dict[str, float] = {}
   counts: dict[str, int] = {}
@@ -1449,6 +1768,11 @@ def _motion_evaluation_stats(
     if segment.outcome in ("reference_complete", "failure")
   ]
   codes = {segment.teacher_code for segment in segments}
+  trial_counts = (
+    None
+    if trial_window_steps is None
+    else standing_trial_buckets(segments, trial_window_steps)
+  )
   return MotionEvaluationStats(
     motion_id=motion_id,
     teacher_code=next(iter(codes)) if len(codes) == 1 else None,
@@ -1465,6 +1789,12 @@ def _motion_evaluation_stats(
     ),
     failure_rate=(
       None if not known else sum(segment.failed for segment in known) / len(known)
+    ),
+    trial_counts=trial_counts,
+    continuation_segments=(
+      None
+      if trial_counts is None
+      else sum(not segment.is_trial for segment in segments)
     ),
   )
 

@@ -18,10 +18,17 @@ import pytest
 import torch
 
 from mjlab.scripts import distill
-from mjlab.scripts.distill import _control_metadata, main
+from mjlab.scripts.distill import (
+  _apply_reset_perturbations,
+  _control_metadata,
+  _reset_provenance_report,
+  _trial_provenance_summary,
+  main,
+)
 from mjlab.tasks.tracking.distillation.adapter import (
   DistillationSnapshot,
   DistillationStep,
+  InitializationKind,
 )
 from mjlab.tasks.tracking.distillation.checkpoint import (
   CheckpointValidationError,
@@ -213,7 +220,25 @@ class _MultiAdapter:
         applied_before_construction=seed is not None,
       ),
     )
-    self.motion = SimpleNamespace(cfg=SimpleNamespace(sampling_mode=phase_policy))
+    self.motion = SimpleNamespace(
+      cfg=SimpleNamespace(
+        sampling_mode=phase_policy,
+        pose_range={
+          "x": (-0.025, 0.025),
+          "y": (-0.025, 0.025),
+          "z": (-0.005, 0.005),
+          "roll": (-0.05, 0.05),
+          "pitch": (-0.05, 0.05),
+          "yaw": (-0.1, 0.1),
+        },
+        velocity_range={
+          "x": (-0.25, 0.25),
+          "y": (-0.25, 0.25),
+          "z": (-0.1, 0.1),
+        },
+        joint_position_range=(-0.05, 0.05),
+      )
+    )
     self.env = SimpleNamespace(
       num_envs=num_envs,
       device=device,
@@ -634,7 +659,13 @@ def test_cohort_help_exposes_the_new_surfaces(
   code = invoke(monkeypatch, ["distill", "evaluate-cohort", "--help"])
   captured = capsys.readouterr()
   assert code == 0
-  for flag in ("--teacher-ids", "--mode", "--sampling-mode", "--checkpoint"):
+  for flag in (
+    "--teacher-ids",
+    "--mode",
+    "--sampling-mode",
+    "--checkpoint",
+    "--reset-profile",
+  ):
     assert flag in captured.out
   # Cohort evaluation is model-only: no trainer setting is advertised.
   for flag in ("--minibatch-size", "--accumulation-steps", "--replay-capacity"):
@@ -643,7 +674,30 @@ def test_cohort_help_exposes_the_new_surfaces(
   monkeypatch.setattr(sys, "argv", ["distill", "--help"])
   main()
   captured = capsys.readouterr()
-  assert "evaluate-cohort" in captured.out
+  # The top-level surface must keep naming every command, and must not have
+  # become a passthrough that prints nothing.
+  assert captured.out.startswith("usage: distill <COMMAND>")
+  for command in (
+    "validate-teachers",
+    "train",
+    "evaluate",
+    "evaluate-cohort",
+    "play",
+    "export",
+  ):
+    assert command in captured.out
+
+
+def test_legacy_train_rejects_standing_options_with_singleton_pointer(
+  monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  code = invoke(
+    monkeypatch,
+    ["distill", "train", "--reset-policy", "standing-mixture"],
+  )
+  captured = capsys.readouterr()
+  assert code == 1
+  assert "--teacher-ids \"('tennis_000',)\"" in captured.err
 
 
 def test_train_rejects_both_singular_and_plural_selection_before_construction(
@@ -1799,3 +1853,246 @@ def test_playback_hot_swap_dispatches_by_checkpoint_version(
   )
   with pytest.raises(CheckpointValidationError):
     foreign.load_checkpoint("checkpoint-iter-000003.pt")
+
+
+# Standing-profile reset provenance and trial accounting.
+#
+# These pin the two contract gaps an independent review found in the first
+# implementation: a standing profile must state the perturbations it actually
+# used, and its report must expose the trials' real initialization provenance
+# instead of only aggregate metrics.
+
+
+def _live_command() -> SimpleNamespace:
+  """A live command stand-in carrying the real reset ranges."""
+  return SimpleNamespace(
+    cfg=SimpleNamespace(
+      sampling_mode="start",
+      pose_range={"x": (-0.025, 0.025), "yaw": (-0.1, 0.1)},
+      velocity_range={"x": (-0.25, 0.25)},
+      joint_position_range=(-0.05, 0.05),
+    )
+  )
+
+
+def test_configured_reset_perturbations_are_reported_verbatim() -> None:
+  live = _live_command()
+
+  report = _reset_provenance_report(live, "configured")
+
+  assert report["mode"] == "configured"
+  assert report["clean"] is False
+  assert report["pose_range"]["x"] == [-0.025, 0.025]
+  assert report["joint_position_range"] == [-0.05, 0.05]
+  # Sensor noise and domain randomization are explicitly out of scope.
+  assert "reset initialization only" in report["scope"]
+
+
+def test_clean_reset_perturbations_zero_every_range_and_report_clean() -> None:
+  live = _live_command()
+
+  _apply_reset_perturbations(live, "clean")
+  report = _reset_provenance_report(live, "clean")
+
+  assert report["clean"] is True
+  assert report["pose_range"]["x"] == [0.0, 0.0]
+  assert report["velocity_range"]["x"] == [0.0, 0.0]
+  assert report["joint_position_range"] == [0.0, 0.0]
+  assert live.cfg.sampling_mode == "start"
+  # The keys survive zeroing, so the live contract keeps its shape.
+  assert set(report["pose_range"]) == {"x", "yaw"}
+
+
+def test_partially_zeroed_perturbations_are_not_reported_as_clean() -> None:
+  live = _live_command()
+  live.cfg.velocity_range = {"x": (-0.25, 0.25)}
+  live.cfg.pose_range = {"x": (0.0, 0.0), "yaw": (0.0, 0.0)}
+  live.cfg.joint_position_range = (0.0, 0.0)
+
+  report = _reset_provenance_report(live, "clean")
+
+  # One non-zero range is enough to refuse the clean claim.
+  assert report["clean"] is False
+
+
+def test_configured_perturbations_leave_the_command_unchanged() -> None:
+  live = _live_command()
+  before = dict(live.cfg.pose_range)
+
+  _apply_reset_perturbations(live, "configured")
+
+  assert live.cfg.pose_range == before
+  assert live.cfg.joint_position_range == (-0.05, 0.05)
+
+
+def _trial_segment(
+  *,
+  kind: int | None,
+  frame: int | None,
+  reason: str | None,
+  steps: int,
+  is_trial: bool,
+  failed: bool,
+) -> EvaluationSegment:
+  return EvaluationSegment(
+    env_index=0,
+    segment_id=0,
+    generation_id=0,
+    steps=steps,
+    completed=False,
+    failed=failed,
+    capped=False,
+    metrics={},
+    outcome="failure" if failed else "step_cap",
+    motion_id=3,
+    initialization_kind=kind,
+    segment_initial_reference_frame=frame,
+    is_trial=is_trial,
+    start_reason=reason,
+  )
+
+
+def test_trial_provenance_reports_counts_for_trials_only() -> None:
+  result = EvaluationResult(
+    mode="teacher",
+    rollout_latent="mean",
+    steps=8,
+    segments=(
+      _trial_segment(
+        kind=int(InitializationKind.STANDING),
+        frame=0,
+        reason="reset",
+        steps=8,
+        is_trial=True,
+        failed=False,
+      ),
+      _trial_segment(
+        kind=int(InitializationKind.STANDING),
+        frame=3,
+        reason="reset",
+        steps=2,
+        is_trial=True,
+        failed=True,
+      ),
+      _trial_segment(
+        kind=int(InitializationKind.REFERENCE),
+        frame=0,
+        reason="reference_completed",
+        steps=5,
+        is_trial=False,
+        failed=False,
+      ),
+    ),
+    metrics={},
+    settings={},
+    trial_window_steps=25,
+  )
+
+  summary = _trial_provenance_summary(result)
+
+  assert summary is not None
+  assert summary["trial_window_steps"] == 25
+  entry = summary["per_motion"]["3"]
+  assert entry["trials"] == 2
+  assert entry["continuation_segments"] == 1
+  assert entry["initialization_kind_counts"] == {"standing": 2}
+  assert entry["initial_reference_frame_counts"] == {"0": 1, "3": 1}
+  assert entry["start_reason_counts"] == {"reset": 2}
+  # The raw per-segment arrays are not copied into the report.
+  assert "segments" not in summary
+
+
+def test_trial_provenance_is_absent_for_a_reference_profile() -> None:
+  result = EvaluationResult(
+    mode="teacher",
+    rollout_latent="mean",
+    steps=4,
+    segments=(
+      _trial_segment(
+        kind=None,
+        frame=None,
+        reason=None,
+        steps=4,
+        is_trial=False,
+        failed=False,
+      ),
+    ),
+    metrics={},
+    settings={},
+  )
+
+  assert _trial_provenance_summary(result) is None
+
+
+def test_standing_perturbation_choice_requires_a_profile(
+  monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  code = invoke(
+    monkeypatch,
+    ["distill", "evaluate", "--reset-perturbations", "clean"],
+  )
+
+  assert code == 1
+  assert "--reset-perturbations applies only to a standing" in capsys.readouterr().err
+
+
+def test_cohort_standing_perturbation_choice_requires_a_profile(
+  monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  code = invoke(
+    monkeypatch,
+    [
+      "distill",
+      "evaluate-cohort",
+      "--mode",
+      "teacher",
+      "--reset-perturbations",
+      "clean",
+    ],
+  )
+
+  assert code == 1
+  assert "--reset-perturbations applies only to a standing" in capsys.readouterr().err
+
+
+def test_rekey_rewrites_trial_provenance_to_the_cohort_motion_id() -> None:
+  # A pinned environment always reports its own local clip 0.  The trial
+  # provenance map is built from those local ids, so a member holding local id 0
+  # would otherwise publish its trials under every other member's name.
+  report = {
+    "per_motion": [{"motion_id": 0, "teacher_code": 0, "segments": 2}],
+    "per_motion_censoring": {"0": {"segments": 2}},
+    "trial_provenance": {
+      "trial_window_steps": 25,
+      "per_motion": {
+        "0": {
+          "trials": 2,
+          "initialization_kind_counts": {"standing": 2},
+          "initial_reference_frame_counts": {"0": 2},
+          "start_reason_counts": {"reset": 2},
+          "continuation_segments": 1,
+        }
+      },
+    },
+  }
+
+  rekeyed = distill._rekey_mode_report(report, motion_id=1, teacher_code=1)
+
+  provenance = rekeyed["trial_provenance"]["per_motion"]
+  assert list(provenance) == ["1"]
+  assert provenance["1"]["trials"] == 2
+  assert provenance["1"]["continuation_segments"] == 1
+  assert rekeyed["per_motion"][0]["motion_id"] == 1
+
+
+def test_rekey_leaves_a_reference_report_without_provenance_alone() -> None:
+  report = {
+    "per_motion": [{"motion_id": 0, "teacher_code": 0, "segments": 1}],
+    "per_motion_censoring": {"0": {"segments": 1}},
+    "trial_provenance": None,
+  }
+
+  rekeyed = distill._rekey_mode_report(report, motion_id=4, teacher_code=4)
+
+  assert rekeyed["trial_provenance"] is None
+  assert rekeyed["per_motion"][0]["motion_id"] == 4

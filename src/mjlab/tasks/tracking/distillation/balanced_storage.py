@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -59,9 +59,11 @@ class ReplayNotReadyError(ReplayValidationError):
   """A requested draw cannot cover every selected motion yet."""
 
 
-def _storage_layout(schema: VaeSchema) -> tuple[tuple[str, int], ...]:
+def _storage_layout(
+  schema: VaeSchema, provenance_enabled: bool = False
+) -> tuple[tuple[str, int], ...]:
   """Ordered ``(field, row width)`` pairs; width ``0`` marks a 1-D field."""
-  return (
+  layout = (
     ("reference", schema.reference_dim),
     ("conditioning", schema.conditioning_dim),
     ("teacher_action", schema.action_dim),
@@ -71,6 +73,13 @@ def _storage_layout(schema: VaeSchema) -> tuple[tuple[str, int], ...]:
     ("episode_id", 0),
     ("collector_iteration", 0),
   )
+  if provenance_enabled:
+    layout += (
+      ("initialization_kind", 0),
+      ("segment_initial_reference_frame", 0),
+      ("segment_age", 0),
+    )
+  return layout
 
 
 def _active_indices(partition: _MotionPartition, device: torch.device) -> torch.Tensor:
@@ -228,6 +237,9 @@ class MotionReplayStats:
   retained: int
   inserted: int
   drawn: int
+  inserted_by_initialization: dict[str, int] = field(default_factory=dict)
+  drawn_by_initialization: dict[str, int] = field(default_factory=dict)
+  retained_by_initialization: dict[str, int] = field(default_factory=dict)
 
   @property
   def coverage(self) -> float:
@@ -246,8 +258,10 @@ class MotionReplayStats:
       "retained": self.retained,
       "inserted": self.inserted,
       "drawn": self.drawn,
+      "inserted_by_initialization": dict(self.inserted_by_initialization),
+      "drawn_by_initialization": dict(self.drawn_by_initialization),
+      "retained_by_initialization": dict(self.retained_by_initialization),
       "coverage": self.coverage,
-      "ready": self.ready,
     }
 
 
@@ -292,6 +306,8 @@ class _MotionPartition:
   inserted: int = 0
   drawn: int = 0
   storage: dict[str, torch.Tensor] | None = None
+  inserted_by_initialization: dict[str, int] = field(default_factory=dict)
+  drawn_by_initialization: dict[str, int] = field(default_factory=dict)
 
 
 def _assemble_batch(
@@ -308,6 +324,18 @@ def _assemble_batch(
     reference_frame=fields["reference_frame"],
     episode_id=fields["episode_id"],
     collector_iteration=fields["collector_iteration"],
+    **(
+      {
+        name: fields[name]
+        for name in (
+          "initialization_kind",
+          "segment_initial_reference_frame",
+          "segment_age",
+        )
+      }
+      if "initialization_kind" in fields
+      else {}
+    ),
   )
 
 
@@ -332,6 +360,7 @@ class BalancedReplayBuffer:
     frame_counts: Mapping[int, int],
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
+    provenance_enabled: bool | None = None,
   ) -> None:
     if not isinstance(schema, VaeSchema):
       raise ReplayValidationError("schema must be a VaeSchema")
@@ -365,7 +394,8 @@ class BalancedReplayBuffer:
     self._device = _canonical_device(device) if device is not None else None
     self._dtype = dtype
     self._size = 0
-    self._layout = _storage_layout(schema)
+    self._provenance_enabled = provenance_enabled
+    self._layout = _storage_layout(schema, bool(provenance_enabled))
     self._partitions = {
       motion_id: _MotionPartition(motion_id=motion_id, quota=quota.quota_for(motion_id))
       for motion_id in motion_ids
@@ -462,6 +492,17 @@ class BalancedReplayBuffer:
     """Retained record count for one selected motion."""
     return self._partition(motion_id).size
 
+  def _retained_by_initialization(self, partition: _MotionPartition) -> dict[str, int]:
+    if partition.storage is None or "initialization_kind" not in partition.storage:
+      return {}
+    values = partition.storage["initialization_kind"]
+    active = _active_indices(partition, values.device)
+    names = {0: "unknown", 1: "reference", 2: "standing"}
+    return {
+      names.get(int(kind), "unknown"): int((values[active] == kind).sum().item())
+      for kind in torch.unique(values[active]).tolist()
+    }
+
   def stats(self) -> tuple[MotionReplayStats, ...]:
     return tuple(
       MotionReplayStats(
@@ -471,6 +512,15 @@ class BalancedReplayBuffer:
         retained=self._partitions[motion_id].size,
         inserted=self._partitions[motion_id].inserted,
         drawn=self._partitions[motion_id].drawn,
+        inserted_by_initialization=dict(
+          self._partitions[motion_id].inserted_by_initialization
+        ),
+        drawn_by_initialization=dict(
+          self._partitions[motion_id].drawn_by_initialization
+        ),
+        retained_by_initialization=self._retained_by_initialization(
+          self._partitions[motion_id]
+        ),
       )
       for index, motion_id in enumerate(self._motion_ids)
     )
@@ -499,7 +549,15 @@ class BalancedReplayBuffer:
   # Insertion.
 
   def validate_batch(self, batch: LabeledReplayBatch) -> None:
-    """Validate routing, mapping, frames, and tensors without mutating storage."""
+    """Validate routing, provenance, and tensors without mutating storage."""
+    has_provenance = batch.has_provenance
+    if (
+      self._provenance_enabled is not None
+      and has_provenance != self._provenance_enabled
+    ):
+      raise ReplayValidationError(
+        "replay layout does not match the enabled provenance contract"
+      )
     validate_replay_batch(batch, self.schema, device=self._device, dtype=self._dtype)
     if batch.batch_size == 0:
       return
@@ -557,9 +615,12 @@ class BalancedReplayBuffer:
     self.validate_batch(batch)
     if batch.batch_size == 0:
       return
-    fields = {name: getattr(batch, name) for name, _ in self._layout}
+    if self._provenance_enabled is None:
+      self._provenance_enabled = batch.has_provenance
+      self._layout = _storage_layout(self.schema, self._provenance_enabled)
     # Row selection happens before any write, so a failure can never leave part
     # of an insertion committed.
+    fields = {name: getattr(batch, name) for name, _ in self._layout}
     groups: list[tuple[int, dict[str, torch.Tensor]]] = []
     for motion_id in self._motion_ids:
       rows = batch.motion_id == motion_id
@@ -610,6 +671,14 @@ class BalancedReplayBuffer:
       partition.size = min(quota, partition.size + count)
       partition.next = (partition.next + count) % quota
     partition.inserted += count
+    if "initialization_kind" in owned:
+      names = {0: "unknown", 1: "reference", 2: "standing"}
+      for kind in torch.unique(owned["initialization_kind"]).tolist():
+        label = names.get(int(kind), "unknown")
+        partition.inserted_by_initialization[label] = (
+          partition.inserted_by_initialization.get(label, 0)
+          + int((owned["initialization_kind"] == kind).sum().item())
+        )
 
   # Sampling.
 
@@ -739,6 +808,14 @@ class BalancedReplayBuffer:
       for name, _ in self._layout:
         parts.setdefault(name, []).append(storage[name][indices])
       partition.drawn += count
+      if storage is not None and "initialization_kind" in storage:
+        names = {0: "unknown", 1: "reference", 2: "standing"}
+        for kind in torch.unique(storage["initialization_kind"][indices]).tolist():
+          label = names.get(int(kind), "unknown")
+          partition.drawn_by_initialization[label] = (
+            partition.drawn_by_initialization.get(label, 0)
+            + int((storage["initialization_kind"][indices] == kind).sum().item())
+          )
 
     order = torch.randperm(batch_size, device=random_device, generator=generator).to(
       device=self._device
@@ -756,7 +833,7 @@ class BalancedReplayBuffer:
     and sampling behavior.  Callers must treat the returned tensors as owned
     copies.
     """
-    return {
+    state = {
       "kind": _STATE_KIND,
       "version": _STATE_VERSION,
       "capacity": self.capacity,
@@ -774,6 +851,9 @@ class BalancedReplayBuffer:
         for motion_id in self._motion_ids
       ],
     }
+    if self._provenance_enabled:
+      state["layout"] = "provenance-v1"
+    return state
 
   @staticmethod
   def _partition_state(partition: _MotionPartition) -> dict[str, Any]:
@@ -815,8 +895,11 @@ class BalancedReplayBuffer:
 
   def _validated_state(
     self, state: Mapping[str, Any]
-  ) -> tuple[dict[int, _MotionPartition], torch.device | None, torch.dtype | None]:
+  ) -> tuple[
+    dict[int, _MotionPartition], torch.device | None, torch.dtype | None, bool
+  ]:
     """Validate one complete checkpoint state into a candidate replacement."""
+    enabled = state.get("layout") == "provenance-v1"
     required = {
       "kind",
       "version",
@@ -831,9 +914,11 @@ class BalancedReplayBuffer:
       "frame_counts",
       "size",
       "partitions",
-    }
+    } | ({"layout"} if enabled else set())
     if set(state) != required:
       raise ReplayValidationError("replay state has missing or unknown fields")
+    if self._provenance_enabled is not None and enabled != self._provenance_enabled:
+      raise ReplayValidationError("replay checkpoint layout does not match buffer")
     if state["kind"] != _STATE_KIND:
       raise ReplayValidationError("replay state is not a balanced motion replay")
     if state["version"] != _STATE_VERSION:
@@ -889,7 +974,7 @@ class BalancedReplayBuffer:
       raise ReplayValidationError(
         "replay state must describe one partition per selected motion"
       )
-    widths = dict(self._layout)
+    widths = dict(_storage_layout(self.schema, enabled))
     candidate: dict[int, _MotionPartition] = {}
     for index, motion_id in enumerate(self._motion_ids):
       candidate[motion_id] = self._validated_partition(
@@ -916,7 +1001,7 @@ class BalancedReplayBuffer:
       raise ReplayValidationError(
         f"replay size {size} disagrees with the {total} retained partition rows"
       )
-    return candidate, device, dtype
+    return candidate, device, dtype, enabled
 
   @staticmethod
   def _resolved_storage_policy(
@@ -1049,7 +1134,7 @@ class BalancedReplayBuffer:
     """
     if not isinstance(state, Mapping):
       raise ReplayValidationError("replay state must be a mapping")
-    partitions, device, dtype = self._validated_state(state)
+    partitions, device, dtype, enabled = self._validated_state(state)
     if self._device is not None and device is not None and self._device != device:
       raise ReplayValidationError("checkpoint replay device does not match buffer")
     if self._dtype is not None and dtype is not None and self._dtype != dtype:
@@ -1057,6 +1142,8 @@ class BalancedReplayBuffer:
     # All checks above complete before any live field is changed.
     self._device = device
     self._dtype = dtype
+    self._provenance_enabled = enabled
+    self._layout = _storage_layout(self.schema, enabled)
     self._partitions = partitions
     self._size = sum(partition.size for partition in partitions.values())
 
