@@ -15,10 +15,14 @@ from typing import Any
 import torch
 
 from mjlab.tasks.tracking.distillation.checkpoint import (
+  CohortLifecycleState,
   LifecycleState,
   load_checkpoint,
+  load_cohort_checkpoint,
   save_checkpoint,
+  save_cohort_checkpoint,
 )
+from mjlab.tasks.tracking.distillation.cohort_contract import CohortIdentity
 from mjlab.tasks.tracking.distillation.collector import (
   CollectionConfig,
   CollectionResult,
@@ -28,7 +32,7 @@ from mjlab.tasks.tracking.distillation.collector import (
   RolloutLatent,
   evaluate_distillation,
 )
-from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
+from mjlab.tasks.tracking.distillation.storage import ReplayBufferProtocol
 from mjlab.tasks.tracking.distillation.trainer import (
   TrainingUpdate,
   VaeDistillationTrainer,
@@ -93,7 +97,14 @@ class LifecycleIteration:
 
 @dataclass(slots=True)
 class DistillationRunner:
-  """Coordinate one teacher, one collector, one trainer, and bounded cycles."""
+  """Coordinate one collector, one trainer, and bounded lifetime cycles.
+
+  The same runner drives the single-teacher M3 lifecycle (one frozen teacher)
+  and the multi-teacher M4 cohort lifecycle (one frozen ``TeacherBank`` whose
+  per-row codes come from the mixed-slot adapter): only the durable identity
+  differs, through :meth:`save`/:meth:`resume` for version-1 checkpoints and
+  :meth:`save_cohort`/:meth:`resume_cohort` for version-2 cohort checkpoints.
+  """
 
   collector: DAggerCollector
   trainer: VaeDistillationTrainer
@@ -116,7 +127,7 @@ class DistillationRunner:
       self.evaluation_teacher = self.collector.teacher
 
   @property
-  def replay(self) -> LabeledReplayBuffer:
+  def replay(self) -> ReplayBufferProtocol:
     return self.trainer.replay
 
   def _collect(
@@ -285,29 +296,107 @@ class DistillationRunner:
       map_location=map_location,
     )
     self.iteration = state.counters.get("iteration", self.iteration)
-    # Always allocate a fresh namespace above the *valid* FIFO records.  The
-    # saved namespace may itself be stale after repeated resumes, and unused
-    # ring slots must never influence this boundary.
-    replay_state = self.replay.state_dict()
-    storage = replay_state["storage"]
-    if storage is not None and self.replay.size:
-      size = self.replay.size
-      next_index = int(replay_state["next"])
-      start = (next_index - size) % self.replay.capacity
-      physical = (torch.arange(size) + start) % self.replay.capacity
-      self._segment_namespace = int(storage["episode_id"][physical].max().item()) + 1
-    else:
-      self._segment_namespace = 0
+    self._segment_namespace = self._open_resume_namespace()
     self._resume_reset_pending = True
     self.events.append(
       {
         "event": "checkpoint_resumed",
         "iteration": self.iteration,
         "simulator_restart": True,
+        "segment_namespace": self._segment_namespace,
         "segment_identity": "new adapter reset generation; no bitwise continuation claimed",
       }
     )
     return state
+
+  def save_cohort(
+    self,
+    path: str,
+    cohort: CohortIdentity,
+    *,
+    resolved_config: Mapping[str, Any] | None = None,
+    schedule: Mapping[str, Any] | None = None,
+  ) -> None:
+    """Persist one version-2 checkpoint of a multi-teacher cohort run.
+
+    ``cohort`` is the live identity of the cohort this runner is training, so
+    the record is built from the adapted environment and replay buffer rather
+    than from a caller-supplied summary.
+    """
+    self.trainer.assert_healthy()
+    save_cohort_checkpoint(
+      path,
+      self.trainer,
+      self.replay,
+      cohort=cohort,
+      counters={
+        "iteration": self.iteration,
+        "segment_namespace": self._segment_namespace,
+      },
+      schedule=schedule or {"max_iterations": self.config.max_iterations},
+      resolved_config=resolved_config or {},
+      collector=self.collector,
+    )
+    self.events.append(
+      {
+        "event": "cohort_checkpoint_saved",
+        "path": path,
+        "cohort_digest": cohort.digest(),
+      }
+    )
+
+  def resume_cohort(
+    self,
+    path: str,
+    cohort: CohortIdentity,
+    *,
+    map_location: str | torch.device = "cpu",
+  ) -> CohortLifecycleState:
+    """Strictly resume a version-2 cohort run and restart the simulator.
+
+    The checkpoint's ordered cohort identity must be reproduced by the live
+    ``cohort``, the recorded replay partition policy must match the live replay
+    buffer, and the fresh segment namespace is opened above every segment ID
+    retained in *all* replay partitions, so resumed records can never collide
+    with the records the restarted simulator regenerates.
+    """
+    state = load_cohort_checkpoint(
+      path,
+      self.trainer,
+      self.replay,
+      expected_cohort=cohort,
+      collector=self.collector,
+      map_location=map_location,
+    )
+    self.iteration = state.counters.get("iteration", self.iteration)
+    self._segment_namespace = self._open_resume_namespace()
+    self._resume_reset_pending = True
+    self.events.append(
+      {
+        "event": "cohort_resumed",
+        "iteration": self.iteration,
+        "simulator_restart": True,
+        "segment_namespace": self._segment_namespace,
+        "retained_records": len(self.replay),
+        "replay_partitions": len(state.replay_policy.motion_ids),
+        "cohort_digest": state.cohort.digest(),
+        "segment_identity": (
+          "new adapter reset generation above every retained partition; no "
+          "bitwise continuation claimed"
+        ),
+      }
+    )
+    return state
+
+  def _open_resume_namespace(self) -> int:
+    """Segment namespace above every valid retained record in every partition.
+
+    The maximum valid segment ID is the replay implementation's own public seam:
+    unused ring slots and other private storage layout details never influence
+    the boundary.
+    """
+    highest = self.replay.max_valid_segment_id()
+    return 0 if highest is None else highest + 1
 
 
 __all__ = [

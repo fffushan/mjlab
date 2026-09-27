@@ -1,6 +1,11 @@
 # BeyondMimic M3: single-teacher closed-loop DAgger
 
-Status: **authorized for implementation on 2026-09-26**. Implementation and
+Current disposition (2026-09-27): **M3 is complete**, and the user has authorized
+[M4 implementation](beyondmimic_vae_m4_implementation.md) after single-teacher
+training/evaluation, including the completed 4096-env 10,000-iteration run.
+The plan and recovery entries below are historical records, not current blockers.
+
+Historical authorization: **authorized for implementation on 2026-09-26**. Implementation and
 bounded validation only; no production training, M4, or hardware work.
 Repository: `/home/agiuser/projects/mjlab`, branch `fxy/test/tracking-exp`.
 Baseline: M1 `cdd9a8201213206d620a4f32b9125f7b0a9a2dc5`; accepted M2 committed

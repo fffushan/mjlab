@@ -28,7 +28,7 @@ from mjlab.tasks.tracking.distillation.model import (
 )
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
-  LabeledReplayBuffer,
+  ReplayBufferProtocol,
   ReplayValidationError,
 )
 from mjlab.tasks.tracking.distillation.training_config import TrainingConfig
@@ -115,7 +115,7 @@ class VaeDistillationTrainer:
   def __init__(
     self,
     model: ConditionalVAE,
-    replay: LabeledReplayBuffer,
+    replay: ReplayBufferProtocol,
     config: TrainingConfig | None = None,
     *,
     replay_generator: torch.Generator | None = None,
@@ -125,8 +125,10 @@ class VaeDistillationTrainer:
   ) -> None:
     if not isinstance(model, ConditionalVAE):
       raise TrainerValidationError("model must be a ConditionalVAE")
-    if not isinstance(replay, LabeledReplayBuffer):
-      raise TrainerValidationError("replay must be a LabeledReplayBuffer")
+    if not isinstance(replay, ReplayBufferProtocol):
+      raise TrainerValidationError(
+        "replay must implement the labeled replay buffer protocol"
+      )
     if config is None:
       config = TrainingConfig()
     if not isinstance(config, TrainingConfig):
@@ -352,7 +354,7 @@ class VaeDistillationTrainer:
     if batch.batch_size <= 0:
       raise TrainerValidationError("training batch must be non-empty")
     try:
-      self.replay._validate_batch(batch)  # noqa: SLF001 - same owned contract
+      self.replay.validate_batch(batch)
     except ReplayValidationError as exc:
       raise TrainerValidationError(str(exc)) from exc
 

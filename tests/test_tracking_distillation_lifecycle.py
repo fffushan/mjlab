@@ -26,6 +26,7 @@ from mjlab.tasks.tracking.distillation.runner import DistillationRunner, RunnerC
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
   LabeledReplayBuffer,
+  ReplayBufferProtocol,
   ReplayValidationError,
 )
 from mjlab.tasks.tracking.distillation.trainer import (
@@ -500,7 +501,7 @@ def test_runner_config_is_bounded_and_cpu_safe() -> None:
     RunnerConfig(max_iterations=1, evaluate_every=1, evaluation_steps=0)
 
 
-def _active_max_episode_id(replay: LabeledReplayBuffer) -> int:
+def _active_max_episode_id(replay: ReplayBufferProtocol) -> int:
   """Return the largest episode ID among the *valid* FIFO records only."""
   state = replay.state_dict()
   storage = state["storage"]

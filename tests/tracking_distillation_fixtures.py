@@ -420,6 +420,53 @@ algorithm:
   )
 
 
+def write_reference_clip(
+  path: Path,
+  *,
+  frames: int,
+  joint_dim: int = 3,
+  bodies: int = 4,
+  fps: float = DEFAULT_FPS,
+  joint_base: float = 0.0,
+  body_base: float = 0.0,
+) -> Path:
+  """Write one small reference clip with per-clip, per-frame sentinel values.
+
+  Values are exact in float32 and distinct per clip base, frame, and body, so a
+  query that reads the wrong clip, frame, or body shows up in an equality
+  assertion instead of merely looking plausible.  ``fps`` is always written, so
+  a clip never relies on the loader's legacy default rate.
+  """
+  frame_index = np.arange(frames, dtype=np.float32)[:, None]
+  joint_index = np.arange(joint_dim, dtype=np.float32)[None, :]
+  joint_pos = joint_base + 10.0 * frame_index + joint_index
+  joint_vel = -joint_pos
+  body_frame = np.arange(frames, dtype=np.float32)[:, None, None]
+  body_index = np.arange(bodies, dtype=np.float32)[None, :, None]
+  body_axis = np.array([0.0, 1.0, 2.0], dtype=np.float32)[None, None, :]
+  body_pos_w = body_base + 100.0 * body_frame + 10.0 * body_index + body_axis
+  angles = (
+    body_base
+    + np.arange(frames, dtype=np.float32)[:, None]
+    + np.arange(bodies, dtype=np.float32)[None, :]
+  ) * 1e-3
+  body_quat_w = np.zeros((frames, bodies, 4), dtype=np.float32)
+  body_quat_w[..., 0] = np.cos(angles)
+  body_quat_w[..., 1] = np.sin(angles)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  np.savez(
+    path,
+    joint_pos=joint_pos.astype(np.float32),
+    joint_vel=joint_vel.astype(np.float32),
+    body_pos_w=body_pos_w.astype(np.float32),
+    body_quat_w=body_quat_w,
+    body_lin_vel_w=(-body_pos_w).astype(np.float32),
+    body_ang_vel_w=(2.0 * body_pos_w).astype(np.float32),
+    fps=np.array([fps], dtype=np.float32),
+  )
+  return path
+
+
 class _OnnxExport(nn.Module):
   """Export wrapper bundling the policy with its reference tensors."""
 

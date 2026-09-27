@@ -15,19 +15,30 @@ collector can label ``snapshot.teacher_observation`` and pack
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 import torch
 
-from mjlab.tasks.tracking.distillation.config import CohortContract, DistillationError
+from mjlab.tasks.tracking.distillation.config import (
+  CohortContract,
+  DistillationError,
+  ResolvedTeacher,
+)
 from mjlab.tasks.tracking.distillation.environment import (
   ReferenceBoundaryEvents,
   RuntimeSeedProvenance,
   SegmentMotionCommand,
   build_distillation_environment,
+  build_multi_motion_environment,
+)
+from mjlab.tasks.tracking.distillation.motion_library import MotionClip, MotionLibrary
+from mjlab.tasks.tracking.distillation.multi_motion import (
+  MotionSlotAllocation,
+  MultiMotionCommand,
+  PhasePolicy,
 )
 from mjlab.tasks.tracking.distillation.observations import (
   ObservationSnapshot,
@@ -36,6 +47,8 @@ from mjlab.tasks.tracking.distillation.observations import (
 )
 from mjlab.tasks.tracking.distillation.teachers import (
   FrozenTeacher,
+  TeacherBank,
+  build_cohort_teacher_bank,
   load_frozen_teacher,
 )
 from mjlab.tasks.tracking.distillation.vae_config import (
@@ -108,8 +121,72 @@ class LiveContractAudit:
 
 
 @dataclass(frozen=True, slots=True)
+class ClipReferenceEvidence:
+  """Saved/live reference evidence for one clip of a multi-motion cohort."""
+
+  motion_id: int
+  teacher_id: str
+  teacher_code: int
+  motion_file: str
+  frames: int
+  fps: float
+  tracked_body_indices: tuple[int, ...]
+  body_reference_compared: tuple[str, ...]
+  body_reference_max_abs_error: tuple[tuple[str, float], ...]
+  body_reference_atol: float
+  body_reference_rtol: float
+  body_reference_convention: str
+
+
+@dataclass(frozen=True, slots=True)
+class MultiMotionAssetAudit:
+  """Compiled asset evidence shared by every row, plus per-clip references.
+
+  One selected motion never stands in for the cohort: ``clips`` holds the
+  correspondence evidence of every selected clip, and the shared fields are the
+  compiled robot facts the mixed rows have in common.
+  """
+
+  robot_bodies: tuple[str, ...]
+  tracked_bodies: tuple[str, ...]
+  tracked_body_indices: tuple[int, ...]
+  anchor_body: str
+  root_frame: str
+  root_body_name: str
+  anchor_body_id: int
+  clips: tuple[ClipReferenceEvidence, ...]
+  sensor_evidence: tuple[SensorFrameEvidence, ...]
+  unresolved: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MultiMotionLiveContractAudit:
+  """Saved/live checks for one mixed-cohort environment, clip by clip."""
+
+  task_id: str
+  teacher_ids: tuple[str, ...]
+  joint_names: tuple[str, ...]
+  control_period_s: float
+  actor_terms: tuple[str, ...]
+  asset: MultiMotionAssetAudit
+  slots: MotionSlotAllocation
+  mapping_digest: str
+  phase_policy: PhasePolicy
+  additional_gravity_policy: str
+  semantic_overrides: tuple[str, ...] = ()
+  seed_provenance: RuntimeSeedProvenance | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DistillationSnapshot:
-  """Owned, aligned tensors captured at one post-observation-manager instant."""
+  """Owned, aligned tensors captured at one post-observation-manager instant.
+
+  ``teacher_codes`` is the owned per-row routing vector aligned with
+  ``motion_id``/``reference_frame``/``segment_id``/``generation_id``.  The
+  legacy scalar ``teacher_code`` stays for single-teacher callers: a mixed
+  batch reports ``teacher_code == -1`` and must be routed row-wise through a
+  ``TeacherBank`` with the vector, never through the scalar.
+  """
 
   teacher_observation: torch.Tensor
   features: ObservationSnapshot
@@ -120,6 +197,7 @@ class DistillationSnapshot:
   reference_frame: torch.Tensor
   segment_id: torch.Tensor
   generation_id: torch.Tensor
+  teacher_codes: torch.Tensor | None = None
   metrics: PhysicalTrackingMetrics | None = None
   boundary_events: ReferenceBoundaryEvents | None = None
 
@@ -131,6 +209,28 @@ class DistillationSnapshot:
         raise ValueError(f"{name} must have shape [{batch}], got {tuple(value.shape)}")
       if value.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"{name} must be an integer tensor")
+    if isinstance(self.teacher_code, bool) or not isinstance(self.teacher_code, int):
+      raise ValueError(
+        "teacher_code must be an integer; -1 marks a batch with no single teacher"
+      )
+    codes = self.teacher_codes
+    if codes is None:
+      return
+    if not isinstance(codes, torch.Tensor):
+      raise ValueError("teacher_codes must be a torch.Tensor or None")
+    if codes.shape != (batch,):
+      raise ValueError(
+        f"teacher_codes must have shape [{batch}], got {tuple(codes.shape)}"
+      )
+    if codes.dtype not in (torch.int32, torch.int64, torch.uint8, torch.int16):
+      raise ValueError(f"teacher_codes must be an integer tensor, got {codes.dtype}")
+    if codes.numel() and bool((codes < 0).any()):
+      raise ValueError("teacher_codes must be non-negative")
+    if self.teacher_code >= 0 and not bool((codes == self.teacher_code).all()):
+      raise ValueError(
+        f"teacher_codes disagree with the scalar teacher_code {self.teacher_code}: a "
+        "mixed batch reports teacher_code=-1 and is routed by a TeacherBank"
+      )
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +253,19 @@ _TERM_FEATURES = {
   "joint_vel",
   "actions",
 }
+
+_BODY_REFERENCE_ARRAYS = (
+  "body_pos_w",
+  "body_quat_w",
+  "body_lin_vel_w",
+  "body_ang_vel_w",
+)
+_BODY_REFERENCE_ATOL = 1e-5
+_BODY_REFERENCE_RTOL = 1e-5
+_MIXED_TEACHER_ID = "multiple"
+"""Scalar ``teacher_id`` of a mixed batch, which has no single teacher."""
+_MIXED_TEACHER_CODE = -1
+"""Scalar ``teacher_code`` of a mixed batch; real teacher codes are non-negative."""
 
 
 def _tensor_equal(left: Any, right: Any) -> bool:
@@ -350,9 +463,9 @@ def _compiled_sensor_evidence(
 def _compare_body_reference_arrays(
   selected: Any, body_indices: tuple[int, ...]
 ) -> tuple[tuple[str, ...], tuple[tuple[str, float], ...]]:
-  atol = 1e-5
-  rtol = 1e-5
-  reference_arrays = ("body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w")
+  atol = _BODY_REFERENCE_ATOL
+  rtol = _BODY_REFERENCE_RTOL
+  reference_arrays = _BODY_REFERENCE_ARRAYS
   try:
     npz = np.load(selected.entry.motion, allow_pickle=False)
   except (OSError, ValueError) as exc:
@@ -397,6 +510,11 @@ def audit_live_asset(
     raise DistillationError(
       "distillation requires SegmentMotionCommand; use the opt-in factory instead "
       "of changing the shared tracking command"
+    )
+  if isinstance(command, MultiMotionCommand):
+    raise DistillationError(
+      "a mixed-slot environment cannot be audited for one selected motion; use "
+      "validate_multi_motion_live_contract instead"
     )
   robot = env.scene[command.cfg.entity_name]
   model = env.sim.mj_model
@@ -460,6 +578,244 @@ def audit_live_asset(
   )
 
 
+def _require_multi_motion_command(env: Any) -> MultiMotionCommand:
+  command = env.command_manager.get_term("motion")
+  if not isinstance(command, MultiMotionCommand):
+    raise DistillationError(
+      "multi-motion distillation requires MultiMotionCommand; build the "
+      "environment with build_multi_motion_environment instead of changing a "
+      "registered task"
+    )
+  return command
+
+
+def _selected_teachers(
+  cohort: CohortContract, teacher_ids: Sequence[str]
+) -> tuple[ResolvedTeacher, ...]:
+  """Selected teachers in manifest order, rejecting unknown or repeated ids.
+
+  Manifest order is what the multi-motion library uses for numeric motion ids,
+  so selection order can never reinterpret an id that a checkpoint recorded.
+  """
+  requested = tuple(teacher_ids)
+  if not requested:
+    raise DistillationError("multi-motion validation needs at least one teacher id")
+  if len(set(requested)) != len(requested):
+    raise DistillationError(f"duplicate teacher ids {requested}")
+  known = {teacher.id for teacher in cohort.teachers}
+  unknown = [teacher_id for teacher_id in requested if teacher_id not in known]
+  if unknown:
+    raise DistillationError(f"cohort has no teacher(s) {unknown}")
+  wanted = set(requested)
+  return tuple(teacher for teacher in cohort.teachers if teacher.id in wanted)
+
+
+def _require_clip_teacher_mapping(
+  cohort: CohortContract, library: MotionLibrary
+) -> None:
+  """Reject a clip table whose code/teacher pairing contradicts the cohort.
+
+  A clip's numeric teacher code decides which frozen teacher labels its rows, so
+  a code that the cohort assigns to a different teacher would silently train on
+  the wrong labels.
+  """
+  positions = tuple(clip.motion_id for clip in library.clips)
+  if positions != tuple(range(library.num_motions)):
+    raise DistillationError(
+      f"library motion ids {positions} must be their position in the clip order"
+    )
+  for clip in library.clips:
+    if not 0 <= clip.teacher_code < len(cohort.teachers):
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} carries teacher code {clip.teacher_code}, which "
+        f"is outside the {len(cohort.teachers)} cohort teachers"
+      )
+    assigned = cohort.teachers[clip.teacher_code].id
+    if assigned != clip.teacher_id:
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} uses teacher code {clip.teacher_code}, but the "
+        f"cohort assigns that code to {assigned!r}: the motion-to-teacher mapping "
+        "would label rows with the wrong frozen teacher"
+      )
+
+
+def _compare_clip_body_references(
+  command: MultiMotionCommand, clip: MotionClip, teacher: ResolvedTeacher
+) -> tuple[tuple[str, ...], tuple[tuple[str, float], ...]]:
+  """Compare every frame of one library clip with its teacher export.
+
+  Both directions are compared with the milestone tolerance: the library's own
+  owned, tracked reference tensors using element-wise ``allclose``, and the saved
+  NPZ file itself (see :func:`_compare_body_reference_arrays`), so a library that
+  loaded the right bytes but indexed the wrong bodies is caught as well.
+  """
+  library = command.library
+  frames = torch.arange(clip.frames, dtype=torch.long, device=library.device)
+  ids = torch.full(
+    (clip.frames,), clip.motion_id, dtype=torch.long, device=library.device
+  )
+  compared: list[str] = []
+  errors: list[tuple[str, float]] = []
+  for name in _BODY_REFERENCE_ARRAYS:
+    embedded = teacher.onnx.reference_tensor(name)
+    if embedded is None:
+      raise DistillationError(f"teacher ONNX has no embedded {name!r} body array")
+    expected = np.asarray(embedded[1], dtype=np.float64)
+    actual = (
+      getattr(library, name)(ids, frames).detach().to(torch.float64).cpu().numpy()
+    )
+    if actual.shape != expected.shape:
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} {name!r} shape {actual.shape} disagrees with the "
+        f"export shape {expected.shape}"
+      )
+    if not np.isfinite(actual).all() or not np.isfinite(expected).all():
+      raise DistillationError(
+        f"non-finite values in body reference array {name!r} of {clip.teacher_id!r}"
+      )
+    maximum = float(np.max(np.abs(actual - expected))) if expected.size else 0.0
+    if not np.allclose(
+      actual, expected, atol=_BODY_REFERENCE_ATOL, rtol=_BODY_REFERENCE_RTOL
+    ):
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} {name!r} disagrees with its teacher export; "
+        f"max_abs_error={maximum:g}, atol={_BODY_REFERENCE_ATOL:g}, "
+        f"rtol={_BODY_REFERENCE_RTOL:g}"
+      )
+    compared.append(name)
+    errors.append((name, maximum))
+  return tuple(compared), tuple(errors)
+
+
+def audit_multi_motion_live_asset(
+  env: Any, cohort: CohortContract, teacher_ids: Sequence[str]
+) -> MultiMotionAssetAudit:
+  """Audit the compiled robot and every selected clip's reference evidence."""
+  selected = _selected_teachers(cohort, teacher_ids)
+  command = _require_multi_motion_command(env)
+  robot = env.scene[command.cfg.entity_name]
+  model = env.sim.mj_model
+  robot_bodies = tuple(robot.body_names)
+  missing = [name for name in cohort.body_names if name not in robot_bodies]
+  if missing:
+    raise DistillationError(f"live robot is missing tracked bodies {missing}")
+  tracked_indices = tuple(robot_bodies.index(name) for name in cohort.body_names)
+  if command.cfg.body_names != cohort.body_names:
+    raise DistillationError(
+      f"live motion body order {command.cfg.body_names} disagrees with saved "
+      f"{cohort.body_names}"
+    )
+  if command.cfg.anchor_body_name != cohort.anchor_body_name:
+    raise DistillationError(
+      f"live anchor {command.cfg.anchor_body_name!r} disagrees with saved "
+      f"{cohort.anchor_body_name!r}"
+    )
+  expected_ids = tuple(teacher.id for teacher in selected)
+  clip_ids = tuple(clip.teacher_id for clip in command.library.clips)
+  if clip_ids != expected_ids:
+    raise DistillationError(
+      f"live library clips {clip_ids} disagree with the selected teachers "
+      f"{expected_ids}"
+    )
+  _require_clip_teacher_mapping(cohort, command.library)
+  if command.library.source_body_count != len(robot_bodies):
+    raise DistillationError(
+      f"reference clips carry {command.library.source_body_count} source bodies but "
+      f"the compiled robot has {len(robot_bodies)}: the clip body axis must be the "
+      "compiled robot body order"
+    )
+  selection = command.library.body_selection
+  if selection is None or tuple(selection.indices) != tracked_indices:
+    raise DistillationError(
+      "the library's resolved tracked-body indices disagree with the compiled "
+      "robot's body order for the saved tracked bodies"
+    )
+  if selection.names is not None and tuple(selection.names) != cohort.body_names:
+    raise DistillationError(
+      f"the library's tracked-body names {tuple(selection.names)} disagree with the "
+      f"saved {cohort.body_names}"
+    )
+  root_body_id = int(robot.indexing.root_body_id)
+  root_body_name = model.body(root_body_id).name
+  anchor_body_id = int(
+    robot.indexing.body_ids[robot_bodies.index(cohort.anchor_body_name)]
+  )
+  sensor_evidence: dict[str, SensorFrameEvidence] = {}
+  for teacher in selected:
+    for sensor in teacher.sensors:
+      evidence = _compiled_sensor_evidence(
+        env,
+        sensor.sensor_name,
+        expected_type="gyro" if sensor.term == "base_ang_vel" else "declared",
+        root_body_id=root_body_id,
+      )
+      previous = sensor_evidence.get(sensor.sensor_name)
+      if previous is not None and previous != evidence:
+        raise DistillationError(
+          f"teachers disagree about compiled sensor {sensor.sensor_name!r}"
+        )
+      sensor_evidence[sensor.sensor_name] = evidence
+      try:
+        env.scene[sensor.sensor_name]
+      except (KeyError, ValueError) as exc:
+        raise DistillationError(
+          f"live environment has no saved sensor {sensor.sensor_name!r}"
+        ) from exc
+  clips: list[ClipReferenceEvidence] = []
+  for clip in command.library.clips:
+    teacher = cohort.teacher(clip.teacher_id)
+    if str(clip.motion_file) != str(teacher.entry.motion):
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} loads {clip.motion_file} but its teacher artifact "
+        f"is {teacher.entry.motion}"
+      )
+    if clip.frames != teacher.reference.frames:
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} has {clip.frames} frames but the teacher declares "
+        f"{teacher.reference.frames}"
+      )
+    if not math.isclose(clip.fps, teacher.reference.fps, rel_tol=1e-5, abs_tol=1e-5):
+      raise DistillationError(
+        f"clip {clip.teacher_id!r} is {clip.fps:g} Hz but the teacher declares "
+        f"{teacher.reference.fps:g} Hz"
+      )
+    compared, errors = _compare_clip_body_references(command, clip, teacher)
+    _compare_body_reference_arrays(teacher, tracked_indices)
+    clips.append(
+      ClipReferenceEvidence(
+        motion_id=clip.motion_id,
+        teacher_id=clip.teacher_id,
+        teacher_code=clip.teacher_code,
+        motion_file=str(clip.motion_file),
+        frames=clip.frames,
+        fps=clip.fps,
+        tracked_body_indices=(
+          tracked_indices if clip.body_indices is None else tuple(clip.body_indices)
+        ),
+        body_reference_compared=compared,
+        body_reference_max_abs_error=errors,
+        body_reference_atol=_BODY_REFERENCE_ATOL,
+        body_reference_rtol=_BODY_REFERENCE_RTOL,
+        body_reference_convention=(
+          "library-owned tracked reference tensors for every clip frame compared "
+          "with the teacher export's embedded arrays in tracked-body order"
+        ),
+      )
+    )
+  return MultiMotionAssetAudit(
+    robot_bodies=robot_bodies,
+    tracked_bodies=cohort.body_names,
+    tracked_body_indices=tracked_indices,
+    anchor_body=cohort.anchor_body_name,
+    root_frame=root_body_name,
+    root_body_name=root_body_name,
+    anchor_body_id=anchor_body_id,
+    clips=tuple(clips),
+    sensor_evidence=tuple(sensor_evidence.values()),
+    unresolved=(),
+  )
+
+
 def _metadata_float_list(metadata: Mapping[str, str], key: str) -> tuple[float, ...]:
   value = metadata.get(key)
   if value is None:
@@ -516,6 +872,110 @@ def _validate_live_control_parameters(
     raise DistillationError("compiled actuator damping disagrees with teacher export")
 
 
+def _validate_live_action_term(teacher: ResolvedTeacher, action_term: Any) -> None:
+  """Reject a live action term that disagrees with a saved teacher contract."""
+  target_names = tuple(action_term.target_names)
+  if target_names != teacher.actions.joint_names:
+    raise DistillationError(
+      f"live action joints {target_names} disagree with saved teacher order "
+      f"{teacher.actions.joint_names}"
+    )
+  if action_term.action_dim != teacher.actions.dim:
+    raise DistillationError("live action dimension disagrees with saved teacher")
+  if getattr(action_term.cfg, "clip", None) is not None:
+    raise DistillationError(
+      "live action clipping is unsupported by saved teacher contract"
+    )
+  if not _action_value_matches(action_term.scale, teacher.actions.joint_scales):
+    raise DistillationError("live action scale disagrees with saved teacher")
+  use_default_offset = bool(getattr(action_term.cfg, "use_default_offset", False))
+  if use_default_offset != teacher.actions.uses_default_offset:
+    raise DistillationError(
+      "live action default-offset setting disagrees with saved teacher"
+    )
+  if not use_default_offset and not _action_value_matches(
+    action_term.offset, (teacher.actions.offset,)
+  ):
+    raise DistillationError("live action offset disagrees with saved teacher")
+
+
+def validate_multi_motion_live_contract(
+  env: Any,
+  cohort: CohortContract,
+  teacher_ids: Sequence[str],
+  *,
+  task_id: str | None = None,
+) -> MultiMotionLiveContractAudit:
+  """Reject saved/live mismatches before a mixed-slot collector labels rows.
+
+  Every selected teacher's saved contract is checked against the same live
+  environment, and every selected clip's reference is compared with its own
+  teacher export, so one selected motion never stands in for the cohort.  The
+  returned evidence keeps the realized slot allocation and the library's
+  ordered mapping digest that strict resume must reproduce.
+  """
+  selected = _selected_teachers(cohort, teacher_ids)
+  first = selected[0]
+  selected_task = task_id or cohort.manifest.base_task
+  if selected_task is None:
+    raise DistillationError("a registered task_id is required for live validation")
+  if (
+    cohort.manifest.base_task is not None and selected_task != cohort.manifest.base_task
+  ):
+    raise DistillationError(
+      f"selected task {selected_task!r} disagrees with saved base task "
+      f"{cohort.manifest.base_task!r}"
+    )
+  for teacher in selected:
+    if abs(float(env.cfg.sim.mujoco.timestep) - teacher.control.sim_timestep) > 1e-9:
+      raise DistillationError(
+        f"live MuJoCo timestep disagrees with saved teacher {teacher.id!r}"
+      )
+    if int(env.cfg.decimation) != teacher.control.decimation:
+      raise DistillationError(
+        f"live decimation disagrees with saved teacher {teacher.id!r}"
+      )
+    _validate_observation_contract(env, cohort, teacher.env_config)
+  command = _require_multi_motion_command(env)
+  if str(command.cfg.motion_file) != "":
+    raise DistillationError(
+      "a multi-motion command must not carry a single motion file; each row's "
+      "reference comes from its own clip"
+    )
+  if command.cfg.sampling_mode not in ("uniform", "start"):
+    raise DistillationError(
+      f"multi-motion phase sampling {command.cfg.sampling_mode!r} is not supported"
+    )
+  clip_ids = tuple(clip.teacher_id for clip in command.library.clips)
+  if command.slot_allocation.teacher_ids != clip_ids:
+    raise DistillationError(
+      f"slot allocation teachers {command.slot_allocation.teacher_ids} disagree with "
+      f"the library clip order {clip_ids}"
+    )
+  for teacher in selected:
+    action_term = env.action_manager.get_term(teacher.actions.term)
+    _validate_live_action_term(teacher, action_term)
+    _validate_live_control_parameters(env, cohort, teacher.id, action_term)
+  asset = audit_multi_motion_live_asset(env, cohort, teacher_ids)
+  return MultiMotionLiveContractAudit(
+    task_id=selected_task,
+    teacher_ids=tuple(teacher.id for teacher in selected),
+    joint_names=first.actions.joint_names,
+    control_period_s=first.control.control_period_s,
+    actor_terms=cohort.observations.names,
+    asset=asset,
+    slots=command.slot_allocation,
+    mapping_digest=command.library.mapping_digest(),
+    phase_policy=command.cfg.sampling_mode,
+    additional_gravity_policy=(
+      "projected gravity is captured once from robot root_link orientation and "
+      "gravity_vec_w; no additional noise, delay, or history is applied"
+    ),
+    semantic_overrides=tuple(getattr(env.cfg, "_distillation_semantic_overrides", ())),
+    seed_provenance=getattr(env.cfg, "_distillation_seed_provenance", None),
+  )
+
+
 def validate_live_contract(
   env: Any,
   cohort: CohortContract,
@@ -543,35 +1003,18 @@ def validate_live_contract(
   command = env.command_manager.get_term("motion")
   if not isinstance(command, SegmentMotionCommand):
     raise DistillationError("live motion command is not segment-aware")
+  if isinstance(command, MultiMotionCommand):
+    raise DistillationError(
+      "a mixed-slot environment has no single motion to validate against one "
+      "teacher; use validate_multi_motion_live_contract instead"
+    )
   if abs(float(command.motion.fps) - teacher.reference.fps) > 1e-5:
     raise DistillationError("live motion FPS disagrees with saved teacher")
   if str(command.cfg.motion_file) != str(teacher.entry.motion):
     raise DistillationError("live motion file differs from selected teacher artifact")
 
   action_term = env.action_manager.get_term(teacher.actions.term)
-  target_names = tuple(action_term.target_names)
-  if target_names != teacher.actions.joint_names:
-    raise DistillationError(
-      f"live action joints {target_names} disagree with saved teacher order "
-      f"{teacher.actions.joint_names}"
-    )
-  if action_term.action_dim != teacher.actions.dim:
-    raise DistillationError("live action dimension disagrees with saved teacher")
-  if getattr(action_term.cfg, "clip", None) is not None:
-    raise DistillationError(
-      "live action clipping is unsupported by saved teacher contract"
-    )
-  if not _action_value_matches(action_term.scale, teacher.actions.joint_scales):
-    raise DistillationError("live action scale disagrees with saved teacher")
-  use_default_offset = bool(getattr(action_term.cfg, "use_default_offset", False))
-  if use_default_offset != teacher.actions.uses_default_offset:
-    raise DistillationError(
-      "live action default-offset setting disagrees with saved teacher"
-    )
-  if not use_default_offset and not _action_value_matches(
-    action_term.offset, (teacher.actions.offset,)
-  ):
-    raise DistillationError("live action offset disagrees with saved teacher")
+  _validate_live_action_term(teacher, action_term)
   asset = audit_live_asset(env, cohort, teacher_id)
   _validate_live_control_parameters(env, cohort, teacher_id, action_term)
   return LiveContractAudit(
@@ -645,6 +1088,82 @@ def _term_slices(cohort: CohortContract) -> dict[str, slice]:
   return result
 
 
+def _require_normalized_action(env: Any, action_dim: int, action: torch.Tensor) -> None:
+  if not isinstance(action, torch.Tensor) or action.shape != (env.num_envs, action_dim):
+    raise ValueError(f"action must have shape [{env.num_envs}, {action_dim}]")
+  if not torch.isfinite(action).all().item():
+    raise ValueError("refusing to step a non-finite action")
+
+
+def _capture_snapshot(
+  env: Any,
+  *,
+  cohort: CohortContract,
+  slices: Mapping[str, slice],
+  schema: VaeSchema,
+  command: SegmentMotionCommand,
+  teacher_id: str,
+  teacher_code: int,
+  motion_id: torch.Tensor,
+  teacher_codes: torch.Tensor | None,
+) -> DistillationSnapshot:
+  """Capture one owned snapshot from the observation manager cache.
+
+  Features and teacher inputs are two views of the same cached actor tensor, so
+  no observation term, noise draw, delay step, or history window is recomputed.
+  The caller supplies the per-row identity and routing tensors, which both
+  adapters read from their own command.
+  """
+  obs = env.get_observations()
+  if not isinstance(obs, dict) or not isinstance(obs.get("actor"), torch.Tensor):
+    raise DistillationError("live actor observations must be a cached flat tensor")
+  teacher_observation = obs["actor"].detach().clone()
+  if teacher_observation.ndim != 2:
+    raise DistillationError("live actor observation must have shape [B, 164]")
+  values = {name: teacher_observation[:, span].clone() for name, span in slices.items()}
+  required = _TERM_FEATURES - set(values)
+  if required:
+    raise DistillationError(f"saved teacher observation lacks terms {sorted(required)}")
+  robot = env.scene[command.cfg.entity_name]
+  try:
+    gravity = robot.data.projected_gravity_b.detach().clone()
+  except AttributeError as exc:
+    raise DistillationError("robot asset has no root projected-gravity data") from exc
+  features = ObservationSnapshot(
+    reference_q=values["command"][:, :31],
+    reference_dq=values["command"][:, 31:62],
+    anchor_orientation_error=values["motion_anchor_ori_b"],
+    projected_gravity=gravity,
+    gyro=values["base_ang_vel"],
+    relative_joint_q=values["joint_pos"],
+    joint_dq=values["joint_vel"],
+    previous_action=values["actions"],
+  )
+  packed = pack_observations(features, schema)
+  return DistillationSnapshot(
+    teacher_observation=teacher_observation,
+    features=features,
+    packed=packed,
+    teacher_id=teacher_id,
+    teacher_code=teacher_code,
+    motion_id=motion_id.detach().clone(),
+    reference_frame=command.time_steps.detach().clone(),
+    segment_id=command.segment_ids.detach().clone(),
+    generation_id=command.generation_ids.detach().clone(),
+    teacher_codes=None if teacher_codes is None else teacher_codes.detach().clone(),
+    metrics=_capture_physical_metrics(command),
+  )
+
+
+def _consume_boundary_events(
+  env: Any, pre_generation: torch.Tensor | None = None
+) -> ReferenceBoundaryEvents | None:
+  command = env.command_manager.get_term("motion")
+  if not isinstance(command, SegmentMotionCommand):
+    return None
+  return command.consume_boundary_events(pre_generation)
+
+
 class DistillationEnvironmentAdapter:
   """One selected frozen teacher and one live vector environment."""
 
@@ -690,86 +1209,143 @@ class DistillationEnvironmentAdapter:
 
   def snapshot(self) -> DistillationSnapshot:
     """Capture the manager's cached actor observation without recomputation."""
-    obs = self.env.get_observations()
-    if not isinstance(obs, dict) or not isinstance(obs.get("actor"), torch.Tensor):
-      raise DistillationError("live actor observations must be a cached flat tensor")
-    teacher_observation = obs["actor"].detach().clone()
-    if teacher_observation.ndim != 2:
-      raise DistillationError("live actor observation must have shape [B, 164]")
-    values = {
-      name: teacher_observation[:, span].clone() for name, span in self._slices.items()
-    }
-    required = _TERM_FEATURES - set(values)
-    if required:
-      raise DistillationError(
-        f"saved teacher observation lacks terms {sorted(required)}"
-      )
     command = self.env.command_manager.get_term("motion")
     if not isinstance(command, SegmentMotionCommand):
       raise DistillationError("live motion command is not segment-aware")
-    robot = self.env.scene[command.cfg.entity_name]
-    try:
-      gravity = robot.data.projected_gravity_b.detach().clone()
-    except AttributeError as exc:
-      raise DistillationError("robot asset has no root projected-gravity data") from exc
-    features = ObservationSnapshot(
-      reference_q=values["command"][:, :31],
-      reference_dq=values["command"][:, 31:62],
-      anchor_orientation_error=values["motion_anchor_ori_b"],
-      projected_gravity=gravity,
-      gyro=values["base_ang_vel"],
-      relative_joint_q=values["joint_pos"],
-      joint_dq=values["joint_vel"],
-      previous_action=values["actions"],
-    )
-    packed = pack_observations(features, self.schema)
-    frame = command.time_steps.detach().clone()
-    segment = command.segment_ids.detach().clone()
-    generation = command.generation_ids.detach().clone()
-    metrics = _capture_physical_metrics(command)
-    return DistillationSnapshot(
-      teacher_observation=teacher_observation,
-      features=features,
-      packed=packed,
+    motion_id = self._motion_id.detach().clone()
+    return _capture_snapshot(
+      self.env,
+      cohort=self.cohort,
+      slices=self._slices,
+      schema=self.schema,
+      command=command,
       teacher_id=self.teacher_id,
       teacher_code=self.teacher_code,
-      motion_id=self._motion_id.detach().clone(),
-      reference_frame=frame,
-      segment_id=segment,
-      generation_id=generation,
-      metrics=metrics,
+      motion_id=motion_id,
+      teacher_codes=torch.full_like(motion_id, self.teacher_code),
     )
 
   def reset(self, seed: int | None = None) -> DistillationSnapshot:
     """Reset the simulator and return the owned post-reset snapshot."""
     self.env.reset(seed=seed)
-    command = self.env.command_manager.get_term("motion")
-    events = (
-      command.consume_boundary_events()
-      if isinstance(command, SegmentMotionCommand)
-      else None
-    )
-    return replace(self.snapshot(), boundary_events=events)
+    return replace(self.snapshot(), boundary_events=_consume_boundary_events(self.env))
 
   def step(self, action: torch.Tensor) -> DistillationStep:
     """Execute one normalized action and return the post-step snapshot."""
-    if not isinstance(action, torch.Tensor) or action.shape != (
-      self.env.num_envs,
-      self.cohort.actions.dim,
-    ):
-      raise ValueError(
-        f"action must have shape [{self.env.num_envs}, {self.cohort.actions.dim}]"
-      )
-    if not torch.isfinite(action).all().item():
-      raise ValueError("refusing to step a non-finite action")
+    _require_normalized_action(self.env, self.cohort.actions.dim, action)
     before = self.snapshot()
     _, reward, terminated, time_outs, extras = self.env.step(action)
-    command = self.env.command_manager.get_term("motion")
-    events = (
-      command.consume_boundary_events(before.generation_id)
-      if isinstance(command, SegmentMotionCommand)
-      else None
+    events = _consume_boundary_events(self.env, before.generation_id)
+    if events is not None:
+      events = events.with_step_outcome(terminated)
+    return DistillationStep(
+      snapshot=self.snapshot(),
+      reward=reward.detach().clone(),
+      terminated=terminated.detach().clone(),
+      time_outs=time_outs.detach().clone(),
+      extras=dict(extras),
+      events=events,
     )
+
+  def close(self) -> None:
+    self.env.close()
+
+
+class MultiMotionDistillationAdapter:
+  """One mixed-slot environment whose rows keep their own reference clip.
+
+  There is deliberately no single teacher identity: per-row routing codes come
+  from the command's own clip mapping, and every code means the same teacher in
+  the frozen bank, so no scalar identity is ever used to label a mixed batch.
+  The observation cache, delay, noise, and action semantics are unchanged from
+  the single-teacher adapter, because both capture the same cached actor tensor.
+  """
+
+  def __init__(
+    self,
+    env: Any,
+    cohort: CohortContract,
+    bank: TeacherBank,
+    *,
+    schema: VaeSchema | None = None,
+    audit: MultiMotionLiveContractAudit | None = None,
+  ) -> None:
+    self.env = env
+    self.cohort = cohort
+    self.bank = bank
+    self.schema = schema or make_schema(joint_order=cohort.actions.joint_names)
+    if self.schema.joint_order != cohort.actions.joint_names:
+      raise DistillationError(
+        "live schema joint_order must exactly match cohort.actions.joint_names"
+      )
+    command = _require_multi_motion_command(env)
+    self.teacher_ids = tuple(clip.teacher_id for clip in command.library.clips)
+    for clip in command.library.clips:
+      code = bank.code(clip.teacher_id)
+      if code != clip.teacher_code:
+        raise DistillationError(
+          f"teacher bank assigns code {code} to {clip.teacher_id!r} but the "
+          f"reference library routes it with code {clip.teacher_code}; build the "
+          "bank over the whole cohort in manifest order"
+        )
+    self.audit = audit or validate_multi_motion_live_contract(
+      env, cohort, self.teacher_ids
+    )
+    self._slices = _term_slices(cohort)
+
+  @property
+  def library(self) -> MotionLibrary:
+    """Reference library of the adapted environment, resolved per row."""
+    return _require_multi_motion_command(self.env).library
+
+  @property
+  def motion_teacher_codes(self) -> dict[int, int]:
+    """Ordered motion-id to teacher-code mapping of this adapted cohort."""
+    return {clip.motion_id: clip.teacher_code for clip in self.library.clips}
+
+  def snapshot(self) -> DistillationSnapshot:
+    """Capture one owned snapshot with validated per-row routing metadata."""
+    command = _require_multi_motion_command(self.env)
+    motion_id = command.motion_ids.detach().clone().to(dtype=torch.long)
+    if motion_id.shape != (self.env.num_envs,):
+      raise DistillationError(
+        f"live motion ids must have shape [{self.env.num_envs}], got "
+        f"{tuple(motion_id.shape)}"
+      )
+    teacher_codes = command.teacher_codes.detach().clone().to(dtype=torch.long)
+    if teacher_codes.shape != motion_id.shape:
+      raise DistillationError(
+        "per-row teacher codes must be aligned with the per-row motion ids"
+      )
+    expected = command.library.teacher_codes_for(motion_id)
+    if not torch.equal(teacher_codes, expected):
+      raise DistillationError(
+        "per-row teacher codes disagree with the reference library's "
+        "motion-to-teacher mapping; rows would be labeled by the wrong teacher"
+      )
+    return _capture_snapshot(
+      self.env,
+      cohort=self.cohort,
+      slices=self._slices,
+      schema=self.schema,
+      command=command,
+      teacher_id=_MIXED_TEACHER_ID,
+      teacher_code=_MIXED_TEACHER_CODE,
+      motion_id=motion_id,
+      teacher_codes=teacher_codes,
+    )
+
+  def reset(self, seed: int | None = None) -> DistillationSnapshot:
+    """Reset the simulator and return the owned post-reset snapshot."""
+    self.env.reset(seed=seed)
+    return replace(self.snapshot(), boundary_events=_consume_boundary_events(self.env))
+
+  def step(self, action: torch.Tensor) -> DistillationStep:
+    """Execute one normalized action and return the post-step snapshot."""
+    _require_normalized_action(self.env, self.cohort.actions.dim, action)
+    before = self.snapshot()
+    _, reward, terminated, time_outs, extras = self.env.step(action)
+    events = _consume_boundary_events(self.env, before.generation_id)
     if events is not None:
       events = events.with_step_outcome(terminated)
     return DistillationStep(
@@ -816,13 +1392,60 @@ def make_distillation_adapter(
     raise
 
 
+def make_multi_teacher_distillation_adapter(
+  cohort: CohortContract,
+  teacher_ids: Sequence[str],
+  *,
+  phase_policy: PhasePolicy = "uniform",
+  task_id: str | None = None,
+  num_envs: int | None = None,
+  device: str = "cpu",
+  render_mode: str | None = None,
+  schema: VaeSchema | None = None,
+  seed: int | None = None,
+) -> MultiMotionDistillationAdapter:
+  """Build one mixed-slot env, audit every selected clip, and adapt it.
+
+  The frozen bank is built over the whole cohort in manifest order, which is the
+  same order the reference library uses for numeric teacher codes, so routing a
+  code can never select a different teacher than the one that trained on the
+  row's clip.
+  """
+  env = build_multi_motion_environment(
+    cohort,
+    teacher_ids,
+    phase_policy=phase_policy,
+    task_id=task_id,
+    num_envs=num_envs,
+    device=device,
+    render_mode=render_mode,
+    seed=seed,
+  )
+  try:
+    bank = build_cohort_teacher_bank(cohort, device=device)
+    audit = validate_multi_motion_live_contract(
+      env, cohort, teacher_ids, task_id=task_id
+    )
+    return MultiMotionDistillationAdapter(env, cohort, bank, schema=schema, audit=audit)
+  except Exception:
+    env.close()
+    raise
+
+
 __all__ = [
   "AssetFrameAudit",
+  "ClipReferenceEvidence",
   "DistillationEnvironmentAdapter",
   "DistillationSnapshot",
   "DistillationStep",
   "LiveContractAudit",
+  "MultiMotionAssetAudit",
+  "MultiMotionDistillationAdapter",
+  "MultiMotionLiveContractAudit",
   "audit_live_asset",
+  "audit_multi_motion_live_asset",
   "make_distillation_adapter",
+  "make_multi_teacher_distillation_adapter",
   "validate_live_contract",
+  "validate_multi_motion_live_contract",
 ]

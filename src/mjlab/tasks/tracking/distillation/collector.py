@@ -1,16 +1,21 @@
-"""Synchronous single-teacher DAgger collection and bounded evaluation.
+"""Synchronous multi-teacher DAgger collection and bounded evaluation.
 
-The collector operates on :class:`DistillationEnvironmentAdapter` snapshots.  A
-snapshot is labeled and copied before its action is stepped; consequently a
-record always describes the state whose teacher action it contains.  This
-module intentionally contains no optimizer, normalizer update, checkpoint, or
-CLI lifecycle.
+The collector operates on :class:`DistillationSnapshot` instances.  A snapshot is
+labeled and copied before its action is stepped; consequently a record always
+describes the state whose teacher action it contains.
+
+Mixed-cohort collection routes every row with the frozen teacher its own
+``teacher_codes`` entry names, through one :class:`TeacherBank`.  A scalar
+``teacher_code`` is only honored for a batch that a single teacher labels
+uniformly, and all stored routing metadata comes from the captured PRE-step
+snapshot, never from the post-reset command.  This module intentionally contains
+no optimizer, normalizer update, checkpoint, or CLI lifecycle.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 import torch
 
@@ -22,14 +27,32 @@ from mjlab.tasks.tracking.distillation.model import ConditionalVAE
 from mjlab.tasks.tracking.distillation.observations import PackedObservationBatch
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
-  LabeledReplayBuffer,
+  ReplayBufferProtocol,
 )
-from mjlab.tasks.tracking.distillation.teachers import FrozenTeacher
+from mjlab.tasks.tracking.distillation.teachers import FrozenTeacher, TeacherBank
 from mjlab.tasks.tracking.distillation.trainer import FreshTrainingData
 
 
 class CollectionNumericalError(RuntimeError):
   """A non-finite snapshot, label, or command prevented a simulator step."""
+
+
+class TeacherRoutingError(ValueError):
+  """Snapshot row routing metadata is malformed or disagrees with the bank.
+
+  This is raised before any label is stored or any simulator step happens: an
+  ambiguous or inconsistent motion/teacher identity must never be resolved by a
+  fallback, because a wrong code silently stores labels from the wrong teacher.
+  """
+
+
+_INTEGER_DTYPES = (
+  torch.int8,
+  torch.int16,
+  torch.int32,
+  torch.int64,
+  torch.uint8,
+)
 
 
 class _AdapterLike(Protocol):
@@ -42,6 +65,16 @@ class _TeacherLike(Protocol):
   action_dim: int
 
   def label(self, observations: torch.Tensor) -> torch.Tensor: ...
+
+
+class _TeacherBankLike(Protocol):
+  """A bank labels every row with the teacher its own routing code names."""
+
+  action_dim: int
+
+  def label(
+    self, teacher_ids: torch.Tensor, observations: torch.Tensor
+  ) -> torch.Tensor: ...
 
 
 RolloutLatent = Literal["mean", "sampled"]
@@ -80,7 +113,14 @@ class CollectionConfig:
 
 @dataclass(frozen=True, slots=True)
 class SegmentBoundary:
-  """A reset, termination, timeout, or motion-generation boundary."""
+  """A reset, termination, timeout, or motion-generation boundary.
+
+  ``before_motion_ids``/``before_teacher_codes`` are aligned with
+  ``env_indices`` and describe the PRE-step state, so a boundary belongs to the
+  segment that just ended even when the step resampled the row into another
+  clip.  They are empty only for a boundary whose producer did not report row
+  identity.
+  """
 
   env_indices: tuple[int, ...]
   reason: str
@@ -88,11 +128,72 @@ class SegmentBoundary:
   after_segment: tuple[int, ...]
   before_generation: tuple[int, ...]
   after_generation: tuple[int, ...]
+  before_motion_ids: tuple[int, ...] = ()
+  before_teacher_codes: tuple[int, ...] = ()
+
+  def __post_init__(self) -> None:
+    if self.before_motion_ids or self.before_teacher_codes:
+      for name in ("before_motion_ids", "before_teacher_codes"):
+        value = getattr(self, name)
+        if len(value) != len(self.env_indices):
+          raise ValueError(
+            f"{name} must align with the {len(self.env_indices)} mentioned "
+            f"environments, got {len(value)}"
+          )
+
+
+@dataclass(frozen=True, slots=True)
+class MotionCollectionStats:
+  """Per-motion collection totals for one bounded collection call.
+
+  Rows are attributed to the motion their PRE-step snapshot named, so a
+  boundary counts against the segment that just ended rather than the clip the
+  row was resampled into.  ``reference_frames_observed`` counts distinct
+  clip-local frames, and the min/max bound them; a caller compares those with
+  the clip length it already owns instead of inferring it here.
+  """
+
+  motion_id: int
+  teacher_id: str | None
+  teacher_code: int
+  samples: int
+  teacher_steps: int
+  student_steps: int
+  boundaries: int
+  disagreement_mean: float | None
+  disagreement_rows: int
+  reference_frames_observed: int
+  reference_frame_min: int | None
+  reference_frame_max: int | None
+
+  def as_dict(self) -> dict[str, Any]:
+    """Plain-data form for run reports and per-motion CLI aggregation."""
+    return {
+      "motion_id": self.motion_id,
+      "teacher_id": self.teacher_id,
+      "teacher_code": self.teacher_code,
+      "samples": self.samples,
+      "teacher_steps": self.teacher_steps,
+      "student_steps": self.student_steps,
+      "boundaries": self.boundaries,
+      "disagreement_mean": self.disagreement_mean,
+      "disagreement_rows": self.disagreement_rows,
+      "reference_frames_observed": self.reference_frames_observed,
+      "reference_frame_min": self.reference_frame_min,
+      "reference_frame_max": self.reference_frame_max,
+    }
 
 
 @dataclass(frozen=True, slots=True)
 class CollectionResult:
-  """Counters and explicit boundaries from one bounded collection call."""
+  """Counters and explicit boundaries from one bounded collection call.
+
+  ``motion_stats`` holds one entry per motion id seen in the captured PRE-step
+  snapshots, so a mixed collection reports per-motion samples, disagreement,
+  boundaries, and reference-frame coverage alongside the total counters.  The
+  explicit-reset boundary is reported once in ``boundaries`` but is not
+  attributed to a motion, because no segment ended at it.
+  """
 
   ticks: int
   samples: int
@@ -102,6 +203,7 @@ class CollectionResult:
   disagreement_mean: float
   diagnostics: tuple[str, ...] = ()
   fresh_data: FreshTrainingData | None = None
+  motion_stats: tuple[MotionCollectionStats, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +226,45 @@ class EvaluationSegment:
   valid_action_transitions: int = 0
   completion_available: bool | None = None
   completion_reason: str | None = None
+  motion_id: int | None = None
+  """Motion id of the snapshot that started this segment, not the post-reset one."""
+  teacher_code: int | None = None
+  """Frozen-teacher code that labeled this segment's starting state."""
+
+
+@dataclass(frozen=True, slots=True)
+class MotionEvaluationStats:
+  """Per-motion aggregation of the segments one evaluation produced.
+
+  Segments are grouped by the motion their segment started in, and the metric
+  means are unweighted over those segments.  ``outcomes`` keeps the raw counts
+  so an aggregate can never hide one failing motion, and ``completion_rate``/
+  ``failure_rate`` follow the same censoring rule as the overall result.
+  """
+
+  motion_id: int
+  teacher_code: int | None
+  segments: int
+  steps: int
+  outcomes: dict[str, int]
+  metrics: dict[str, float]
+  completion_known_segments: int
+  completion_rate: float | None
+  failure_rate: float | None
+
+  def as_dict(self) -> dict[str, Any]:
+    """Plain-data form for per-motion evaluation reports."""
+    return {
+      "motion_id": self.motion_id,
+      "teacher_code": self.teacher_code,
+      "segments": self.segments,
+      "steps": self.steps,
+      "outcomes": dict(self.outcomes),
+      "metrics": dict(self.metrics),
+      "completion_known_segments": self.completion_known_segments,
+      "completion_rate": self.completion_rate,
+      "failure_rate": self.failure_rate,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +277,19 @@ class EvaluationResult:
   segments: tuple[EvaluationSegment, ...]
   metrics: dict[str, float]
   settings: dict[str, Any] = field(default_factory=dict)
+
+  @property
+  def per_motion(self) -> tuple[MotionEvaluationStats, ...]:
+    """Per-motion aggregates, ordered by motion id, for cohort reporting."""
+    grouped: dict[int, list[EvaluationSegment]] = {}
+    for segment in self.segments:
+      if segment.motion_id is None:
+        continue
+      grouped.setdefault(segment.motion_id, []).append(segment)
+    return tuple(
+      _motion_evaluation_stats(motion_id, grouped[motion_id])
+      for motion_id in sorted(grouped)
+    )
 
   @property
   def completion_rate(self) -> float | None:
@@ -233,6 +387,198 @@ def _ids(snapshot: DistillationSnapshot) -> tuple[torch.Tensor, torch.Tensor]:
   return segment, generation
 
 
+def _row_teacher_codes(snapshot: DistillationSnapshot) -> torch.Tensor | None:
+  """Return the snapshot's owned per-row teacher codes, or ``None`` if absent."""
+  codes = snapshot.teacher_codes
+  if codes is None:
+    return None
+  batch = snapshot.teacher_observation.shape[0]
+  if not isinstance(codes, torch.Tensor):
+    raise TeacherRoutingError("snapshot teacher_codes must be a torch.Tensor")
+  if codes.shape != (batch,):
+    raise TeacherRoutingError(
+      f"snapshot teacher_codes must have shape [{batch}], got {tuple(codes.shape)}"
+    )
+  if codes.dtype not in _INTEGER_DTYPES:
+    raise TeacherRoutingError(
+      f"snapshot teacher_codes must be an integer tensor, got {codes.dtype}"
+    )
+  if codes.numel() and bool((codes < 0).any()):
+    raise TeacherRoutingError("snapshot teacher_codes must be non-negative")
+  return codes.to(dtype=torch.int64)
+
+
+def _route_teacher_codes(
+  snapshot: DistillationSnapshot,
+  teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
+) -> torch.Tensor:
+  """Per-row routing codes for one tick, before any simulator step.
+
+  A batch from several teachers requires the owned per-row vector; the legacy
+  scalar ``teacher_code`` is only usable for a batch whose rows all belong to
+  that one teacher, so a mixed batch can never fall back to a scalar identity.
+  """
+  batch = snapshot.teacher_observation.shape[0]
+  codes = _row_teacher_codes(snapshot)
+  if codes is None:
+    if isinstance(teacher, TeacherBank):
+      raise TeacherRoutingError(
+        "mixed multi-teacher routing needs per-row snapshot.teacher_codes; a "
+        "scalar snapshot.teacher_code cannot label a batch from several teachers"
+      )
+    if snapshot.teacher_code < 0:
+      raise TeacherRoutingError(
+        "snapshot has neither per-row teacher codes nor a single teacher identity"
+      )
+    return torch.full(
+      (batch,),
+      int(snapshot.teacher_code),
+      dtype=torch.int64,
+      device=snapshot.motion_id.device,
+    )
+  if not isinstance(teacher, TeacherBank) and bool((codes != int(codes[0])).any()):
+    raise TeacherRoutingError(
+      "snapshot rows carry different teacher codes; label a mixed batch with a "
+      "TeacherBank instead of one teacher"
+    )
+  return codes
+
+
+def _motion_teacher_label(
+  bank: TeacherBank | None, snapshot: DistillationSnapshot, code: int
+) -> str | None:
+  """Human-readable teacher id for one code, or ``None`` when it is unknown."""
+  if bank is not None:
+    ids = bank.teacher_ids
+    return ids[code] if 0 <= code < len(ids) else None
+  return snapshot.teacher_id if snapshot.teacher_code == code else None
+
+
+@dataclass(slots=True)
+class _MotionRecord:
+  """Mutable per-motion counters accumulated across the collection ticks."""
+
+  teacher_id: str | None
+  teacher_code: int
+  samples: int = 0
+  teacher_steps: int = 0
+  student_steps: int = 0
+  boundaries: int = 0
+  disagreement_sum: float = 0.0
+  disagreement_rows: int = 0
+  frames: set[int] = field(default_factory=set)
+  frame_min: int | None = None
+  frame_max: int | None = None
+
+  def observe_tick(self, frames: torch.Tensor) -> None:
+    self.frames.update(int(value) for value in torch.unique(frames).tolist())
+    lowest = int(frames.min().item())
+    highest = int(frames.max().item())
+    self.frame_min = lowest if self.frame_min is None else min(self.frame_min, lowest)
+    self.frame_max = highest if self.frame_max is None else max(self.frame_max, highest)
+
+  def build(self, motion_id: int) -> MotionCollectionStats:
+    return MotionCollectionStats(
+      motion_id=motion_id,
+      teacher_id=self.teacher_id,
+      teacher_code=self.teacher_code,
+      samples=self.samples,
+      teacher_steps=self.teacher_steps,
+      student_steps=self.student_steps,
+      boundaries=self.boundaries,
+      disagreement_mean=(
+        None
+        if self.disagreement_rows == 0
+        else self.disagreement_sum / self.disagreement_rows
+      ),
+      disagreement_rows=self.disagreement_rows,
+      reference_frames_observed=len(self.frames),
+      reference_frame_min=self.frame_min,
+      reference_frame_max=self.frame_max,
+    )
+
+
+def _observe_motion_tick(
+  records: dict[int, _MotionRecord],
+  snapshot: DistillationSnapshot,
+  *,
+  teacher_codes: torch.Tensor,
+  teacher_rows: torch.Tensor,
+  disagreement: torch.Tensor,
+  bank: TeacherBank | None,
+) -> None:
+  """Account one tick's rows under the motion their PRE-step snapshot named.
+
+  A motion that is labeled by two different teacher codes within one collection
+  call is rejected: it means the motion-to-teacher mapping changed under the
+  collector and the stored labels would no longer share one teacher.
+  """
+  motion_id = snapshot.motion_id.detach().clone().to(dtype=torch.int64)
+  reference_frame = snapshot.reference_frame.detach().clone().to(dtype=torch.int64)
+  for motion in torch.unique(motion_id).tolist():
+    rows = motion_id == motion
+    code = int(teacher_codes[rows][0].item())
+    record = records.get(motion)
+    if record is None:
+      record = _MotionRecord(
+        teacher_id=_motion_teacher_label(bank, snapshot, code), teacher_code=code
+      )
+      records[motion] = record
+    elif record.teacher_code != code:
+      raise TeacherRoutingError(
+        f"motion {motion} was labeled by teacher codes {record.teacher_code} and "
+        f"{code} in one collection call; the motion-to-teacher mapping changed"
+      )
+    record.samples += int(rows.sum().item())
+    record.teacher_steps += int(teacher_rows[rows].sum().item())
+    record.student_steps += int((~teacher_rows[rows]).sum().item())
+    record.disagreement_sum += float(disagreement[rows].sum().item())
+    record.disagreement_rows += int(rows.sum().item())
+    record.observe_tick(reference_frame[rows])
+
+
+def _observe_boundary(
+  records: dict[int, _MotionRecord],
+  boundary: SegmentBoundary,
+  snapshot: DistillationSnapshot,
+  bank: TeacherBank | None,
+) -> None:
+  """Attribute one boundary to the motions of the states it ended."""
+  if not boundary.before_motion_ids:
+    return
+  for position, motion in enumerate(boundary.before_motion_ids):
+    code = boundary.before_teacher_codes[position]
+    record = records.get(motion)
+    if record is None:
+      record = _MotionRecord(
+        teacher_id=_motion_teacher_label(bank, snapshot, code), teacher_code=code
+      )
+      records[motion] = record
+    record.boundaries += 1
+
+
+def _build_motion_stats(
+  records: dict[int, _MotionRecord],
+) -> tuple[MotionCollectionStats, ...]:
+  return tuple(records[motion].build(motion) for motion in sorted(records))
+
+
+def _reason_text(tokens: list[str]) -> str:
+  """Join reason tokens in first-seen order, without repeating a token.
+
+  A producer reports one row's termination both as an event reason and as the
+  ``terminated`` flag, and an event reason may itself be a ``+``-joined group
+  (for example ``timer_resampled+terminated``), so the tokens are merged instead
+  of concatenated: no reason is lost and none is reported twice.
+  """
+  merged: dict[str, None] = {}
+  for token in tokens:
+    for part in token.split("+"):
+      if part:
+        merged[part] = None
+  return "+".join(merged) or "boundary"
+
+
 def _boundary(
   before: DistillationSnapshot,
   after: DistillationSnapshot,
@@ -272,13 +618,19 @@ def _boundary(
     reasons.append("generation")
   elif bool((before_segment != after_segment).any()):
     reasons.append("segment")
+  before_motion = before.motion_id.detach().clone().to(dtype=torch.int64)
+  before_codes = _row_teacher_codes(before)
+  if before_codes is None:
+    before_codes = torch.full_like(before_motion, int(before.teacher_code))
   return SegmentBoundary(
     env_indices=tuple(int(index) for index in indices),
-    reason="+".join(reasons) or "boundary",
+    reason=_reason_text(reasons),
     before_segment=tuple(int(value) for value in before_segment.tolist()),
     after_segment=tuple(int(value) for value in after_segment.tolist()),
     before_generation=tuple(int(value) for value in before_generation.tolist()),
     after_generation=tuple(int(value) for value in after_generation.tolist()),
+    before_motion_ids=tuple(int(before_motion[index].item()) for index in indices),
+    before_teacher_codes=tuple(int(before_codes[index].item()) for index in indices),
   )
 
 
@@ -303,11 +655,20 @@ def _student_action(
 
 
 def _teacher_action(
-  teacher: _TeacherLike, snapshot: DistillationSnapshot
+  teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
+  snapshot: DistillationSnapshot,
+  teacher_codes: torch.Tensor,
 ) -> torch.Tensor:
+  """Label one PRE-step snapshot, routing each row to its own frozen teacher."""
   _finite("teacher observation", snapshot.teacher_observation)
-  with torch.no_grad():
-    action = teacher.label(snapshot.teacher_observation)
+  if isinstance(teacher, TeacherBank):
+    # A bank labels each unique code once and restores row order; the codes are
+    # the captured pre-step routing metadata, never the live command state.
+    action = teacher.label(teacher_codes, snapshot.teacher_observation)
+  else:
+    single = cast(FrozenTeacher | _TeacherLike, teacher)
+    with torch.no_grad():
+      action = single.label(snapshot.teacher_observation)
   _finite("teacher label", action)
   if action.shape != (snapshot.teacher_observation.shape[0], teacher.action_dim):
     raise ValueError("teacher label has an unexpected shape")
@@ -339,6 +700,8 @@ def _replay_batch(
   snapshot: DistillationSnapshot,
   teacher_action: torch.Tensor,
   collector_iteration: int,
+  *,
+  teacher_codes: torch.Tensor,
 ) -> LabeledReplayBatch:
   batch = snapshot.packed.batch_size
 
@@ -349,9 +712,7 @@ def _replay_batch(
     observations=snapshot.packed,
     teacher_action=teacher_action.detach().clone(),
     motion_id=metadata(snapshot.motion_id),
-    teacher_id=torch.full_like(
-      snapshot.motion_id, snapshot.teacher_code, dtype=torch.int64
-    ),
+    teacher_id=metadata(teacher_codes),
     reference_frame=metadata(snapshot.reference_frame),
     episode_id=metadata(snapshot.segment_id),
     collector_iteration=torch.full(
@@ -366,13 +727,14 @@ class DAggerCollector:
   def __init__(
     self,
     adapter: _AdapterLike,
-    teacher: FrozenTeacher | _TeacherLike,
+    teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
     student: ConditionalVAE,
-    replay: LabeledReplayBuffer,
+    replay: ReplayBufferProtocol,
   ) -> None:
     self.adapter = adapter
     _require_auto_reset(adapter)
     self.teacher = teacher
+    self.bank = teacher if isinstance(teacher, TeacherBank) else None
     self.student = student
     self.replay = replay
     self._generator = torch.Generator(device="cpu")
@@ -458,34 +820,54 @@ class DAggerCollector:
         reset_reason = _event_reason_summary(
           snapshot.boundary_events, snapshot.packed.batch_size
         )
+        reset_segments = tuple(int(value) for value in segment.tolist())
+        reset_generations = tuple(int(value) for value in generation.tolist())
+        reset_motions = tuple(int(value) for value in snapshot.motion_id.tolist())
+        reset_codes_tensor = _row_teacher_codes(snapshot)
+        if reset_codes_tensor is None:
+          reset_codes_tensor = torch.full_like(
+            snapshot.motion_id, int(snapshot.teacher_code)
+          )
+        reset_codes = tuple(int(value) for value in reset_codes_tensor.tolist())
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
+      # The explicit reset is reported once here and is deliberately not
+      # attributed to a motion: no segment ended at it, and a per-motion
+      # boundary count must stay a count of finished segments.
       boundaries.append(
         SegmentBoundary(
           tuple(range(snapshot.packed.batch_size)),
           "explicit_reset" if reset_reason is None else reset_reason,
-          tuple(int(value) for value in segment.tolist()),
-          tuple(int(value) for value in segment.tolist()),
-          tuple(int(value) for value in generation.tolist()),
-          tuple(int(value) for value in generation.tolist()),
+          reset_segments,
+          reset_segments,
+          reset_generations,
+          reset_generations,
+          reset_motions,
+          reset_codes,
         )
       )
     disagreements: list[float] = []
     fresh_batches: list[LabeledReplayBatch] = []
+    records: dict[int, _MotionRecord] = {}
+
     if config.steps == 0:
       return CollectionResult(
-        0, 0, 0, 0, tuple(boundaries), 0.0, tuple(diagnostics), None
+        0, 0, 0, 0, tuple(boundaries), 0.0, tuple(diagnostics), None, ()
       )
     for _ in range(config.steps):
       try:
-        teacher_action = _teacher_action(self.teacher, snapshot)
+        teacher_codes = _route_teacher_codes(snapshot, self.teacher)
+        teacher_action = _teacher_action(self.teacher, snapshot, teacher_codes)
         _finite("packed reference", snapshot.packed.reference)
         _finite("packed conditioning", snapshot.packed.conditioning)
         # A valid pre-failure label is retained even if student inference below
         # produces a non-finite command.  No such command can reach ``step``.
         fresh_batch = _replay_batch(
-          snapshot, teacher_action, config.collector_iteration
+          snapshot,
+          teacher_action,
+          config.collector_iteration,
+          teacher_codes=teacher_codes,
         )
       except Exception as exc:
         self._invalidate_on_failure(exc)
@@ -506,10 +888,26 @@ class DAggerCollector:
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
-      disagreement = (teacher_action - student_action).abs().mean().item()
-      disagreements.append(float(disagreement))
+      row_disagreement = (teacher_action - student_action).abs().mean(dim=-1)
+      disagreement = float(row_disagreement.mean().item())
+      disagreements.append(disagreement)
       teacher_steps += int(use_teacher.sum().item())
       student_steps += int((~use_teacher).sum().item())
+      try:
+        # Attributing before the step keeps every counter on the PRE-step state,
+        # so a row that the step resampled into another clip is still counted
+        # under the motion whose segment its label describes.
+        _observe_motion_tick(
+          records,
+          snapshot,
+          teacher_codes=teacher_codes,
+          teacher_rows=use_teacher,
+          disagreement=row_disagreement,
+          bank=self.bank,
+        )
+      except Exception as exc:
+        self._invalidate_on_failure(exc)
+        raise
       try:
         step = self.adapter.step(selected)
       except Exception as exc:
@@ -530,6 +928,8 @@ class DAggerCollector:
           time_outs,
           step.events,
         )
+        if boundary is not None:
+          _observe_boundary(records, boundary, snapshot, self.bank)
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
@@ -555,6 +955,7 @@ class DAggerCollector:
       sum(disagreements) / len(disagreements) if disagreements else 0.0,
       tuple(diagnostics),
       fresh_data,
+      _build_motion_stats(records),
     )
 
 
@@ -562,9 +963,9 @@ class DAggerCollector:
 # collector object between bounded calls.
 def collect_dagger(
   adapter: _AdapterLike,
-  teacher: FrozenTeacher | _TeacherLike,
+  teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
   student: ConditionalVAE,
-  replay: LabeledReplayBuffer,
+  replay: ReplayBufferProtocol,
   config: CollectionConfig,
   *,
   reset: bool = True,
@@ -723,7 +1124,7 @@ def _event_at(events: Any, index: int, batch: int) -> _BoundaryEvent | None:
 
 def evaluate_distillation(
   adapter: _AdapterLike,
-  teacher: FrozenTeacher | _TeacherLike,
+  teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
   student: ConditionalVAE | None = None,
   *,
   mode: EvaluationMode = "student",
@@ -766,12 +1167,16 @@ def evaluate_distillation(
     completion_reasons: dict[tuple[int, int, int], str | None] = {}
 
     def start_segments(value: DistillationSnapshot) -> None:
+      codes = _row_teacher_codes(value)
       for index in range(batch):
         key = (
           index,
           int(value.segment_id[index].item()),
           int(value.generation_id[index].item()),
         )
+        # Identity is recorded when the segment first appears, so a segment is
+        # always attributed to the motion and teacher that started it, never to
+        # the state a boundary resampled the row into.
         records.setdefault(
           key,
           {
@@ -784,13 +1189,18 @@ def evaluate_distillation(
             "action_transitions": 0,
             "start_frame": None,
             "end_frame": None,
+            "motion_id": int(value.motion_id[index].item()),
+            "teacher_code": int(
+              value.teacher_code if codes is None else codes[index].item()
+            ),
           },
         )
 
     start_segments(snapshot)
     total_steps = 0
     while total_steps < steps:
-      teacher_action = _teacher_action(teacher, snapshot)
+      teacher_codes = _route_teacher_codes(snapshot, teacher)
+      teacher_action = _teacher_action(teacher, snapshot, teacher_codes)
       if mode == "teacher":
         action = teacher_action
       else:
@@ -936,6 +1346,8 @@ def evaluate_distillation(
           transitions,
           completion_availability.get((index, segment_id, generation_id)),
           completion_reasons.get((index, segment_id, generation_id)),
+          record["motion_id"],
+          record["teacher_code"],
         )
       )
 
@@ -1008,11 +1420,53 @@ def evaluate_distillation(
         "action_rate_denominator": "valid_same_segment_transitions",
         "metric_aligned_time": aligned_time,
         "manual_reset_policy": "rejected",
+        "motion_attribution": "pre_step_snapshot_motion_id",
+        "motion_ids": sorted(
+          {item.motion_id for item in segments if item.motion_id is not None}
+        ),
       },
     )
   finally:
     if student is not None and was_training is not None:
       student.train(was_training)
+
+
+def _motion_evaluation_stats(
+  motion_id: int, segments: list[EvaluationSegment]
+) -> MotionEvaluationStats:
+  """Aggregate the segments that started in one motion."""
+  outcomes: dict[str, int] = {}
+  totals: dict[str, float] = {}
+  counts: dict[str, int] = {}
+  for segment in segments:
+    outcomes[segment.outcome] = outcomes.get(segment.outcome, 0) + 1
+    for name, value in segment.metrics.items():
+      totals[name] = totals.get(name, 0.0) + value
+      counts[name] = counts.get(name, 0) + 1
+  known = [
+    segment
+    for segment in segments
+    if segment.outcome in ("reference_complete", "failure")
+  ]
+  codes = {segment.teacher_code for segment in segments}
+  return MotionEvaluationStats(
+    motion_id=motion_id,
+    teacher_code=next(iter(codes)) if len(codes) == 1 else None,
+    segments=len(segments),
+    steps=sum(segment.steps for segment in segments),
+    outcomes=outcomes,
+    metrics={name: totals[name] / counts[name] for name in sorted(totals)},
+    completion_known_segments=len(known),
+    completion_rate=(
+      None
+      if not known
+      else sum(segment.outcome == "reference_complete" for segment in known)
+      / len(known)
+    ),
+    failure_rate=(
+      None if not known else sum(segment.failed for segment in known) / len(known)
+    ),
+  )
 
 
 __all__ = [
@@ -1023,8 +1477,11 @@ __all__ = [
   "EvaluationMode",
   "EvaluationResult",
   "EvaluationSegment",
+  "MotionCollectionStats",
+  "MotionEvaluationStats",
   "RolloutLatent",
   "SegmentBoundary",
+  "TeacherRoutingError",
   "collect_dagger",
   "evaluate_distillation",
 ]

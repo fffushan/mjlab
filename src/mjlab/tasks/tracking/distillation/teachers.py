@@ -17,6 +17,7 @@ from torch import nn
 
 from mjlab.tasks.tracking.distillation.config import (
   ActorArchitecture,
+  CohortContract,
   DistillationError,
   UnsupportedTeacherError,
   load_actor_state_dict,
@@ -150,6 +151,11 @@ class TeacherBank(nn.Module):
     """
     return next(self.parameters()).device
 
+  @property
+  def teacher_ids(self) -> tuple[str, ...]:
+    """Teacher ids in code order: ``teacher_ids[code]`` names that teacher."""
+    return self._ids
+
   def code(self, teacher_id: str) -> int:
     """Return the integer routing code of ``teacher_id``."""
     try:
@@ -225,6 +231,29 @@ class TeacherBank(nn.Module):
       rows = teacher_ids == code
       actions[rows] = self.teacher(int(code)).label(observations[rows])
     return actions
+
+
+def build_cohort_teacher_bank(
+  cohort: CohortContract, device: str | torch.device = "cpu"
+) -> TeacherBank:
+  """Build one frozen bank over every cohort teacher, in manifest order.
+
+  Bank codes are positions in ``cohort.teachers``, which is exactly the routing
+  code the multi-motion library assigns to a clip of that teacher.  Building the
+  bank over the whole cohort (rather than only the selected teachers) keeps that
+  identity stable when a caller selects a subset, so a snapshot's per-row teacher
+  code can never select a teacher other than the one that trained on the row's
+  clip.
+  """
+  return TeacherBank(
+    [
+      build_frozen_teacher(
+        teacher.id, teacher.actor_state_dict, teacher.actor, device=device
+      )
+      for teacher in cohort.teachers
+    ],
+    device=device,
+  )
 
 
 def build_frozen_teacher(

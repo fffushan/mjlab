@@ -1,6 +1,7 @@
-"""Bounded single-teacher distillation commands.
+"""Bounded single- and multi-teacher distillation commands.
 
-The CLI keeps M1 teacher validation lightweight and adds the opt-in M3 train and
+The CLI keeps M1 teacher validation lightweight and adds the opt-in M3
+single-teacher and M4 shared-student cohort (``--teacher-ids``) train and
 bounded evaluation surfaces.  Train/evaluate construct the trusted native Luna
 adapter; defaults are deliberately small and never start an unbounded run.
 Student evaluation is model-only: the saved schema and model settings are
@@ -16,7 +17,7 @@ import re
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -25,20 +26,38 @@ import torch
 import tyro
 
 import mjlab
-from mjlab.tasks.tracking.distillation.adapter import make_distillation_adapter
+from mjlab.tasks.tracking.distillation.adapter import (
+  MultiMotionDistillationAdapter,
+  make_distillation_adapter,
+  make_multi_teacher_distillation_adapter,
+)
+from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuffer
 from mjlab.tasks.tracking.distillation.checkpoint import (
+  CHECKPOINT_VERSION,
+  COHORT_CHECKPOINT_VERSION,
   CheckpointValidationError,
+  CohortLifecycleState,
+  CohortMemberInference,
   InferenceModel,
   LifecycleState,
+  load_cohort_member_inference,
   load_inference_checkpoint,
+)
+from mjlab.tasks.tracking.distillation.cohort_contract import (
+  CohortIdentity,
+  cohort_identity_from_adapter,
+  require_member_matches,
 )
 from mjlab.tasks.tracking.distillation.collector import (
   DAggerCollector,
   EvaluationMode,
+  EvaluationResult,
+  MotionEvaluationStats,
   RolloutLatent,
   evaluate_distillation,
 )
 from mjlab.tasks.tracking.distillation.config import (
+  CohortContract,
   DistillationError,
   MissingValidationDependencyError,
   load_manifest,
@@ -72,12 +91,26 @@ from mjlab.tasks.tracking.distillation.trainer import (
 )
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
 
-_COMMANDS = ("validate-teachers", "train", "evaluate", "play", "export")
+_COMMANDS = (
+  "validate-teachers",
+  "train",
+  "evaluate",
+  "evaluate-cohort",
+  "play",
+  "export",
+)
 SamplingMode = Literal["start", "uniform"]
+CohortEvaluationMode = Literal["teacher", "student", "both"]
 ReportBoundaries = Literal["summary", "full"]
 PlayViewer = Literal["viser", "native", "auto"]
 PROVENANCE_VERSION = 1
 """Version of the ``resolved_config`` record written into checkpoints."""
+
+_DEFAULT_TEACHER_ID = "tennis_000"
+"""Single-teacher default used when neither selection flag is supplied."""
+
+_COHORT_PHASE_POLICY = "uniform"
+"""Phase policy of an M4 training build; pinned evaluation overrides it."""
 
 _RESUME_INVARIANT_KEYS = (
   "teacher_id",
@@ -93,6 +126,28 @@ _RESUME_INVARIANT_KEYS = (
 )
 """Provenance entries a resume must reproduce; only the iteration budget grows."""
 
+_COHORT_RESUME_INVARIANT_KEYS = (
+  "manifest",
+  "teacher_ids",
+  "cohort_digest",
+  "mapping_digest",
+  "phase_policy",
+  "task",
+  "task_id",
+  "runtime",
+  "trainer",
+  "replay",
+  "model",
+)
+"""Cohort entries a version-2 resume must reproduce; only the budget grows.
+
+The member identities, artifact digests, clip extents, slot/phase policy,
+replay partition policy, and seed/device resources live in the checkpoint's
+stored cohort record and are compared strictly by ``resume_cohort`` before this
+list is consulted, so this list only pins the remaining runner/trainer/model
+settings that are not part of the cohort contract.
+"""
+
 
 def _print_help(stream) -> None:
   print("usage: distill <COMMAND> [OPTIONS]", file=stream)
@@ -102,8 +157,15 @@ def _print_help(stream) -> None:
     "  validate-teachers  Validate a teacher manifest and check native/ONNX parity.",
     file=stream,
   )
-  print("  train              Run a bounded single-teacher M3 lifecycle.", file=stream)
+  print(
+    "  train              Run a bounded M3 single-teacher or M4 shared cohort run.",
+    file=stream,
+  )
   print("  evaluate           Run bounded teacher/student evaluation.", file=stream)
+  print(
+    "  evaluate-cohort    Pin every selected motion and report per motion.",
+    file=stream,
+  )
   print(
     "  play               Play a checkpointed student in a Viser/native viewer.",
     file=stream,
@@ -135,6 +197,14 @@ def _print_help(stream) -> None:
     "  and decodes the mean latent; it constructs no trainer, replay, or runner.",
     file=stream,
   )
+  print(
+    "  'train --teacher-ids A B' trains one shared student over a multi-motion",
+    file=stream,
+  )
+  print(
+    "  cohort; 'train' also accepts the mutually exclusive singular --teacher-id.",
+    file=stream,
+  )
   print(file=stream)
   print("Run 'distill <COMMAND> --help' for command-specific options.", file=stream)
 
@@ -161,6 +231,87 @@ def _write_report(payload: dict, report: Path | None) -> str:
 
 def _resolve(manifest: Path, repo_root: Path):
   return resolve_cohort(load_manifest(manifest, repo_root))
+
+
+def _checkpoint_version(path: Path) -> int | None:
+  """On-disk envelope version of a checkpoint, without loading a model.
+
+  The version tag is the stable part of the saved envelope.  A payload whose
+  version is neither known value is reported as ``None`` so the corresponding
+  loader raises its own malformed-artifact error instead of this probe
+  guessing which format the file claims to be.
+  """
+  try:
+    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+  except OSError as exc:
+    raise DistillationError(f"cannot read checkpoint {path}: {exc}") from exc
+  if not isinstance(payload, Mapping):
+    return None
+  version = payload.get("version")
+  if isinstance(version, bool) or not isinstance(version, int):
+    return None
+  return version if version in (CHECKPOINT_VERSION, COHORT_CHECKPOINT_VERSION) else None
+
+
+def _is_cohort_checkpoint(path: Path) -> bool:
+  """True when the checkpoint is a version-2 multi-teacher cohort artifact."""
+  return _checkpoint_version(Path(path)) == COHORT_CHECKPOINT_VERSION
+
+
+def _load_member_inference(
+  checkpoint: Path,
+  cohort: CohortContract,
+  teacher_id: str,
+  *,
+  device: str,
+  expected_schema=None,
+):
+  """Load one checked member of a saved M4 cohort for inference only.
+
+  The member must exist in the stored cohort, and its artifact digests, clip
+  extent, saved reference digest, and common action/control/observation
+  contract must match the live manifest.  The stored cohort identity is kept as
+  provenance, so a pinned report never loses the identity of the shared
+  student it evaluated.
+  """
+  return load_cohort_member_inference(
+    checkpoint,
+    cohort,
+    teacher_id,
+    device=device,
+    expected_schema=expected_schema,
+  )
+
+
+def _load_student_inference(
+  checkpoint: Path,
+  cohort: CohortContract,
+  teacher_id: str,
+  *,
+  device: str,
+  expected_schema=None,
+):
+  """Dispatch to the version-1 or version-2 model-only loader by envelope.
+
+  Legacy callers of ``load_inference_checkpoint`` keep its exact behavior and
+  relaxation; a version-2 artifact is loaded through the checked cohort member
+  selection instead, so a pinned report always names the member it evaluated.
+  """
+  if _is_cohort_checkpoint(checkpoint):
+    return _load_member_inference(
+      checkpoint,
+      cohort,
+      teacher_id,
+      device=device,
+      expected_schema=expected_schema,
+    )
+  return load_inference_checkpoint(
+    checkpoint,
+    device=device,
+    expected_schema=expected_schema,
+    expected_teacher_hashes=cohort.teacher(teacher_id).hashes,
+    expected_control_contract=_control_metadata(cohort, teacher_id),
+  )
 
 
 def _control_metadata(cohort, teacher_id: str) -> dict:
@@ -303,14 +454,18 @@ def _resolved_config(
 
 
 def _check_resume_compatibility(
-  state: LifecycleState, requested: Mapping[str, Any]
+  state: LifecycleState | CohortLifecycleState,
+  requested: Mapping[str, Any],
+  *,
+  invariant_keys: tuple[str, ...] = _RESUME_INVARIANT_KEYS,
 ) -> dict[str, Any]:
   """Refuse a resume that would silently change stored settings/schedules.
 
-  Every stored semantic entry must be reproduced; only the total lifetime
-  iteration budget may grow.  A checkpoint that predates this provenance record
-  is reported as unverified rather than being failed against fields it never
-  stored, and any entry the checkpoint *did* record is still compared.
+  Every stored semantic entry listed in ``invariant_keys`` must be reproduced;
+  only the total lifetime iteration budget may grow.  A checkpoint that
+  predates this provenance record is reported as unverified rather than being
+  failed against fields it never stored, and any entry the checkpoint *did*
+  record is still compared.
   """
   stored = state.resolved_config
   verified = stored.get("provenance_version") == PROVENANCE_VERSION
@@ -324,7 +479,7 @@ def _check_resume_compatibility(
   }
   if not stored:
     audit["unverified"].append("resolved_config")
-  for key in _RESUME_INVARIANT_KEYS:
+  for key in invariant_keys:
     if key not in stored:
       audit["unverified"].append(key)
       continue
@@ -371,6 +526,32 @@ def _checkpoint_model_report(inference: InferenceModel | None) -> dict[str, Any]
     "settings": inference.settings.to_metadata(),
     "counters": dict(inference.counters),
     "schedule": dict(inference.schedule),
+  }
+
+
+def _member_inference_report(inference) -> dict[str, Any] | None:
+  """Model-only identity of one checked member of a saved M4 cohort.
+
+  A pinned report keeps the whole stored cohort identity next to the member it
+  evaluated, so the shared student's trained cohort is never reduced to the one
+  pinned motion.  ``relocated_artifact_roles`` names artifacts accepted only by
+  content digest, so a moved inference asset is visible instead of implicit.
+  """
+  if inference is None:
+    return None
+  report = _checkpoint_model_report(inference)
+  assert report is not None
+  return {
+    **report,
+    "checkpoint_version": COHORT_CHECKPOINT_VERSION,
+    "cohort_digest": inference.cohort.digest(),
+    "trained_teacher_ids": list(inference.cohort.teacher_ids),
+    "mapping_digest": inference.cohort.mapping_digest,
+    "requested_teacher_id": inference.requested_teacher_id,
+    "motion_id": inference.motion_id,
+    "teacher_code": inference.teacher_code,
+    "artifact_hashes": dict(inference.artifact_hashes),
+    "relocated_artifact_roles": list(inference.relocated_artifact_roles),
   }
 
 
@@ -444,6 +625,192 @@ def _build_runner(
   return runner, cohort.teacher(teacher_id), sampling_mode
 
 
+def _build_cohort_runner(
+  *,
+  cohort: CohortContract,
+  teacher_ids: tuple[str, ...],
+  device: str,
+  num_envs: int,
+  task_id: str | None,
+  replay_capacity: int,
+  minibatch_size: int,
+  accumulation_steps: int,
+  learning_rate: float,
+  beta: float,
+  seed: int,
+  max_iterations: int,
+  bootstrap_steps: int,
+  collection_steps: int,
+  updates_per_iteration: int,
+  teacher_probability: float,
+  evaluate_every: int,
+  evaluation_steps: int,
+  rollout_latent: RolloutLatent,
+):
+  """Build the M4 shared-student cohort run: one adapter, bank, and replay.
+
+  One environment carries every selected clip (its rows keep their own
+  reference), one frozen ``TeacherBank`` labels the mixed rows by their per-row
+  codes, and one per-motion balanced replay partitions the capacity by the
+  manifest weights.  The cohort identity is built from the live adapter and
+  replay, so it records what was actually constructed rather than a summary the
+  caller supplied.
+
+  Cheap budgets and the selection are validated *before* any environment is
+  constructed, and everything that runs after the adapter exists is wrapped so a
+  later failure closes the already-built environment exactly once instead of
+  leaking it (the caller has no runner to close in that case).
+  """
+  known = {teacher.id for teacher in cohort.teachers}
+  unknown = [teacher_id for teacher_id in teacher_ids if teacher_id not in known]
+  if unknown:
+    raise DistillationError(f"cohort has no teacher(s) {unknown}")
+  if not teacher_ids:
+    raise DistillationError("a cohort run needs at least one teacher id")
+  if len(set(teacher_ids)) != len(teacher_ids):
+    raise DistillationError(f"duplicate teacher ids {list(teacher_ids)}")
+  if replay_capacity < len(teacher_ids):
+    raise DistillationError(
+      f"--replay-capacity {replay_capacity} cannot give each of the "
+      f"{len(teacher_ids)} selected motions a slot"
+    )
+  # Pure-data configuration validates before a simulator exists.
+  training_config = TrainingConfig(
+    learning_rate=learning_rate,
+    beta=beta,
+    accumulation_steps=accumulation_steps,
+    minibatch_size=minibatch_size,
+  )
+  runner_config = RunnerConfig(
+    max_iterations=max_iterations,
+    bootstrap_steps=bootstrap_steps,
+    collection_steps=collection_steps,
+    updates_per_iteration=updates_per_iteration,
+    teacher_probability=teacher_probability,
+    evaluate_every=evaluate_every,
+    evaluation_steps=evaluation_steps,
+    evaluation_mode="student",
+    rollout_latent=rollout_latent,
+    seed=seed,
+  )
+  adapter = make_multi_teacher_distillation_adapter(
+    cohort,
+    teacher_ids,
+    phase_policy=_COHORT_PHASE_POLICY,
+    task_id=task_id,
+    num_envs=num_envs,
+    device=device,
+    seed=seed,
+  )
+  try:
+    # Model initialization only: environment startup randomization is seeded by
+    # the adapter factory above, before the private env config is constructed.
+    torch.manual_seed(seed)
+    model = ConditionalVAE(adapter.schema, DEFAULT_MODEL_SETTINGS).to(device)
+    weights = {
+      clip.motion_id: float(cohort.teacher(clip.teacher_id).entry.sampling_weight)
+      for clip in adapter.library.clips
+    }
+    replay = BalancedReplayBuffer(
+      replay_capacity,
+      adapter.schema,
+      weights,
+      teacher_codes=dict(adapter.motion_teacher_codes),
+      frame_counts={clip.motion_id: int(clip.frames) for clip in adapter.library.clips},
+      device=torch.device(device),
+      dtype=torch.float32,
+    )
+    identity = cohort_identity_from_adapter(adapter, replay=replay)
+    trainer = VaeDistillationTrainer(
+      model,
+      replay,
+      training_config,
+      seed=seed,
+      teacher=adapter.bank,
+    )
+    collector = DAggerCollector(adapter, adapter.bank, model, replay)
+    runner = DistillationRunner(collector, trainer, runner_config)
+  except BaseException:
+    # The caller never received a runner, so this is the only chance to release
+    # the environment the adapter already built.
+    adapter.close()
+    raise
+  sampling_mode = adapter.env.command_manager.get_term("motion").cfg.sampling_mode
+  return runner, adapter, identity, sampling_mode
+
+
+def _cohort_resolved_config(
+  *,
+  manifest: Path,
+  repo_root: Path,
+  adapter: MultiMotionDistillationAdapter,
+  identity: CohortIdentity,
+  task_id: str | None,
+  device: str,
+  num_envs: int,
+  seed: int,
+  seed_audit: Mapping[str, Any],
+  runner: DistillationRunner,
+  resume: Path | None,
+  checkpoint_every: int,
+) -> dict[str, Any]:
+  """Complete resolved M4 configuration recorded in every cohort checkpoint.
+
+  The member identities and their artifact digests are not repeated here: they
+  are the checkpoint's stored cohort record, which ``resume_cohort`` compares
+  strictly.  This record pins what the cohort record does not carry (trainer
+  settings, model settings, replay partition shape, and the resolved schedule),
+  using the same ``checkpoint_every``-is-audit-only rule as the single-teacher
+  path so a resumed run may change its save cadence.
+  """
+  trainer = runner.trainer
+  replay = runner.replay
+  assert isinstance(replay, BalancedReplayBuffer)
+  quota = replay.quota
+  return {
+    "provenance_version": PROVENANCE_VERSION,
+    "command": "train",
+    "manifest": str(manifest),
+    "repo_root": str(repo_root),
+    "teacher_ids": list(identity.teacher_ids),
+    "cohort_digest": identity.digest(),
+    "mapping_digest": identity.mapping_digest,
+    "phase_policy": identity.slots.phase_policy,
+    "task": adapter.cohort.manifest.base_task,
+    "task_id": task_id,
+    "runtime": {
+      "device": device,
+      "num_envs": num_envs,
+      "seed": seed,
+      "resolved_seed": seed_audit["effective_seed"],
+      "seed_provenance": dict(seed_audit),
+    },
+    "schedule": _schedule_config(
+      runner, adapter.env.command_manager.get_term("motion").cfg.sampling_mode
+    ),
+    "checkpoint_every": checkpoint_every,
+    "trainer": {
+      "learning_rate": trainer.config.learning_rate,
+      "beta": trainer.config.beta,
+      "accumulation_steps": trainer.config.accumulation_steps,
+      "minibatch_size": trainer.config.minibatch_size,
+      "latent_mode": trainer.config.latent_mode,
+    },
+    "replay": {
+      "kind": "balanced-motion-replay",
+      "capacity": replay.capacity,
+      "weights": list(replay.weights),
+      "quotas": list(quota.quotas),
+      "motion_ids": list(replay.motion_ids),
+    },
+    "model": {
+      "settings": trainer.model.settings.to_metadata(),
+      "schema": trainer.model.schema_metadata,
+    },
+    "resumed_from": None if resume is None else str(resume),
+  }
+
+
 def _observed_range(values: list[int]) -> list[int] | None:
   """Inclusive ``[min, max]`` of the observed ids, or ``None`` if none."""
   return None if not values else [min(values), max(values)]
@@ -513,6 +880,7 @@ def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
       "disagreement_mean": collection.disagreement_mean,
       "diagnostics": list(collection.diagnostics),
       "boundaries": _boundaries_report(collection, report_boundaries),
+      "motion_stats": [stats.as_dict() for stats in collection.motion_stats],
       "fresh_data_samples": (
         None
         if collection.fresh_data is None
@@ -526,10 +894,113 @@ def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
   }
 
 
-def _train(
+def _fail(exc: BaseException) -> int:
+  """Report one CLI-level refusal on stderr and return the failure exit code."""
+  print(f"[FAIL] {exc}", file=sys.stderr)
+  return 1
+
+
+def _require_train_settings(
+  report_boundaries: str, checkpoint_every: int, progress_every: int
+) -> None:
+  """Validate `train` reporting/save settings before any environment exists."""
+  if report_boundaries not in ("summary", "full"):
+    raise ValueError(
+      f"report_boundaries must be 'summary' or 'full' (got {report_boundaries!r})"
+    )
+  if checkpoint_every < 0:
+    raise ValueError(
+      f"--checkpoint-every must be a non-negative integer (got "
+      f"{checkpoint_every}); use 0 to disable periodic checkpoints and keep "
+      "only the final checkpoint"
+    )
+  if progress_every < 0:
+    raise ValueError(
+      f"--progress-every must be a non-negative integer (got {progress_every}); "
+      "use 0 to disable progress output"
+    )
+
+
+def _drive_lifecycle(
+  runner: DistillationRunner,
+  *,
+  max_iterations: int,
+  checkpoint_every: int,
+  progress_every: int,
+  output_dir: Path,
+  report_boundaries: ReportBoundaries,
+  write_checkpoint,
+  device: str,
+  num_envs: int,
+) -> tuple[list[dict], list[Path]]:
+  """Drive one bounded runner and return its per-iteration reports and checkpoints.
+
+  The existing bounded runner is driven in chunks and its one save call is
+  reused, so a periodic checkpoint carries the same provenance/schedule
+  metadata as the final one and is an ordinary resume input.  Filenames use
+  ``runner.iteration``, the total lifetime counter, so a resumed run continues
+  the same sequence instead of colliding with earlier files.  Each iteration is
+  converted to its report form as soon as it returns, so a summary report never
+  holds more than one iteration's boundary arrays.  This driver is shared by the
+  single-teacher and shared-student cohort runs; only the save call differs.
+  """
+  iteration_reports: list[dict] = []
+  checkpoints: list[Path] = []
+  progress_started = time.monotonic()
+  iterations_this_run = 0
+  if progress_every > 0:
+    print(
+      f"[progress] starting at iteration {runner.iteration}/{max_iterations} "
+      f"device={device} num_envs={num_envs} progress_every={progress_every}",
+      file=sys.stderr,
+      flush=True,
+    )
+  while runner.iteration < max_iterations:
+    remaining = max_iterations - runner.iteration
+    chunk = remaining if checkpoint_every <= 0 else min(checkpoint_every, remaining)
+    for _ in range(chunk):
+      iteration_report = _iteration_report(runner.run_iteration(), report_boundaries)
+      if isinstance(runner.replay, BalancedReplayBuffer):
+        iteration_report["replay"] = runner.replay.report().as_dict()
+      iteration_reports.append(iteration_report)
+      iterations_this_run += 1
+      if progress_every > 0 and (
+        runner.iteration % progress_every == 0 or runner.iteration >= max_iterations
+      ):
+        latest = iteration_reports[-1]
+        collection = latest.get("collection") or {}
+        updates = latest.get("updates") or []
+        raw_loss = updates[-1].get("total_loss") if updates else None
+        raw_disagreement = collection.get("disagreement_mean")
+        loss_text = "n/a" if raw_loss is None else f"{raw_loss:.4f}"
+        disagreement_text = (
+          "n/a" if raw_disagreement is None else f"{raw_disagreement:.4f}"
+        )
+        elapsed = time.monotonic() - progress_started
+        per_iteration = elapsed / max(iterations_this_run, 1)
+        eta_hours = per_iteration * (max_iterations - runner.iteration) / 3600.0
+        print(
+          f"[progress] iter {runner.iteration}/{max_iterations} "
+          f"samples={collection.get('samples')} loss={loss_text} "
+          f"disagreement={disagreement_text} elapsed={elapsed:.1f}s "
+          f"({per_iteration:.2f} s/iter this run) eta={eta_hours:.2f}h",
+          file=sys.stderr,
+          flush=True,
+        )
+    if checkpoint_every > 0:
+      periodic = output_dir / f"checkpoint-iter-{runner.iteration:06d}.pt"
+      write_checkpoint(periodic)
+      checkpoints.append(periodic)
+  checkpoint = output_dir / "checkpoint-final.pt"
+  write_checkpoint(checkpoint)
+  checkpoints.append(checkpoint)
+  return iteration_reports, checkpoints
+
+
+def _train_single(
   manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
   repo_root: Path = Path("."),
-  teacher_id: str = "tennis_000",
+  teacher_id: str = _DEFAULT_TEACHER_ID,
   task_id: str | None = None,
   device: str = "cpu",
   num_envs: int = 1,
@@ -553,60 +1024,10 @@ def _train(
   output_dir: Path | None = None,
   resume: Path | None = None,
 ) -> int:
-  """Run a bounded native single-teacher collect/update lifecycle.
-
-  ``max_iterations`` is the total lifetime iteration budget, including when
-  ``resume`` is supplied.  Resume restores replay, normalizers, optimizer, and
-  RNG state; the simulator is restarted and bootstrap is not repeated when the
-  checkpoint contains replay.  ``seed`` is forwarded into environment
-  construction before startup randomization, and the resolved seed, the seed
-  provenance, and the complete resolved configuration are reported.
-
-  ``checkpoint_every`` is a periodic save cadence counted in *completed*
-  iterations.  ``0`` disables periodic checkpoints and keeps only the final
-  ``checkpoint-final.pt``.  When positive, a checkpoint named from the total
-  lifetime iteration counter is written atomically every ``checkpoint_every``
-  completed iterations, every checkpoint is a complete resume input, and the
-  report lists every checkpoint written by this invocation.
-
-  The default cadence is 500.  ``progress_every`` defaults to 10 and writes
-  flushed progress lines to stderr.  When ``output_dir`` is omitted, the run is
-  stored under ``logs/distillation/<task-id>/`` when ``task_id`` is supplied,
-  otherwise under ``logs/distillation/<UTC timestamp>/``.
-
-  ``progress_every`` writes a flushed ``[progress]`` line to **stderr** every
-  ``N`` completed iterations, reporting the lifetime iteration, collected
-  samples, last update loss, teacher/student disagreement, elapsed time,
-  seconds per iteration for this invocation, and a projected ETA.  ``0``
-  disables progress output.  Progress deliberately goes to stderr so that
-  stdout stays exactly the machine-readable JSON report that callers and tests
-  parse; a long run is otherwise observable only through its periodic
-  checkpoints.
-
-  ``report_boundaries`` selects the boundary evidence in each iteration's
-  ``collection.boundaries``.  ``summary`` (the default) reports per-``reason``
-  record/environment-mention counts and the observed before/after segment and
-  generation ranges, and never retains a boundary's per-environment arrays;
-  ``full`` writes those arrays as before, which is roughly 2 MB per iteration
-  at 4096 environments, so it is a debugging option, not the default.
-  """
+  """Run the bounded native single-teacher (M3) collect/update lifecycle."""
   runner = None
   try:
-    if report_boundaries not in ("summary", "full"):
-      raise ValueError(
-        f"report_boundaries must be 'summary' or 'full' (got {report_boundaries!r})"
-      )
-    if checkpoint_every < 0:
-      raise ValueError(
-        f"--checkpoint-every must be a non-negative integer (got "
-        f"{checkpoint_every}); use 0 to disable periodic checkpoints and keep "
-        "only the final checkpoint"
-      )
-    if progress_every < 0:
-      raise ValueError(
-        f"--progress-every must be a non-negative integer (got {progress_every}); "
-        "use 0 to disable progress output"
-      )
+    _require_train_settings(report_boundaries, checkpoint_every, progress_every)
     cohort = _resolve(manifest, repo_root)
     runner, selected, evaluation_sampling_mode = _build_runner(
       cohort=cohort,
@@ -669,62 +1090,18 @@ def _train(
         schedule=resolved_config["schedule"],
       )
 
-    # The existing bounded runner is driven in chunks and its one save call is
-    # reused, so a periodic checkpoint carries the same provenance/schedule
-    # metadata as the final one and is an ordinary resume input.  Filenames use
-    # ``runner.iteration``, the total lifetime counter, so a resumed run
-    # continues the same sequence instead of colliding with earlier files.
-    # Each iteration is converted to its report form as soon as it returns, so
-    # a summary report never holds more than one iteration's boundary arrays.
-    iteration_reports: list[dict] = []
-    checkpoints: list[Path] = []
-    progress_started = time.monotonic()
-    iterations_this_run = 0
-    if progress_every > 0:
-      print(
-        f"[progress] starting at iteration {runner.iteration}/{max_iterations} "
-        f"device={device} num_envs={num_envs} progress_every={progress_every}",
-        file=sys.stderr,
-        flush=True,
-      )
-    while runner.iteration < max_iterations:
-      remaining = max_iterations - runner.iteration
-      chunk = remaining if checkpoint_every <= 0 else min(checkpoint_every, remaining)
-      for _ in range(chunk):
-        iteration_reports.append(
-          _iteration_report(runner.run_iteration(), report_boundaries)
-        )
-        iterations_this_run += 1
-        if progress_every > 0 and (
-          runner.iteration % progress_every == 0 or runner.iteration >= max_iterations
-        ):
-          latest = iteration_reports[-1]
-          collection = latest.get("collection") or {}
-          updates = latest.get("updates") or []
-          raw_loss = updates[-1].get("total_loss") if updates else None
-          raw_disagreement = collection.get("disagreement_mean")
-          loss_text = "n/a" if raw_loss is None else f"{raw_loss:.4f}"
-          disagreement_text = (
-            "n/a" if raw_disagreement is None else f"{raw_disagreement:.4f}"
-          )
-          elapsed = time.monotonic() - progress_started
-          per_iteration = elapsed / max(iterations_this_run, 1)
-          eta_hours = per_iteration * (max_iterations - runner.iteration) / 3600.0
-          print(
-            f"[progress] iter {runner.iteration}/{max_iterations} "
-            f"samples={collection.get('samples')} loss={loss_text} "
-            f"disagreement={disagreement_text} elapsed={elapsed:.1f}s "
-            f"({per_iteration:.2f} s/iter this run) eta={eta_hours:.2f}h",
-            file=sys.stderr,
-            flush=True,
-          )
-      if checkpoint_every > 0:
-        periodic = output_dir / f"checkpoint-iter-{runner.iteration:06d}.pt"
-        write_checkpoint(periodic)
-        checkpoints.append(periodic)
-    checkpoint = output_dir / "checkpoint-final.pt"
-    write_checkpoint(checkpoint)
-    checkpoints.append(checkpoint)
+    iteration_reports, checkpoints = _drive_lifecycle(
+      runner,
+      max_iterations=max_iterations,
+      checkpoint_every=checkpoint_every,
+      progress_every=progress_every,
+      output_dir=output_dir,
+      report_boundaries=report_boundaries,
+      write_checkpoint=write_checkpoint,
+      device=device,
+      num_envs=num_envs,
+    )
+    checkpoint = checkpoints[-1]
     payload = {
       "command": " ".join(sys.argv),
       "status": "implementation_smoke_only",
@@ -767,6 +1144,335 @@ def _train(
         close()
 
 
+def _train_cohort(
+  *,
+  manifest: Path,
+  repo_root: Path,
+  teacher_ids: tuple[str, ...],
+  task_id: str | None,
+  device: str,
+  num_envs: int,
+  max_iterations: int,
+  bootstrap_steps: int,
+  collection_steps: int,
+  updates_per_iteration: int,
+  teacher_probability: float,
+  evaluate_every: int,
+  evaluation_steps: int,
+  minibatch_size: int,
+  accumulation_steps: int,
+  replay_capacity: int,
+  learning_rate: float,
+  beta: float,
+  seed: int,
+  rollout_latent: RolloutLatent,
+  checkpoint_every: int,
+  progress_every: int,
+  report_boundaries: ReportBoundaries,
+  output_dir: Path | None,
+  resume: Path | None,
+) -> int:
+  """Run the bounded shared-student M4 cohort collect/update lifecycle.
+
+  One environment carries every selected clip, one frozen bank labels rows by
+  their per-row codes, and one per-motion balanced replay holds the capacity.
+  The checkpoint is a version-2 cohort artifact, so it is saved and resumed
+  through the cohort lifecycle; a version-1 artifact is refused before any
+  environment is constructed instead of being reinterpreted.
+  """
+  runner = None
+  try:
+    _require_train_settings(report_boundaries, checkpoint_every, progress_every)
+    if resume is not None and not _is_cohort_checkpoint(resume):
+      raise DistillationError(
+        "--teacher-ids requires a version-2 M4 cohort checkpoint to resume; "
+        f"{resume} is not one. Use --teacher-id for a version-1 resume, or "
+        "start a new cohort run"
+      )
+    cohort = _resolve(manifest, repo_root)
+    runner, adapter, identity, evaluation_sampling_mode = _build_cohort_runner(
+      cohort=cohort,
+      teacher_ids=teacher_ids,
+      device=device,
+      num_envs=num_envs,
+      task_id=task_id,
+      replay_capacity=replay_capacity,
+      minibatch_size=minibatch_size,
+      accumulation_steps=accumulation_steps,
+      learning_rate=learning_rate,
+      beta=beta,
+      seed=seed,
+      max_iterations=max_iterations,
+      bootstrap_steps=bootstrap_steps,
+      collection_steps=collection_steps,
+      updates_per_iteration=updates_per_iteration,
+      teacher_probability=teacher_probability,
+      evaluate_every=evaluate_every,
+      evaluation_steps=evaluation_steps,
+      rollout_latent=rollout_latent,
+    )
+    seed_audit = _seed_audit(adapter)
+    _require_requested_seed_applied(seed, seed_audit)
+    assert isinstance(runner.replay, BalancedReplayBuffer)
+    resolved_config = _cohort_resolved_config(
+      manifest=manifest,
+      repo_root=repo_root,
+      adapter=adapter,
+      identity=identity,
+      task_id=task_id,
+      device=device,
+      num_envs=num_envs,
+      seed=seed,
+      seed_audit=seed_audit,
+      runner=runner,
+      resume=resume,
+      checkpoint_every=checkpoint_every,
+    )
+    resume_audit = None
+    if resume is not None:
+      # ``resume_cohort`` reproduces the whole stored cohort record strictly
+      # (members, digests, clip extents, slot/phase policy, replay partitions,
+      # and seed/device resources) before the runner settings below are checked.
+      state = runner.resume_cohort(str(resume), identity, map_location=device)
+      resume_audit = _check_resume_compatibility(
+        state, resolved_config, invariant_keys=_COHORT_RESUME_INVARIANT_KEYS
+      )
+    if output_dir is None:
+      output_dir = _default_train_output_dir(task_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_checkpoint(path: Path) -> None:
+      runner.save_cohort(
+        str(path),
+        identity,
+        resolved_config=resolved_config,
+        schedule=resolved_config["schedule"],
+      )
+
+    iteration_reports, checkpoints = _drive_lifecycle(
+      runner,
+      max_iterations=max_iterations,
+      checkpoint_every=checkpoint_every,
+      progress_every=progress_every,
+      output_dir=output_dir,
+      report_boundaries=report_boundaries,
+      write_checkpoint=write_checkpoint,
+      device=device,
+      num_envs=num_envs,
+    )
+    checkpoint = checkpoints[-1]
+    payload = {
+      "command": " ".join(sys.argv),
+      "status": "implementation_smoke_only",
+      "checkpoint": str(checkpoint),
+      "checkpoints": [str(path) for path in checkpoints],
+      "iteration": runner.iteration,
+      "iterations": iteration_reports,
+      "events": runner.events,
+      "runtime": {
+        "device": device,
+        "num_envs": num_envs,
+        "requested_seed": seed,
+        "resolved_seed": seed_audit["effective_seed"],
+        "seed_provenance": seed_audit,
+      },
+      "schedule": resolved_config["schedule"],
+      "resolved_config": resolved_config,
+      "resume": resume_audit,
+      "replay": runner.replay.report().as_dict(),
+      "cohort": {
+        "teacher_ids": list(identity.teacher_ids),
+        "cohort_digest": identity.digest(),
+        "mapping_digest": identity.mapping_digest,
+        "phase_policy": identity.slots.phase_policy,
+        "slot_counts": list(identity.slots.counts),
+        "slot_weights": list(identity.slots.weights),
+        "num_envs": identity.slots.num_envs,
+        "replay_motion_ids": list(identity.replay.motion_ids),
+        "replay_quotas": list(identity.replay.quotas),
+        "clip_frames": [member.frames for member in identity.members],
+        "evaluation_sampling_mode": evaluation_sampling_mode,
+      },
+      "quality": {
+        "implementation": "bounded native shared-student cohort lifecycle constructed",
+        "smoke": "not a policy-quality or convergence claim",
+        "policy_quality": "not assessed by this command",
+        "hardware_readiness": "not assessed",
+      },
+    }
+    _write_report(payload, output_dir / "train-report.json")
+    return 0
+  except (
+    DistillationError,
+    CheckpointValidationError,
+    ValueError,
+    RuntimeError,
+  ) as exc:
+    print(f"[FAIL] {exc}", file=sys.stderr)
+    return 1
+  finally:
+    if runner is not None:
+      close = getattr(runner.collector.adapter, "close", None)
+      if callable(close):
+        close()
+
+
+def _train(
+  manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
+  repo_root: Path = Path("."),
+  teacher_id: str | None = None,
+  teacher_ids: tuple[str, ...] = (),
+  task_id: str | None = None,
+  device: str = "cpu",
+  num_envs: int = 1,
+  max_iterations: int = 1,
+  bootstrap_steps: int = 0,
+  collection_steps: int = 32,
+  updates_per_iteration: int = 1,
+  teacher_probability: float = 0.0,
+  evaluate_every: int = 0,
+  evaluation_steps: int = 0,
+  minibatch_size: int = 256,
+  accumulation_steps: int = 15,
+  replay_capacity: int = 16_384,
+  learning_rate: float = 5e-4,
+  beta: float = 0.01,
+  seed: int = 0,
+  rollout_latent: RolloutLatent = "mean",
+  checkpoint_every: int = 500,
+  progress_every: int = 10,
+  report_boundaries: ReportBoundaries = "summary",
+  output_dir: Path | None = None,
+  resume: Path | None = None,
+) -> int:
+  """Run a bounded native single-teacher or shared-student cohort lifecycle.
+
+  Selection is explicit and mutually exclusive: ``--teacher-id`` (singular)
+  keeps the M3 single-teacher path, ``--teacher-ids`` (plural) trains one shared
+  student over a multi-motion cohort in one environment, and supplying both is
+  refused before any environment is constructed.  This repository's Tyro
+  configuration uses Python literal syntax for collections, so the plural form
+  is ``--teacher-ids ('tennis_000','tennis_001')``; a single element keeps a
+  trailing comma (``--teacher-ids ('tennis_000',)``).  With neither flag the
+  single-teacher path uses the historical ``tennis_000`` default, so an existing
+  invocation behaves exactly as before.  A cohort run always samples phases
+  uniformly and records that policy as an explicit private override, and it
+  saves and resumes version-2 cohort checkpoints instead of version-1 ones.
+
+  ``max_iterations`` is the total lifetime iteration budget, including when
+  ``resume`` is supplied.  Resume restores replay, normalizers, optimizer, and
+  RNG state; the simulator is restarted and bootstrap is not repeated when the
+  checkpoint contains replay.  ``seed`` is forwarded into environment
+  construction before startup randomization, and the resolved seed, the seed
+  provenance, and the complete resolved configuration are reported.
+
+  ``checkpoint_every`` is a periodic save cadence counted in *completed*
+  iterations.  ``0`` disables periodic checkpoints and keeps only the final
+  ``checkpoint-final.pt``.  When positive, a checkpoint named from the total
+  lifetime iteration counter is written atomically every ``checkpoint_every``
+  completed iterations, every checkpoint is a complete resume input, and the
+  report lists every checkpoint written by this invocation.
+
+  The default cadence is 500.  ``progress_every`` defaults to 10 and writes
+  flushed progress lines to stderr.  When ``output_dir`` is omitted, the run is
+  stored under ``logs/distillation/<task-id>/`` when ``task_id`` is supplied,
+  otherwise under ``logs/distillation/<UTC timestamp>/``.
+
+  ``progress_every`` writes a flushed ``[progress]`` line to **stderr** every
+  ``N`` completed iterations, reporting the lifetime iteration, collected
+  samples, last update loss, teacher/student disagreement, elapsed time,
+  seconds per iteration for this invocation, and a projected ETA.  ``0``
+  disables progress output.  Progress deliberately goes to stderr so that
+  stdout stays exactly the machine-readable JSON report that callers and tests
+  parse; a long run is otherwise observable only through its periodic
+  checkpoints.
+
+  ``report_boundaries`` selects the boundary evidence in each iteration's
+  ``collection.boundaries``.  ``summary`` (the default) reports per-``reason``
+  record/environment-mention counts and the observed before/after segment and
+  generation ranges, and never retains a boundary's per-environment arrays;
+  ``full`` writes those arrays as before, which is roughly 2 MB per iteration
+  at 4096 environments, so it is a debugging option, not the default.
+  """
+  if teacher_ids and teacher_id is not None:
+    return _fail(
+      ValueError(
+        "--teacher-id and --teacher-ids are mutually exclusive: pass exactly one "
+        f"selection (got teacher_id={teacher_id!r} and "
+        f"teacher_ids={list(teacher_ids)!r})"
+      )
+    )
+  if teacher_ids:
+    return _train_cohort(
+      manifest=manifest,
+      repo_root=repo_root,
+      teacher_ids=tuple(teacher_ids),
+      task_id=task_id,
+      device=device,
+      num_envs=num_envs,
+      max_iterations=max_iterations,
+      bootstrap_steps=bootstrap_steps,
+      collection_steps=collection_steps,
+      updates_per_iteration=updates_per_iteration,
+      teacher_probability=teacher_probability,
+      evaluate_every=evaluate_every,
+      evaluation_steps=evaluation_steps,
+      minibatch_size=minibatch_size,
+      accumulation_steps=accumulation_steps,
+      replay_capacity=replay_capacity,
+      learning_rate=learning_rate,
+      beta=beta,
+      seed=seed,
+      rollout_latent=rollout_latent,
+      checkpoint_every=checkpoint_every,
+      progress_every=progress_every,
+      report_boundaries=report_boundaries,
+      output_dir=output_dir,
+      resume=resume,
+    )
+  return _train_single(
+    manifest=manifest,
+    repo_root=repo_root,
+    teacher_id=teacher_id or _DEFAULT_TEACHER_ID,
+    task_id=task_id,
+    device=device,
+    num_envs=num_envs,
+    max_iterations=max_iterations,
+    bootstrap_steps=bootstrap_steps,
+    collection_steps=collection_steps,
+    updates_per_iteration=updates_per_iteration,
+    teacher_probability=teacher_probability,
+    evaluate_every=evaluate_every,
+    evaluation_steps=evaluation_steps,
+    minibatch_size=minibatch_size,
+    accumulation_steps=accumulation_steps,
+    replay_capacity=replay_capacity,
+    learning_rate=learning_rate,
+    beta=beta,
+    seed=seed,
+    rollout_latent=rollout_latent,
+    checkpoint_every=checkpoint_every,
+    progress_every=progress_every,
+    report_boundaries=report_boundaries,
+    output_dir=output_dir,
+    resume=resume,
+  )
+
+
+def _student_identity_report(inference) -> dict[str, Any] | None:
+  """Model-only student identity for the report, version-dispatched.
+
+  A version-2 cohort artifact reports the member it pinned and the whole stored
+  cohort identity it belongs to; a version-1 artifact keeps its original
+  model-only report.
+  """
+  if inference is None:
+    return None
+  if isinstance(inference, CohortMemberInference):
+    return _member_inference_report(inference)
+  return _checkpoint_model_report(inference)
+
+
 def _evaluate(
   manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
   repo_root: Path = Path("."),
@@ -794,6 +1500,14 @@ def _evaluate(
   contributes to it; it is not heading-invariant articulation error.  Heading
   is reported separately as ``tracking_heading_error`` (wrapped root-relative
   yaw delta).
+
+  A version-2 M4 cohort checkpoint is supported through checked member
+  selection: ``--teacher-id`` must name a member of the saved cohort, that
+  member's artifact digests and common contract are validated against the live
+  manifest, and the report keeps the full stored cohort identity next to the
+  pinned member.  The environment is still one pinned single-motion simulator,
+  so this command evaluates a member; use ``evaluate-cohort`` to pin every
+  selected motion in one bounded run.
   """
   adapter = None
   try:
@@ -804,12 +1518,20 @@ def _evaluate(
     if mode == "student" and checkpoint is None:
       raise ValueError("student evaluation requires --checkpoint")
     cohort = _resolve(manifest, repo_root)
+    member = None
+    if mode == "student":
+      assert checkpoint is not None
+      if _is_cohort_checkpoint(checkpoint):
+        # A v2 member is loaded before the simulator because its saved schema is
+        # what the live packing must be built from.
+        member = _load_member_inference(checkpoint, cohort, teacher_id, device=device)
     adapter = make_distillation_adapter(
       cohort,
       teacher_id,
       task_id=task_id,
       num_envs=num_envs,
       device=device,
+      schema=None if member is None else member.schema,
       seed=seed,
     )
     seed_audit = _seed_audit(adapter)
@@ -825,12 +1547,16 @@ def _evaluate(
       # Model-only load: the saved optimizer, replay, and collector RNG are not
       # required, and no training tensor is moved to ``device``.  The saved
       # schema/model settings are inferred instead of being re-declared here.
-      inference = load_inference_checkpoint(
-        checkpoint,
-        device=device,
-        expected_schema=adapter.schema,
-        expected_teacher_hashes=cohort.teacher(teacher_id).hashes,
-        expected_control_contract=_control_metadata(cohort, teacher_id),
+      inference = (
+        _load_student_inference(
+          checkpoint,
+          cohort,
+          teacher_id,
+          device=device,
+          expected_schema=adapter.schema,
+        )
+        if member is None
+        else member
       )
       student = inference.model
     result = evaluate_distillation(
@@ -843,12 +1569,26 @@ def _evaluate(
       seed=seed,
       control_period_s=cohort.control.control_period_s,
     )
+    if member is not None:
+      # The pinned adapter has local ID zero. Expose the saved cohort identity
+      # consistently, including raw segment records, without changing the rollout.
+      result = replace(
+        result,
+        segments=tuple(
+          replace(segment, motion_id=member.motion_id, teacher_code=member.teacher_code)
+          for segment in result.segments
+        ),
+        settings={**result.settings, "motion_ids": [member.motion_id]},
+      )
     payload = {
       "command": " ".join(sys.argv),
       "status": "evaluation",
       "mode": mode,
       "sampling_mode": sampling_mode,
       "checkpoint": None if checkpoint is None else str(checkpoint),
+      "checkpoint_version": (
+        None if checkpoint is None else _checkpoint_version(checkpoint)
+      ),
       "teacher_id": teacher_id,
       "motion": str(cohort.teacher(teacher_id).entry.motion),
       "control_hz": cohort.control.control_hz,
@@ -859,7 +1599,7 @@ def _evaluate(
         "resolved_seed": seed_audit["effective_seed"],
         "seed_provenance": seed_audit,
       },
-      "checkpoint_model": _checkpoint_model_report(inference),
+      "checkpoint_model": _student_identity_report(inference),
       "checkpoint_resolved_config": (
         None if inference is None else dict(inference.resolved_config)
       ),
@@ -886,6 +1626,445 @@ def _evaluate(
       adapter.close()
 
 
+def _aggregate_motion_metrics(
+  per_motion: Mapping[int, Mapping[str, float]],
+  weights: Mapping[int, float],
+) -> dict[str, Any]:
+  """Equal-motion macro and clip-duration-weighted aggregate of one metric set.
+
+  ``macro`` gives every motion the same weight and ``clip_duration_weighted``
+  weights each motion by its reference duration in seconds (frames/FPS), so a
+  long clip cannot be read as a pooled episode mean and a short clip cannot be
+  read as representative.  Each aggregate reports the per-motion values it
+  consumed, how many motions contributed to each metric, and any metric present
+  in only some motions (reported, never silently dropped).  These are metric
+  aggregates over per-motion means, not a quality verdict.
+  """
+  motion_ids = sorted(per_motion)
+  names: set[str] = set()
+  for values in per_motion.values():
+    names.update(values)
+  macro: dict[str, float] = {}
+  weighted: dict[str, float] = {}
+  contributed: dict[str, int] = {}
+  partial: dict[str, list[str]] = {}
+  for name in sorted(names):
+    macro_values = [
+      float(per_motion[motion][name])
+      for motion in motion_ids
+      if name in per_motion[motion]
+    ]
+    if len(macro_values) != len(motion_ids):
+      partial[name] = [
+        str(motion) for motion in motion_ids if name not in per_motion[motion]
+      ]
+    if macro_values:
+      macro[name] = sum(macro_values) / len(macro_values)
+      contributed[name] = len(macro_values)
+    pairs = [
+      (float(weights[motion]), float(per_motion[motion][name]))
+      for motion in motion_ids
+      if name in per_motion[motion] and weights[motion] > 0.0
+    ]
+    total_weight = sum(weight for weight, _ in pairs)
+    if total_weight > 0.0:
+      weighted[name] = sum(weight * value for weight, value in pairs) / total_weight
+  return {
+    "motion_ids": motion_ids,
+    "per_motion": {str(motion): dict(per_motion[motion]) for motion in motion_ids},
+    "macro": macro,
+    "clip_duration_weighted": weighted,
+    "contributed_motions": contributed,
+    "metrics_missing_from_some_motion": {
+      name: missing for name, missing in sorted(partial.items())
+    },
+  }
+
+
+def _combine_outcomes(
+  per_label: Mapping[str, Mapping[str, int]],
+) -> dict[str, Any]:
+  """Raw outcome counts per motion plus the total, so no failure is hidden."""
+  totals: dict[str, int] = {}
+  for label in sorted(per_label):
+    for outcome, count in per_label[label].items():
+      totals[outcome] = totals.get(outcome, 0) + int(count)
+  return {
+    "per_motion": {label: dict(per_label[label]) for label in sorted(per_label)},
+    "total": totals,
+  }
+
+
+def _cohort_mode_report(result: EvaluationResult) -> dict[str, Any]:
+  """One bounded per-mode result: total metrics plus per-motion aggregates.
+
+  ``per_motion`` keeps every motion's own segment count, outcome counts,
+  completion/failure denominators, and censored segment count, so an aggregate
+  can never hide one motion's failures.  ``completion_rate`` is defined over
+  completed-or-failed segments only; ``censored_segments`` counts the segments
+  whose outcome was a timeout, teleport, timer resample, reset, or step cap, so
+  a high completion rate cannot be read as all initiated segments completing.
+  """
+  stats: tuple[MotionEvaluationStats, ...] = result.per_motion
+  return {
+    "mode": result.mode,
+    "steps": result.steps,
+    "rollout_latent": result.rollout_latent,
+    "settings": dict(result.settings),
+    "metrics": dict(result.metrics),
+    "segments": len(result.segments),
+    "per_motion": [item.as_dict() for item in stats],
+    "per_motion_censoring": {
+      str(item.motion_id): {
+        "segments": item.segments,
+        "completion_known_segments": item.completion_known_segments,
+        "censored_segments": item.segments - item.completion_known_segments,
+        "outcomes": dict(item.outcomes),
+      }
+      for item in stats
+    },
+  }
+
+
+def _rekey_mode_report(
+  report: dict[str, Any], *, motion_id: int, teacher_code: int
+) -> dict[str, Any]:
+  """Rewrite one pinned singleton's local ids to the cohort's authoritative ids.
+
+  A pinned single-motion environment always reports its own local clip 0, so
+  presenting that value as the cohort motion id would misattribute every member
+  after the first (a ``tennis_001`` pin reports local 0 while its cohort motion
+  id is 1).  This rewrites the per-motion entry and its censoring entry - and
+  therefore every aggregate that reads them - so no nested level disagrees with
+  the cohort identity.  A pinned evaluation must report exactly one motion;
+  anything else is refused instead of being folded into one cohort identity.
+  """
+  per_motion = report["per_motion"]
+  if len(per_motion) != 1:
+    raise DistillationError(
+      "a pinned single-motion evaluation must report exactly one motion, got "
+      f"{len(per_motion)}"
+    )
+  entry = per_motion[0]
+  local_key = str(entry["motion_id"])
+  censoring = report["per_motion_censoring"].get(local_key)
+  if censoring is None:
+    raise DistillationError(
+      "a pinned evaluation's censoring map does not match its local motion id"
+    )
+  entry["motion_id"] = motion_id
+  entry["teacher_code"] = teacher_code
+  report["settings"] = {**report.get("settings", {}), "motion_ids": [motion_id]}
+  report["per_motion_censoring"] = {
+    str(motion_id): {
+      **censoring,
+      "motion_id": motion_id,
+      "teacher_code": teacher_code,
+    }
+  }
+  return report
+
+
+def _evaluate_cohort(
+  manifest: Path = Path("configs/distillation/x2_tennis.yaml"),
+  repo_root: Path = Path("."),
+  teacher_ids: tuple[str, ...] = (),
+  task_id: str | None = None,
+  device: str = "cpu",
+  num_envs: int = 1,
+  mode: CohortEvaluationMode = "both",
+  checkpoint: Path | None = None,
+  steps: int = 512,
+  seed: int = 0,
+  sampling_mode: SamplingMode = "start",
+  rollout_latent: RolloutLatent = "mean",
+  report: Path | None = None,
+) -> int:
+  """Evaluate every selected motion separately with one shared student.
+
+  Each selected motion is pinned into its own single-motion environment and
+  **each mode gets a fresh identically seeded adapter**: the baseline and the
+  student never share a live environment, because a reset is not proof that
+  startup randomization, event timers, and adapter state were restored.  At most
+  one simulator exists at a time, and one student model is loaded once and
+  reused across every mode and motion.  All evaluation freezes normalizers and
+  constructs no optimizer or replay.
+
+  ``--teacher-ids`` defaults to every manifest teacher and uses this
+  repository's Python literal collection syntax
+  (``--teacher-ids ('tennis_000','tennis_001')``).  A request is normalized to
+  **manifest order**, repeated ids are refused, and unknown ids are refused
+  before any environment is constructed.  With ``--mode student``/``both`` one
+  version-2 M4 cohort checkpoint supplies the single student identity: each
+  requested motion must be a stored member whose artifact digests, clip extent,
+  and common contract match the live manifest.
+
+  Every reported level is attributed to the motion's **cohort identity** rather
+  than to the pinned environment's local clip 0: a saved member's ``motion_id``
+  and ``teacher_code`` come from the stored cohort record (already checked
+  against the live manifest by ``require_member_matches``), and a teacher-only
+  run states the explicit manifest position instead and records which source it
+  used (``motion_id_source``).  The per-motion entry, its censoring entry, the
+  aggregate per-motion maps, and the outcome counts all use that identity, so a
+  reversed or subset request never presents a local singleton 0 as another
+  member's cohort motion.
+
+  The report holds one pinned block per motion plus two aggregate summaries per
+  mode: ``macro`` (equal motion weight) and ``clip_duration_weighted`` (weights
+  proportional to clip frames/FPS).  Both keep the per-motion values, raw
+  counts, outcome counts, and censoring denominators, because a good aggregate
+  must never hide one failing motion.  An evaluation that raises is recorded as
+  an execution error separate from a policy failure, and a missing report makes
+  ``complete`` false and blocks any overall quality pass.  This command does not
+  assess policy quality.
+  """
+  try:
+    if sampling_mode not in ("start", "uniform"):
+      raise ValueError("sampling_mode must be 'start' or 'uniform'")
+    if mode not in ("teacher", "student", "both"):
+      raise ValueError("mode must be 'teacher', 'student', or 'both'")
+    if mode in ("student", "both") and checkpoint is None:
+      raise ValueError("student cohort evaluation requires --checkpoint")
+    if num_envs <= 0:
+      raise ValueError("num_envs must be a positive integer")
+    if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
+      raise ValueError("steps must be a positive integer")
+    cohort = _resolve(manifest, repo_root)
+    manifest_order = tuple(teacher.id for teacher in cohort.teachers)
+    requested = tuple(teacher_ids)
+    if requested:
+      duplicates = sorted({item for item in requested if requested.count(item) > 1})
+      if duplicates:
+        raise ValueError(f"--teacher-ids repeats {duplicates}; pass each motion once")
+      unknown = [item for item in requested if item not in manifest_order]
+      if unknown:
+        raise DistillationError(f"cohort has no teacher(s) {unknown}")
+      wanted = set(requested)
+      # Normalized to manifest order, so a reversed request cannot renumber the
+      # cohort identity or the aggregate keys.
+      selected = tuple(item for item in manifest_order if item in wanted)
+    else:
+      selected = manifest_order
+    if not selected:
+      raise ValueError("the manifest selects no teacher to evaluate")
+    member = None
+    identities: dict[str, tuple[int, int, str]] = {}
+    if checkpoint is not None:
+      if mode == "teacher":
+        raise ValueError(
+          "--mode teacher ignores a checkpoint; omit --checkpoint or evaluate a student"
+        )
+      if not _is_cohort_checkpoint(checkpoint):
+        raise DistillationError(
+          "cohort evaluation of a student requires a version-2 M4 cohort "
+          f"checkpoint; {checkpoint} is not one. Use 'distill evaluate' for a "
+          "version-1 single-teacher checkpoint"
+        )
+      member = _load_member_inference(checkpoint, cohort, selected[0], device=device)
+      if member.relocated_artifact_roles:
+        print(
+          "[INFO] accepted relocated inference artifacts by content digest: "
+          f"{list(member.relocated_artifact_roles)}",
+          file=sys.stderr,
+          flush=True,
+        )
+      # The same checked selection the single-member paths use, applied per
+      # motion, and the source of the authoritative cohort motion id/code.
+      for teacher_id in selected:
+        stored = require_member_matches(member.cohort, cohort, teacher_id)
+        identities[teacher_id] = (
+          int(stored.motion_id),
+          int(stored.teacher_code),
+          "saved_cohort_member",
+        )
+    else:
+      # Teacher-only: there is no saved cohort to provide a library clip
+      # position, so the explicit manifest position is the only authoritative
+      # identity available, and it is recorded as such.
+      identities = {
+        teacher_id: (
+          manifest_order.index(teacher_id),
+          manifest_order.index(teacher_id),
+          "manifest_position",
+        )
+        for teacher_id in selected
+      }
+    schema = None if member is None else member.schema
+    student = None if member is None else member.model
+    if student is not None:
+      student.eval()
+
+    modes = ("teacher", "student") if mode == "both" else (mode,)
+    motions: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for teacher_id in selected:
+      teacher = cohort.teacher(teacher_id)
+      motion_id, teacher_code, id_source = identities[teacher_id]
+      entry: dict[str, Any] = {
+        "teacher_id": teacher_id,
+        "motion_id": motion_id,
+        "teacher_code": teacher_code,
+        "motion_id_source": id_source,
+        "motion": str(teacher.entry.motion),
+        "frames": teacher.reference.frames,
+        "fps": teacher.reference.fps,
+        "clip_seconds": (
+          teacher.reference.frames / teacher.reference.fps
+          if teacher.reference.fps
+          else None
+        ),
+        "reports": {},
+      }
+      for current in modes:
+        adapter = None
+        try:
+          # A fresh identically seeded adapter per mode: the next mode (and the
+          # next motion) never inherits this rollout's simulator state.
+          adapter = make_distillation_adapter(
+            cohort,
+            teacher_id,
+            task_id=task_id,
+            num_envs=num_envs,
+            device=device,
+            schema=schema,
+            seed=seed,
+          )
+          seed_audit = _seed_audit(adapter)
+          _require_requested_seed_applied(seed, seed_audit)
+          resolved_runtime = {
+            "device": device,
+            "num_envs": num_envs,
+            "requested_seed": seed,
+            "resolved_seed": seed_audit["effective_seed"],
+            "seed_provenance": seed_audit,
+          }
+          if "runtime" in entry and entry["runtime"] != resolved_runtime:
+            raise DistillationError(
+              f"{teacher_id} resolved a different runtime for {current}: "
+              f"{entry['runtime']} != {resolved_runtime}"
+            )
+          entry["runtime"] = resolved_runtime
+          live = adapter.env.command_manager.get_term("motion")
+          live.cfg.sampling_mode = sampling_mode
+          result = evaluate_distillation(
+            adapter,
+            adapter.teacher,
+            None if current == "teacher" else student,
+            mode=current,
+            steps=steps,
+            rollout_latent=rollout_latent,
+            seed=seed,
+            control_period_s=cohort.control.control_period_s,
+          )
+          entry["reports"][current] = _rekey_mode_report(
+            _cohort_mode_report(result),
+            motion_id=motion_id,
+            teacher_code=teacher_code,
+          )
+        except (
+          DistillationError,
+          CheckpointValidationError,
+          ValueError,
+          RuntimeError,
+        ) as exc:
+          errors.append(
+            {
+              "teacher_id": teacher_id,
+              "mode": current,
+              "error_type": type(exc).__name__,
+              "error": str(exc),
+            }
+          )
+          print(f"[FAIL] {teacher_id} {current}: {exc}", file=sys.stderr)
+        finally:
+          # One active simulator at a time: this mode's environment is closed
+          # before the next mode or motion builds its own.
+          if adapter is not None:
+            adapter.close()
+      motions.append(entry)
+
+    expected_reports = modes
+    missing = [
+      {"teacher_id": entry["teacher_id"], "mode": name}
+      for entry in motions
+      for name in expected_reports
+      if name not in entry["reports"]
+    ]
+    # Aggregate keys are the authoritative cohort motion ids, matching the
+    # per-motion entries, so a reversed request cannot renumber an aggregate.
+    weights = {
+      identities[entry["teacher_id"]][0]: entry["clip_seconds"] for entry in motions
+    }
+    aggregates: dict[str, Any] = {}
+    for name in expected_reports:
+      per_motion_metrics: dict[int, dict[str, float]] = {}
+      per_motion_outcomes: dict[str, dict[str, int]] = {}
+      for entry in motions:
+        mode_report = entry["reports"].get(name)
+        if mode_report is None:
+          continue
+        item = mode_report["per_motion"][0]
+        per_motion_metrics[int(item["motion_id"])] = dict(item["metrics"])
+        per_motion_outcomes[str(item["motion_id"])] = dict(item["outcomes"])
+      if not per_motion_metrics:
+        continue
+      aggregate = _aggregate_motion_metrics(per_motion_metrics, weights)
+      aggregate["outcomes"] = _combine_outcomes(per_motion_outcomes)
+      aggregates[name] = aggregate
+
+    complete = not errors and not missing
+    payload = {
+      "command": " ".join(sys.argv),
+      "status": "cohort_evaluation",
+      "mode": mode,
+      "sampling_mode": sampling_mode,
+      "checkpoint": None if checkpoint is None else str(checkpoint),
+      "checkpoint_version": (
+        None if checkpoint is None else _checkpoint_version(checkpoint)
+      ),
+      "requested_teacher_ids": list(requested),
+      "teacher_ids": list(selected),
+      "selection_normalized_to_manifest_order": list(requested) != list(selected),
+      "control_hz": cohort.control.control_hz,
+      "checkpoint_model": _student_identity_report(member),
+      "motions": motions,
+      "aggregate": {
+        "aggregation_weights": {
+          "macro": "equal per motion",
+          "clip_duration_weighted": {
+            "formula": "frames/fps",
+            "values": {
+              entry["teacher_id"]: weights[entry["motion_id"]] for entry in motions
+            },
+          },
+        },
+        "motion_ids": {entry["teacher_id"]: entry["motion_id"] for entry in motions},
+        "per_mode": aggregates,
+      },
+      "evaluation_errors": errors,
+      "missing_reports": missing,
+      "complete": complete,
+      "quality": {
+        "implementation": "bounded pinned per-motion cohort evaluation",
+        "smoke": "metrics are bounded-run evidence only",
+        "policy_quality": "requires parent baseline-relative interpretation",
+        "aggregate_is_not_a_quality_pass": True,
+        "overall_pass": False,
+        "hardware_readiness": "not assessed",
+      },
+    }
+    _write_report(payload, report)
+    return 0 if complete else 1
+  except (
+    DistillationError,
+    CheckpointValidationError,
+    ValueError,
+    RuntimeError,
+  ) as exc:
+    print(f"[FAIL] {exc}", file=sys.stderr)
+    return 1
+
+
 def _resolve_play_viewer(viewer: str) -> str:
   """Resolve ``auto`` to native when a display is present, otherwise Viser."""
   if viewer != "auto":
@@ -904,20 +2083,18 @@ def _playback_checkpoint_manager(
   """Build a Viser checkpoint manager that discovers and validates swaps.
 
   Discovery uses the distillation naming scheme, and every load (including a
-  hot swap) goes through :func:`load_inference_checkpoint` with the live
-  schema, teacher hashes, and control contract, so an incompatible artifact is
-  rejected instead of silently replacing the running policy.  The live schema
-  is the one the initialized environment packs with, so a swap whose saved
-  schema differs is refused rather than mis-packed.
+  hot swap) is validated against the live schema, teacher hashes, control
+  contract, and (for a version-2 artifact) the saved cohort membership, so an
+  incompatible artifact is rejected instead of silently replacing the running
+  policy.  The live schema is the one the initialized environment packs with,
+  so a swap whose saved schema differs is refused rather than mis-packed.
   """
   from mjlab.viewer.viser.viewer import CheckpointManager, format_time_ago
 
   directory = checkpoint.parent
-  expected = {
-    "expected_schema": adapter.schema,
-    "expected_teacher_hashes": cohort.teacher(teacher_id).hashes,
-    "expected_control_contract": _control_metadata(cohort, teacher_id),
-  }
+  # The live schema the running environment packs with, so a swapped-in policy
+  # cannot mis-pack a checkpoint trained for a different conditioning layout.
+  expected_schema = adapter.schema
 
   def fetch_available() -> list[tuple[str, str]]:
     discovered = discover_distillation_checkpoints(directory)
@@ -930,7 +2107,16 @@ def _playback_checkpoint_manager(
     ]
 
   def load(name: str):
-    inference = load_inference_checkpoint(directory / name, device=device, **expected)
+    # Version-dispatched model-only load: a version-1 artifact keeps its
+    # existing teacher-hash/control-contract check, while a version-2 cohort
+    # artifact must name a member of the stored cohort and match the live one.
+    inference = _load_student_inference(
+      directory / name,
+      cohort,
+      teacher_id,
+      device=device,
+      expected_schema=expected_schema,
+    )
     return DistillationPlayPolicy(inference.model)
 
   return CheckpointManager(
@@ -964,6 +2150,13 @@ def _play(
   decoded with deterministic mean-latent inference.  ``--viewer viser``
   (default) serves the browser viewer; ``native`` uses MuJoCo's passive viewer.
 
+  A version-2 M4 cohort checkpoint is supported through checked member
+  selection: ``--teacher-id`` must name a member of the saved cohort, its
+  artifacts and common contract are validated against the live manifest, and
+  the pinned member is played in a single-motion environment of that member's
+  clip.  Hot swaps use the same version-dispatched validation, so a version-1
+  and a version-2 artifact in one directory can both be inspected.
+
   The checkpoint is loaded *before* the simulator is built, so a missing or
   incompatible artifact never constructs an environment, and the saved schema
   is what the live packing is built from.  One audited seeded reset runs after
@@ -984,16 +2177,11 @@ def _play(
     if not math.isfinite(frame_rate) or frame_rate <= 0.0:
       raise ValueError("frame_rate must be finite and positive")
     cohort = _resolve(manifest, repo_root)
-    teacher = cohort.teacher(teacher_id)
-    # Early model-only load: cheap, validates teacher identity and the control
-    # contract, and yields the SAVED schema the live packing must reproduce
-    # (the saved settings imply the trained architecture, not a default one).
-    inference = load_inference_checkpoint(
-      checkpoint,
-      device=device,
-      expected_teacher_hashes=teacher.hashes,
-      expected_control_contract=_control_metadata(cohort, teacher_id),
-    )
+    # Early model-only load: cheap, validates teacher/cohort identity and the
+    # control contract, and yields the SAVED schema the live packing must
+    # reproduce (the saved settings imply the trained architecture, not a
+    # default one).
+    inference = _load_student_inference(checkpoint, cohort, teacher_id, device=device)
     # The adapter re-checks the live joint order, teacher sensors/action, and
     # timing against the saved contract; passing the saved schema is what makes
     # an anchor/gravity_anchor checkpoint pack correctly instead of being
@@ -1064,7 +2252,16 @@ def _export(
   output_dir: Path = Path("rl_model"),
   asset_audit: Path | None = None,
 ) -> int:
-  """Export a saved gravity VAE after an explicit physical asset audit."""
+  """Export a saved gravity VAE after an explicit physical asset audit.
+
+  Only version-1 single-teacher checkpoints are exportable through this seam.
+  A version-2 M4 cohort checkpoint is refused explicitly rather than silently
+  reduced to one teacher: the exported contract records a single teacher's
+  artifacts and motion, and the asset audit producer
+  (``make_export_audit``) validates against one audited single-motion
+  environment, so a cohort member cannot be certified here without a new audit
+  contract.  This is a reported limitation, not a disabled check.
+  """
   if asset_audit is None:
     print(
       "[FAIL] --asset-audit is required; tensor schema is not physical frame evidence",
@@ -1072,6 +2269,16 @@ def _export(
     )
     return 1
   try:
+    if _is_cohort_checkpoint(checkpoint):
+      raise ExportValidationError(
+        "distill export does not support a version-2 M4 cohort checkpoint. The "
+        "exported bundle records one teacher's artifacts, motion, and sensor "
+        "audit, and the asset audit producer validates one audited "
+        "single-motion environment, so a cohort member cannot be certified "
+        "through this seam. Export the version-1 single-teacher checkpoint "
+        "instead; cohort export needs a new audit contract (reported "
+        "limitation, not a disabled check)."
+      )
     result = export_bundle(
       checkpoint,
       manifest,
@@ -1156,6 +2363,7 @@ def main() -> None:
     "validate-teachers": _validate_teachers,
     "train": _train,
     "evaluate": _evaluate,
+    "evaluate-cohort": _evaluate_cohort,
     "play": _play,
     "export": _export,
   }

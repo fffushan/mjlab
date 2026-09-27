@@ -1,24 +1,30 @@
-X2 Tennis Distillation Teacher Foundation and Latent Core (M1/M2/M3)
-=======================================================================
+X2 Tennis Distillation: Teacher Foundation, Latent Core, and Shared Cohorts (M1-M4)
+====================================================================================
 
 Overview
 --------
 
-This page documents the first two milestones of the BeyondMimic-style
+This page documents the first four milestones of the BeyondMimic-style
 conditional VAE distillation effort: freezing and validating the two selected
 50 Hz AgiBot X2 tennis tracking teachers, then adding a pure tensor core for
-schema packing, conditional VAE inference/loss, and bounded raw replay. The
-design proposal lives in ``docs/plans/beyondmimic_vae_distillation.md`` and the
-milestone contracts live in ``docs/plans/beyondmimic_vae_implementation.md`` and
-``docs/plans/beyondmimic_vae_m2_implementation.md``.
-
-**M1 validates teachers, M2 provides the pure tensor core, and M3 adds a
+schema packing, conditional VAE inference/loss, and bounded raw replay, then a
 bounded native single-teacher collector, trainer, checkpoint lifecycle, and
-``distill train``/``distill evaluate`` commands.** M3 remains an implementation
-and smoke-validation surface: it does not claim policy quality, production
-training, hardware readiness, student export, diffusion, or multi-motion
-collection. The selected live environment is the existing 50 Hz X2 tracking
-task, with ``tennis_000`` as the only collection teacher.
+``distill train``/``distill evaluate`` commands, and finally **one shared
+student trained over both teachers's clips in one simulator**. The design
+proposal lives in ``docs/plans/beyondmimic_vae_distillation.md`` and the
+milestone contracts live in ``docs/plans/beyondmimic_vae_implementation.md`` and
+``docs/plans/beyondmimic_vae_m2_implementation.md``; the current authority
+document for M4 is ``docs/plans/beyondmimic_vae_m4_implementation.md``.
+
+**M1 validates teachers, M2 provides the pure tensor core, M3 adds a bounded
+native single-teacher collector, trainer, checkpoint lifecycle, and ``distill
+train``/``distill evaluate`` commands, and M4 adds one shared student over the
+multi-motion ``--teacher-ids`` cohort with per-motion balanced replay,
+version-2 cohort checkpoints, and a bounded ``distill evaluate-cohort``
+command.** M3 and M4 remain implementation and smoke-validation surfaces: they
+do not claim policy quality, production training, hardware readiness,
+diffusion, or multi-motion deployment qualification. Single-teacher defaults and
+version-1 artifacts are preserved unchanged.
 
 M3 bounded lifecycle usage
 ---------------------------
@@ -129,7 +135,14 @@ capacity) and does not require the checkpoint's optimizer, replay buffer, or
 collector RNG. The report echoes the inferred model identity and the
 checkpoint's stored provenance. ``InferenceModel`` and
 ``load_inference_checkpoint`` are exported from
-``mjlab.tasks.tracking.distillation``.
+``mjlab.tasks.tracking.distillation``. A **version-2 M4 cohort checkpoint** is
+also accepted here through checked member selection: ``--teacher-id`` must name
+a member of the saved cohort, that member's artifact digests, clip extent, and
+common action/control/observation contract are validated against the live
+manifest, the environment is still one pinned single-motion simulator, and the
+report keeps the full stored cohort identity (and any artifact accepted only by
+content digest) next to the pinned member. Resume stays path-strict; only the
+model-only member load reports relocations.
 
 Because ``control_contract['motion']`` stores an absolute path, an
 inference-only load also accepts a relocated, byte-identical motion artifact:
@@ -154,6 +167,171 @@ reference completion, failure, timeout, teleport/timer boundaries, and step
 caps; a missing live completion flag is reported conservatively rather than as
 zero completion.
 
+M4 shared multi-teacher cohort
+-------------------------------
+
+M4 trains **one shared conditional VAE** on both clips in **one vectorized
+simulator**. Each environment row keeps its own reference clip and is labeled by
+that clip's frozen teacher. There is no ensemble and no per-clip student, and no
+separate student is created for the second motion.
+
+.. code-block:: bash
+
+   # One shared student over both clips; explicit plural selection.
+   uv run distill train --manifest configs/distillation/x2_tennis.yaml \
+     --repo-root . --teacher-ids "('tennis_000','tennis_001')" \
+     --num-envs 4 --device cpu --max-iterations 4 --collection-steps 8 \
+     --bootstrap-steps 8 --minibatch-size 32 --replay-capacity 256 \
+     --seed 7 --output-dir logs/distillation/m4-smoke
+
+   # The same M4 checkpoint, one member pinned as a single-motion environment.
+   uv run distill evaluate --manifest configs/distillation/x2_tennis.yaml \
+     --repo-root . --teacher-id tennis_001 \
+     --checkpoint logs/distillation/m4-smoke/checkpoint-final.pt \
+     --mode student --num-envs 4 --steps 512 --sampling-mode start --seed 7
+
+   # Bounded all-selected-motion evaluation: one pinned environment per motion,
+   # teacher and student measured with matching seeds/phase/resources.
+   uv run distill evaluate-cohort --manifest configs/distillation/x2_tennis.yaml \
+     --repo-root . --teacher-ids "('tennis_000','tennis_001')" \
+     --checkpoint logs/distillation/m4-smoke/checkpoint-final.pt \
+     --mode both --num-envs 4 --steps 512 --sampling-mode start --seed 7 \
+     --report /tmp/mjlab-m4-live-validation/cohort-start.json
+   # Playback pins one member of the saved cohort (existing viewers).
+   uv run distill play --manifest configs/distillation/x2_tennis.yaml \
+     --repo-root . --teacher-id tennis_001 \
+     --checkpoint logs/distillation/m4-smoke/checkpoint-final.pt --seed 7
+
+Selection syntax
+^^^^^^^^^^^^^^^^
+
+``--teacher-id`` (singular) keeps the M3 single-teacher path and
+``--teacher-ids`` (plural) selects the cohort path. The two are mutually
+exclusive and supplying both is refused **before any environment is
+constructed**. With neither flag the single-teacher path keeps the historical
+``tennis_000`` default, so every existing invocation behaves exactly as before.
+
+This repository's shared Tyro configuration
+(``mjlab.TYRO_FLAGS``) sets ``UsePythonSyntaxForLiteralCollections``, so a
+collection flag takes a **Python literal** rather than a space-separated list:
+``--teacher-ids "('tennis_000','tennis_001')"``. A single element keeps the
+trailing comma (``--teacher-ids "('tennis_000',)"``), because without it the
+literal is a string and not a tuple. The same spelling applies to
+``evaluate-cohort --teacher-ids``; omitting it there evaluates every manifest
+teacher in manifest order.
+
+What M4 constructs
+^^^^^^^^^^^^^^^^^^
+
+* One mixed-slot environment: the registered tracking task is copied privately
+  and only its motion command is replaced, so observations, rewards,
+  terminations, and control timing keep their meanings.
+* Stratified fixed environment slots: rows are allocated by the manifest's
+  positive sampling weights with deterministic largest-remainder allocation and
+  a seeded row permutation. Every selected motion gets at least one row, and an
+  impossible budget/weight combination is refused. Each slot keeps its clip
+  through ordinary per-row reset/timer/wrap, which deliberately avoids the
+  clip-duration bias of equal-probability motion sampling at episode boundaries
+  and makes equal fresh-data normalization coverage possible. This is an
+  engineering choice, not a paper claim and not a promise of seamless
+  transitions between clips.
+* Uniform phase sampling for training, ``start``/``uniform`` for pinned
+  evaluation, both recorded as explicit private overrides of the teacher's
+  adaptive sampling. Adaptive/weighted multi-motion sampling is refused rather
+  than sharing failure bins across clips.
+* One frozen teacher bank over the whole manifest, so a row's teacher code
+  always selects the teacher that trained on that row's clip. Motion and teacher
+  ids are routing metadata only; they never enter the decoder conditioning, and
+  the gravity schema stays reference 68 / conditioning 99 / latent 32 /
+  actions 31.
+* One per-motion balanced replay: the capacity is split into integer quotas by
+  the configured weights (summing exactly to the capacity, at least one slot per
+  motion), each motion has its own FIFO partition so a shorter or easier clip
+  cannot evict another, the whole incoming batch is validated before any
+  partition is mutated, draws use the configured motion proportions with
+  unbiased residual allocation, and a missing motion is reported as not ready
+  instead of being silently omitted. Fresh raw rows update the normalizers once,
+  balanced replay draws never do. The selection and the cheap budgets (unknown
+  or repeated teacher ids, and a replay capacity that cannot give each selected
+  motion a slot) are validated before any environment is constructed, and a
+  failure after the environment exists closes it exactly once.
+
+Reports and cohort identity
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A cohort ``train`` report adds ``cohort`` (ordered teacher ids, cohort and
+mapping digests, slot counts/weights and row count, replay partitions/quotas,
+clip frame counts, phase policy) next to the per-motion collection attribution
+(``collection.motion_stats``: per-motion samples, teacher/student steps,
+boundaries, disagreement, and reference-frame coverage). Each iteration and the
+final report also include ``replay`` telemetry: capacity, retained/inserted/drawn
+counts, occupancy, readiness, and per-motion quotas/counters. Replay ``coverage``
+means retained rows divided by that motion's capacity quota, not clip-frame
+coverage. ``evaluate-cohort`` requires a positive step budget and
+normalizes ``--teacher-ids`` into **manifest order** (a repeated id is refused),
+records the request next to the normalized selection, and pins each motion into
+its own single-motion environment.  The teacher baseline and the student never
+share a live environment: each mode builds a **fresh identically seeded**
+adaptor and closes it before the next one is built, because a reset is not proof
+that startup randomization, event timers, and adapter state were restored; one
+student model is loaded once and reused.
+
+Every reported level is attributed to the motion's **cohort identity**, not to
+the pinned environment's local clip 0 (a ``tennis_001`` pin reports local 0 while
+its cohort motion id is 1).  For a saved cohort the ``motion_id`` and
+``teacher_code`` come from the stored cohort record, whose membership and
+contracts are re-checked against the live manifest; a teacher-only run states
+the explicit manifest position instead.  Each motion block records which source
+it used (``motion_id_source``), and the per-motion entry, its censoring entry,
+the aggregate per-motion maps, and the aggregate outcome counts all use the same
+identity.  Each motion block therefore holds separate ``teacher`` and
+``student`` reports with their own segment counts, outcome counts,
+completion/failure denominators, censored-segment counts, and metrics, plus two
+aggregate views: ``macro`` (equal motion weight) and ``clip_duration_weighted``
+(weights proportional to the clip duration in seconds, ``frames/fps``).  Both
+keep the per-motion values, the aggregation weights, the contributing-motion
+counts, and any metric that only some motions reported, because a good aggregate
+must never hide one failing motion.  A high ``completion_rate`` is defined over
+completed-or-failed segments only and must not be read as every initiated
+segment completing; execution errors are reported separately in
+``evaluation_errors`` (per motion and mode), a missing report makes ``complete``
+false, and the ``quality`` block explicitly states that the aggregate is not a
+quality pass.
+
+A cohort run saves **version-2** checkpoints that record the ordered member
+identities with every artifact path and digest, per-clip extent/source
+digest/audited body mapping, the ordered mapping digest, the common
+action/control/observation contract, the slot and phase policy with realized
+counts, the replay partition policy, resource settings, and all RNG state.
+Strict resume reproduces the whole record and refuses reordered, missing, or
+changed members; changed artifacts, clip extents, body mapping, common contract,
+slot/phase policy, replay policy, or resource settings; a corrupted later replay
+partition; a corrupted generator state; and a FIFO replay buffer. Resume
+restarts the simulator, creates a segment namespace above every retained
+partition, and never claims bitwise simulator continuation. The only runtime
+exceptions are the total ``--max-iterations`` budget and the
+``--checkpoint-every``/reporting cadence. Version-1 and version-2 artifacts are
+never converted into each other, and each loader names the loader that fits.
+Periodic checkpointing (default every 500 completed iterations) and flushed
+``[progress]`` stderr lines (default every 10 iterations) behave exactly as in
+M3, and stdout remains the machine-readable JSON report.
+
+Limitations
+^^^^^^^^^^^
+
+* ``distill export`` refuses a version-2 M4 cohort checkpoint explicitly. The
+exported bundle records one teacher's artifacts, motion, and physical sensor
+anchor audit, and the asset-audit producer validates one audited single-motion
+environment, so a cohort member cannot be certified through that seam. This is a
+reported limitation, not a disabled check; version-1 export is unchanged. See
+``docs/source/x2_vae_export_contract.rst``.
+* A cohort checkpoint cannot be resumed from a relocated checkout: the stored
+identity keeps absolute manifest and artifact paths. Model-only inference of one
+member does accept a byte-identical relocated artifact by content digest and
+reports the relocation.
+* M4 does not add random clip reassignment, curriculum, curriculum-scale
+  transitions, or multi-motion deployment qualification.
+
 Interactive playback (``distill play``)
 ---------------------------------------
 
@@ -161,9 +339,14 @@ Interactive playback (``distill play``)
 native viewers to inspect a checkpointed student without any training
 machinery: it constructs no trainer, optimizer, replay buffer, collector, or PPO
 runner, and the student is reconstructed model-only with
-``load_inference_checkpoint`` and evaluated with deterministic mean-latent
-inference (no latent sampling, no normalizer update). One environment and
-``--sampling-mode start`` are the defaults.
+``load_inference_checkpoint`` (a version-2 cohort artifact through checked
+member selection) and evaluated with deterministic mean-latent inference (no
+latent sampling, no normalizer update). One environment and
+``--sampling-mode start`` are the defaults. For a version-2 cohort checkpoint,
+``--teacher-id`` must name a member of the saved cohort and that member's clip
+is what the pinned environment plays; the Viser Checkpoints tab dispatches each
+discovered artifact to the loader its version requires, so a directory holding
+both a version-1 and a version-2 checkpoint can be inspected in one session.
 
 The checkpoint is loaded *before* the simulator is built, so a missing or
 incompatible artifact never constructs an environment, and the saved schema is

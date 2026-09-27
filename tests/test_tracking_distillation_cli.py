@@ -938,6 +938,8 @@ _RAW_BOUNDARY_FIELDS = {
   "after_segment",
   "before_generation",
   "after_generation",
+  "before_motion_ids",
+  "before_teacher_codes",
 }
 
 
@@ -1093,6 +1095,21 @@ def test_train_report_boundaries_full_keeps_the_raw_detail(
     assert all(len(record["before_segment"]) == 1024 for record in records)
     assert all(len(record["after_generation"]) == 1024 for record in records)
     assert len(sparse[0]["before_segment"]) == 1024
+    # The pre-step attribution vectors are per-mention, so a sparse boundary
+    # stores exactly the starting motion/teacher of the environments it names.
+    assert all(
+      len(record["before_motion_ids"]) == len(record["env_indices"])
+      for record in records
+    )
+    assert all(
+      len(record["before_teacher_codes"]) == len(record["env_indices"])
+      for record in records
+    )
+    assert len(sparse[0]["before_motion_ids"]) == 1
+    # This fixture has one selected motion and one selected teacher, so the
+    # attribution of every mentioned environment is that motion and teacher.
+    assert all(set(record["before_motion_ids"]) == {0} for record in records)
+    assert all(set(record["before_teacher_codes"]) == {0} for record in records)
     assert summary["records"] == len(records)
     assert summary["env_mentions"] == sum(
       len(record["env_indices"]) for record in records

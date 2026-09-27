@@ -13,12 +13,17 @@ default.  A caller may pass a ``torch.Generator`` to make the draw
 reproducible; the generator's device is used for random-index generation.
 Empty insertion is a validated no-op.  Sampling an empty buffer raises
 ``ReplayValidationError``.
+
+Lifecycle code never needs to know this storage layout: :class:`ReplayBuffer`
+implements :class:`ReplayBufferProtocol` (batch validation, checkpoint state
+validation, and the maximum valid segment ID) so a checkpoint, runner, or
+trainer can treat any labeled replay implementation uniformly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 import torch
 
@@ -88,6 +93,64 @@ class LabeledReplayBatch:
 ReplayBatch = LabeledReplayBatch
 
 
+@runtime_checkable
+class ReplayBufferProtocol(Protocol):
+  """The labeled replay contract shared by every replay implementation.
+
+  ``LabeledReplayBuffer`` (the M3 single-partition FIFO) and the opt-in M4
+  balanced buffer both satisfy it, so the trainer, checkpoint writer, and
+  lifecycle runner can depend on the protocol instead of one storage layout.
+
+  ``validate_batch`` validates an insertion request without mutating the
+  buffer, ``validate_state`` validates a candidate checkpoint state without
+  mutating the buffer, and ``max_valid_segment_id`` reports the largest
+  retained segment ID (``None`` when empty) so resume can open a fresh segment
+  namespace without reading private storage fields.
+  """
+
+  @property
+  def capacity(self) -> int: ...
+
+  @property
+  def schema(self) -> VaeSchema: ...
+
+  @property
+  def size(self) -> int: ...
+
+  @property
+  def device(self) -> torch.device | None: ...
+
+  @property
+  def dtype(self) -> torch.dtype | None: ...
+
+  @property
+  def is_empty(self) -> bool: ...
+
+  def __len__(self) -> int: ...
+
+  def insert(self, batch: LabeledReplayBatch) -> None: ...
+
+  def validate_batch(self, batch: LabeledReplayBatch) -> None: ...
+
+  def sample(
+    self,
+    batch_size: int,
+    *,
+    replacement: bool = True,
+    generator: torch.Generator | None = None,
+  ) -> LabeledReplayBatch: ...
+
+  def state_dict(self) -> dict[str, Any]: ...
+
+  def load_state_dict(self, state: Mapping[str, Any]) -> None: ...
+
+  def validate_state(self, state: Mapping[str, Any]) -> None: ...
+
+  def rebase_segment_ids(self, collector_iteration: int, base: int) -> int: ...
+
+  def max_valid_segment_id(self) -> int | None: ...
+
+
 def _require_tensor(name: str, value: object) -> torch.Tensor:
   if not isinstance(value, torch.Tensor):
     raise ReplayValidationError(f"{name} must be a torch.Tensor")
@@ -121,6 +184,74 @@ def _require_metadata(name: str, value: object, batch_size: int) -> torch.Tensor
   if tensor.dtype != torch.int64:
     raise ReplayValidationError(f"{name} must use torch.int64")
   return tensor
+
+
+def validate_replay_batch(
+  batch: LabeledReplayBatch,
+  schema: VaeSchema,
+  *,
+  device: torch.device | str | None = None,
+  dtype: torch.dtype | None = None,
+) -> None:
+  """Validate one insertion request against a schema and buffer policy.
+
+  Every replay implementation and the trainer call this before touching
+  storage, so a malformed batch is rejected identically everywhere.  ``device``
+  and ``dtype`` are the buffer's established policy; ``None`` accepts the
+  batch's own values for a buffer that has not been established yet.
+  """
+  if not isinstance(batch, LabeledReplayBatch):
+    raise ReplayValidationError("batch must be a LabeledReplayBatch")
+  if batch.schema != schema:
+    raise ReplayValidationError("batch schema does not match replay schema")
+
+  batch_size = batch.batch_size
+  reference = _require_matrix(
+    "reference", batch.reference, batch_size, schema.reference_dim
+  )
+  conditioning = _require_matrix(
+    "conditioning", batch.conditioning, batch_size, schema.conditioning_dim
+  )
+  teacher_action = _require_matrix(
+    "teacher_action", batch.teacher_action, batch_size, schema.action_dim
+  )
+  metadata = (
+    ("motion_id", batch.motion_id),
+    ("teacher_id", batch.teacher_id),
+    ("reference_frame", batch.reference_frame),
+    ("episode_id", batch.episode_id),
+    ("collector_iteration", batch.collector_iteration),
+  )
+  metadata_tensors = [
+    _require_metadata(name, value, batch_size) for name, value in metadata
+  ]
+
+  tensors = [reference, conditioning, teacher_action, *metadata_tensors]
+  expected_device = tensors[0].device
+  expected_dtype = tensors[0].dtype
+  if any(tensor.device != expected_device for tensor in tensors[1:]):
+    raise ReplayValidationError("all replay fields must share one device")
+  if any(tensor.dtype != expected_dtype for tensor in (conditioning, teacher_action)):
+    raise ReplayValidationError(
+      "reference, conditioning and teacher_action must share one dtype"
+    )
+  policy_device = _canonical_device(device) if device is not None else None
+  if policy_device is not None and expected_device != policy_device:
+    raise ReplayValidationError(
+      f"replay tensors use {expected_device}, expected {policy_device}"
+    )
+  if dtype is not None and expected_dtype != dtype:
+    raise ReplayValidationError(
+      f"replay tensors use {expected_dtype}, expected {dtype}"
+    )
+  # PackedObservationBatch.validate deliberately requires a non-empty batch.
+  # The replay boundary has already checked the complete empty shape/device/
+  # dtype contract above, so only invoke it where its precondition holds.
+  if batch_size > 0:
+    try:
+      batch.observations.validate()
+    except ObservationValidationError as exc:
+      raise ReplayValidationError(str(exc)) from exc
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -186,58 +317,9 @@ class LabeledReplayBuffer:
   def __len__(self) -> int:
     return self._size
 
-  def _validate_batch(self, batch: LabeledReplayBatch) -> None:
-    if not isinstance(batch, LabeledReplayBatch):
-      raise ReplayValidationError("batch must be a LabeledReplayBatch")
-    if batch.schema != self.schema:
-      raise ReplayValidationError("batch schema does not match replay schema")
-
-    batch_size = batch.batch_size
-    reference = _require_matrix(
-      "reference", batch.reference, batch_size, self.schema.reference_dim
-    )
-    conditioning = _require_matrix(
-      "conditioning", batch.conditioning, batch_size, self.schema.conditioning_dim
-    )
-    teacher_action = _require_matrix(
-      "teacher_action", batch.teacher_action, batch_size, self.schema.action_dim
-    )
-    metadata = (
-      ("motion_id", batch.motion_id),
-      ("teacher_id", batch.teacher_id),
-      ("reference_frame", batch.reference_frame),
-      ("episode_id", batch.episode_id),
-      ("collector_iteration", batch.collector_iteration),
-    )
-    metadata_tensors = [
-      _require_metadata(name, value, batch_size) for name, value in metadata
-    ]
-
-    tensors = [reference, conditioning, teacher_action, *metadata_tensors]
-    expected_device = tensors[0].device
-    expected_dtype = tensors[0].dtype
-    if any(tensor.device != expected_device for tensor in tensors[1:]):
-      raise ReplayValidationError("all replay fields must share one device")
-    if any(tensor.dtype != expected_dtype for tensor in (conditioning, teacher_action)):
-      raise ReplayValidationError(
-        "reference, conditioning and teacher_action must share one dtype"
-      )
-    if self._device is not None and expected_device != self._device:
-      raise ReplayValidationError(
-        f"replay tensors use {expected_device}, expected {self._device}"
-      )
-    if self._dtype is not None and expected_dtype != self._dtype:
-      raise ReplayValidationError(
-        f"replay tensors use {expected_dtype}, expected {self._dtype}"
-      )
-    # PackedObservationBatch.validate deliberately requires a non-empty batch.
-    # The replay boundary has already checked the complete empty shape/device/
-    # dtype contract above, so only invoke it where its precondition holds.
-    if batch_size > 0:
-      try:
-        batch.observations.validate()
-      except ObservationValidationError as exc:
-        raise ReplayValidationError(str(exc)) from exc
+  def validate_batch(self, batch: LabeledReplayBatch) -> None:
+    """Validate an insertion request without changing this buffer."""
+    validate_replay_batch(batch, self.schema, device=self._device, dtype=self._dtype)
 
   def _owned_batch(self, batch: LabeledReplayBatch) -> dict[str, torch.Tensor]:
     """Clone all fields before the first ring slot is mutated."""
@@ -259,7 +341,7 @@ class LabeledReplayBuffer:
     batch is a no-op, including when the buffer has no established device or
     dtype.
     """
-    self._validate_batch(batch)
+    self.validate_batch(batch)
     if batch.batch_size == 0:
       return
     if self._device is None:
@@ -420,6 +502,30 @@ class LabeledReplayBuffer:
     self._next = next_index
     self._storage = storage
 
+  def validate_state(self, state: Mapping[str, Any]) -> None:
+    """Validate a candidate checkpoint replay state without mutating anything.
+
+    Checkpoint code uses this public seam instead of reading ring internals, so
+    an invalid state is rejected before any live field is replaced.
+    """
+    if not isinstance(state, Mapping):
+      raise ReplayValidationError("replay state must be a mapping")
+    self._validated_state_storage(state)
+
+  def max_valid_segment_id(self) -> int | None:
+    """Largest segment/episode ID among retained records, ``None`` when empty.
+
+    Resume opens a fresh segment namespace above every *valid* retained record;
+    unused ring slots must never influence that boundary, so the caller must not
+    read the raw storage layout itself.
+    """
+    if self._storage is None or self._size == 0:
+      return None
+    start = (self._next - self._size) % self.capacity
+    logical = torch.arange(self._size, device=self._device)
+    physical = (logical + start) % self.capacity
+    return int(self._storage["episode_id"][physical].max().item())
+
   def rebase_segment_ids(self, collector_iteration: int, base: int) -> int:
     """Add ``base`` to segment IDs from one owned collection iteration.
 
@@ -516,5 +622,7 @@ __all__ = [
   "LabeledReplayBuffer",
   "ReplayBatch",
   "ReplayBuffer",
+  "ReplayBufferProtocol",
   "ReplayValidationError",
+  "validate_replay_batch",
 ]

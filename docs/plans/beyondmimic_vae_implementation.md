@@ -2,7 +2,7 @@
 
 Architecture: [beyondmimic_vae_distillation.md](beyondmimic_vae_distillation.md).
 Repository: `/home/agiuser/projects/mjlab`.
-Current status: **M1 and M2 are parent-accepted and committed** as `cdd9a8201` and `76ca932bb`. The [M2 acceptance record](beyondmimic_vae_m2_implementation.md) documents the gravity-first core and explicit future ablation schemas. **M3 implementation and bounded validation are now authorized**, using `lingzhi/gpt-5.6-luna` serial component workers and 15-minute parent supervision under the [M3 plan](beyondmimic_vae_m3_implementation.md). Production training, M4+, diffusion, and hardware work remain separate.
+Current status: **M1–M3 are complete; M4 implementation and bounded CPU integration are parent-accepted**, with explicit inherited repository-check exceptions. See [M4 acceptance and evidence](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27). Multi-teacher policy-quality training/evaluation remains the next, separately budgeted step; the five-iteration smoke is not a usable policy. The user accepted moving on after the single-teacher training/evaluation work, including the completed 4096-env 10,000-iteration run. Follow the [M4 plan](beyondmimic_vae_m4_implementation.md): serial `ds-oc/deepseek-flash` component workers, 20-minute parent supervision, balanced two-motion collection/replay, and parent acceptance. M4 production training, diffusion, and hardware work remain separate. Earlier milestone sections below retain their historical acceptance boundaries.
 
 ## M1 acceptance record — 2026-09-26
 
@@ -154,7 +154,11 @@ Follow the [bounded M3 plan](beyondmimic_vae_m3_implementation.md), including ex
 
 Integrate with the existing single-motion environment before adding multi-motion commands. Establish the deterministic teacher rollout baseline and physical sensor frames. Snapshot before stepping, use executed previous actions, retain valid pre-failure labels, handle auto-reset and motion-end segments, and implement optional teacher bootstrap/mixing followed by student-only collection. Add resumable checkpoints, logging, evaluation, and bounded resource-configurable smoke runs. Large training runs need a separately specified device/environment/iteration budget.
 
-### M4: multi-motion training
+### M4: multi-motion training — implementation/smoke accepted
+
+The [parent acceptance record](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27) separates passing integration evidence, inherited repository-check failures, and remaining multi-teacher policy-quality work. No production M4 training or commit was performed.
+
+Follow the [detailed M4 plan](beyondmimic_vae_m4_implementation.md) for current scope, contracts, exclusive component ownership, validation, and 20-minute supervision. It explicitly selects stratified per-motion environment slots and uniform phase sampling for the first baseline; new large training runs require a separate resource budget.
 
 Add motion-indexed reference storage and command/reset handling, no cross-clip indexing or accidental motion-ID leaks into the decoder, equal initial motion weights, and motion-balanced bounded replay. One shared VAE trains on both teachers. Require per-motion baseline-relative evaluation, not only aggregate reward/MSE.
 

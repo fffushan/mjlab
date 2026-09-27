@@ -3,15 +3,17 @@
 This module owns only the simulator boundary used by distillation.  It does not
 alter the registered tracking tasks: :func:`build_distillation_environment`
 loads a registered configuration, makes a private copy, and replaces only its
-motion command with :class:`SegmentMotionCommand`.
+motion command with :class:`SegmentMotionCommand`, and
+:func:`build_multi_motion_environment` does the same for the opt-in
+multi-motion command whose rows follow different reference clips.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -144,6 +146,14 @@ class SegmentMotionCommand(MotionCommand):
 
   def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
+    self._init_boundary_bookkeeping()
+
+  def _init_boundary_bookkeeping(self) -> None:
+    """Allocate the per-environment boundary event state.
+
+    Kept as its own step so a motion command that does not build a single-clip
+    ``MotionLoader`` can reuse the exact same bookkeeping.
+    """
     self.generation_ids = torch.zeros(
       self.num_envs, dtype=torch.long, device=self.device
     )
@@ -421,9 +431,105 @@ def build_distillation_environment(
   return env
 
 
+def build_multi_motion_environment(
+  cohort: Any,
+  teacher_ids: Sequence[str],
+  *,
+  phase_policy: str = "uniform",
+  task_id: str | None = None,
+  num_envs: int | None = None,
+  device: str = "cpu",
+  render_mode: str | None = None,
+  seed: int | None = None,
+) -> ManagerBasedRlEnv:
+  """Build one environment whose rows are pinned to different reference clips.
+
+  This is the opt-in multi-motion sibling of
+  :func:`build_distillation_environment`: it copies a registered task
+  configuration privately, replaces only its motion command with
+  :class:`MultiMotionCommand`, and pins each environment row to a selected
+  clip.  Only the registry task factory is executable; saved environment YAML
+  remains validation data.
+
+  ``phase_policy`` is the private phase-sampling override recorded alongside
+  the delay-timing overrides (``start`` for pinned evaluation, ``uniform`` for
+  training).  ``seed`` seeds the environment and the row permutation of the
+  stratified slot allocation.
+  """
+  # Imported here because the multi-motion module builds on this module's
+  # SegmentMotionCommand; module-level import would be circular.
+  from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.tasks.registry import load_env_cfg
+  from mjlab.tasks.tracking.distillation.multi_motion import (
+    MultiMotionCommandCfg,
+    PhasePolicy,
+    make_multi_motion_cfg,
+    plan_multi_motion,
+  )
+
+  if phase_policy not in ("uniform", "start"):
+    raise ValueError(f"phase_policy must be 'uniform' or 'start', got {phase_policy!r}")
+  selected_task = task_id or cohort.manifest.base_task
+  if selected_task is None:
+    raise ValueError("cohort has no base_task; task_id is required")
+  cfg = load_env_cfg(selected_task)
+  validated_seed = _validate_factory_seed(seed)
+  if validated_seed is not None:
+    cfg.seed = validated_seed
+  if num_envs is not None:
+    if num_envs <= 0:
+      raise ValueError("num_envs must be positive")
+    cfg.scene.num_envs = num_envs
+  motion_cfg = cfg.commands.get("motion")
+  if not isinstance(motion_cfg, MotionCommandCfg):
+    raise ValueError(f"registered task {selected_task!r} has no motion command")
+  if isinstance(motion_cfg, MultiMotionCommandCfg):
+    raise ValueError("registered task already declares a multi-motion command")
+  if motion_cfg.standing_start_prob != 0.0:
+    raise ValueError(
+      "multi-motion build requires standing_start_prob == 0.0; the registered "
+      f"task sets {motion_cfg.standing_start_prob!r}"
+    )
+
+  slot_generator = (
+    None if validated_seed is None else torch.Generator().manual_seed(validated_seed)
+  )
+  plan = plan_multi_motion(
+    cohort,
+    teacher_ids,
+    int(cfg.scene.num_envs),
+    phase_policy=cast(PhasePolicy, phase_policy),
+    slot_generator=slot_generator,
+    device=device,
+  )
+  first_teacher = cohort.teacher(plan.teacher_ids[0])
+  semantic_overrides = list(
+    _apply_saved_observation_timing(
+      cfg, first_teacher.env_config, str(first_teacher.entry.env_config)
+    )
+  )
+  if motion_cfg.sampling_mode != plan.phase_policy:
+    semantic_overrides.append(
+      "private multi-motion config: commands.motion.sampling_mode: "
+      f"{motion_cfg.sampling_mode!r} -> {plan.phase_policy!r}"
+    )
+  cfg.commands["motion"] = make_multi_motion_cfg(motion_cfg, plan)
+
+  env = ManagerBasedRlEnv(cfg, device=device, render_mode=render_mode)
+  env.cfg.__dict__["_distillation_semantic_overrides"] = tuple(semantic_overrides)
+  env.cfg.__dict__["_distillation_seed_provenance"] = RuntimeSeedProvenance(
+    requested_seed=validated_seed,
+    effective_seed=env.cfg.seed,
+    applied_before_construction=validated_seed is not None,
+  )
+  env.cfg.__dict__["_distillation_motion_slots"] = plan.slots
+  return env
+
+
 __all__ = [
   "SegmentMotionCommand",
   "SegmentMotionCommandCfg",
   "build_distillation_environment",
+  "build_multi_motion_environment",
   "make_segment_motion_cfg",
 ]

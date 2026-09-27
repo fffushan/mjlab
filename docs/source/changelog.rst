@@ -8,6 +8,67 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the M4 shared multi-teacher distillation cohort. ``distill train
+  --teacher-ids "('tennis_000','tennis_001')"`` trains **one shared conditional
+  VAE** over both 50 Hz tennis clips in **one** vectorized simulator: rows keep
+  their own reference clip and are labeled by that clip's frozen teacher through
+  one frozen teacher bank, actions/observations keep their meanings, and the
+  gravity schema (68/99/32/31) is unchanged. Motion and teacher ids stay routing
+  metadata and never enter decoder conditioning. Selection is explicit and
+  mutually exclusive with the preserved single-teacher ``--teacher-id`` path
+  (supplying both is refused before any environment is constructed), and
+  omitting both keeps the historical ``tennis_000`` default. Cohort runs use
+  stratified fixed environment slots (deterministic largest-remainder allocation
+  from the manifest weights, at least one row per selected motion, seeded row
+  permutation), uniform phase sampling recorded as an explicit private override,
+  and one per-motion balanced replay that cannot let a shorter or easier clip
+  evict another. Unknown or repeated teacher ids and an impossible replay
+  capacity are refused before any environment is constructed, and a failure
+  after the environment exists closes it exactly once. See
+  ``docs/source/x2_tennis_distillation.rst``.
+
+- Added version-2 M4 cohort checkpoints, strict cohort resume, and checked
+  member selection. ``distill train`` records the ordered member identities with
+  every artifact path and digest, per-clip extent/source digest/audited body
+  mapping, the ordered mapping digest, the common action/control/observation
+  contract, the slot and phase policy, the replay partition policy, resource
+  settings, and all RNG state; strict resume reproduces the whole record and
+  only the total iteration budget and the save/reporting cadence may differ. A
+  version-2 checkpoint is never converted to or from version 1, resume restarts
+  the simulator with a segment namespace above every retained replay partition,
+  and ``distill evaluate``/``distill play`` accept a single **member** of the
+  saved cohort (member artifacts and the common contract validated against the
+  live manifest, the full stored cohort identity kept in the report). The
+  Viser Checkpoints tab dispatches each discovered artifact to its version's
+  loader. Version-1 training resume, inference, playback, and export are
+  unchanged.
+
+- Added ``distill evaluate-cohort``: a bounded evaluation that normalizes
+  ``--teacher-ids`` into manifest order (repeated ids refused before any
+  environment is constructed), pins each selected motion into its own
+  single-motion environment, and builds a fresh identically seeded adapter for
+  each mode so the student baseline never inherits the teacher rollout's
+  simulator state; one student model is loaded once and reused. Each motion
+  block reports, separately for the teacher baseline and the shared student, the
+  segment and outcome counts, completion/failure denominators, censored-segment
+  counts, reference coverage, timeout/step-cap/timer censoring, disaggregation,
+  and action-rate metrics with the same seed, phase mode, environment count, and
+  step cap. Every reported level is attributed to the motion's cohort identity
+  (the stored cohort member's motion id and teacher code, or the explicit
+  manifest position for a teacher-only run) rather than to the pinned
+  environment's local clip 0, and each block records which source it used.
+  Aggregate summaries report an equal-motion ``macro`` view and an explicitly
+  ``clip_duration_weighted`` view (weights proportional to ``frames/fps``) with
+  the per-motion values, aggregation weights, contributing motion counts, and
+  partially covered metrics retained; execution errors are reported per motion
+  and mode, make ``complete`` false, and the report states that no aggregate is
+  a quality pass.
+
+- Added ``distill train`` reporting of per-motion collection attribution
+  (``collection.motion_stats``: per-motion samples, teacher/student steps,
+  boundaries, teacher/student disagreement, and reference-frame coverage)
+  alongside the existing totals and boundary summary.
+
 - Added the audited ``distill export`` VAE deployment seam. Version-2 bundles
   contain matching encoder/decoder ONNX graphs, frozen exact normalizers, a
   frame-major float32 motion table, full-precision action metadata, explicit
@@ -222,6 +283,19 @@ Added
   ``robot_joint_names``) into the tracking-format npz consumed by ``train.py``.
   It resamples the trajectory to the environment rate (50 Hz by default) and
   replays it kinematically through the G1 29DOF mode-15 robot.
+
+Changed
+^^^^^^^
+
+- ``distill train --teacher-id`` now defaults to ``None`` so the plural
+  ``--teacher-ids`` selection can be unambiguously distinguished from it. The
+  resolved behavior is unchanged: with neither flag the single-teacher path uses
+  ``tennis_000`` exactly as before, and ``--teacher-id <id>`` behaves as before.
+  Because the shared Tyro configuration uses Python literal syntax for
+  collections, the plural form is ``--teacher-ids "('a','b')"`` (a single
+  element keeps its trailing comma). ``distill export`` refuses a version-2 M4
+  cohort checkpoint explicitly instead of fabricating a single-teacher training
+  history; version-1 export is unchanged.
 
 Fixed
 ^^^^^
