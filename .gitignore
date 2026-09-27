@@ -24,6 +24,11 @@ runs/
 .egl-fallback/
 queue/runs/
 queue/state/
+# The live job list is queue state, not source: the dispatcher rewrites it as
+# jobs start and finish, so tracking it would make every server push depend on a
+# dirty working tree. A missing file is an empty queue, which dispatch.sh already
+# handles. Keep queue/dispatch.sh, status.sh and stop.sh tracked.
+queue/jobs.tsv
 queue/queue.log
 queue/batch.*
 queue/dispatch.lock
