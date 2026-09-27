@@ -19,5 +19,15 @@ benchmark_results/
 **/_build/*
 **/generated/*
 
+# Remote runtime artifacts (server-only).
+runs/
+.egl-fallback/
+queue/runs/
+queue/state/
+queue/queue.log
+queue/batch.*
+queue/dispatch.lock
+
+# Remote data.
 data/*
 .pi/*
