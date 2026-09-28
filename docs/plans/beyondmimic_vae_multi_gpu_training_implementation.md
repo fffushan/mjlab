@@ -240,9 +240,10 @@ refuse an existing run's resume.
   per tick but returns them flat), and the ordering that actually matters for
   correctness is the row order, which decides what a full replay forgets first.
   A consumer correlating boundaries with rows therefore correlates per shard.
-- Diagnostics are prefixed with the worker index; seed provenance is reported
-  per worker; per-worker collection/evaluation wall-time joins the iteration
-  event so the speedup can be read from the run itself.
+- Diagnostics are prefixed with the worker index and seed provenance is reported
+  per worker. Per-worker wall time is **not** reported yet: nothing times a
+  worker call, so a speedup can be read from the iteration rate but not
+  attributed to a shard (see 9.7).
 - Replay telemetry is unchanged: there is still exactly one replay.
 
 ### 3.8 Evaluation
@@ -382,9 +383,9 @@ miss in the later steps. These are required coverage, not aspirations:
 
 On the 8-card host (authorized separately):
 
-10. Bounded smoke: 2 workers × 4096 envs, 2 iterations — per-GPU VRAM, s/iter,
-    per-worker collection time, transport share of the iteration, aggregated
-    report, and a save→resume round trip.
+10. Bounded smoke: 2 workers × 4096 envs — per-GPU VRAM, s/iter, aggregated
+    report, checkpoint, and a resume. Transport share and per-worker collection
+    time are **not** measurable yet: no timing surface exists (see 9.7).
 11. Target run: 3-GPU layout, 2 × 8192 = 16384 envs on the eight-teacher v2
     manifest, reporting s/iter against the current 3.78 s/iter single-GPU
     baseline and ≈9.5 GB per worker GPU.
