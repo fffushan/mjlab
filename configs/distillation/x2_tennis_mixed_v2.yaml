@@ -1,0 +1,91 @@
+# Mixed cohort v2: eight standing-capable tennis teachers.
+#
+# Successor to x2_tennis_mixed.yaml. Changes vs. v1:
+#   - tennis_002_ss (16.5k mid-training freeze) is REPLACED by tennis_002, the
+#     same source job's COMPLETED 30k run, frozen to
+#     logs/distillation/teachers/tennis_002/ (see its PROVENANCE.md).
+#   - tennis_003_ss / tennis_004_ss: completed 30k standing-start teachers,
+#     frozen from their finished platform runs.
+#   - tennis_005_ss / tennis_006_ss / tennis_007_ss: MID-TRAINING freezes
+#     (26000 / 25000 / 22500 iterations at freeze time) under
+#     logs/distillation/teachers/, because their source runs are still
+#     exporting new ONNX on every save. See each PROVENANCE.md for source,
+#     iteration, freeze time, and digests.
+#
+# Every new teacher is frozen under logs/distillation/teachers/<id>/ so the
+# referenced paths resolve identically on the laptop checkout and on the
+# server (the server's runs/ tree does not mirror the laptop's, and the
+# platform output/ tree has a different layout).
+#
+# tennis_000 and tennis_001 remain the ORIGINAL plain-task teachers from
+# x2_tennis.yaml so this cohort stays comparable with every earlier run; the
+# completed standing 000/001 runs exist but are deliberately not used here.
+#
+# Why a new file instead of editing x2_tennis_mixed.yaml: the cohort identity
+# records manifest_sha256, and strict resume/evaluation compares it
+# (require_same_cohort). Editing the v1 manifest would invalidate the
+# phase-balanced run currently training from it.
+version: 1
+name: x2-tennis-teachers-mixed-v2
+robot: agibot_x2
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations
+teachers:
+  - id: tennis_000
+    checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/model_29999.pt
+    motion: data/tennis/single_000_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/env.yaml
+    agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/agent.yaml
+    onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/2026-09-23_21-24-56.onnx
+    sampling_weight: 1.0
+  - id: tennis_001
+    checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/model_29999.pt
+    motion: data/tennis/single_001_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/env.yaml
+    agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/agent.yaml
+    onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/2026-09-23_19-28-08.onnx
+    sampling_weight: 1.0
+  # Completed 30k run of the job whose 16.5k freeze was tennis_002_ss.
+  - id: tennis_002
+    checkpoint: logs/distillation/teachers/tennis_002/model_29999.pt
+    motion: data/tennis/single_002_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_002/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_002/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_002/model_29999.onnx
+    sampling_weight: 1.0
+  # Completed 30k standing-start teachers.
+  - id: tennis_003_ss
+    checkpoint: logs/distillation/teachers/tennis_003_ss/model_29999.pt
+    motion: data/tennis/single_003_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_003_ss/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_003_ss/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_003_ss/model_29999.onnx
+    sampling_weight: 1.0
+  - id: tennis_004_ss
+    checkpoint: logs/distillation/teachers/tennis_004_ss/model_29999.pt
+    motion: data/tennis/single_004_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_004_ss/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_004_ss/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_004_ss/model_29999.onnx
+    sampling_weight: 1.0
+  # Frozen mid-training copies (sources still training; see PROVENANCE.md).
+  - id: tennis_005_ss
+    checkpoint: logs/distillation/teachers/tennis_005_ss/model_26000.pt
+    motion: data/tennis/single_005_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_005_ss/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_005_ss/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_005_ss/model_26000.onnx
+    sampling_weight: 1.0
+  - id: tennis_006_ss
+    checkpoint: logs/distillation/teachers/tennis_006_ss/model_25000.pt
+    motion: data/tennis/single_006_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_006_ss/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_006_ss/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_006_ss/model_25000.onnx
+    sampling_weight: 1.0
+  - id: tennis_007_ss
+    checkpoint: logs/distillation/teachers/tennis_007_ss/model_22500.pt
+    motion: data/tennis/single_007_zhanghongyu_agibot_x2_tracking.npz
+    env_config: logs/distillation/teachers/tennis_007_ss/params/env.yaml
+    agent_config: logs/distillation/teachers/tennis_007_ss/params/agent.yaml
+    onnx: logs/distillation/teachers/tennis_007_ss/model_22500.onnx
+    sampling_weight: 1.0
