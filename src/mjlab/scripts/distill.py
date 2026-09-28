@@ -10,6 +10,7 @@ inferred from the checkpoint instead of being repeated on the command line.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -78,6 +79,7 @@ from mjlab.tasks.tracking.distillation.export import (
   export_cohort_bundle,
 )
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
+from mjlab.tasks.tracking.distillation.multi_motion import plan_multi_motion
 from mjlab.tasks.tracking.distillation.parity import (
   DEFAULT_ATOL,
   DEFAULT_RTOL,
@@ -1106,10 +1108,25 @@ def _build_sharded_cohort_runner(
       dtype=torch.float32,
       phase_bins=phase_bins,
     )
+    # The identity describes the run, so it carries the run's slot allocation
+    # rather than shard 0's: a shard's rows (and its seeded per-row clip
+    # assignment) describe that shard alone.  Rebuilt through the same pure plan
+    # a single-process run of this recipe builds, from the same base seed, so a
+    # sharded run and a single-process run record the same identity.
+    audit = replace(
+      primary.audit,
+      slots=_run_level_slots(
+        cohort,
+        tuple(teacher_ids),
+        num_envs,
+        device=device,
+        base_seed=setup.base_seed,
+      ),
+    )
     identity = cohort_identity_from_parts(
       cohort=cohort,
       library=primary.library,
-      audit=primary.audit,
+      audit=audit,
       replay=replay,
       device=device,
     )
@@ -1419,6 +1436,70 @@ def _teardown_on_signal(teardown):
     restore()
 
 
+def _record_differences(left: Any, right: Any, prefix: str = "") -> tuple[str, ...]:
+  """Name the leaf fields where two comparable records disagree.
+
+  The cross-shard check compares records as a *whole*, deliberately, so that a
+  field added to the audited contract later cannot escape it.  A whole-record
+  refusal then hides which field differed, which is what this restores: the
+  comparison keeps its coverage and the message names the field.
+  """
+  if dataclasses.is_dataclass(left) and dataclasses.is_dataclass(right):
+    if type(left) is not type(right):
+      return (prefix or "<record>",)
+    names = [field.name for field in dataclasses.fields(left)]
+    differences: list[str] = []
+    for name in names:
+      where = f"{prefix}.{name}" if prefix else name
+      differences.extend(
+        _record_differences(getattr(left, name), getattr(right, name), where)
+      )
+    return tuple(differences)
+  if isinstance(left, tuple) and isinstance(right, tuple) and len(left) == len(right):
+    differences = []
+    for index, (first, second) in enumerate(zip(left, right, strict=True)):
+      differences.extend(_record_differences(first, second, f"{prefix}[{index}]"))
+    return tuple(differences)
+  if isinstance(left, Mapping) and isinstance(right, Mapping):
+    if set(left) != set(right):
+      return (prefix or "<record>",)
+    differences = []
+    for key in left:
+      differences.extend(_record_differences(left[key], right[key], f"{prefix}.{key}"))
+    return tuple(differences)
+  return () if left == right else (prefix or "<record>",)
+
+
+def _run_level_slots(
+  cohort: CohortContract,
+  teacher_ids: tuple[str, ...],
+  num_envs: int,
+  *,
+  device: str,
+  base_seed: int,
+) -> Any:
+  """The slot allocation of the *whole* run, not of one shard.
+
+  A shard's own allocation describes its own rows, and its per-row clip
+  assignment is seeded from its own environment seed, so no two shards share it
+  and none of them describes the run.  The cohort identity records the run, so
+  it is rebuilt here exactly as a single-process run of this recipe builds it:
+  the plan for the run's row count, with the row assignment seeded from the base
+  seed -- which is worker 0's derivation, and therefore the single-process one.
+
+  This is a pure computation: it selects clips, pins rows and validates the
+  phase policy without touching a simulator.
+  """
+  return plan_multi_motion(
+    cohort,
+    teacher_ids,
+    num_envs,
+    phase_policy=_COHORT_PHASE_POLICY,
+    slot_generator=torch.Generator().manual_seed(base_seed),
+    device=device,
+  ).slots
+
+
 def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup) -> Any:
   """Require every shard to describe the same cohort contract as shard 0.
 
@@ -1444,18 +1525,44 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
   primary = descriptions[0]
 
   def audited_contract(item: Any) -> Any:
-    """The audited contract of one shard, minus its per-shard seed stratum.
+    """The audited contract of one shard, minus what is per-shard by design.
 
     Comparing the whole record rather than a hand-picked list is what keeps this
-    honest as the audit grows: the parent records these fields in the cohort
-    identity, so every one of them -- slots, mapping digest, phase policy,
-    additional-gravity policy, semantic overrides, joint order, control period,
-    actor terms -- must agree across shards.  The seed provenance is excluded
-    because each shard's environment is built on its own seed by design, and is
-    checked against its stratum below instead.
+    honest as the audit grows: everything -- the clip set and compiled-asset
+    evidence, the mapping digest, the phase policy, the additional-gravity
+    policy, the semantic overrides, the joint order, the control period, the
+    actor terms, the slot weights and counts and teacher routing -- must agree
+    across shards.
+
+    Exactly two members are excluded, both because each shard is *deliberately*
+    its own instance rather than a copy: the environment seed provenance (each
+    shard is its own seed stratum, checked below), and the per-row clip
+    assignment (`slots.row_motion_ids`), which the adapter seeds from that same
+    per-shard environment seed.  The weights, the counts and the teacher routing
+    are still compared.
     """
     audit = item.audit
-    return None if audit is None else replace(audit, seed_provenance=None)
+    if audit is None:
+      return None
+    # The audit is compared as a whole with only the seed stratum removed, so a
+    # field added to it later cannot escape.  The slots are compared as their
+    # shard-independent members: a blank row assignment cannot be constructed at
+    # all, because the allocation validates its own row count.
+    excluded = {"seed_provenance", "slots"}
+    return {
+      # Enumerated from the record itself, so a field added to the audit later
+      # is compared without anyone remembering to add it here.
+      "audit": {
+        field.name: getattr(audit, field.name)
+        for field in dataclasses.fields(audit)
+        if field.name not in excluded
+      },
+      "slots": {
+        "weights": tuple(audit.slots.weights),
+        "counts": tuple(audit.slots.counts),
+        "teacher_ids": tuple(audit.slots.teacher_ids),
+      },
+    }
 
   fields = (
     ("observation schema", lambda item: item.schema),
@@ -1470,10 +1577,14 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
   )
   for index, description in enumerate(descriptions):
     for name, read in fields:
-      if read(description) != read(primary):
+      theirs, ours = read(description), read(primary)
+      if theirs != ours:
+        differing = _record_differences(ours, theirs, name)
+        detail = ", ".join(differing[:4]) if differing else "<record>"
         raise DistillationError(
-          f"worker {index} reported a different {name} than worker 0; the "
-          "shards do not describe one cohort contract"
+          f"worker {index} reported a different {name} than worker 0 "
+          f"(differing fields: {detail}); the shards do not describe one "
+          "cohort contract"
         )
     provenance = description.audit.seed_provenance
     if provenance is not None:

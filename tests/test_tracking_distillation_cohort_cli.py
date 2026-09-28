@@ -2878,6 +2878,54 @@ def test_shard_descriptions_must_agree_on_the_whole_cohort_contract() -> None:
       distill._require_one_shard_contract([first, second], setup)
 
 
+def test_shards_may_differ_in_their_own_per_row_clip_assignment() -> None:
+  """A shard's row assignment is its own; its weights and counts are not.
+
+  Each shard is its own environment, built on its own seed, and the adapter
+  seeds the per-row clip assignment from that seed.  Requiring equality there
+  refused a legitimate three-GPU run on its first real execution -- which is why
+  the comparison excludes exactly that member and keeps comparing the rest.
+  """
+  setup = SimpleNamespace(base_seed=5)
+  # Three rows over two motions: every motion keeps at least one row, so both
+  # allocations are valid and only the assignment differs.
+  shared = dict(weights=(0.5, 0.5), teacher_ids=("a", "b"))
+  mine = _with_audit(
+    _shard_description(0),
+    slots=MotionSlotAllocation(counts=(2, 1), row_motion_ids=(0, 0, 1), **shared),
+  )
+  second = _shard_description(1)
+  theirs = _with_audit(
+    second,
+    slots=MotionSlotAllocation(counts=(2, 1), row_motion_ids=(0, 1, 0), **shared),
+  )
+  assert distill._require_one_shard_contract([mine, theirs], setup) is mine
+
+  # The shard-independent members of the same record are still compared.
+  other_counts = _with_audit(
+    second,
+    slots=MotionSlotAllocation(counts=(1, 2), row_motion_ids=(0, 1, 1), **shared),
+  )
+  with pytest.raises(DistillationError, match="slots.counts"):
+    distill._require_one_shard_contract([mine, other_counts], setup)
+
+
+def test_a_contract_refusal_names_the_differing_field() -> None:
+  """A whole-record comparison must still say which field differed.
+
+  The refusal that stopped the first real run named only the record, which cost
+  a full smoke cycle to diagnose.
+  """
+  setup = SimpleNamespace(base_seed=5)
+  first = _shard_description()
+  other = _with_audit(first, additional_gravity_policy="doubled")
+
+  with pytest.raises(DistillationError) as error:
+    distill._require_one_shard_contract([first, other], setup)
+
+  assert "additional_gravity_policy" in str(error.value)
+
+
 def test_the_real_audited_contract_supports_the_comparison() -> None:
   """The comparison neutralises the seed provenance with dataclasses.replace.
 

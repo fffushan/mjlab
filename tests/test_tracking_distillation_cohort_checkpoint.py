@@ -1913,3 +1913,39 @@ def test_cohort_save_refuses_a_derived_declaration_with_a_live_collector(
       reset_rng_derived=True,
     )
   assert not path.exists()
+
+
+def test_the_sharded_identity_records_the_run_level_slots(
+  real_cohort: CohortContract,
+) -> None:
+  """The identity describes the run, not one shard.
+
+  A shard's own allocation describes its own rows and its per-row clip
+  assignment is seeded from its own environment seed, so none of them describes
+  the run.  The parent rebuilds the run's allocation from the same pure plan and
+  the same base seed a single-process run uses, which is what makes the two
+  layouts record the same identity -- and what the first real three-GPU run
+  showed was missing.
+
+  Pure computation: no simulator is built.
+  """
+  from mjlab.scripts import distill
+
+  teacher_ids = tuple(real_cohort.teacher_ids)
+  run_slots = distill._run_level_slots(
+    real_cohort, teacher_ids, 8192, device="cpu", base_seed=5
+  )
+  again = distill._run_level_slots(
+    real_cohort, teacher_ids, 8192, device="cpu", base_seed=5
+  )
+  shard_slots = distill._run_level_slots(
+    real_cohort, teacher_ids, 4096, device="cpu", base_seed=5
+  )
+
+  assert run_slots.num_envs == 8192
+  assert run_slots.row_motion_ids == again.row_motion_ids, "not deterministic"
+  assert shard_slots.num_envs == 4096
+  assert run_slots.row_motion_ids != shard_slots.row_motion_ids
+  # The routing and the weights are the run's, not a shard's.
+  assert run_slots.teacher_ids == shard_slots.teacher_ids
+  assert tuple(run_slots.weights) == tuple(shard_slots.weights)

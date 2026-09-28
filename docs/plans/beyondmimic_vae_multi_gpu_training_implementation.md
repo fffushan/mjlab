@@ -840,3 +840,44 @@ Remaining and honest:
 - `merge_evaluations` still copies a shard's informational settings from shard 0
   after validating the call and the standing profile; the fields that decide a
   metric are validated.
+
+### 9.8 First real run: two bugs the CPU fakes could not see
+
+The first smoke reached two worker environments in 58 seconds and then refused
+the run, in the new cross-shard contract check:
+
+```
+[FAIL] worker 1 reported a different audited contract than worker 0;
+       the shards do not describe one cohort contract
+```
+
+Both causes were mine, and both were invisible to the CPU tests because those
+tests build descriptions by hand and made every shard identical:
+
+1. **The comparison was too strict.** Each worker builds its environment on its
+   own seed, and the adapter seeds the *per-row clip assignment* from that same
+   seed (`slot_generator = manual_seed(validated_seed)`, then
+   `plan_multi_motion(..., num_envs=<this shard>, slot_generator=...)`). So
+   `audit.slots.row_motion_ids` is per-shard **by design** and can never be equal
+   across shards. The check now excludes exactly two members -- the seed
+   provenance and the per-row assignment -- and enumerates the remaining audit
+   fields from the record itself, so a field added later is still compared. The
+   slot weights, counts and teacher routing are compared.
+2. **The identity described one shard, not the run.** `cohort_identity_from_parts`
+   took `audit.slots` from worker 0, whose assignment covers that shard's rows
+   (4096) rather than the run's (8192) -- so a sharded run would have recorded an
+   identity a single-process run of the same recipe would *not*, which is exactly
+   what 9.4 claims. The parent now rebuilds the run's allocation from the same
+   pure plan and the same base seed the single-process path uses
+   (`plan_multi_motion` with `num_envs` rows and worker 0's seed), so the two
+   layouts record the same identity.
+
+The refusal itself was also unhelpful -- it named the record, not the field --
+which cost a smoke cycle to diagnose the first cause. It now walks the compared
+records and reports the differing leaf fields, which is how the second cause was
+then confirmed.
+
+493 distillation tests pass (3 new: a legitimate per-shard row assignment is
+accepted while its weights, counts and routing are still compared; a refusal
+names the differing field; the run-level allocation is the run's, deterministic,
+and distinct from a shard's).
