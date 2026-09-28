@@ -13,7 +13,7 @@ POLL_SECONDS="${POLL_SECONDS:-60}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-8}"
 MEM_FREE_MIB="${MEM_FREE_MIB:-1000}"
 # GPUs to never use (e.g. a device with degraded DMA: see queue.log notes).
-EXCLUDE_GPUS="${EXCLUDE_GPUS:-}"
+EXCLUDE_GPUS="${EXCLUDE_GPUS:-4,5,6,7}"
 LAUNCH_ROOT="$QUEUE_DIR/runs"
 LOG_ROOT="${LOG_ROOT:-/home/fushan/mjlab/runs}"
 NUM_ENVS="${NUM_ENVS:-8192}"
