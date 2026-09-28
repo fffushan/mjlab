@@ -881,3 +881,60 @@ then confirmed.
 accepted while its weights, counts and routing are still compared; a refusal
 names the differing field; the run-level allocation is the run's, deterministic,
 and distinct from a shard's).
+
+### 9.9 First successful hardware run (two phases, 3 GPUs)
+
+Run on the 8-card host at `701aa3f3d` + `4edf636b1`: `cuda:4` as the trainer,
+`cuda:5,6` as collection workers, 4096 environments per shard, the eight-teacher
+v2 manifest, `standing-mixture` resets, `--phase-bins 10`, seed 7.
+
+- **Phase 1, 20 iterations, no failures.** 5.66 s/iter at iteration 1 rising to
+  7.34 s/iter by iteration 20 (146.7 s total). Loss 80.77 to 17.60, disagreement
+  0.993 to 0.465: the workers collected real rows, the parent merged them into
+  its one replay, and the learner trained on them.
+- **Phase 2, resume and continue to 100, no failures.** Resumed
+  `checkpoint-iter-000020.pt` with `--max-iterations 100`, logged
+  `starting at iteration 20/100` and `cohort_resumed` with
+  `resumed_simulator_reset: true`, then ran 80 iterations at 3.37 to 7.09 s/iter
+  (567 s). Loss continued from 13.49 down to 6.44 -- a continuation, not a
+  restart. `checkpoint-iter-000100.pt` and `checkpoint-final.pt` were written.
+- **The standing checkpoint now works on hardware.** The payload is version 3 and
+  its RNG keys are `global_cpu` and `trainer` with **no `reset` stream**: the
+  derived-per-call reset contract is what made this run possible at all.
+- **The identity describes the run.** Its recorded slot allocation carries
+  **8192** row assignments, not the 4096 of the shard the parent would otherwise
+  have taken -- the fix of 9.8, confirmed where it matters.
+- **Worker identity is recorded**: `{mode: sharded, devices: [cuda:5, cuda:6],
+  count: 2, envs_per_worker: 4096, seed_scheme: 1}`, schedule
+  `max_iterations: 100` (the extension was accepted), counters
+  `{iteration: 100, segment_namespace: 1099511627790}` -- the worker-namespaced
+  segment block, live.
+- **The changed-worker-list resume is refused** with `resume refused: the
+  checkpoint records different runtime`.
+
+**Load, which is the part that changes the plan's assumptions.** Sampled every
+5 s through both phases: the trainer peaked at ~850 MiB and averaged **0.2-0.4%**
+utilisation; each worker peaked at ~3.4 GB and averaged **7.6-10.7%**. The cards
+are overwhelmingly idle. Three consequences:
+
+1. **Memory is not the constraint.** ~3.4 GB per 4096-environment worker implies
+   roughly 6.8 GB per 8192-environment worker, so the target 16384-environment
+   run fits the 24 GB cards with room to spare -- the earlier ~9.5 GB estimate was
+   pessimistic.
+2. **Transport is not the bottleneck.** At single-digit utilisation the plan's
+   "switch transport if it exceeds 10% of an iteration" trigger is very unlikely
+   to fire; what dominates ~7 s/iter at `--collection-steps 4` and one update is
+   CPU-side orchestration around small kernels. The useful measurement is
+   therefore *phase* timing (collect, merge, train, evaluate), not transport
+   alone -- which is also why the missing instrumentation in 9.7 is now worth
+   more than it was.
+3. **Throughput has headroom**: the same three cards should absorb several times
+   the work per iteration (more steps, more updates, more environments) before
+   compute becomes the limit.
+
+One wart found by the third phase: the resume-invariant refusal happens *after*
+the workers and their environments are built, because the full resolved-config
+comparison needs the constructed runner. A resume with a changed worker list
+therefore pays a full environment build before being refused. The outcome is
+correct and fail-closed; making it cheap means comparing the stored `runtime`
+record early, before any builder runs.
