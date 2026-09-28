@@ -42,6 +42,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
 )
 from mjlab.tasks.tracking.distillation.cohort_setup import (
   CohortSetup,
+  worker_evaluation_seed,
   worker_generator_seed,
 )
 from mjlab.tasks.tracking.distillation.collector import (
@@ -537,6 +538,16 @@ class _Worker:
   def evaluate(self, request: EvaluateRequest) -> EvaluateReply:
     self.build()
     self.apply_weights(request.weights)
+    # Evaluation resets draw standing/reference decisions too, from the same
+    # command generator.  Deriving its stream as well is what keeps an evaluated
+    # iteration reproducible after a resume; the offset keeps it disjoint from the
+    # collection of the same iteration, so a policy is never scored on the resets
+    # it was just trained against.
+    self.seed_reset_rng(
+      worker_evaluation_seed(
+        self.spec.setup.base_seed, request.iteration, self.spec.worker_index
+      )
+    )
     result = evaluate_distillation(
       self.adapter,
       self.adapter.bank,

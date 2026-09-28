@@ -1731,10 +1731,15 @@ def test_sharded_standing_cohort_checkpoint_derives_its_reset_state(
   runner, identity = make_sharded_runner(
     real_cohort, plan, body_selection, schema, provenance
   )
+  # A resumed run must continue the stored iteration counter, because every
+  # derived seed depends on it: saving at zero would leave the counters plumbing
+  # untested.
+  runner.iteration = 3
   path = tmp_path / "sharded-standing-v3.pt"
   runner.save_cohort(str(path), identity)
 
   payload = torch.load(path, weights_only=True)
+  assert payload["counters"]["iteration"] == 3
   assert payload["version"] == 3
   assert payload["reset_provenance"] == provenance.as_dict()
   # The standing contract is recorded; the RNG that draws it is derived per
@@ -1746,7 +1751,7 @@ def test_sharded_standing_cohort_checkpoint_derives_its_reset_state(
   )
   state = restored.resume_cohort(str(path), restored_identity)
   assert state.reset_provenance == provenance
-  assert restored.iteration == 0
+  assert restored.iteration == 3
 
 
 def test_sharded_declaration_is_checked_against_the_stored_rng_set(

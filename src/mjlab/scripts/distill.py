@@ -1333,21 +1333,30 @@ def _release(owner) -> Callable[[], None]:
   return release
 
 
-@contextmanager
-def _teardown_on_signal(teardown):
-  """Run ``teardown`` when an operator or scheduler stops the run.
+def _install_signal_teardown(teardown) -> Callable[[], None]:
+  """Install the teardown handlers and return the action that restores them.
 
-  A sharded run holds worker processes on collection devices.  Without this,
-  Ctrl-C or a scheduler's ``SIGTERM`` would leave them to their own watchdog
-  rather than closing them before the process exits, which is the difference
-  between releasing a GPU promptly and holding it while a collection finishes.
-  Handlers are restored on exit, so the surrounding process keeps its own
-  disposition.
+  Separated from the context manager because a run's owner appears part-way
+  through building it: a sharded build starts worker processes before it
+  returns, so the handlers must be installed *before* the owner exists and the
+  teardown must read it from a holder.  Installing the handlers only around the
+  drive loop would leave a signal during construction with the process's prior
+  disposition, which for the default disposition means exiting without closing
+  the pool.
+
+  A teardown that raises is reported and does not change the exit status: the
+  operator's signal must still decide how the process reports itself.
   """
   previous: dict[int, Any] = {}
 
   def handler(signum, _frame):
-    teardown()
+    try:
+      teardown()
+    except BaseException as exc:  # noqa: BLE001 - reported, never swallowed
+      print(
+        f"[FAIL] releasing the run after signal {signum} failed: {exc}",
+        file=sys.stderr,
+      )
     raise SystemExit(128 + signum)
 
   for signum in (signal.SIGINT, signal.SIGTERM):
@@ -1357,11 +1366,34 @@ def _teardown_on_signal(teardown):
     except ValueError:
       # Not the main thread: the caller's own teardown still runs.
       pass
+
+  def restore() -> None:
+    for signum, original in previous.items():
+      try:
+        signal.signal(signum, original)
+      except ValueError:
+        pass
+
+  return restore
+
+
+@contextmanager
+def _teardown_on_signal(teardown):
+  """Run ``teardown`` when an operator or scheduler stops the run.
+
+  A sharded run holds worker processes on collection devices.  Without this,
+  Ctrl-C or a scheduler's ``SIGTERM`` would leave them to their own watchdog
+  rather than closing them before the process exits, which is the difference
+  between releasing a GPU promptly and holding it while a collection finishes.
+  Handlers are restored on exit, so the surrounding process keeps its own
+  disposition, and a teardown failure is reported without replacing the exit
+  status the signal implies.
+  """
+  restore = _install_signal_teardown(teardown)
   try:
     yield
   finally:
-    for signum, original in previous.items():
-      signal.signal(signum, original)
+    restore()
 
 
 def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup) -> Any:
@@ -1387,16 +1419,27 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
     DistillationError: if any shard disagrees about any of the above.
   """
   primary = descriptions[0]
+
+  def audited_contract(item: Any) -> Any:
+    """The audited contract of one shard, minus its per-shard seed stratum.
+
+    Comparing the whole record rather than a hand-picked list is what keeps this
+    honest as the audit grows: the parent records these fields in the cohort
+    identity, so every one of them -- slots, mapping digest, phase policy,
+    additional-gravity policy, semantic overrides, joint order, control period,
+    actor terms -- must agree across shards.  The seed provenance is excluded
+    because each shard's environment is built on its own seed by design, and is
+    checked against its stratum below instead.
+    """
+    audit = item.audit
+    return None if audit is None else replace(audit, seed_provenance=None)
+
   fields = (
     ("observation schema", lambda item: item.schema),
     ("reference library clips", lambda item: item.library.clips),
     ("library body selection", lambda item: item.library.body_selection),
     ("library source body count", lambda item: item.library.source_body_count),
-    ("audited slot allocation", lambda item: item.audit.slots),
-    ("audited body mapping digest", lambda item: item.audit.mapping_digest),
-    ("audited phase policy", lambda item: item.audit.phase_policy),
-    ("audited common contract", lambda item: item.audit.asset),
-    ("reset policy", lambda item: item.audit.reset_policy),
+    ("audited contract", audited_contract),
     ("motion teacher codes", lambda item: item.motion_teacher_codes),
     ("sampling mode", lambda item: item.sampling_mode),
     ("reset policy enablement", lambda item: item.reset_policy_enabled),
@@ -1735,10 +1778,22 @@ def _train_cohort(
   """
   runner = None
   primary = None
-  # Bound before the run is built so the final cleanup can always call it: an
-  # error between acquiring the owner and reaching the drive loop must not turn
-  # into a cleanup failure that hides the original one.
-  release: Callable[[], None] = _release(None)
+  # The owner appears part-way through this function: a sharded build starts
+  # worker processes before it returns.  Teardown is therefore installed before
+  # the owner exists and reads it from this holder, so a signal during
+  # construction still releases the pool and a signal during the drive loop is
+  # unchanged.  The holder is emptied *before* closing, so both teardown paths
+  # together close the owner at most once; a close that raises is reported and
+  # not retried, because calling into a half-closed environment twice is worse
+  # than leaving the first failure as the record.
+  owned: list[Any] = []
+
+  def release_owned() -> None:
+    if owned:
+      owner, owned[:] = owned[0], []
+      _release(owner)()
+
+  restore_signals = _install_signal_teardown(release_owned)
   try:
     _require_train_settings(report_boundaries, checkpoint_every, progress_every)
     if resume is not None and not _is_cohort_checkpoint(resume):
@@ -1815,7 +1870,7 @@ def _train_cohort(
         ResetPolicy(),
       ).as_dict()
     runner, primary, identity, evaluation_sampling_mode, seed_audit = primary_build
-    release = _release(primary)
+    owned.append(primary)
     _require_requested_seed_applied(seed, seed_audit)
     assert isinstance(runner.replay, BalancedReplayBuffer)
     resolved_config = _cohort_resolved_config(
@@ -1856,12 +1911,10 @@ def _train_cohort(
         schedule=resolved_config["schedule"],
       )
 
-    # One release action for the whole run: the teardown-on-signal path and the
-    # final cleanup both call it, and it must close the owner exactly once.  It
-    # is bound here, next to the owner it releases, so the final cleanup never
-    # has to reconstruct it from a partially built run.
-    release = _release(primary)
-    with _teardown_on_signal(release):
+    # Teardown is already installed from before the owner existed; this nested
+    # context keeps the drive loop covered by the same shared action and restores
+    # the earlier handlers when it exits.
+    with _teardown_on_signal(release_owned):
       iteration_reports, checkpoints = _drive_lifecycle(
         runner,
         max_iterations=max_iterations,
@@ -1926,8 +1979,8 @@ def _train_cohort(
     print(f"[FAIL] {exc}", file=sys.stderr)
     return 1
   finally:
-    if primary is not None:
-      release()
+    release_owned()
+    restore_signals()
 
 
 def _train(

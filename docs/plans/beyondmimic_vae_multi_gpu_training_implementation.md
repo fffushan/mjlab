@@ -138,8 +138,9 @@ updates, no replay insertion, no report emission.
 
 - worker env seed: `base + worker_index * 1_000_003`
 - worker collection generator: `base + iteration + worker_index * 7_919`
-- worker evaluation: `base + iteration + worker_index * 7_919` (same domain as
-  collection; they are distinct calls, never concurrent)
+- worker evaluation: `base + iteration + worker_index * 7_919 + 1_000_003` (a
+  disjoint offset, so an evaluation never replays the reset decisions the
+  collection of the same iteration just made)
 - `worker_seed_scheme_version = 1` is recorded, so any future change is a
   resume-identity break rather than silent distribution drift.
 
@@ -153,6 +154,15 @@ to the checkpoint: iteration `k` draws the same randomness for worker `w`
 whether or not the run was interrupted before it. The persistent per-worker
 stream a single-process collector uses would have to be saved and restored for
 each worker, which the version-2 checkpoint has no place for.
+
+The motion command's **standing-reset** generator is derived the same way, and
+it is a second stream rather than the same one: it decides standing-versus-
+reference for every full-reset row, so the collection of iteration `k` derives
+it from the collection seed and the evaluation of iteration `k` derives it from
+the evaluation seed. Both are therefore reproducible after a resume, and neither
+can shift the other's draws. A single-process run keeps the owned persistent
+stream and stores it in the checkpoint; a sharded run stores none, and declares
+that in the checkpoint's RNG contract (see 9.5).
 
 ### 3.4 Process model and protocol
 
@@ -727,3 +737,44 @@ Known gap: the transport share of an iteration is still not instrumented, so the
 10%-of-iteration upgrade trigger of 3.4 cannot be measured by this smoke. Closing
 it needs a timing surface on `ShardedCollection.collect` and a line in the CLI
 progress report; no checkpoint format is involved.
+
+### 9.6 Second review pass, and the remaining gaps it found
+
+A re-review of the fix commit (`0390e86c3`) returned BLOCK again. The RNG
+contract and the evaluation merge were verified -- including both subversion
+attempts, which are refused with `checkpoint RNG streams do not match live
+components`, and the cross-shard checks, the merge refusals and single-close --
+but three real gaps remained, all fixed here:
+
+- **Teardown did not cover acquisition.** The handlers were installed only
+  around the drive loop, while a sharded build starts worker processes before it
+  returns the owner: a `SIGTERM` during `pool.start()`, `describe()`, the
+  contract check or the builder's own cleanup ran under the process's previous
+  disposition, which exits without closing the pool (the child-side watchdog
+  still reaps the workers, so this was a slower, less orderly release rather
+  than a permanent leak). The handlers are now installed before the owner
+  exists and the teardown reads it from a holder, and a teardown that raises is
+  reported without replacing the exit status the signal implies.
+- **The cross-shard check compared a hand-picked field list.** It missed
+  `semantic_overrides` -- which the cohort identity records -- along with the
+  joint order, the control period and the actor terms. It now compares the whole
+  audited record with the per-shard seed provenance neutralised, so a field
+  added to the audit later cannot silently escape the check.
+- **Evaluation drew standing resets from an underived, unrecorded generator.**
+  `_Worker.evaluate` never derived one, so `adapter.reset(seed=...)` left the
+  command's generator to draw standing/reference decisions from whatever state
+  it happened to hold. Collection was unaffected (it derives before drawing),
+  but evaluation trajectories and metrics were not reproducible after a resume.
+  Evaluation now derives its own stream, disjoint from the collection's so a
+  policy is never scored on the resets it was just trained against.
+
+The re-review also flagged two test weaknesses. The cross-shard fake omitted
+the very fields the check was missing, and the sharded checkpoint test saved at
+iteration zero -- now it advances the counter before saving and requires the
+resume to return it, because every derived seed depends on that counter. What is
+still not covered on CPU is the collection call that follows a resume: the
+worker-side derivation is tested, and the runner passes its restored iteration
+straight into that call, but no CPU test drives the sharded collection source
+through a full resumed iteration. 486 distillation tests cover the rest: the
+acquisition-window teardown, a teardown that raises, a close that raises, the
+extended contract fields, and the evaluation derivation.

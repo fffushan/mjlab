@@ -13,6 +13,8 @@ import json
 import os
 import signal
 import sys
+from dataclasses import dataclass
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,6 +34,7 @@ from mjlab.tasks.tracking.distillation.adapter import (
   DistillationSnapshot,
   DistillationStep,
   InitializationKind,
+  MultiMotionLiveContractAudit,
 )
 from mjlab.tasks.tracking.distillation.checkpoint import (
   CheckpointValidationError,
@@ -54,12 +57,16 @@ from mjlab.tasks.tracking.distillation.motion_library import (
   MotionClipSpec,
   MotionLibrary,
 )
-from mjlab.tasks.tracking.distillation.multi_motion import stratified_slot_allocation
+from mjlab.tasks.tracking.distillation.multi_motion import (
+  MotionSlotAllocation,
+  stratified_slot_allocation,
+)
 from mjlab.tasks.tracking.distillation.observations import (
   ObservationSnapshot,
   pack_observations,
 )
 from mjlab.tasks.tracking.distillation.playback import DistillationPlayPolicy
+from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
 from mjlab.tasks.tracking.distillation.teachers import build_cohort_teacher_bank
 from mjlab.tasks.tracking.distillation.trainer import VaeDistillationTrainer
@@ -2717,12 +2724,33 @@ def test_release_tolerates_an_owner_without_close() -> None:
   assert release() is None
 
 
+@dataclass(frozen=True)
+class _ShardAudit:
+  """Stand-in for the audited contract, shaped so replace() applies.
+
+  The comparison neutralises the per-shard seed provenance with
+  dataclasses.replace, so the stand-in must be a frozen dataclass like the real
+  MultiMotionLiveContractAudit -- which a separate case asserts.
+  """
+
+  joint_names: tuple[str, ...]
+  control_period_s: float
+  semantic_overrides: tuple[str, ...]
+  slots: MotionSlotAllocation
+  mapping_digest: str
+  phase_policy: str
+  reset_policy: ResetPolicy
+  seed_provenance: RuntimeSeedProvenance | None
+
+
 def _shard_description(worker_index: int = 0, **overrides: Any) -> SimpleNamespace:
   """One worker's describe reply, as the parent reads it.
 
   The default seed is the one the given shard index derives, because the shards
   of a run are its seed strata and a description that carried another shard's
-  seed is exactly what the parent must refuse.
+  seed is exactly what the parent must refuse.  The audit is a frozen dataclass
+  because that is what the real one is, and the comparison replaces its seed
+  provenance rather than comparing a hand-picked field list.
   """
   derived = worker_env_seed(5, worker_index)
   values: dict[str, Any] = {
@@ -2732,12 +2760,19 @@ def _shard_description(worker_index: int = 0, **overrides: Any) -> SimpleNamespa
       body_selection=("body",),
       source_body_count=29,
     ),
-    "audit": SimpleNamespace(
-      slots=(("slot",),),
+    "audit": _ShardAudit(
+      joint_names=("joint_a", "joint_b"),
+      control_period_s=0.02,
+      semantic_overrides=(),
+      slots=MotionSlotAllocation(
+        weights=(1.0,),
+        counts=(2,),
+        teacher_ids=("tennis_000",),
+        row_motion_ids=(0, 0),
+      ),
       mapping_digest="mapping",
       phase_policy="uniform",
-      asset=("asset",),
-      reset_policy="standing-mixture",
+      reset_policy=ResetPolicy(),
       seed_provenance=RuntimeSeedProvenance(
         requested_seed=derived,
         effective_seed=derived,
@@ -2755,7 +2790,7 @@ def _shard_description(worker_index: int = 0, **overrides: Any) -> SimpleNamespa
 def _with_audit(
   description: SimpleNamespace, **audit_overrides: Any
 ) -> SimpleNamespace:
-  audit = SimpleNamespace(**{**vars(description.audit), **audit_overrides})
+  audit = dataclasses_replace(description.audit, **audit_overrides)
   return SimpleNamespace(**{**vars(description), "audit": audit})
 
 
@@ -2763,42 +2798,70 @@ def test_shard_descriptions_must_agree_on_the_whole_cohort_contract() -> None:
   """The parent builds the replay and identity from shard 0, so shards must agree.
 
   Only the observation schema used to be compared: a shard could disagree about
-  the clip mapping, the audited slots, the phase policy, the routing or the
-  reset contract and still collect rows the parent would treat as its own.
+  the clip mapping, the audited contract, the routing or the reset contract and
+  still collect rows the parent would treat as its own.  The audited contract is
+  compared as a whole record, because the identity records it as a whole -- so a
+  new audit field cannot silently escape the check.
   """
   setup = SimpleNamespace(base_seed=5)
   first = _shard_description()
-  agreeing = _shard_description(1)
-  assert distill._require_one_shard_contract([first, agreeing], setup) is first
+  assert (
+    distill._require_one_shard_contract([first, _shard_description(1)], setup) is first
+  )
 
-  cases = (
+  changed_slots = MotionSlotAllocation(
+    weights=(2.0,), counts=(2,), teacher_ids=("other",), row_motion_ids=(0, 0)
+  )
+  changed_library = SimpleNamespace(
+    clips=(("other",),),
+    body_selection=first.library.body_selection,
+    source_body_count=first.library.source_body_count,
+  )
+  cases: tuple[tuple[str, SimpleNamespace], ...] = (
     (
       "reference library clips",
-      {"library": SimpleNamespace(**(vars(first.library) | {"clips": (("other",),)}))},
+      SimpleNamespace(**{**vars(first), "library": changed_library}),
     ),
-    ("audited slot allocation", None),
-    ("audited body mapping digest", None),
-    ("audited phase policy", None),
-    ("audited common contract", None),
-    ("reset policy", None),
-    ("motion teacher codes", {"motion_teacher_codes": {0: 1}}),
-    ("sampling mode", {"sampling_mode": "uniform"}),
-    ("reset policy enablement", {"reset_policy_enabled": False}),
+    ("audited contract", _with_audit(first, slots=changed_slots)),
+    ("audited contract", _with_audit(first, mapping_digest="other")),
+    ("audited contract", _with_audit(first, phase_policy="other")),
+    (
+      "audited contract",
+      _with_audit(first, reset_policy=ResetPolicy(kind="standing-mixture")),
+    ),
+    # The identity records these two, so a shard that disagrees changes the
+    # run's effective contract even though every other field agrees.
+    ("audited contract", _with_audit(first, semantic_overrides=("timing changed",))),
+    ("audited contract", _with_audit(first, joint_names=("joint_other",))),
+    ("audited contract", _with_audit(first, control_period_s=0.01)),
+    (
+      "motion teacher codes",
+      SimpleNamespace(**{**vars(first), "motion_teacher_codes": {0: 1}}),
+    ),
+    ("sampling mode", SimpleNamespace(**{**vars(first), "sampling_mode": "uniform"})),
+    (
+      "reset policy enablement",
+      SimpleNamespace(**{**vars(first), "reset_policy_enabled": False}),
+    ),
   )
-  audit_keys = {
-    "audited slot allocation": "slots",
-    "audited body mapping digest": "mapping_digest",
-    "audited phase policy": "phase_policy",
-    "audited common contract": "asset",
-    "reset policy": "reset_policy",
-  }
-  for name, overrides in cases:
-    if overrides is None:
-      second = _with_audit(first, **{audit_keys[name]: ("changed",)})
-    else:
-      second = SimpleNamespace(**{**vars(first), **overrides})
+  for name, second in cases:
     with pytest.raises(DistillationError, match=name):
       distill._require_one_shard_contract([first, second], setup)
+
+
+def test_the_real_audited_contract_supports_the_comparison() -> None:
+  """The comparison neutralises the seed provenance with dataclasses.replace.
+
+  That only works on the frozen dataclass the live audit really is, so this pins
+  the assumption the cross-shard check rests on rather than discovering it on a
+  GPU host.
+  """
+  import dataclasses
+
+  assert dataclasses.is_dataclass(MultiMotionLiveContractAudit)
+  parameters = MultiMotionLiveContractAudit.__dataclass_fields__
+  assert "seed_provenance" in parameters
+  assert parameters["seed_provenance"].default is None
 
 
 def test_shard_descriptions_check_each_environment_seed_against_its_index() -> None:
@@ -2810,7 +2873,7 @@ def test_shard_descriptions_check_each_environment_seed_against_its_index() -> N
   """
   setup = SimpleNamespace(base_seed=5)
   first = _shard_description()
-  derived = distill.worker_env_seed(setup.base_seed, 1)
+  derived = worker_env_seed(setup.base_seed, 1)
   correct = _with_audit(
     first,
     seed_provenance=RuntimeSeedProvenance(
@@ -2827,3 +2890,81 @@ def test_shard_descriptions_check_each_environment_seed_against_its_index() -> N
   )
   with pytest.raises(DistillationError, match="instead of the seed"):
     distill._require_one_shard_contract([first, copied_seed], setup)
+
+
+def test_signal_teardown_covers_an_owner_acquired_after_installation() -> None:
+  """A signal during construction must still release the run's owner.
+
+  A sharded build starts worker processes before it returns the owner, so the
+  handlers are installed before the owner exists and the teardown reads it from
+  a holder.  Installing them only around the drive loop left a signal during
+  construction with the process's prior disposition, which exits without closing
+  the pool.
+  """
+  owned: list[Any] = []
+  closes: list[str] = []
+
+  def release_owned() -> None:
+    if owned:
+      owner, owned[:] = owned[0], []
+      owner.close()
+
+  previous = signal.getsignal(signal.SIGTERM)
+  restore = distill._install_signal_teardown(release_owned)
+  try:
+    # A signal before the owner exists releases nothing, and still exits.
+    with pytest.raises(SystemExit) as early:
+      os.kill(os.getpid(), signal.SIGTERM)
+    assert early.value.code == 128 + signal.SIGTERM
+    assert closes == []
+
+    owned.append(SimpleNamespace(close=lambda: closes.append("close")))
+    with pytest.raises(SystemExit):
+      os.kill(os.getpid(), signal.SIGTERM)
+    assert closes == ["close"]
+  finally:
+    restore()
+
+  assert signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_signal_teardown_reports_a_failure_and_keeps_the_exit_status(capsys) -> None:
+  """A teardown that raises must not change how the process reports the stop.
+
+  The operator's signal decides the exit status; a failure while releasing is
+  reported to stderr instead of replacing it with an unrelated traceback.
+  """
+
+  def failing() -> None:
+    raise RuntimeError("close failed")
+
+  restore = distill._install_signal_teardown(failing)
+  try:
+    with pytest.raises(SystemExit) as info:
+      os.kill(os.getpid(), signal.SIGTERM)
+  finally:
+    restore()
+
+  assert info.value.code == 128 + signal.SIGTERM
+  assert "close failed" in capsys.readouterr().err
+
+
+def test_release_does_not_retry_a_close_that_raised() -> None:
+  """A failed close is reported once; a half-closed owner is not closed twice.
+
+  The action is spent before the call, so the invariant that matters -- an owner
+  is never closed twice, and a second close can never replace the SystemExit of
+  a stopped run -- holds even when the first close fails.
+  """
+  calls: list[str] = []
+
+  def close() -> None:
+    calls.append("close")
+    raise RuntimeError("boom")
+
+  release = distill._release(SimpleNamespace(close=close))
+  with pytest.raises(RuntimeError):
+    release()
+  release()
+
+  assert calls == ["close"]

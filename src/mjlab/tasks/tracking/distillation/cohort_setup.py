@@ -43,6 +43,9 @@ ENV_SEED_STRIDE = 1_000_003
 """Distance between two workers' environment seeds."""
 
 GENERATOR_SEED_STRIDE = 7_919
+
+EVALUATION_SEED_STRIDE = 1_000_003
+"""Offset that separates an evaluation's reset stream from the collection's."""
 """Distance between two workers' collection generator seeds."""
 
 
@@ -65,6 +68,24 @@ def worker_generator_seed(base_seed: int, iteration: int, worker_index: int) -> 
   value depends only on the iteration, a resumed run reproduces it exactly.
   """
   return base_seed + iteration + worker_index * GENERATOR_SEED_STRIDE
+
+
+def worker_evaluation_seed(base_seed: int, iteration: int, worker_index: int) -> int:
+  """Return the seed one worker's evaluation derives its standing resets from.
+
+  Evaluation draws its own standing/reference decisions, so it must not replay
+  the decisions the collection of the same iteration already made: a run whose
+  evaluation reused the collection stream would score the policy on the very
+  resets it had just been trained against.  The offset keeps both streams
+  reproducible from (base seed, iteration, worker) while making them disjoint
+  for every iteration a run can reach.
+  """
+  return (
+    base_seed
+    + iteration
+    + worker_index * GENERATOR_SEED_STRIDE
+    + EVALUATION_SEED_STRIDE
+  )
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,8 +21,10 @@ from typing import Any
 import pytest
 import torch
 
+from mjlab.tasks.tracking.distillation import worker as worker_module
 from mjlab.tasks.tracking.distillation.cohort_setup import (
   CohortSetup,
+  worker_evaluation_seed,
   worker_generator_seed,
 )
 from mjlab.tasks.tracking.distillation.observations import PackedObservationBatch
@@ -34,6 +36,7 @@ from mjlab.tasks.tracking.distillation.worker import (
   CollectRequest,
   DescribeReply,
   DescribeWorker,
+  EvaluateReply,
   EvaluateRequest,
   ShutdownWorker,
   WorkerEnvironmentDescription,
@@ -586,6 +589,63 @@ def test_worker_seeds_its_reset_rng_before_it_collects(tmp_path) -> None:
   assert isinstance(reply, CollectReply)
   assert order == ["seed", "collect"]
   derived = worker_generator_seed(spec.setup.base_seed, 3, spec.worker_index)
+  assert command.state is not None
+  assert torch.equal(
+    command.state, torch.Generator(device="cpu").manual_seed(derived).get_state()
+  )
+
+
+def test_worker_derives_its_reset_rng_before_it_evaluates(
+  tmp_path, monkeypatch
+) -> None:
+  """Evaluation draws standing resets too, from its own derived stream.
+
+  A shard evaluates after collecting the same iteration, and evaluation resets
+  draw standing/reference decisions from the same command generator.  Deriving
+  evaluation's stream as well is what keeps an evaluated iteration reproducible
+  after a resume; the separate offset is what stops the policy from being scored
+  on the very resets it was just trained against.
+  """
+  order: list[str] = []
+  command = _fake_command(enabled=True, calls=order)
+  adapter = SimpleNamespace(
+    env=SimpleNamespace(
+      command_manager=SimpleNamespace(get_term=lambda name: command),
+    ),
+    bank=SimpleNamespace(),
+  )
+  spec = _specs(tmp_path, devices=("cpu",))[0]
+  collection_seed = worker_generator_seed(spec.setup.base_seed, 4, spec.worker_index)
+
+  def fake_evaluate(adapter_arg, bank, student, **kwargs):
+    order.append("evaluate")
+    assert kwargs["seed"] == collection_seed
+    return "evaluated"
+
+  monkeypatch.setattr(worker_module, "evaluate_distillation", fake_evaluate)
+
+  worker = _Worker(spec)
+  worker._adapter = adapter
+  worker._student = SimpleNamespace(
+    load_state_dict=lambda state: None,
+    reference_normalizer=SimpleNamespace(freeze=lambda: None),
+    conditioning_normalizer=SimpleNamespace(freeze=lambda: None),
+  )
+  reply = worker.evaluate(
+    EvaluateRequest(
+      call_id=1,
+      iteration=4,
+      steps=2,
+      mode="student",
+      rollout_latent="mean",
+      weights={},
+    )
+  )
+
+  assert isinstance(reply, EvaluateReply)
+  assert order == ["seed", "evaluate"]
+  derived = worker_evaluation_seed(spec.setup.base_seed, 4, spec.worker_index)
+  assert derived != collection_seed
   assert command.state is not None
   assert torch.equal(
     command.state, torch.Generator(device="cpu").manual_seed(derived).get_state()
