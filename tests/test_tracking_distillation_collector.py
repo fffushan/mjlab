@@ -569,3 +569,31 @@ def test_evaluation_is_bounded_and_does_not_mutate_replay_or_normalizers() -> No
     not segment.completed and not segment.failed and not segment.capped
     for segment in result.segments
   )
+
+
+def test_collector_without_a_replay_sink_returns_rows_and_writes_nowhere() -> None:
+  """A sharded worker labels rows without owning a replay.
+
+  The worker must never write to the trainer's replay, whose single owner is
+  the parent, so the collector accepts no sink; the returned fresh batch is
+  then the only copy of the rows.  Counters, boundaries and row order must be
+  exactly what the replay-backed path produces, because the parent rebuilds
+  the tick structure from this batch alone.
+  """
+  adapter = FakeAdapter()
+  collector = DAggerCollector(adapter, FakeTeacher(), _student(), None)
+  result = collector.collect(
+    CollectionConfig(steps=3, teacher_probability=0.0), reset=True
+  )
+
+  assert result.ticks == 3
+  assert result.samples == 6
+  assert adapter.step_calls == 3
+  assert result.fresh_data is not None
+  batch = result.fresh_data.batch
+  assert batch.batch_size == 6
+  torch.testing.assert_close(batch.teacher_action, torch.full((6, 31), 2.0))
+  # Rows are concatenated tick by tick, which is what lets the parent slice the
+  # batch back into per-tick blocks for a tick-major merge.
+  assert batch.reference_frame.tolist() == [0, 0, 1, 1, 2, 2]
+  assert any(boundary.reason == "generation" for boundary in result.boundaries)

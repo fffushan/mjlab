@@ -138,6 +138,13 @@ class SegmentBoundary:
   after_generation: tuple[int, ...]
   before_motion_ids: tuple[int, ...] = ()
   before_teacher_codes: tuple[int, ...] = ()
+  worker_index: int | None = None
+  """Shard that produced this boundary, or ``None`` for a single-process run.
+
+  ``env_indices`` index one shard's environment batch, so a merged boundary has
+  to name its shard: without it, row 3 of two different shards would read as the
+  same environment.
+  """
 
   def __post_init__(self) -> None:
     if self.before_motion_ids or self.before_teacher_codes:
@@ -917,14 +924,21 @@ def _replay_batch(
 
 
 class DAggerCollector:
-  """Collect valid pre-step labels from one adapter into raw replay."""
+  """Collect valid pre-step labels from one adapter into raw replay.
+
+  ``replay`` may be ``None``, which is what a sharded collection worker uses:
+  the worker labels rows and returns them, and must never write to the
+  trainer's replay, whose single owner is the parent.  With no sink the
+  returned ``fresh_data`` is the only copy of the collected rows, so a caller
+  that drops it has lost them.
+  """
 
   def __init__(
     self,
     adapter: _AdapterLike,
     teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
     student: ConditionalVAE,
-    replay: ReplayBufferProtocol,
+    replay: ReplayBufferProtocol | None,
   ) -> None:
     self.adapter = adapter
     _require_auto_reset(adapter)
@@ -1085,7 +1099,11 @@ class DAggerCollector:
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
-      self.replay.insert(fresh_batch)
+      # A sharded worker owns no replay (``None``): the parent is the only
+      # writer, and the returned fresh batch is then the single copy of these
+      # rows.
+      if self.replay is not None:
+        self.replay.insert(fresh_batch)
       fresh_batches.append(fresh_batch)
       samples += snapshot.packed.batch_size
       try:

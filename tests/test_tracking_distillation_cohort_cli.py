@@ -334,6 +334,14 @@ def _install_fake_multi_adapter(
       adapters.append(adapter)
     return adapter
 
+  # The cohort training path now builds its environment through the shared
+  # cohort recipe (``cohort_setup``), so the fake must stand in for the factory
+  # there as well as for the CLI's own remaining call sites (pinned evaluation
+  # and playback).
+  monkeypatch.setattr(
+    "mjlab.tasks.tracking.distillation.cohort_setup.make_multi_teacher_distillation_adapter",
+    factory,
+  )
   monkeypatch.setattr(
     "mjlab.scripts.distill.make_multi_teacher_distillation_adapter", factory
   )
@@ -2273,4 +2281,372 @@ def test_single_teacher_train_refuses_phase_bins(
     assert code == 1, (value, captured.err)
     assert captured.out == ""
     assert "cohort path" in captured.err
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_cohort_train_records_single_device_workers(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """The default path records one implicit worker holding every environment.
+
+  The multi-worker runtime keys are recorded even when the option is unset,
+  because a resume compares that entry verbatim; the recorded values are the
+  single-process equivalent, so a checkpoint written by this path stays
+  resumable by this path, and the run report repeats them for visibility.
+  """
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "1"],
+  )
+  assert code == 0, err
+  report = json.loads(out)
+  runtime = report["resolved_config"]["runtime"]
+  assert runtime["num_envs"] == 2
+  assert runtime["workers"] == {
+    "mode": "single",
+    "devices": [],
+    "count": 1,
+    "envs_per_worker": 2,
+    "seed_scheme": 1,
+  }
+  # The runtime entry gains exactly the documented worker identity and nothing
+  # else, so the default path's resolved configuration is otherwise unchanged.
+  assert set(runtime) == {
+    "device",
+    "num_envs",
+    "seed",
+    "resolved_seed",
+    "seed_provenance",
+    "workers",
+  }
+  # The run report mirrors the identity a resume compares, transport included.
+  assert report["runtime"]["workers"] == runtime["workers"]
+  assert report["runtime"]["transport"] == "in-process"
+  assert report["resolved_config"]["execution"]["transport"] == "in-process"
+
+
+def test_cohort_worker_devices_are_refused_before_an_environment_exists(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """A malformed worker list is refused before any simulator is constructed.
+
+  An empty list, a repeated device, a device string torch cannot parse, a
+  repeat that differs only by an omitted CUDA index (``cuda`` against
+  ``cuda:0``), a list that does not divide ``--num-envs`` evenly (two
+  environments over three workers), and a list above the eight worker bound are
+  all configuration errors rather than implicit fallbacks to a single device,
+  and every one of them is decided without touching a simulator: the fake
+  adapter records no call.  An uppercase or zero-padded alias is refused as an
+  unparseable device, matching how the trainer device is validated.
+  """
+  calls: list[dict] = []
+  adapters: list[_MultiAdapter] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters)
+  for value, expected in (
+    ("()", "at least one device"),
+    ("('cuda:1','cuda:1')", "repeats a device"),
+    ("('cuda','cuda:0')", "repeats a device"),
+    ("('not-a-device',)", "is not a device"),
+    ("('CUDA:01',)", "is not a device"),
+    ("('cuda:1','cuda:2','cuda:3')", "does not split evenly"),
+    (
+      "('cuda:1','cuda:2','cuda:3','cuda:4','cuda:5','cuda:6','cuda:7','cuda:8',"
+      "'cuda:9')",
+      "at most 8",
+    ),
+  ):
+    code, out, err = _train_cohort(
+      tmp_path,
+      monkeypatch,
+      capsys,
+      [
+        "--worker-devices",
+        value,
+        "--max-iterations",
+        "1",
+        "--output-dir",
+        str(tmp_path / "refused"),
+      ],
+    )
+    assert code == 1, (value, out, err)
+    assert out == ""
+    assert expected in err, (value, err)
+  assert calls == []
+  assert adapters == []
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_cohort_multi_worker_is_refused_until_collection_is_sharded(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """A valid multi-worker list is refused instead of silently using one device.
+
+  The list is well formed (two devices, two environments), so it passes
+  validation; the collection pool is not wired into the runner yet, and
+  accepting the flag would collect from one environment while the resolved
+  configuration claimed two workers.  The refusal is therefore explicit and
+  happens before the simulator exists.
+  """
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--worker-devices",
+      "('cuda:1','cuda:2')",
+      "--max-iterations",
+      "1",
+      "--output-dir",
+      str(tmp_path / "refused"),
+    ],
+  )
+  assert code == 1, (out, err)
+  assert out == ""
+  assert "not wired" in err
+  assert calls == []
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_single_teacher_train_refuses_worker_devices(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """--worker-devices exists only on the cohort path; the M3 path refuses it.
+
+  The refusal is decided from the selection alone, so a well formed list is
+  refused with the cohort-path diagnostic rather than being validated as if
+  the single-teacher path could shard it, and the observable adapter call list
+  proves no environment was constructed before the refusal.
+  """
+  calls: list[dict] = []
+  _install_fake_single_adapter(monkeypatch, calls, schema)
+  code = invoke(
+    monkeypatch,
+    [
+      "distill",
+      "train",
+      "--manifest",
+      str(MANIFEST),
+      "--repo-root",
+      str(REPO_ROOT),
+      "--teacher-id",
+      TEACHER_ID,
+      *_TRAIN_ARGV,
+      "--worker-devices",
+      "('cuda:1','cuda:2')",
+      "--max-iterations",
+      "1",
+      "--output-dir",
+      str(tmp_path / "refused"),
+    ],
+  )
+  captured = capsys.readouterr()
+  assert code == 1, captured.err
+  assert captured.out == ""
+  assert "cohort path" in captured.err
+  assert calls == []
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_cohort_resume_legacy_runtime_without_worker_keys_is_compatible(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """A checkpoint recorded before multi-worker collection resumes unchanged.
+
+  The stored runtime entry carries no worker keys; the comparison must treat
+  that as the documented single-process equivalent (no worker devices, every
+  environment in the one environment, seed scheme 1) instead of refusing a
+  resume of a run that never had workers.
+  """
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  first_dir = tmp_path / "first"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "1", "--output-dir", str(first_dir)],
+  )
+  assert code == 0, err
+  first = first_dir / "checkpoint-final.pt"
+
+  payload = torch.load(first, map_location="cpu", weights_only=False)
+  stored = payload["resolved_config"]["runtime"]
+  assert stored["workers"]["mode"] == "single"
+  del stored["workers"]
+  torch.save(payload, first)
+
+  second_dir = tmp_path / "second"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "2", "--resume", str(first), "--output-dir", str(second_dir)],
+  )
+  assert code == 0, err
+  report = json.loads(out)
+  assert report["iteration"] == 2
+  assert report["resume"]["mismatches"] == []
+  assert report["resolved_config"]["runtime"]["workers"]["mode"] == "single"
+
+
+def test_cohort_resume_refuses_a_changed_worker_devices(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """A checkpoint trained with sharded workers is not resumable unsharded.
+
+  Worker devices, per-worker environment counts and the seed scheme are all
+  recorded in the compared runtime entry, so a single-process invocation
+  cannot silently continue a run whose rows came from two environments.
+  """
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  first_dir = tmp_path / "first"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "1", "--output-dir", str(first_dir)],
+  )
+  assert code == 0, err
+  first = first_dir / "checkpoint-final.pt"
+
+  payload = torch.load(first, map_location="cpu", weights_only=False)
+  stored = payload["resolved_config"]["runtime"]
+  stored["workers"] = {
+    "mode": "sharded",
+    "devices": ["cuda:1", "cuda:2"],
+    "count": 2,
+    "envs_per_worker": 1,
+    "seed_scheme": 1,
+  }
+  torch.save(payload, first)
+
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "2",
+      "--resume",
+      str(first),
+      "--output-dir",
+      str(tmp_path / "refused"),
+    ],
+  )
+  assert code == 1, (out, err)
+  assert out == ""
+  assert "runtime" in err
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_cohort_transport_is_recorded_but_not_a_resume_invariant(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """Changing only the transport name must not refuse a resume.
+
+  The transport does not change which rows are collected, so it is recorded for
+  audit next to the worker identity but deliberately excluded from the compared
+  entries -- the distinction ``checkpoint_every`` already has.  A stored
+  transport the current build does not use is therefore resumed, and the
+  resumed run reports its own transport rather than the stored audit value.
+  """
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  first_dir = tmp_path / "first"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "1", "--output-dir", str(first_dir)],
+  )
+  assert code == 0, err
+  first = first_dir / "checkpoint-final.pt"
+
+  payload = torch.load(first, map_location="cpu", weights_only=False)
+  assert payload["resolved_config"]["execution"]["transport"] == "in-process"
+  payload["resolved_config"]["execution"]["transport"] = "pinned-host-v9"
+  torch.save(payload, first)
+
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "2",
+      "--resume",
+      str(first),
+      "--output-dir",
+      str(tmp_path / "second"),
+    ],
+  )
+  assert code == 0, err
+  report = json.loads(out)
+  assert report["iteration"] == 2
+  assert report["resume"]["mismatches"] == []
+  assert report["runtime"]["transport"] == "in-process"
+
+
+def test_single_explicit_worker_device_is_refused(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """An explicit one-device worker list is refused, not silently ignored.
+
+  A singleton list is not "multi-worker" by length, but it still asks for a
+  sharded collection on a named device while the environment is built on the
+  trainer device.  Accepting it records a worker identity no process honors, so
+  every explicit list is refused until the collection pool exists.
+  """
+  calls: list[dict] = []
+  adapters: list[_MultiAdapter] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters)
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--worker-devices",
+      "('cuda:1',)",
+      "--max-iterations",
+      "1",
+      "--output-dir",
+      str(tmp_path / "refused"),
+    ],
+  )
+  assert code == 1, (out, err)
+  assert out == ""
+  assert "not wired" in err
+  assert calls == []
+  assert adapters == []
   assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()

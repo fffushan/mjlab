@@ -110,9 +110,19 @@ class DistillationRunner:
   :meth:`save_cohort`/:meth:`resume_cohort` for version-2 cohort checkpoints.
   """
 
-  collector: DAggerCollector
+  collector: DAggerCollector | None
   trainer: VaeDistillationTrainer
   config: RunnerConfig = field(default_factory=RunnerConfig)
+  sharded: Any | None = None
+  """Sharded collection source, or ``None`` for in-process collection.
+
+  Exactly one of ``collector`` and ``sharded`` is present.  A sharded source
+  owns the worker pool and inserts the merged rows into the same single replay,
+  so the runner's own lifecycle — bootstrap, rebase, training, checkpointing —
+  is identical either way.  The parent owns no environment in that layout, so
+  the environment description it records comes from the source instead of from
+  an adapter.
+  """
   evaluation_teacher: Any | None = None
   evaluation_student: Any | None = None
   iteration: int = 0
@@ -122,13 +132,65 @@ class DistillationRunner:
   _segment_namespace: int = 0
 
   def __post_init__(self) -> None:
-    if self.collector.replay is not self.trainer.replay:
+    if (self.collector is None) == (self.sharded is None):
+      raise RunnerValidationError(
+        "a runner needs exactly one collection source: an in-process collector "
+        "or a sharded source"
+      )
+    if (
+      self.sharded is not None
+      and self.config.evaluate_every
+      and self.config.evaluation_steps > 0
+    ):
+      # Refused here, at construction, rather than when the first evaluation
+      # interval arrives: a run must not start and then fail an hour in for a
+      # reason knowable before it began.
+      raise RunnerValidationError(
+        "sharded evaluation is not wired yet: this build collects sharded and "
+        "evaluates single-device only, so evaluate_every must be 0"
+      )
+    if self.collector is not None and self.collector.replay is not self.trainer.replay:
       raise RunnerValidationError("collector and trainer must share one replay owner")
     if self.config.evaluation_mode == "student" and self.config.evaluate_every:
       if self.evaluation_student is None:
         self.evaluation_student = self.trainer.model
     if self.config.evaluation_mode == "teacher" and self.evaluation_teacher is None:
+      if self.collector is None:
+        raise RunnerValidationError(
+          "teacher-mode evaluation needs an in-process collector to label with; "
+          "a sharded run evaluates its workers' shards instead"
+        )
       self.evaluation_teacher = self.collector.teacher
+
+  @property
+  def collection_source(self) -> Any:
+    """The one object that collects this run's rows."""
+    return self.collector if self.collector is not None else self.sharded
+
+  @property
+  def environment_description(self) -> Any | None:
+    """The environment record a checkpoint needs when the parent has no adapter."""
+    return None if self.sharded is None else self.sharded
+
+  def _reset_provenance_for_save(self) -> Any | None:
+    """Reset provenance read from whichever side owns an environment.
+
+    The single-process path reads the live command on its own adapter.  In the
+    sharded layout the parent has no environment, so the value is the one the
+    workers reported when they built their shards; every shard applies the same
+    reset policy, so the record still describes the run.
+    """
+    if self.collector is None:
+      return None if self.sharded is None else self.sharded.reset_provenance
+    command = getattr(
+      getattr(self.collector.adapter, "env", None), "command_manager", None
+    )
+    get_term = getattr(command, "get_term", None)
+    motion = get_term("motion") if callable(get_term) else None
+    policy = getattr(motion, "reset_policy", None)
+    if getattr(policy, "enabled", False):
+      return reset_provenance_from_adapter(self.collector.adapter)
+    return None
 
   @property
   def replay(self) -> ReplayBufferProtocol:
@@ -138,7 +200,7 @@ class DistillationRunner:
     self, steps: int, probability: float, *, reset: bool
   ) -> CollectionResult:
     self.trainer.begin_collection()
-    return self.collector.collect(
+    return self.collection_source.collect(
       CollectionConfig(
         steps=steps,
         teacher_probability=probability,
@@ -206,6 +268,11 @@ class DistillationRunner:
       and (self.iteration + 1) % self.config.evaluate_every == 0
       and self.config.evaluation_steps > 0
     ):
+      if self.sharded is not None:
+        raise RunnerValidationError(
+          "sharded evaluation is not wired yet: this build collects sharded and "
+          "evaluates single-device only, so evaluate_every must be 0"
+        )
       teacher = self.evaluation_teacher or self.collector.teacher
       student = self.evaluation_student or self.trainer.model
       try:
@@ -330,14 +397,7 @@ class DistillationRunner:
     """
     self.trainer.assert_healthy()
     if reset_provenance is None:
-      command = getattr(
-        getattr(self.collector.adapter, "env", None), "command_manager", None
-      )
-      get_term = getattr(command, "get_term", None)
-      motion = get_term("motion") if callable(get_term) else None
-      policy = getattr(motion, "reset_policy", None)
-      if getattr(policy, "enabled", False):
-        reset_provenance = reset_provenance_from_adapter(self.collector.adapter)
+      reset_provenance = self._reset_provenance_for_save()
     save_cohort_checkpoint(
       path,
       self.trainer,
@@ -377,14 +437,7 @@ class DistillationRunner:
     with the records the restarted simulator regenerates.
     """
     if reset_provenance is None:
-      command = getattr(
-        getattr(self.collector.adapter, "env", None), "command_manager", None
-      )
-      get_term = getattr(command, "get_term", None)
-      motion = get_term("motion") if callable(get_term) else None
-      policy = getattr(motion, "reset_policy", None)
-      if getattr(policy, "enabled", False):
-        reset_provenance = reset_provenance_from_adapter(self.collector.adapter)
+      reset_provenance = self._reset_provenance_for_save()
     state = load_cohort_checkpoint(
       path,
       self.trainer,

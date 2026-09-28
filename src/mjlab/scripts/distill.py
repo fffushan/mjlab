@@ -50,6 +50,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
   cohort_identity_from_adapter,
   require_member_matches,
 )
+from mjlab.tasks.tracking.distillation.cohort_setup import CohortSetup
 from mjlab.tasks.tracking.distillation.collector import (
   DAggerCollector,
   EvaluationMode,
@@ -135,6 +136,17 @@ _DEFAULT_TEACHER_ID = "tennis_000"
 
 _COHORT_PHASE_POLICY = "uniform"
 """Phase policy of an M4 training build; pinned evaluation overrides it."""
+
+_WORKER_SEED_SCHEME_VERSION = 1
+"""Version of the per-worker environment and generator seeding derivation.
+
+Recorded in the resolved configuration so a future change to the derivation is
+refused as a resume mismatch instead of silently collecting a different data
+mix under the same stored settings.
+"""
+
+_MAX_WORKERS = 8
+"""Upper bound on the ``--worker-devices`` entries one training run accepts."""
 
 _RESUME_INVARIANT_KEYS = (
   "teacher_id",
@@ -515,6 +527,102 @@ def _schedule_config(
   }
 
 
+def _resolve_worker_devices(
+  worker_devices: tuple[str, ...] | None, *, num_envs: int
+) -> tuple[str, ...]:
+  """Validate and canonicalize the opt-in worker device list.
+
+  ``None`` keeps the single-process path: one environment holding all of
+  ``num_envs`` on the trainer device.  An explicit list names one device per
+  sharded collection worker and splits ``num_envs`` evenly across them, so the
+  collected row count per iteration is unchanged and only the parallelism is.
+  Every refusal below happens before a simulator exists.
+
+  Entries are canonicalized through ``torch.device``, which needs no CUDA
+  runtime: an unparseable device string is refused here rather than surfacing
+  from a worker later, and an omitted CUDA index is normalized so ``cuda`` and
+  ``cuda:0`` are recognized as the same device.  Entries must otherwise be
+  exactly what ``torch.device`` accepts (no case or zero-padded aliases), which
+  is the same requirement the trainer device already carries.  Repeated CPU
+  entries are deliberately allowed: a CPU shard contends for no physical device,
+  and repeating ``'cpu'`` is how an N-worker merge path is exercised without
+  GPUs.
+  """
+  if worker_devices is None:
+    return ()
+  devices = tuple(worker_devices)
+  if not devices:
+    raise ValueError("--worker-devices needs at least one device")
+  canonical: list[str] = []
+  for device in devices:
+    if not isinstance(device, str) or not device.strip():
+      raise ValueError(
+        f"--worker-devices entries must be non-empty device strings; got {device!r}"
+      )
+    try:
+      resolved = torch.device(device)
+    except (RuntimeError, ValueError) as exc:
+      raise ValueError(
+        f"--worker-devices entry {device!r} is not a device: {exc}"
+      ) from exc
+    if resolved.type == "cuda" and resolved.index is None:
+      resolved = torch.device("cuda", 0)
+    canonical.append(str(resolved))
+  repeated = sorted(
+    {
+      device
+      for device in canonical
+      if canonical.count(device) > 1 and torch.device(device).type != "cpu"
+    }
+  )
+  if repeated:
+    raise ValueError(
+      f"--worker-devices repeats a device: {repeated}; one worker per device"
+    )
+  if len(canonical) > _MAX_WORKERS:
+    raise ValueError(
+      f"--worker-devices accepts at most {_MAX_WORKERS} workers; got {len(canonical)}"
+    )
+  if num_envs % len(canonical) != 0:
+    raise ValueError(
+      f"--num-envs {num_envs} does not split evenly over the {len(canonical)} "
+      "worker devices in --worker-devices; every worker must own the same "
+      "number of environments"
+    )
+  return tuple(canonical)
+
+
+def _workers_identity(worker_devices: tuple[str, ...], num_envs: int) -> dict[str, Any]:
+  """The worker identity one resume must reproduce, as a single object.
+
+  A single-process run records ``mode: 'single'`` with no devices, so the record
+  states that no worker exists instead of leaving it to be inferred from an
+  empty list.  Keeping the whole identity in one object is what makes the
+  legacy default safe: a checkpoint recorded before workers existed is defaulted
+  as a whole, so a partially populated worker record can never be read as the
+  single-process case.
+  """
+  count = max(len(worker_devices), 1)
+  return {
+    "mode": "single" if not worker_devices else "sharded",
+    "devices": list(worker_devices),
+    "count": count,
+    "envs_per_worker": num_envs // count,
+    "seed_scheme": _WORKER_SEED_SCHEME_VERSION,
+  }
+
+
+def _collection_transport(worker_devices: tuple[str, ...]) -> str:
+  """Audit-only name of the path collected rows take to the trainer.
+
+  Recorded in the resolved configuration but deliberately kept out of the
+  resume invariants: the transport does not change which rows are sampled, so
+  replacing it with a faster one must not refuse an existing run's resume.  It
+  sits with ``checkpoint_every`` on the audit-only side of that distinction.
+  """
+  return "in-process" if not worker_devices else "pinned-host-v1"
+
+
 def _resolved_config(
   *,
   command: str,
@@ -590,7 +698,12 @@ def _resume_compatible_value(key: str, stored: Any, requested: Any) -> Any:
   sub-key is filled in on the stored side before the comparison.  Currently:
   ``replay.phase_bins`` (cohort entries only) defaults to 0 in checkpoints
   that predate the option; single-teacher replay entries never carry it, so
-  they are compared verbatim.
+  they are compared verbatim.  Likewise ``runtime.workers`` defaults to the
+  single-process identity in cohort checkpoints recorded before multi-worker
+  collection existed, because a single-process run is exactly what those
+  checkpoints used.  That default is applied to the whole worker object, never
+  per field, so a partially populated worker record cannot be mistaken for the
+  single-process case; a checkpoint that records workers is compared verbatim.
   """
   if (
     key == "replay"
@@ -600,6 +713,21 @@ def _resume_compatible_value(key: str, stored: Any, requested: Any) -> Any:
   ):
     stored_equivalent = dict(stored)
     stored_equivalent.setdefault("phase_bins", 0)
+    return stored_equivalent
+  if (
+    key == "runtime"
+    and isinstance(stored, Mapping)
+    and isinstance(requested, Mapping)
+    and "workers" in requested
+  ):
+    # Only a cohort runtime carries the worker identity, so the requested side
+    # decides whether this entry is one of them; a single-teacher runtime entry
+    # never carries it and is compared verbatim.  The default is the whole
+    # single-process object, never a per-field fill.
+    stored_equivalent = dict(stored)
+    stored_num_envs = stored.get("num_envs")
+    if isinstance(stored_num_envs, int) and not isinstance(stored_num_envs, bool):
+      stored_equivalent.setdefault("workers", _workers_identity((), stored_num_envs))
     return stored_equivalent
   return stored
 
@@ -779,6 +907,7 @@ def _build_runner(
 def _build_cohort_runner(
   *,
   cohort: CohortContract,
+  setup: CohortSetup,
   teacher_ids: tuple[str, ...],
   device: str,
   num_envs: int,
@@ -801,6 +930,10 @@ def _build_cohort_runner(
   reset_policy: ResetPolicy,
 ):
   """Build the M4 shared-student cohort run: one adapter, bank, and replay.
+
+  The environment and the student come from ``setup``, the same recipe a sharded
+  collection worker calls, so the single-process path and every worker build one
+  environment by construction rather than by convention.
 
   One environment carries every selected clip (its rows keep their own
   reference), one frozen ``TeacherBank`` labels the mixed rows by their per-row
@@ -846,21 +979,15 @@ def _build_cohort_runner(
     rollout_latent=rollout_latent,
     seed=seed,
   )
-  adapter = make_multi_teacher_distillation_adapter(
-    cohort,
-    teacher_ids,
-    phase_policy=_COHORT_PHASE_POLICY,
-    task_id=task_id,
-    num_envs=num_envs,
-    device=device,
-    seed=seed,
-    reset_policy=reset_policy,
-  )
+  # The adapter and student come from the shared cohort recipe, so a worker
+  # builds the environment this path builds; worker index 0 is the
+  # single-process derivation and leaves the requested seed unchanged.
+  adapter = setup.build_adapter(device=device, num_envs=num_envs)
   try:
-    # Model initialization only: environment startup randomization is seeded by
-    # the adapter factory above, before the private env config is constructed.
-    torch.manual_seed(seed)
-    model = ConditionalVAE(adapter.schema, DEFAULT_MODEL_SETTINGS).to(device)
+    # Model initialization only: environment startup randomization is seeded
+    # inside the adapter factory above, before the private env config is
+    # constructed.
+    model = setup.build_student(schema=adapter.schema, device=device)
     weights = {
       clip.motion_id: float(cohort.teacher(clip.teacher_id).entry.sampling_weight)
       for clip in adapter.library.clips
@@ -903,6 +1030,7 @@ def _cohort_resolved_config(
   task_id: str | None,
   device: str,
   num_envs: int,
+  worker_devices: tuple[str, ...] = (),
   seed: int,
   seed_audit: Mapping[str, Any],
   runner: DistillationRunner,
@@ -944,7 +1072,9 @@ def _cohort_resolved_config(
       "seed": seed,
       "resolved_seed": seed_audit["effective_seed"],
       "seed_provenance": dict(seed_audit),
+      "workers": _workers_identity(worker_devices, num_envs),
     },
+    "execution": {"transport": _collection_transport(worker_devices)},
     "schedule": _schedule_config(
       runner, adapter.env.command_manager.get_term("motion").cfg.sampling_mode
     ),
@@ -1019,10 +1149,24 @@ def _boundary_summary(collection) -> dict[str, Any]:
   }
 
 
+def _boundary_record(boundary) -> dict[str, Any]:
+  """Plain-data boundary record, with the shard tag only when it has one.
+
+  A single-process run has one environment batch, so tagging each record with a
+  null worker would change an unchanged report while adding no information.
+  A merged record keeps the tag, because its environment indices belong to one
+  shard and cannot be read as global indices.
+  """
+  record = asdict(boundary)
+  if record.get("worker_index") is None:
+    record.pop("worker_index", None)
+  return record
+
+
 def _boundaries_report(collection, mode: ReportBoundaries):
   """Boundary evidence for one iteration: compact summary, or raw detail."""
   if mode == "full":
-    return [asdict(item) for item in collection.boundaries]
+    return [_boundary_record(item) for item in collection.boundaries]
   return _boundary_summary(collection)
 
 
@@ -1325,6 +1469,7 @@ def _train_cohort(
   accumulation_steps: int,
   replay_capacity: int,
   phase_bins: int,
+  worker_devices: tuple[str, ...] = (),
   learning_rate: float,
   beta: float,
   seed: int,
@@ -1354,8 +1499,18 @@ def _train_cohort(
         "start a new cohort run"
       )
     cohort = _resolve(manifest, repo_root)
+    setup = CohortSetup(
+      manifest=manifest,
+      repo_root=repo_root,
+      teacher_ids=tuple(teacher_ids),
+      task_id=task_id,
+      phase_policy=_COHORT_PHASE_POLICY,
+      reset_policy=reset_policy,
+      base_seed=seed,
+    )
     runner, adapter, identity, evaluation_sampling_mode = _build_cohort_runner(
       cohort=cohort,
+      setup=setup,
       teacher_ids=teacher_ids,
       device=device,
       num_envs=num_envs,
@@ -1388,6 +1543,7 @@ def _train_cohort(
       task_id=task_id,
       device=device,
       num_envs=num_envs,
+      worker_devices=worker_devices,
       seed=seed,
       seed_audit=seed_audit,
       runner=runner,
@@ -1441,6 +1597,8 @@ def _train_cohort(
         "requested_seed": seed,
         "resolved_seed": seed_audit["effective_seed"],
         "seed_provenance": seed_audit,
+        "workers": dict(resolved_config["runtime"]["workers"]),
+        "transport": resolved_config["execution"]["transport"],
       },
       "schedule": resolved_config["schedule"],
       "resolved_config": resolved_config,
@@ -1502,6 +1660,7 @@ def _train(
   accumulation_steps: int = 15,
   replay_capacity: int = 16_384,
   phase_bins: int | None = None,
+  worker_devices: tuple[str, ...] | None = None,
   learning_rate: float = 5e-4,
   beta: float = 0.01,
   seed: int = 0,
@@ -1538,6 +1697,17 @@ def _train(
   resolved configuration and must be reproduced on resume.  Passing it with
   the single-teacher path — including an explicit ``--phase-bins 0`` — is
   refused, and negative values are refused by the replay constructor.
+
+  ``worker_devices`` is the opt-in multi-device collection configuration and
+  applies only to the cohort path.  Unset (the default) keeps the historical
+  single-process path: one environment holding all of ``num_envs`` on
+  ``device``.  An explicit list, e.g. ``--worker-devices "('cuda:1','cuda:2')"``,
+  names one device per sharded collection worker and splits ``num_envs`` evenly
+  across them, while the trainer, replay and checkpoint writer stay on
+  ``device``.  The list is recorded in the resolved configuration and is
+  therefore a resume invariant.  A list that repeats a device, exceeds eight
+  entries, or does not divide ``num_envs`` evenly is refused before any
+  environment is constructed, as is any use on the single-teacher path.
 
   ``max_iterations`` is the total lifetime iteration budget, including when
   ``resume`` is supplied.  Resume restores replay, normalizers, optimizer, and
@@ -1606,6 +1776,26 @@ def _train(
         "syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
       )
     )
+  if not teacher_ids and worker_devices is not None:
+    return _fail(
+      ValueError(
+        "--worker-devices applies only to the cohort path; use singleton "
+        "cohort syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
+      )
+    )
+  try:
+    resolved_worker_devices = _resolve_worker_devices(worker_devices, num_envs=num_envs)
+  except ValueError as exc:
+    return _fail(exc)
+  if len(resolved_worker_devices):
+    return _fail(
+      ValueError(
+        "multi-worker collection is not wired into the runner in this build: "
+        f"--worker-devices {list(resolved_worker_devices)} validates and records "
+        "the configuration without sharding it, so it is refused rather than "
+        "silently training on a single device"
+      )
+    )
   if teacher_ids:
     return _train_cohort(
       manifest=manifest,
@@ -1625,6 +1815,7 @@ def _train(
       accumulation_steps=accumulation_steps,
       replay_capacity=replay_capacity,
       phase_bins=resolved_phase_bins,
+      worker_devices=resolved_worker_devices,
       learning_rate=learning_rate,
       beta=beta,
       seed=seed,
