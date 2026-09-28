@@ -426,3 +426,63 @@ def test_repr_describes_clips_and_selection(selected_library: MotionLibrary) -> 
   text = repr(selected_library)
   assert "tiny_000" in text and "tiny_001" in text
   assert "selection=(0, 1)" in text
+
+
+def test_cpu_copy_moves_storage_to_the_host_and_keeps_identity() -> None:
+  """A library that crosses a process boundary must carry host storage.
+
+  A sharded parent builds its replay and cohort identity from a worker's
+  library, so the worker sends a copy: sending the live library would try to
+  move device tensors through a queue, and a reduced stand-in would not satisfy
+  the identity builder's type.
+  """
+  import torch
+
+  from mjlab.tasks.tracking.distillation.motion_library import (
+    BodySelection,
+    MotionClip,
+    MotionLibrary,
+  )
+
+  clips = (
+    MotionClip(
+      motion_id=0,
+      teacher_id="tennis_000",
+      teacher_code=0,
+      motion_file=Path("a.npz"),
+      source_hash="deadbeef",
+      frames=4,
+      fps=50.0,
+      storage_offset=0,
+      source_body_count=2,
+    ),
+  )
+  library = MotionLibrary(
+    clips=clips,
+    device=torch.device("cpu"),
+    dtype=torch.float32,
+    offsets=torch.tensor([0, 4], dtype=torch.long),
+    frame_counts=torch.tensor([4], dtype=torch.long),
+    teacher_codes=torch.tensor([0], dtype=torch.long),
+    joint_pos=torch.zeros(4, 2, 3),
+    joint_vel=torch.ones(4, 2, 3),
+    body_pos_w=torch.zeros(4, 2, 3),
+    body_quat_w=torch.zeros(4, 2, 4),
+    body_lin_vel_w=torch.zeros(4, 2, 3),
+    body_ang_vel_w=torch.zeros(4, 2, 3),
+    selection=BodySelection(indices=(0, 1), source_body_count=2),
+  )
+
+  copy = library.cpu_copy()
+
+  assert isinstance(copy, MotionLibrary)
+  assert copy.clips == library.clips
+  assert copy.body_selection == library.body_selection
+  assert copy.source_body_count == library.source_body_count
+  assert copy.device.type == "cpu"
+  # Equal values, independent host storage: the copy is what crosses the
+  # boundary.  The gather methods are the public API, so this asserts on the
+  # storage the copy is about.
+  assert copy._joint_vel.device.type == "cpu"
+  assert torch.equal(copy._joint_vel, library._joint_vel)
+  assert copy._joint_vel.data_ptr() != library._joint_vel.data_ptr()

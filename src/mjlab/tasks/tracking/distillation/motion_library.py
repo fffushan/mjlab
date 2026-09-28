@@ -167,6 +167,43 @@ class MotionLibrary:
     self._selection = selection
     self._selection_index = selection_index
 
+  def cpu_copy(self) -> MotionLibrary:
+    """Return an equivalent library whose storage lives on the host.
+
+    A library owns the reference motion arrays on its environment's device, so
+    it cannot simply be handed to another process: a sharded parent builds its
+    replay and cohort identity from a worker's environment, and that worker has
+    to send a copy whose tensors can cross the boundary.  Metadata (clips, body
+    selection, digests) is shared, because it is immutable and carries no
+    device.
+
+    The receiver still gets a real library rather than a reduced stand-in: the
+    identity builder checks the type and reads the library's own metadata, so a
+    partial substitute would have to be taught the same contract.  The storage
+    is always copied, never aliased: a same-process caller must not be able to
+    see one library's arrays change through the other.
+    """
+    return MotionLibrary(
+      clips=self._clips,
+      device=torch.device("cpu"),
+      dtype=self._dtype,
+      offsets=self._offsets.detach().to("cpu", copy=True),
+      frame_counts=self._frame_counts.detach().to("cpu", copy=True),
+      teacher_codes=self._teacher_codes.detach().to("cpu", copy=True),
+      joint_pos=self._joint_pos.detach().to("cpu", copy=True),
+      joint_vel=self._joint_vel.detach().to("cpu", copy=True),
+      body_pos_w=self._body_pos_w.detach().to("cpu", copy=True),
+      body_quat_w=self._body_quat_w.detach().to("cpu", copy=True),
+      body_lin_vel_w=self._body_lin_vel_w.detach().to("cpu", copy=True),
+      body_ang_vel_w=self._body_ang_vel_w.detach().to("cpu", copy=True),
+      selection=self._selection,
+      selection_index=(
+        None
+        if self._selection_index is None
+        else self._selection_index.detach().to("cpu", copy=True)
+      ),
+    )
+
   @classmethod
   def from_clips(
     cls,

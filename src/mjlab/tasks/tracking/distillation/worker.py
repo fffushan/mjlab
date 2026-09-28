@@ -359,7 +359,11 @@ def describe_environment(
     reset_policy_enabled=enabled,
     reset_provenance=provenance,
     sampling_mode=sampling_mode,
-    library=adapter.library,
+    # The library owns reference arrays on the shard's device, so the copy the
+    # parent receives must already be host storage; the parent builds its
+    # replay and cohort identity from it and must not move device tensors
+    # across a process boundary.
+    library=adapter.library.cpu_copy(),
     audit=adapter.audit,
     motion_teacher_codes=dict(adapter.motion_teacher_codes),
   )
