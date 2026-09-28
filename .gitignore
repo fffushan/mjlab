@@ -36,3 +36,4 @@ queue/dispatch.lock
 # Remote data.
 data/*
 .pi/*
+distillation-runs/*
