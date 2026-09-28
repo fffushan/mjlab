@@ -411,6 +411,10 @@ class DistillationRunner:
       resolved_config=resolved_config or {},
       collector=self.collector,
       reset_provenance=reset_provenance,
+      # The parent owns no environment here and each shard derives its own
+      # standing resets per collection call, so there is no owned reset stream
+      # to store (see save_cohort_checkpoint's contract).
+      reset_rng_derived=self.sharded is not None,
     )
     self.events.append(
       {
@@ -445,6 +449,9 @@ class DistillationRunner:
       expected_cohort=cohort,
       expected_reset_provenance=reset_provenance,
       collector=self.collector,
+      # A sharded resume derives its resets per call, so the stored checkpoint is
+      # held to the matching RNG contract and must carry no reset stream.
+      reset_rng_derived=self.sharded is not None,
       map_location=map_location,
     )
     self.iteration = state.counters.get("iteration", self.iteration)

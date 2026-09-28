@@ -671,6 +671,7 @@ def _validate_cohort_payload(
   expected_cohort: CohortIdentity,
   expected_reset_provenance: ResetProvenance | None,
   collector: DAggerCollector | None,
+  reset_rng_derived: bool = False,
 ) -> tuple[dict[str, Any], ReplayPolicy, ResetProvenance | None]:
   """Validate one multi-teacher cohort checkpoint before any mutation.
 
@@ -704,7 +705,10 @@ def _validate_cohort_payload(
     identity_fields=_COHORT_IDENTITY_FIELDS
     | ({"reset_provenance"} if enabled else set()),
     collector=collector,
-    require_reset_rng=enabled,
+    # A sharded run derives its reset RNG per collection call, so its v3
+    # checkpoint carries no reset stream; the exact RNG key set below is what
+    # refuses a declaration that disagrees with the stored payload.
+    require_reset_rng=enabled and not reset_rng_derived,
   )
   reset_provenance: ResetProvenance | None = None
   if enabled:
@@ -890,6 +894,7 @@ def save_cohort_checkpoint(
   resolved_config: Mapping[str, Any] | None = None,
   collector: DAggerCollector | None = None,
   reset_provenance: ResetProvenance | None = None,
+  reset_rng_derived: bool = False,
 ) -> Path:
   """Atomically save a version-2 or enabled version-3 cohort checkpoint.
 
@@ -899,16 +904,30 @@ def save_cohort_checkpoint(
   live replay policy, so a strict resume can require all of them.  A poisoned
   trainer and a cohort that disagrees with the live replay or the trained schema
   are refused before any file is created.
+
+  ``reset_rng_derived`` says the run draws its standing resets from a per-call
+  derived seed instead of an owned stream.  Such a run records no reset RNG
+  state: the state is reproducible from the call that will draw it, so storing
+  one would only record what the next call replaces.  A sharded run says this
+  because its workers each derive their own reset RNG; a single-process run
+  keeps its owned stream and stores it.
   """
   trainer.assert_healthy()
   if reset_provenance is not None and not isinstance(reset_provenance, ResetProvenance):
     raise CheckpointValidationError("reset_provenance must be a ResetProvenance")
-  reset_rng_state = (
-    _adapter_reset_rng_state(collector) if reset_provenance is not None else None
-  )
-  if reset_provenance is not None and reset_rng_state is None:
+  if reset_rng_derived and reset_provenance is None:
     raise CheckpointValidationError(
-      "enabled v3 cohort save requires a multi-motion command reset RNG state"
+      "a derived reset RNG belongs to a standing run; reset_provenance is missing"
+    )
+  reset_rng_state = (
+    None
+    if reset_rng_derived or reset_provenance is None
+    else _adapter_reset_rng_state(collector)
+  )
+  if reset_provenance is not None and reset_rng_state is None and not reset_rng_derived:
+    raise CheckpointValidationError(
+      "enabled v3 cohort save requires a multi-motion command reset RNG state; "
+      "a run whose shards derive their reset RNG must say so with reset_rng_derived"
     )
   if reset_provenance is not None and not reset_provenance.reset_policy.enabled:
     raise CheckpointValidationError("v3 cohort save requires standing-mixture policy")
@@ -1109,6 +1128,7 @@ def load_cohort_checkpoint(
   expected_cohort: CohortIdentity,
   expected_reset_provenance: ResetProvenance | None = None,
   collector: DAggerCollector | None = None,
+  reset_rng_derived: bool = False,
   map_location: str | torch.device = "cpu",
 ) -> CohortLifecycleState:
   """Validate then restore version-2 cohort state; failures roll state back.
@@ -1126,6 +1146,7 @@ def load_cohort_checkpoint(
     expected_cohort=expected_cohort,
     expected_reset_provenance=expected_reset_provenance,
     collector=collector,
+    reset_rng_derived=reset_rng_derived,
   )
   stored = CohortIdentity.from_dict(clean["cohort"], "checkpoint cohort")
   _restore_state(clean, trainer, replay, collector)

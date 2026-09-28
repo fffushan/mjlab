@@ -1666,3 +1666,156 @@ def test_multi_teacher_runner_evaluates_both_motions_per_iteration(
     assert [item.teacher_code for item in result.evaluation.per_motion] == [0, 1]
   # Evaluation advanced the shared adapter, so the next collection resets.
   assert adapter.reset_calls >= 2
+
+
+class FakeShardedSource:
+  """Parent-side view of a sharded run, with no workers and no simulator.
+
+  A sharded parent owns no environment: it reads the standing contract from a
+  worker description and every shard derives its own reset RNG for the
+  collection call it is about to run.  This stands in for that source so the
+  checkpoint contract can be exercised without devices.
+  """
+
+  def __init__(
+    self, provenance: ResetProvenance, *, policy_enabled: bool = True
+  ) -> None:
+    self.reset_provenance = provenance if policy_enabled else None
+    self.invalidated = 0
+    self.closed = False
+
+  def invalidate_snapshot(self, *, requires_reset: bool = True) -> None:
+    self.invalidated += 1
+
+  def close(self) -> None:
+    self.closed = True
+
+
+def make_sharded_runner(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  body_selection: BodySelection,
+  schema: Any,
+  provenance: ResetProvenance,
+) -> tuple[DistillationRunner, Any]:
+  trainer, identity, _adapter, _collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  source = FakeShardedSource(provenance)
+  runner = DistillationRunner(
+    None,
+    trainer,
+    RunnerConfig(max_iterations=2, seed=5),
+    sharded=source,
+  )
+  return runner, identity
+
+
+def test_sharded_standing_cohort_checkpoint_derives_its_reset_state(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """A sharded standing run saves and resumes with no owned reset stream.
+
+  Each shard derives its standing resets from the collection it is about to
+  run, so the checkpoint records the standing contract and no reset RNG state,
+  and a resume installs none.  Before this contract existed the save failed
+  outright -- "enabled v3 cohort save requires a multi-motion command reset RNG
+  state" -- which made a standing multi-GPU run impossible to checkpoint at all,
+  not merely untested.
+  """
+  provenance = make_reset_provenance(plan)
+  runner, identity = make_sharded_runner(
+    real_cohort, plan, body_selection, schema, provenance
+  )
+  path = tmp_path / "sharded-standing-v3.pt"
+  runner.save_cohort(str(path), identity)
+
+  payload = torch.load(path, weights_only=True)
+  assert payload["version"] == 3
+  assert payload["reset_provenance"] == provenance.as_dict()
+  # The standing contract is recorded; the RNG that draws it is derived per
+  # call, so there is no stream to store and nothing for a resume to install.
+  assert set(payload["rng"]) == {"global_cpu", "trainer"}
+
+  restored, restored_identity = make_sharded_runner(
+    real_cohort, plan, body_selection, schema, provenance
+  )
+  state = restored.resume_cohort(str(path), restored_identity)
+  assert state.reset_provenance == provenance
+  assert restored.iteration == 0
+
+
+def test_sharded_declaration_is_checked_against_the_stored_rng_set(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """The derived declaration is verified against the payload, not trusted.
+
+  ``_validate_state_payload`` compares the RNG key set exactly, so claiming a
+  stored reset stream for a payload that has none is refused rather than
+  resumed into a run whose resets would silently restart from an arbitrary
+  state.
+  """
+  provenance = make_reset_provenance(plan)
+  runner, identity = make_sharded_runner(
+    real_cohort, plan, body_selection, schema, provenance
+  )
+  path = tmp_path / "sharded-standing-v3.pt"
+  runner.save_cohort(str(path), identity)
+
+  restored, restored_identity = make_sharded_runner(
+    real_cohort, plan, body_selection, schema, provenance
+  )
+  with pytest.raises(CheckpointValidationError, match="RNG streams"):
+    load_cohort_checkpoint(
+      path,
+      restored.trainer,
+      restored.replay,
+      expected_cohort=restored_identity,
+      expected_reset_provenance=provenance,
+      collector=None,
+    )
+
+
+def test_cohort_save_refuses_an_undeclared_derived_reset_rng(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """A standing save without a stream must say where its resets come from.
+
+  The historical refusal is preserved for a caller that has neither a live
+  collector nor a declaration, and a declaration without a standing contract is
+  refused as well: a derived RNG only has meaning when something is drawing it.
+  """
+  provenance = make_reset_provenance(plan)
+  trainer, identity, _adapter, _collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  with pytest.raises(CheckpointValidationError, match="reset RNG state"):
+    save_cohort_checkpoint(
+      tmp_path / "undeclared.pt",
+      trainer,
+      trainer.replay,
+      cohort=identity,
+      reset_provenance=provenance,
+      collector=None,
+    )
+  with pytest.raises(CheckpointValidationError, match="standing run"):
+    save_cohort_checkpoint(
+      tmp_path / "unprovenanced.pt",
+      trainer,
+      trainer.replay,
+      cohort=identity,
+      collector=None,
+      reset_rng_derived=True,
+    )

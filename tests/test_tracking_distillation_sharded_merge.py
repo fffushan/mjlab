@@ -669,3 +669,54 @@ def test_merged_evaluation_reports_a_standing_profile_from_shard_settings() -> N
 
   assert "trial_failure_rate" in merged.metrics
   assert "trial_window_steps" in merged.settings
+
+
+def test_merged_evaluation_refuses_shards_from_different_iterations() -> None:
+  """Merging two iterations would report one iteration's metrics as the other's."""
+  with pytest.raises(ShardedCollectionError) as error:
+    merge_evaluations(
+      [
+        _evaluate_reply(0, [_segment(0, outcome="timeout")]),
+        EvaluateReply(
+          call_id=2,
+          iteration=1,
+          result=_evaluation([_segment(0, outcome="timeout")]),
+        ),
+      ]
+    )
+  assert "do not describe one evaluation" in str(error.value)
+
+
+def test_merged_evaluation_refuses_a_mixed_standing_profile() -> None:
+  """A standing shard and a non-standing one do not describe one evaluation.
+
+  Their trial accounting differs, so pooling the segments would apply standing
+  trial buckets to rows that never ran under that profile.
+  """
+  with pytest.raises(ShardedCollectionError) as error:
+    merge_evaluations(
+      [
+        _evaluate_reply(
+          0, [_segment(0, outcome="timeout")], settings={"trial_window_steps": 25}
+        ),
+        _evaluate_reply(1, [_segment(0, outcome="timeout")]),
+      ]
+    )
+  assert "trial accounting cannot be merged" in str(error.value)
+
+
+def test_merged_evaluation_refuses_two_different_trial_windows() -> None:
+  """The trial window decides the buckets, so every shard must share it."""
+  with pytest.raises(ShardedCollectionError) as error:
+    merge_evaluations(
+      [
+        _evaluate_reply(
+          0, [_segment(0, outcome="timeout")], settings={"trial_window_steps": 25}
+        ),
+        _evaluate_reply(
+          1, [_segment(0, outcome="timeout")], settings={"trial_window_steps": 50}
+        ),
+      ]
+    )
+  assert "window 50 while shard 0 reported" in str(error.value)
+  assert "window 25" in str(error.value)

@@ -23,7 +23,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 import tyro
@@ -53,7 +53,10 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
   cohort_identity_from_parts,
   require_member_matches,
 )
-from mjlab.tasks.tracking.distillation.cohort_setup import CohortSetup
+from mjlab.tasks.tracking.distillation.cohort_setup import (
+  CohortSetup,
+  worker_env_seed,
+)
 from mjlab.tasks.tracking.distillation.collector import (
   DAggerCollector,
   EvaluationMode,
@@ -1076,13 +1079,7 @@ def _build_sharded_cohort_runner(
   try:
     pool.start()
     descriptions = pool.describe()
-    primary = descriptions[0]
-    for index, description in enumerate(descriptions):
-      if description.schema != primary.schema:
-        raise DistillationError(
-          f"worker {index} reported a different observation schema than worker "
-          f"0; the shards would train one model on two contracts"
-        )
+    primary = _require_one_shard_contract(descriptions, setup)
     torch.manual_seed(seed)
     model = ConditionalVAE(primary.schema, DEFAULT_MODEL_SETTINGS).to(device)
     weights = {
@@ -1307,15 +1304,33 @@ def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
   }
 
 
-def _release(owner):
-  """Return a callable that releases whichever object owns the environment.
+def _release(owner) -> Callable[[], None]:
+  """Return a callable that releases the run's owner, at most once.
 
   The single-process layout owns one adapter; the sharded layout owns a pool of
   worker processes.  Both are released by ``close``, so callers that must clean
   up on failure or on a signal do not branch on which layout is running.
+
+  Releasing twice must be impossible rather than merely unexpected: a signal
+  handler releases the owner before raising, and the surrounding ``finally``
+  releases it again, so a second ``close`` would run against a live environment.
+  An exception raised there would also replace the ``SystemExit`` that carries
+  the operator's exit status, turning a clean stop into an opaque failure.  The
+  returned action is therefore built once and shared by both sites.
   """
   close = getattr(owner, "close", None)
-  return close if callable(close) else (lambda: None)
+  if not callable(close):
+    return lambda: None
+  released = False
+
+  def release() -> None:
+    nonlocal released
+    if released:
+      return
+    released = True
+    close()
+
+  return release
 
 
 @contextmanager
@@ -1347,6 +1362,61 @@ def _teardown_on_signal(teardown):
   finally:
     for signum, original in previous.items():
       signal.signal(signum, original)
+
+
+def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup) -> Any:
+  """Require every shard to describe the same cohort contract as shard 0.
+
+  The parent takes the replay's clip weights and frame counts, the
+  motion-to-teacher routing, and the whole cohort identity from worker 0, so a
+  shard that disagrees about the library, the audited slots, the phase policy,
+  the routing or the reset contract would have the model trained on one
+  contract while that shard collected under another.  Comparing the observation
+  schema alone left all of that unverified.
+
+  The environment seed is deliberately not compared for equality: each shard's
+  environment is built on its own stratum by construction, so its recorded seed
+  differs by design.  What is checked instead is that each shard's environment
+  actually carries the seed its index derives, which is the invariant the cohort
+  identity's single seed record and a sharded resume both rest on.
+
+  Returns:
+    The description every shard agreed with.
+
+  Raises:
+    DistillationError: if any shard disagrees about any of the above.
+  """
+  primary = descriptions[0]
+  fields = (
+    ("observation schema", lambda item: item.schema),
+    ("reference library clips", lambda item: item.library.clips),
+    ("library body selection", lambda item: item.library.body_selection),
+    ("library source body count", lambda item: item.library.source_body_count),
+    ("audited slot allocation", lambda item: item.audit.slots),
+    ("audited body mapping digest", lambda item: item.audit.mapping_digest),
+    ("audited phase policy", lambda item: item.audit.phase_policy),
+    ("audited common contract", lambda item: item.audit.asset),
+    ("reset policy", lambda item: item.audit.reset_policy),
+    ("motion teacher codes", lambda item: item.motion_teacher_codes),
+    ("sampling mode", lambda item: item.sampling_mode),
+    ("reset policy enablement", lambda item: item.reset_policy_enabled),
+  )
+  for index, description in enumerate(descriptions):
+    for name, read in fields:
+      if read(description) != read(primary):
+        raise DistillationError(
+          f"worker {index} reported a different {name} than worker 0; the "
+          "shards do not describe one cohort contract"
+        )
+    expected_seed = worker_env_seed(setup.base_seed, index)
+    recorded = getattr(description.audit.seed_provenance, "effective_seed", None)
+    if recorded is not None and recorded != expected_seed:
+      raise DistillationError(
+        f"worker {index} built its environment on seed {recorded} instead of "
+        f"the seed {expected_seed} its shard index derives; the shards are not "
+        "the strata this run's identity and resume describe"
+      )
+  return primary
 
 
 def _validate_cohort_run(
@@ -1665,6 +1735,10 @@ def _train_cohort(
   """
   runner = None
   primary = None
+  # Bound before the run is built so the final cleanup can always call it: an
+  # error between acquiring the owner and reaching the drive loop must not turn
+  # into a cleanup failure that hides the original one.
+  release: Callable[[], None] = _release(None)
   try:
     _require_train_settings(report_boundaries, checkpoint_every, progress_every)
     if resume is not None and not _is_cohort_checkpoint(resume):
@@ -1741,6 +1815,7 @@ def _train_cohort(
         ResetPolicy(),
       ).as_dict()
     runner, primary, identity, evaluation_sampling_mode, seed_audit = primary_build
+    release = _release(primary)
     _require_requested_seed_applied(seed, seed_audit)
     assert isinstance(runner.replay, BalancedReplayBuffer)
     resolved_config = _cohort_resolved_config(
@@ -1781,7 +1856,12 @@ def _train_cohort(
         schedule=resolved_config["schedule"],
       )
 
-    with _teardown_on_signal(_release(primary)):
+    # One release action for the whole run: the teardown-on-signal path and the
+    # final cleanup both call it, and it must close the owner exactly once.  It
+    # is bound here, next to the owner it releases, so the final cleanup never
+    # has to reconstruct it from a partially built run.
+    release = _release(primary)
+    with _teardown_on_signal(release):
       iteration_reports, checkpoints = _drive_lifecycle(
         runner,
         max_iterations=max_iterations,
@@ -1847,7 +1927,7 @@ def _train_cohort(
     return 1
   finally:
     if primary is not None:
-      _release(primary)()
+      release()
 
 
 def _train(

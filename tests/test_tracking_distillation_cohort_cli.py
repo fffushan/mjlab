@@ -15,6 +15,7 @@ import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -36,6 +37,7 @@ from mjlab.tasks.tracking.distillation.checkpoint import (
   CheckpointValidationError,
   save_checkpoint,
 )
+from mjlab.tasks.tracking.distillation.cohort_setup import worker_env_seed
 from mjlab.tasks.tracking.distillation.collector import (
   EvaluationResult,
   EvaluationSegment,
@@ -2689,3 +2691,139 @@ def test_signal_teardown_releases_workers_and_restores_handlers() -> None:
   assert released == ["closed"]
   assert exit_info.value.code == 128 + signal.SIGTERM
   assert signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_release_closes_its_owner_exactly_once() -> None:
+  """One release action serves both the signal path and the final cleanup.
+
+  The signal handler releases the owner and then raises, and the surrounding
+  finally releases it again.  Without a shared action the second close would run
+  against an already-closed environment, and an exception raised there would
+  replace the SystemExit that carries the operator's exit status.
+  """
+  closes: list[str] = []
+  owner = SimpleNamespace(close=lambda: closes.append("close"))
+  release = distill._release(owner)
+
+  release()
+  release()
+
+  assert closes == ["close"]
+
+
+def test_release_tolerates_an_owner_without_close() -> None:
+  """A layout that owns nothing releasable still yields a callable."""
+  release = distill._release(SimpleNamespace())
+  assert release() is None
+
+
+def _shard_description(worker_index: int = 0, **overrides: Any) -> SimpleNamespace:
+  """One worker's describe reply, as the parent reads it.
+
+  The default seed is the one the given shard index derives, because the shards
+  of a run are its seed strata and a description that carried another shard's
+  seed is exactly what the parent must refuse.
+  """
+  derived = worker_env_seed(5, worker_index)
+  values: dict[str, Any] = {
+    "schema": DEFAULT_SCHEMA,
+    "library": SimpleNamespace(
+      clips=(("tennis_000", 0, 448),),
+      body_selection=("body",),
+      source_body_count=29,
+    ),
+    "audit": SimpleNamespace(
+      slots=(("slot",),),
+      mapping_digest="mapping",
+      phase_policy="uniform",
+      asset=("asset",),
+      reset_policy="standing-mixture",
+      seed_provenance=RuntimeSeedProvenance(
+        requested_seed=derived,
+        effective_seed=derived,
+        applied_before_construction=True,
+      ),
+    ),
+    "motion_teacher_codes": {0: 0},
+    "sampling_mode": "mixed",
+    "reset_policy_enabled": True,
+  }
+  values.update(overrides)
+  return SimpleNamespace(**values)
+
+
+def _with_audit(
+  description: SimpleNamespace, **audit_overrides: Any
+) -> SimpleNamespace:
+  audit = SimpleNamespace(**{**vars(description.audit), **audit_overrides})
+  return SimpleNamespace(**{**vars(description), "audit": audit})
+
+
+def test_shard_descriptions_must_agree_on_the_whole_cohort_contract() -> None:
+  """The parent builds the replay and identity from shard 0, so shards must agree.
+
+  Only the observation schema used to be compared: a shard could disagree about
+  the clip mapping, the audited slots, the phase policy, the routing or the
+  reset contract and still collect rows the parent would treat as its own.
+  """
+  setup = SimpleNamespace(base_seed=5)
+  first = _shard_description()
+  agreeing = _shard_description(1)
+  assert distill._require_one_shard_contract([first, agreeing], setup) is first
+
+  cases = (
+    (
+      "reference library clips",
+      {"library": SimpleNamespace(**(vars(first.library) | {"clips": (("other",),)}))},
+    ),
+    ("audited slot allocation", None),
+    ("audited body mapping digest", None),
+    ("audited phase policy", None),
+    ("audited common contract", None),
+    ("reset policy", None),
+    ("motion teacher codes", {"motion_teacher_codes": {0: 1}}),
+    ("sampling mode", {"sampling_mode": "uniform"}),
+    ("reset policy enablement", {"reset_policy_enabled": False}),
+  )
+  audit_keys = {
+    "audited slot allocation": "slots",
+    "audited body mapping digest": "mapping_digest",
+    "audited phase policy": "phase_policy",
+    "audited common contract": "asset",
+    "reset policy": "reset_policy",
+  }
+  for name, overrides in cases:
+    if overrides is None:
+      second = _with_audit(first, **{audit_keys[name]: ("changed",)})
+    else:
+      second = SimpleNamespace(**{**vars(first), **overrides})
+    with pytest.raises(DistillationError, match=name):
+      distill._require_one_shard_contract([first, second], setup)
+
+
+def test_shard_descriptions_check_each_environment_seed_against_its_index() -> None:
+  """A shard's seed must be the stratum its index derives, not shard 0's.
+
+  The seeds differ by design, so equality is the wrong test; what matters is
+  that shard i carries the seed its index derives, which is what makes the
+  identity's single seed record and a sharded resume describe the same run.
+  """
+  setup = SimpleNamespace(base_seed=5)
+  first = _shard_description()
+  derived = distill.worker_env_seed(setup.base_seed, 1)
+  correct = _with_audit(
+    first,
+    seed_provenance=RuntimeSeedProvenance(
+      requested_seed=derived, effective_seed=derived, applied_before_construction=True
+    ),
+  )
+  assert distill._require_one_shard_contract([first, correct], setup) is first
+
+  copied_seed = _with_audit(
+    first,
+    seed_provenance=RuntimeSeedProvenance(
+      requested_seed=5, effective_seed=5, applied_before_construction=True
+    ),
+  )
+  with pytest.raises(DistillationError, match="instead of the seed"):
+    distill._require_one_shard_contract([first, copied_seed], setup)

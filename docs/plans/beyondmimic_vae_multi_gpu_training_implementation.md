@@ -450,9 +450,10 @@ replacing it with a measurement is exactly what the smoke is for.
 
 ## 8. Adjacent, not part of this plan
 
-The bare-metal host's queue still sets `EXCLUDE_GPUS=5` and its dispatcher is
-not running after the GPU-5 repair; the interrupted standing-teacher jobs are
-marked pending/failed. Lifting the exclusion is a small separate change plus a
+The bare-metal host's queue still sets `EXCLUDE_GPUS=5`, which is stale: GPU 5
+was repaired and reports no ECC uncorrected errors, and the other cards are
+idle. Its dispatcher is not running, and the interrupted standing-teacher jobs
+are marked pending/failed. Lifting the exclusion is a small separate change plus a
 dispatcher restart (`queue/dispatch.sh` is tracked in the repo).
 
 ## 9. Progress
@@ -613,27 +614,116 @@ Everything above is now implemented in the same working tree:
   sharded builder, and the single-teacher path still refuses it.
 
 What the CPU suites can and cannot prove: the pool, merge, aggregation, refusal
-and dispatch behaviour are covered by 466 distillation tests, but the sharded
+and dispatch behaviour are covered by 481 distillation tests, but the sharded
 end-to-end path needs real environments. The first real exercise is the smoke
 below, on the 8-card host, which is also what validates env construction through
 the shared recipe, the transport's real cost, and a worker-produced checkpoint.
 
-Smoke command (2 workers, bounded):
+Smoke command (2 workers, bounded).  The 8-card host runs the team queue on
+GPUs 0-3, so this uses the free cards: `cuda:4` for the trainer and
+`cuda:5,cuda:6` for the two 4096-env shards.
 
 ```
 .venv/bin/distill train \
   --manifest configs/distillation/x2_tennis_mixed_v2.yaml \
   --teacher-ids "('tennis_000','tennis_001','tennis_002','tennis_003_ss','tennis_004_ss','tennis_005_ss','tennis_006_ss','tennis_007_ss')" \
-  --device cuda:0 --worker-devices "('cuda:1','cuda:2')" \
+  --device cuda:4 --worker-devices "('cuda:5','cuda:6')" \
   --num-envs 8192 --bootstrap-steps 8 --collection-steps 4 \
   --updates-per-iteration 1 --minibatch-size 1024 --accumulation-steps 2 \
-  --replay-capacity 16384 --phase-bins 10 --max-iterations 2 \
+  --replay-capacity 16384 --phase-bins 10 \
   --reset-policy standing-mixture --standing-start-fraction 0.25 \
   --standing-start-window-frames 25 --standing-start-frame-zero-fraction 0.5 \
-  --checkpoint-every 1 --progress-every 1 --seed 7 --output-dir <run dir>
+  --evaluate-every 1 --evaluation-steps 32 \
+  --max-iterations 2 --checkpoint-every 1 --progress-every 1 --seed 7 \
+  --output-dir <run dir>
 ```
 
-Deliberately small: its job is to prove that two worker processes build their
-environments through the shared recipe, that rows arrive and merge into one
-replay, that a checkpoint is written with the worker identity, and that a resume
-of it is accepted — not to produce a policy.
+The smoke is four bounded phases, because one invocation cannot show a resume.
+`--evaluate-every 1` is what exercises sharded evaluation, which the first draft
+of this command omitted entirely:
+
+1. two iterations with `--checkpoint-every 1`: two worker processes build their
+   environments through the shared recipe, rows cross the queue and merge into
+   one replay, sharded evaluation runs and merges, and a standing-mixture v3
+   checkpoint is written with the worker identity;
+2. resume that checkpoint with `--max-iterations 4`: a budget *extension* is the
+   only budget change a resume accepts, so this is a real continuation rather
+   than a no-op load;
+3. resume the same checkpoint with a different (but legal) worker list and expect
+   a refusal naming `runtime`, because the worker list is a resume invariant;
+4. `SIGTERM` a longer run mid-flight and confirm the pool is released with no
+   surviving workers.
+
+Deliberately small: its job is to prove those mechanisms, not to produce a
+policy.  What it must measure: per-GPU VRAM, seconds per iteration, the
+first-request latency against the pool's 900 s request deadline (workers build
+environments lazily on the first request, and the deadline is anchored at
+dispatch), and transport cost -- see 9.5 for why that last one is not yet
+instrumented.
+
+### 9.5 Review of steps 4 and 5, and the standing-checkpoint fix
+
+An independent review of `a572cf529` and `46f90a244` returned BLOCK. Every
+finding was reproduced before it was accepted, and the first was a genuine
+blocker for the intended recipe:
+
+- **A sharded standing run could not write a checkpoint at all.**
+  `save_cohort_checkpoint` obtains the reset RNG only from a live adapter
+  collector and refuses to proceed without it, while a sharded parent owns no
+  collector. With `--reset-policy standing-mixture` the first
+  `--checkpoint-every` save raised `enabled v3 cohort save requires a
+  multi-motion command reset RNG state`, and resume refused the symmetric case.
+  The smoke of 9.4 would have died at its first checkpoint.
+- **Only the observation schema was compared across shards.** The parent takes
+  the replay weights and frame counts, the motion routing and the whole cohort
+  identity from worker 0, so a shard that disagreed about the library, the
+  audited slots, the phase policy or the routing could still join the run.
+- **`merge_evaluations` accepted inconsistent standing profiles.** It validated
+  mode, rollout latent and steps, then read the standing flag and the trial
+  window from shard 0 alone, and never checked that the shards evaluated the
+  same iteration.
+- **Adapter close was not idempotent.** The signal handler closes the owner and
+  raises, and the surrounding `finally` closed it again; an exception raised by
+  that second close would have replaced the `SystemExit` carrying the operator's
+  exit status.
+
+**The reset-RNG fix derives the seed instead of storing a stream.** The command's
+reset generator decides standing-versus-reference per full-reset row, and the v3
+format stores one such stream while a sharded run has one per shard. Rather than
+extend the format with a per-shard stream -- or persist a single shared stream,
+which per-shard environment seeds make meaningless -- each shard now derives its
+reset RNG per collection call from `worker_generator_seed(base, iteration,
+worker_index)`, exactly the mechanism its rollout stream already uses. Iteration
+*k* is therefore reproducible on a resume with no per-shard state in the
+checkpoint, a shard's own environment seed never stands in for a shared record,
+and an evaluation or a bootstrap cannot shift what collection draws next. The
+checkpoint declares which contract it was written under, and the loader's exact
+RNG key-set comparison verifies that declaration against the payload rather than
+trusting it.
+
+Also fixed: cross-shard agreement on the whole cohort contract, with each
+environment seed checked against the stratum its index derives rather than
+compared for equality (the shards are the seed strata, so equality is the wrong
+test); agreement on standing profile, trial window and iteration in
+`merge_evaluations`; and one shared release action so both teardown paths close
+the owner exactly once.
+
+Test evidence: 481 distillation tests pass (14 new). The blocker is pinned by a
+CPU round-trip test that drives a sharded standing save and resume against a fake
+parent-side source; with the fix stashed, that test fails with exactly the
+historical message above, so it is a regression test rather than a description.
+The other additions cover the worker-side derivation and its ordering (the seed
+is derived *before* the collection whose resets it governs), the three
+evaluation-merge refusals, the cross-shard contract refusals, and single-close.
+
+Two process notes, because they cost real time: a read-only reviewer committed
+its own work-in-progress (it was reset, and the tree was verified clean against
+the expected HEAD and the unrelated documentation edits); and reading the
+repository while that run was live produced a wrong interim conclusion about
+which reset-RNG plumbing already existed. Neither changed the outcome, but a
+shared working tree is not readable while another agent can write to it.
+
+Known gap: the transport share of an iteration is still not instrumented, so the
+10%-of-iteration upgrade trigger of 3.4 cannot be measured by this smoke. Closing
+it needs a timing surface on `ShardedCollection.collect` and a line in the CLI
+progress report; no checkpoint format is involved.

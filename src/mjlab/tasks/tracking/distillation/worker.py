@@ -90,6 +90,32 @@ class WorkerError(RuntimeError):
   """A worker failed, timed out, or answered a request it should not have."""
 
 
+def derive_reset_rng(command: Any, seed: int) -> None:
+  """Re-seed one multi-motion command's standing-reset RNG from a call seed.
+
+  The derived state is a pure function of the call seed, so a resumed iteration
+  reproduces its standing-reset draws without any per-shard RNG state in the
+  checkpoint.  A command whose reset policy is disabled draws no decision from
+  this generator and is left at its construction seed, so a non-standing or
+  evaluation-only configuration is never force-seeded.
+
+  Raises:
+    WorkerError: if the policy is enabled but the command cannot accept a
+      derived state, because those resets would then be neither derived nor
+      recorded anywhere.
+  """
+  policy = getattr(command, "reset_policy", None)
+  if not getattr(policy, "enabled", False):
+    return
+  setter = getattr(command, "set_reset_rng_state", None)
+  if not callable(setter):
+    raise WorkerError(
+      "the motion command enables a reset policy but exposes no "
+      "set_reset_rng_state setter, so its standing resets cannot be derived"
+    )
+  setter(torch.Generator(device="cpu").manual_seed(int(seed)).get_state())
+
+
 class WorkerPoolError(RuntimeError):
   """The pool is unusable: a worker failed, so no reply can be trusted."""
 
@@ -448,12 +474,27 @@ class _Worker:
       description=describe_environment(self.adapter, self.spec),
     )
 
+  def seed_reset_rng(self, seed: int) -> None:
+    """Derive this shard's standing-reset RNG for one collection call.
+
+    The motion command owns a CPU generator that decides standing-versus-
+    reference for every full-reset row, seeded from this shard's environment
+    seed.  A shard re-derives it per call for the same reason its rollout stream
+    is derived per call: a resumed iteration reproduces the resets it draws
+    without per-shard RNG state in the checkpoint, and each shard's own
+    environment seed never stands in for a shared record.  Re-seeding per call
+    also means an evaluation or a bootstrap cannot shift what collection draws
+    next.
+    """
+    derive_reset_rng(self.adapter.env.command_manager.get_term("motion"), seed)
+
   def collect(self, request: CollectRequest) -> CollectReply:
     self.build()
     self.apply_weights(request.weights)
     generator_seed = worker_generator_seed(
       self.spec.setup.base_seed, request.iteration, self.spec.worker_index
     )
+    self.seed_reset_rng(generator_seed)
     result: CollectionResult = self.collector.collect(
       CollectionConfig(
         steps=request.steps,

@@ -15,11 +15,16 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
-from mjlab.tasks.tracking.distillation.cohort_setup import CohortSetup
+from mjlab.tasks.tracking.distillation.cohort_setup import (
+  CohortSetup,
+  worker_generator_seed,
+)
 from mjlab.tasks.tracking.distillation.observations import PackedObservationBatch
 from mjlab.tasks.tracking.distillation.reset_policy import make_reset_policy
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBatch
@@ -38,6 +43,8 @@ from mjlab.tasks.tracking.distillation.worker import (
   WorkerPoolError,
   WorkerSpec,
   _stage_batch,
+  _Worker,
+  derive_reset_rng,
   watch_parent,
   worker_specs,
 )
@@ -464,3 +471,122 @@ def test_parent_watchdog_exits_without_waiting_for_a_request() -> None:
     assert lost.wait(2.0), "the watcher did not notice reparenting"
   finally:
     stop()
+
+
+def _fake_command(*, enabled: bool, calls: list[str] | None = None) -> Any:
+  """A multi-motion command stand-in, recording when it is re-seeded."""
+
+  class _Command:
+    reset_policy = SimpleNamespace(enabled=enabled)
+
+    def __init__(self) -> None:
+      self.state: torch.Tensor | None = None
+
+    def set_reset_rng_state(self, state: torch.Tensor) -> None:
+      self.state = state.clone()
+      if calls is not None:
+        calls.append("seed")
+
+  return _Command()
+
+
+def test_derive_reset_rng_is_a_pure_function_of_the_seed() -> None:
+  """A derived reset stream is reproducible from the call that draws it.
+
+  That is the whole reason a sharded standing run needs no per-shard RNG state
+  in its checkpoint: iteration k derives the same resets on a resume as it drew
+  the first time.
+  """
+  first = _fake_command(enabled=True)
+  second = _fake_command(enabled=True)
+  derive_reset_rng(first, 1234)
+  derive_reset_rng(second, 1234)
+  expected = torch.Generator(device="cpu").manual_seed(1234).get_state()
+  assert first.state is not None
+  assert torch.equal(first.state, expected)
+  assert torch.equal(first.state, second.state)
+
+  derive_reset_rng(second, 1235)
+  assert not torch.equal(first.state, second.state)
+
+
+def test_derive_reset_rng_leaves_a_disabled_policy_at_its_construction_seed() -> None:
+  """A run that draws no standing decision is not force-seeded."""
+  calls: list[str] = []
+  command = _fake_command(enabled=False, calls=calls)
+  derive_reset_rng(command, 7)
+  assert calls == []
+  assert command.state is None
+
+
+def test_derive_reset_rng_refuses_an_enabled_policy_it_cannot_seed() -> None:
+  """Resets that are neither derived nor recorded must not run silently."""
+
+  class _Command:
+    reset_policy = SimpleNamespace(enabled=True)
+
+  with pytest.raises(WorkerError, match="set_reset_rng_state"):
+    derive_reset_rng(_Command(), 7)
+
+
+def test_worker_seeds_its_reset_rng_before_it_collects(tmp_path) -> None:
+  """The derivation happens before the call whose resets it governs.
+
+  Seeding after collection would be a silent no-op: the call would draw from
+  whatever stream the shard happened to hold, which no checkpoint records.
+  """
+  order: list[str] = []
+  command = _fake_command(enabled=True, calls=order)
+  adapter = SimpleNamespace(
+    env=SimpleNamespace(
+      command_manager=SimpleNamespace(get_term=lambda name: command),
+    )
+  )
+  batch = _batch(2, 0)
+
+  class _Collector:
+    def collect(self, config, *, reset: bool):
+      order.append("collect")
+      return SimpleNamespace(
+        ticks=1,
+        samples=2,
+        teacher_steps=1,
+        student_steps=1,
+        disagreement_mean=0.0,
+        diagnostics=(),
+        motion_stats=(),
+        boundaries=(),
+        eligible_resets={},
+        initialization_resets={},
+        fresh_data=SimpleNamespace(batch=batch),
+      )
+
+  spec = _specs(tmp_path, devices=("cpu",))[0]
+  worker = _Worker(spec)
+  worker._adapter = adapter
+  worker._collector = _Collector()
+  worker._student = SimpleNamespace(
+    load_state_dict=lambda state: None,
+    reference_normalizer=SimpleNamespace(freeze=lambda: None),
+    conditioning_normalizer=SimpleNamespace(freeze=lambda: None),
+  )
+
+  reply = worker.collect(
+    CollectRequest(
+      call_id=1,
+      iteration=3,
+      steps=1,
+      teacher_probability=0.0,
+      reset=True,
+      rollout_latent="mean",
+      weights={},
+    )
+  )
+
+  assert isinstance(reply, CollectReply)
+  assert order == ["seed", "collect"]
+  derived = worker_generator_seed(spec.setup.base_seed, 3, spec.worker_index)
+  assert command.state is not None
+  assert torch.equal(
+    command.state, torch.Generator(device="cpu").manual_seed(derived).get_state()
+  )

@@ -408,6 +408,19 @@ def merge_collection_replies(
   )
 
 
+def _evaluation_profile(result: EvaluationResult) -> tuple[bool, int]:
+  """The trial-accounting profile one shard's evaluation ran under.
+
+  A standing-trial run records its window in the result settings; that presence
+  is exactly the flag the single-process aggregation gated on.  A shard that
+  ran no standing trials reports no window, and its unused window field is
+  deliberately not compared.
+  """
+  if "trial_window_steps" not in result.settings:
+    return False, 0
+  return True, int(result.settings["trial_window_steps"])
+
+
 def merge_evaluations(replies: Sequence[EvaluateReply]) -> EvaluationResult:
   """Merge shard evaluations into one result by recomputing from segments.
 
@@ -421,37 +434,52 @@ def merge_evaluations(replies: Sequence[EvaluateReply]) -> EvaluationResult:
 
   Whether the profile is a standing-trial run is read from the shards'
   settings, because that is exactly the flag that gated the trial accounting
-  when each shard produced its own result.
+  when each shard produced its own result -- and every shard must report the
+  same profile, since a standing shard and a non-standing one do not describe
+  one evaluation however well their call arguments agree.
   """
   if not replies:
     raise ShardedCollectionError("a merged evaluation needs at least one shard")
-  first = replies[0].result
+  first = replies[0]
+  expected_call = (
+    first.iteration,
+    first.result.mode,
+    first.result.rollout_latent,
+    first.result.steps,
+  )
+  expected_profile = _evaluation_profile(first.result)
   for index, reply in enumerate(replies):
     result = reply.result
-    if (result.mode, result.rollout_latent, result.steps) != (
-      first.mode,
-      first.rollout_latent,
-      first.steps,
-    ):
+    call = (reply.iteration, result.mode, result.rollout_latent, result.steps)
+    if call != expected_call:
       raise ShardedCollectionError(
-        f"shard {index} evaluated mode={result.mode!r} "
+        f"shard {index} evaluated iteration={reply.iteration} mode={result.mode!r} "
         f"rollout_latent={result.rollout_latent!r} steps={result.steps} while "
-        f"shard 0 evaluated mode={first.mode!r} "
-        f"rollout_latent={first.rollout_latent!r} steps={first.steps}; their "
-        f"segments do not describe one evaluation"
+        f"shard 0 evaluated iteration={first.iteration} mode={first.result.mode!r} "
+        f"rollout_latent={first.result.rollout_latent!r} steps={first.result.steps}; "
+        "their segments do not describe one evaluation"
+      )
+    profile = _evaluation_profile(result)
+    if profile != expected_profile:
+      theirs = "a standing-trial" if profile[0] else "no standing-trial"
+      ours = "a standing-trial" if expected_profile[0] else "no standing-trial"
+      raise ShardedCollectionError(
+        f"shard {index} reported {theirs} profile with window {profile[1]} while "
+        f"shard 0 reported {ours} profile with window {expected_profile[1]}; "
+        "their trial accounting cannot be merged"
       )
   segments = tuple(
     replace(segment, worker_index=index)
     for index, reply in enumerate(replies)
     for segment in reply.result.segments
   )
-  standing = "trial_window_steps" in first.settings
+  standing, trial_window = expected_profile
   metrics = aggregate_evaluation_metrics(
     segments,
     standing_trials=standing,
-    trial_window_steps=int(first.settings.get("trial_window_steps", 25)),
+    trial_window_steps=trial_window,
   )
-  settings = dict(first.settings)
+  settings = dict(first.result.settings)
   settings["num_envs"] = sum(
     int(reply.result.settings.get("num_envs", 0)) for reply in replies
   )
@@ -460,13 +488,13 @@ def merge_evaluations(replies: Sequence[EvaluateReply]) -> EvaluationResult:
     "recomputed from every shard's segments, not averaged from shard results"
   )
   return EvaluationResult(
-    mode=first.mode,
-    rollout_latent=first.rollout_latent,
-    steps=first.steps,
+    mode=first.result.mode,
+    rollout_latent=first.result.rollout_latent,
+    steps=first.result.steps,
     segments=segments,
     metrics=metrics,
     settings=settings,
-    trial_window_steps=first.trial_window_steps,
+    trial_window_steps=first.result.trial_window_steps,
   )
 
 
