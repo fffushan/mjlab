@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -1141,6 +1142,7 @@ def export_cohort_bundle(
       },
     }
     descriptor_members: list[dict[str, Any]] = []
+    member_parity: list[dict[str, Any]] = []
     for member, contract_id in zip(members, member_contract_ids, strict=True):
       teacher_id = member["teacher_id"]
       parity = validate_export_parity(
@@ -1160,6 +1162,16 @@ def export_cohort_bundle(
       )
       parity_path = staging / teacher_id / "parity.json"
       parity_path.write_text(json.dumps(parity, indent=2, sort_keys=True) + "\n")
+      member_parity.append(
+        {
+          "teacher_id": teacher_id,
+          "contract_id": contract_id,
+          "latent_max_abs_error": parity["latent_max_abs_error"],
+          "action_max_abs_error": parity["action_max_abs_error"],
+          "atol": 1e-5,
+          "rtol": 1e-5,
+        }
+      )
       descriptor_members.append(
         {
           "teacher_id": teacher_id,
@@ -1211,11 +1223,20 @@ def export_cohort_bundle(
         }
         for member, entry in zip(members, descriptor_members, strict=True)
       ],
-      "parity": "pending",
+      "parity": {
+        "verified": True,
+        "atol": 1e-5,
+        "rtol": 1e-5,
+        "members": member_parity,
+      },
     }
     os.replace(staging, final)
 
-  # The store-level descriptor points into the bundle directory.
+  # Publish the store-level descriptor: written to a temporary sibling and
+  # atomically renamed, so no partial descriptor is ever visible at the store
+  # level. If that publication fails, the just-published bundle directory is
+  # removed again: a retry can start from a clean output directory instead of
+  # being refused by half-published remains.
   root_descriptor = {
     **descriptor,
     "files": {name: _prefixed(item) for name, item in descriptor_files.items()},
@@ -1227,9 +1248,16 @@ def export_cohort_bundle(
       for member in descriptor_members
     ],
   }
-  descriptor_root.write_text(
-    json.dumps(root_descriptor, indent=2, sort_keys=True) + "\n"
-  )
+  descriptor_temp = directory / f".{bundle_name}.descriptor.tmp"
+  try:
+    descriptor_temp.write_text(
+      json.dumps(root_descriptor, indent=2, sort_keys=True) + "\n"
+    )
+    os.replace(descriptor_temp, descriptor_root)
+  except BaseException:
+    descriptor_temp.unlink(missing_ok=True)
+    shutil.rmtree(final, ignore_errors=True)
+    raise
   return CohortExportResult(
     descriptor=descriptor_root,
     encoder=final / "shared" / "encoder.onnx",

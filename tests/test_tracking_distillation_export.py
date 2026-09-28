@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -642,6 +643,44 @@ def test_cohort_export_emits_v3_bundle_with_shared_graphs_and_member_triples(
       path = result.descriptor.parent / item["path"]
       assert hashlib.sha256(path.read_bytes()).hexdigest() == item["sha256"]
 
+  # The contained bundle.json copy keeps bundle-relative paths (the v2 bundle
+  # convention) and the same identities; the store-level descriptor is the only
+  # place those paths are prefixed with the bundle directory.
+  contained = json.loads((bundle_dir / "bundle.json").read_text())
+  assert contained["version"] == 3
+  assert contained["policy_id"] == descriptor["policy_id"]
+  assert contained["model_id"] == descriptor["model_id"]
+  assert contained["contract_id"] == descriptor["contract_id"]
+  assert set(contained["files"]) == {"encoder.onnx", "decoder.onnx"}
+  for name, item in contained["files"].items():
+    assert item["path"] == f"shared/{name}"
+    assert "vae-tiny-cohort" not in item["path"]
+    assert (
+      hashlib.sha256((bundle_dir / item["path"]).read_bytes()).hexdigest()
+      == item["sha256"]
+    )
+  assert [m["teacher_id"] for m in contained["members"]] == list(COHORT_TEACHER_IDS)
+  for member in contained["members"]:
+    assert member["contract_id"] == next(
+      item["contract_id"]
+      for item in descriptor["members"]
+      if item["teacher_id"] == member["teacher_id"]
+    )
+    for name, item in member["files"].items():
+      assert item["path"] == f"{member['teacher_id']}/{name}"
+      assert "vae-tiny-cohort" not in item["path"]
+      assert (
+        hashlib.sha256((bundle_dir / item["path"]).read_bytes()).hexdigest()
+        == item["sha256"]
+      )
+  # The store descriptor prefixes exactly the contained paths.
+  assert (
+    descriptor["files"]["encoder.onnx"]["path"] == "vae-tiny-cohort/shared/encoder.onnx"
+  )
+  assert descriptor["members"][0]["files"]["motion.json"]["path"] == (
+    f"vae-tiny-cohort/{COHORT_TEACHER_IDS[0]}/motion.json"
+  )
+
   # Shared graphs are stamped with the cohort identity only.
   for graph_name in ("encoder.onnx", "decoder.onnx"):
     proto = onnx.load(bundle_dir / "shared" / graph_name)
@@ -691,6 +730,17 @@ def test_cohort_export_emits_v3_bundle_with_shared_graphs_and_member_triples(
   assert result.report["member_contract_ids"] == [
     declared[teacher_id] for teacher_id in COHORT_TEACHER_IDS
   ]
+  # The report must state the parity that actually ran, per member, not a
+  # placeholder: every member's fixture is measured and its error is reported.
+  parity_report = result.report["parity"]
+  assert parity_report["verified"] is True
+  assert [item["teacher_id"] for item in parity_report["members"]] == list(
+    COHORT_TEACHER_IDS
+  )
+  for item in parity_report["members"]:
+    assert item["latent_max_abs_error"] <= 1e-5
+    assert item["action_max_abs_error"] <= 1e-5
+    assert item["contract_id"] == declared[item["teacher_id"]]
 
 
 def test_cohort_export_refuses_missing_or_extra_audits(tmp_path: Path) -> None:
@@ -831,3 +881,35 @@ def test_cli_export_dispatches_cohort_checkpoint_to_the_cohort_seam(
   )
   assert rc == 1
   assert "--asset-audit" in capsys.readouterr().err
+
+
+def test_cohort_export_rolls_back_a_failed_descriptor_publication(
+  tmp_path: Path, monkeypatch
+) -> None:
+  """A failure after the bundle is renamed must not strand or block the output."""
+  resolved, _, _, checkpoint, audits = _cohort_fixture(tmp_path)
+  out = tmp_path / "out"
+  real_replace = os.replace
+
+  def failing_replace(src, dst):
+    if str(dst).endswith("vae-tiny-cohort.yaml"):
+      raise OSError("injected descriptor publication failure")
+    return real_replace(src, dst)
+
+  monkeypatch.setattr(export_module.os, "replace", failing_replace)
+  with pytest.raises(OSError, match="injected descriptor publication failure"):
+    export_cohort_bundle(
+      checkpoint, resolved, out, repo_root=tmp_path, asset_audits=audits
+    )
+  # The half-published bundle is removed, so nothing is left behind that a
+  # retry would be refused by.
+  assert not (out / "vae-tiny-cohort").exists()
+  assert not (out / "vae-tiny-cohort.yaml").exists()
+  assert not list(out.glob(".*descriptor.tmp"))
+
+  monkeypatch.setattr(export_module.os, "replace", real_replace)
+  result = export_cohort_bundle(
+    checkpoint, resolved, out, repo_root=tmp_path, asset_audits=audits
+  )
+  assert result.descriptor.is_file()
+  assert (out / "vae-tiny-cohort").is_dir()

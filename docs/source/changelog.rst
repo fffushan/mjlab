@@ -40,10 +40,21 @@ Added
   Student-only ``standing-start`` and ``standing-window`` evaluation profiles
   retain explicit censoring and completed-or-failed denominators. Enabled runs
   use version-3 cohort checkpoints; version-2 reference-only runs remain
-  unchanged, cannot be resumed with standing enabled, and version-2/version-3
-  cohort export remains unsupported. This work is simulation-only and makes no
-  policy-quality, sim2sim, or hardware claim. See
+  unchanged and cannot be resumed with standing enabled. This work is
+  simulation-only and makes no policy-quality, sim2sim, or hardware claim. See
   ``docs/source/x2_tennis_distillation.rst``.
+
+- Added version-3 cohort export. ``distill export --asset-audits`` exports a
+  saved version-2/3 M4 cohort checkpoint as one shared student graph pair
+  stamped with the cohort identity plus one ``{contract, motion, parity}``
+  triple per manifest member in manifest order (the order the deployed
+  controller plays them in). Each member is audited by the existing
+  ``make_export_audit`` producer against a pinned single-teacher environment of
+  that member; audits that describe different compiled robots are refused, and
+  a cohort checkpoint with the singular ``--asset-audit`` is refused rather
+  than silently reduced to one teacher. Member contracts stay version-2 shaped
+  so the C++ deployment parser is unchanged. See
+  ``docs/source/x2_vae_export_contract.rst``.
 
 - Added the M4 shared multi-teacher distillation cohort. ``distill train
   --teacher-ids "('tennis_000','tennis_001')"`` trains **one shared conditional
