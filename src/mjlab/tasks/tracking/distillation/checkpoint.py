@@ -919,6 +919,14 @@ def save_cohort_checkpoint(
     raise CheckpointValidationError(
       "a derived reset RNG belongs to a standing run; reset_provenance is missing"
     )
+  if reset_rng_derived and collector is not None:
+    # The declaration is not a free choice: a live collector owns a persistent
+    # reset stream, so claiming derivation while holding one would store a
+    # checkpoint whose resets nothing reproduces.
+    raise CheckpointValidationError(
+      "a live collector owns its reset stream; reset_rng_derived describes a run "
+      "whose shards derive their resets per collection call"
+    )
   reset_rng_state = (
     None
     if reset_rng_derived or reset_provenance is None

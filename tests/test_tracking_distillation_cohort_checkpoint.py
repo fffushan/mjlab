@@ -43,7 +43,10 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
   cohort_identity_from_adapter,
   require_same_cohort,
 )
-from mjlab.tasks.tracking.distillation.collector import DAggerCollector
+from mjlab.tasks.tracking.distillation.collector import (
+  CollectionResult,
+  DAggerCollector,
+)
 from mjlab.tasks.tracking.distillation.config import (
   ActorArchitecture,
   CohortContract,
@@ -1683,6 +1686,19 @@ class FakeShardedSource:
     self.reset_provenance = provenance if policy_enabled else None
     self.invalidated = 0
     self.closed = False
+    self.collections: list[tuple[int, int, bool]] = []
+
+  def collect(self, config: Any, *, reset: bool) -> CollectionResult:
+    """Record the call without workers, so a lifecycle can be driven on CPU."""
+    self.collections.append((config.collector_iteration, config.seed, reset))
+    return CollectionResult(
+      ticks=1,
+      samples=2,
+      teacher_steps=1,
+      student_steps=1,
+      boundaries=(),
+      disagreement_mean=0.0,
+    )
 
   def invalidate_snapshot(self, *, requires_reset: bool = True) -> None:
     self.invalidated += 1
@@ -1697,7 +1713,7 @@ def make_sharded_runner(
   body_selection: BodySelection,
   schema: Any,
   provenance: ResetProvenance,
-) -> tuple[DistillationRunner, Any]:
+) -> tuple[DistillationRunner, Any, FakeShardedSource]:
   trainer, identity, _adapter, _collector = make_v3_trainer(
     schema, plan, body_selection, real_cohort
   )
@@ -1708,7 +1724,7 @@ def make_sharded_runner(
     RunnerConfig(max_iterations=2, seed=5),
     sharded=source,
   )
-  return runner, identity
+  return runner, identity, source
 
 
 def test_sharded_standing_cohort_checkpoint_derives_its_reset_state(
@@ -1728,7 +1744,7 @@ def test_sharded_standing_cohort_checkpoint_derives_its_reset_state(
   not merely untested.
   """
   provenance = make_reset_provenance(plan)
-  runner, identity = make_sharded_runner(
+  runner, identity, _source = make_sharded_runner(
     real_cohort, plan, body_selection, schema, provenance
   )
   # A resumed run must continue the stored iteration counter, because every
@@ -1746,7 +1762,7 @@ def test_sharded_standing_cohort_checkpoint_derives_its_reset_state(
   # call, so there is no stream to store and nothing for a resume to install.
   assert set(payload["rng"]) == {"global_cpu", "trainer"}
 
-  restored, restored_identity = make_sharded_runner(
+  restored, restored_identity, _restored_source = make_sharded_runner(
     real_cohort, plan, body_selection, schema, provenance
   )
   state = restored.resume_cohort(str(path), restored_identity)
@@ -1769,13 +1785,13 @@ def test_sharded_declaration_is_checked_against_the_stored_rng_set(
   state.
   """
   provenance = make_reset_provenance(plan)
-  runner, identity = make_sharded_runner(
+  runner, identity, _source = make_sharded_runner(
     real_cohort, plan, body_selection, schema, provenance
   )
   path = tmp_path / "sharded-standing-v3.pt"
   runner.save_cohort(str(path), identity)
 
-  restored, restored_identity = make_sharded_runner(
+  restored, restored_identity, _restored_source = make_sharded_runner(
     real_cohort, plan, body_selection, schema, provenance
   )
   with pytest.raises(CheckpointValidationError, match="RNG streams"):
@@ -1824,3 +1840,76 @@ def test_cohort_save_refuses_an_undeclared_derived_reset_rng(
       collector=None,
       reset_rng_derived=True,
     )
+
+
+def test_a_resumed_sharded_run_hands_the_stored_iteration_to_its_source(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """The restored counter must reach the collection call, not just the record.
+
+  Every derived seed -- standing resets, the rollout generator and the
+  process-global RNG -- is a function of (base seed, iteration, worker), so a
+  resume that restored the counter but collected at zero would reproduce the
+  wrong randomness while every checkpoint field still looked right.  This is the
+  lifecycle the CPU suites otherwise leave untested: a real saved counter, a
+  resume, and the call the runner then makes.
+  """
+  provenance = make_reset_provenance(plan)
+  runner, identity, _source = make_sharded_runner(
+    real_cohort, plan, body_selection, schema, provenance
+  )
+  runner.iteration = 1
+  path = tmp_path / "sharded-resumed-lifecycle.pt"
+  runner.save_cohort(str(path), identity)
+
+  restored, restored_identity, source = make_sharded_runner(
+    real_cohort, plan, body_selection, schema, provenance
+  )
+  restored.resume_cohort(str(path), restored_identity)
+  assert restored.iteration == 1
+
+  restored.run_iteration()
+
+  assert source.collections, "the resumed run never collected"
+  iteration, seed, reset = source.collections[0]
+  assert iteration == 1
+  # The runner derives its per-iteration seed from the restored counter, and a
+  # resumed run always resets the simulator before its first collection.
+  assert seed == restored.config.seed + 1
+  assert reset is True
+
+
+def test_cohort_save_refuses_a_derived_declaration_with_a_live_collector(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """A declaration is checked against the live components it contradicts.
+
+  The exact RNG key-set check already refuses a payload whose streams disagree
+  with the declaration.  A live collector owns a persistent reset stream, so
+  claiming derivation *while holding one* would store a checkpoint whose resets
+  nothing reproduces -- refused at the save, before any file exists.
+  """
+  provenance = make_reset_provenance(plan)
+  trainer, identity, _adapter, collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  path = tmp_path / "contradictory.pt"
+  with pytest.raises(CheckpointValidationError, match="live collector owns"):
+    save_cohort_checkpoint(
+      path,
+      trainer,
+      trainer.replay,
+      cohort=identity,
+      reset_provenance=provenance,
+      collector=collector,
+      reset_rng_derived=True,
+    )
+  assert not path.exists()

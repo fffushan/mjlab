@@ -937,6 +937,7 @@ def _build_cohort_runner(
   evaluation_steps: int,
   rollout_latent: RolloutLatent,
   reset_policy: ResetPolicy,
+  owner: _RunOwner | None = None,
 ):
   """Build the M4 shared-student cohort run: one adapter, bank, and replay.
 
@@ -980,6 +981,10 @@ def _build_cohort_runner(
   # builds the environment this path builds; worker index 0 is the
   # single-process derivation and leaves the requested seed unchanged.
   adapter = setup.build_adapter(device=device, num_envs=num_envs)
+  if owner is not None:
+    # Hand the owner over *as soon as it exists*: everything below can fail, and
+    # the caller's signal teardown then has something to release.
+    owner.take(adapter)
   try:
     # Model initialization only: environment startup randomization is seeded
     # inside the adapter factory above, before the private env config is
@@ -1011,8 +1016,12 @@ def _build_cohort_runner(
     runner = DistillationRunner(collector, trainer, runner_config)
   except BaseException:
     # The caller never received a runner, so this is the only chance to release
-    # the environment the adapter already built.
-    adapter.close()
+    # the environment the adapter already built -- through the slot when it holds
+    # the adapter, so nothing is closed twice.
+    if owner is not None and owner.is_holding():
+      owner.release()
+    else:
+      adapter.close()
     raise
   sampling_mode = adapter.env.command_manager.get_term("motion").cfg.sampling_mode
   return runner, adapter, identity, sampling_mode, _seed_audit(adapter)
@@ -1041,6 +1050,7 @@ def _build_sharded_cohort_runner(
   evaluate_every: int,
   evaluation_steps: int,
   rollout_latent: RolloutLatent,
+  owner: _RunOwner | None = None,
 ):
   """Build the sharded M4 cohort run: N worker environments, one parent replay.
 
@@ -1113,10 +1123,19 @@ def _build_sharded_cohort_runner(
     source = ShardedCollection(
       pool, replay=replay, model=model, descriptions=descriptions
     )
+    if owner is not None:
+      # Hand the owner over *before* returning: a signal in the caller's
+      # unpacking window would otherwise find an empty slot and leave the pool
+      # to its watchdog instead of closing it.
+      owner.take(source)
     runner = DistillationRunner(None, trainer, runner_config, sharded=source)
   except BaseException:
-    # The caller never received a source, so releasing the pool is ours to do.
-    if source is not None:
+    # The caller never received a source, so releasing the pool is ours to do --
+    # through the slot when it already holds the source, so no object is closed
+    # twice.
+    if owner is not None and owner.is_holding():
+      owner.release()
+    elif source is not None:
       source.close()
     else:
       pool.close()
@@ -1304,33 +1323,37 @@ def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
   }
 
 
-def _release(owner) -> Callable[[], None]:
-  """Return a callable that releases the run's owner, at most once.
+class _RunOwner:
+  """Holds whatever releases a run, so teardown can run from anywhere.
 
-  The single-process layout owns one adapter; the sharded layout owns a pool of
-  worker processes.  Both are released by ``close``, so callers that must clean
-  up on failure or on a signal do not branch on which layout is running.
-
-  Releasing twice must be impossible rather than merely unexpected: a signal
-  handler releases the owner before raising, and the surrounding ``finally``
-  releases it again, so a second ``close`` would run against a live environment.
-  An exception raised there would also replace the ``SystemExit`` that carries
-  the operator's exit status, turning a clean stop into an opaque failure.  The
-  returned action is therefore built once and shared by both sites.
+  A sharded build starts worker processes long before it returns, and a signal
+  can arrive at any point in between, so the owner is handed here as soon as it
+  exists rather than when the build finishes.  A successful release clears the
+  slot, which is what keeps two teardown paths from closing a live environment
+  twice; a release that raises keeps it, so the cleanup that follows can retry
+  once instead of abandoning a pool to its own watchdog.
   """
-  close = getattr(owner, "close", None)
-  if not callable(close):
-    return lambda: None
-  released = False
 
-  def release() -> None:
-    nonlocal released
-    if released:
+  def __init__(self) -> None:
+    self._owner: Any = None
+
+  def take(self, owner: Any) -> None:
+    """Record the object whose close releases the run."""
+    self._owner = owner
+
+  def is_holding(self) -> bool:
+    """Whether an owner is recorded and not yet released."""
+    return self._owner is not None
+
+  def release(self) -> None:
+    """Close the recorded owner, at most once per successful close."""
+    owner = self._owner
+    if owner is None:
       return
-    released = True
-    close()
-
-  return release
+    close = getattr(owner, "close", None)
+    if callable(close):
+      close()
+    self._owner = None
 
 
 def _install_signal_teardown(teardown) -> Callable[[], None]:
@@ -1339,7 +1362,7 @@ def _install_signal_teardown(teardown) -> Callable[[], None]:
   Separated from the context manager because a run's owner appears part-way
   through building it: a sharded build starts worker processes before it
   returns, so the handlers must be installed *before* the owner exists and the
-  teardown must read it from a holder.  Installing the handlers only around the
+  teardown must read it from the slot.  Installing the handlers only around the
   drive loop would leave a signal during construction with the process's prior
   disposition, which for the default disposition means exiting without closing
   the pool.
@@ -1440,6 +1463,7 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
     ("library body selection", lambda item: item.library.body_selection),
     ("library source body count", lambda item: item.library.source_body_count),
     ("audited contract", audited_contract),
+    ("live reset provenance", lambda item: item.reset_provenance),
     ("motion teacher codes", lambda item: item.motion_teacher_codes),
     ("sampling mode", lambda item: item.sampling_mode),
     ("reset policy enablement", lambda item: item.reset_policy_enabled),
@@ -1451,14 +1475,22 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
           f"worker {index} reported a different {name} than worker 0; the "
           "shards do not describe one cohort contract"
         )
-    expected_seed = worker_env_seed(setup.base_seed, index)
-    recorded = getattr(description.audit.seed_provenance, "effective_seed", None)
-    if recorded is not None and recorded != expected_seed:
-      raise DistillationError(
-        f"worker {index} built its environment on seed {recorded} instead of "
-        f"the seed {expected_seed} its shard index derives; the shards are not "
-        "the strata this run's identity and resume describe"
-      )
+    provenance = description.audit.seed_provenance
+    if provenance is not None:
+      expected_seed = worker_env_seed(setup.base_seed, index)
+      recorded = provenance.effective_seed
+      if recorded != expected_seed or provenance.requested_seed != expected_seed:
+        raise DistillationError(
+          f"worker {index} built its environment on seed {recorded} "
+          f"(requested {provenance.requested_seed}) instead of the seed "
+          f"{expected_seed} its shard index derives; the shards are not the "
+          "strata this run's identity and resume describe"
+        )
+      if not provenance.applied_before_construction:
+        raise DistillationError(
+          f"worker {index} did not apply its seed before construction, so its "
+          "startup randomization is not the one this run's seed record describes"
+        )
   return primary
 
 
@@ -1783,17 +1815,14 @@ def _train_cohort(
   # the owner exists and reads it from this holder, so a signal during
   # construction still releases the pool and a signal during the drive loop is
   # unchanged.  The holder is emptied *before* closing, so both teardown paths
-  # together close the owner at most once; a close that raises is reported and
-  # not retried, because calling into a half-closed environment twice is worse
-  # than leaving the first failure as the record.
-  owned: list[Any] = []
-
-  def release_owned() -> None:
-    if owned:
-      owner, owned[:] = owned[0], []
-      _release(owner)()
-
-  restore_signals = _install_signal_teardown(release_owned)
+  # The run's owner appears part-way through this function: a sharded build
+  # starts worker processes before it returns.  Teardown is therefore installed
+  # before the owner exists, and each builder hands its owner to this slot as
+  # soon as it exists, so a signal during construction releases it too.  A
+  # successful release clears the slot -- no second close of a live environment --
+  # while a release that raises keeps it, so the cleanup below can retry once.
+  owner = _RunOwner()
+  restore_signals = _install_signal_teardown(owner.release)
   try:
     _require_train_settings(report_boundaries, checkpoint_every, progress_every)
     if resume is not None and not _is_cohort_checkpoint(resume):
@@ -1835,6 +1864,7 @@ def _train_cohort(
         evaluate_every=evaluate_every,
         evaluation_steps=evaluation_steps,
         rollout_latent=rollout_latent,
+        owner=owner,
       )
       # The workers built their environments from exactly this policy, and
       # their live audit is what the cohort identity records.
@@ -1863,6 +1893,7 @@ def _train_cohort(
         evaluation_steps=evaluation_steps,
         rollout_latent=rollout_latent,
         reset_policy=reset_policy,
+        owner=owner,
       )
       reset_policy_dict = getattr(
         primary_build[1].env.command_manager.get_term("motion"),
@@ -1870,7 +1901,6 @@ def _train_cohort(
         ResetPolicy(),
       ).as_dict()
     runner, primary, identity, evaluation_sampling_mode, seed_audit = primary_build
-    owned.append(primary)
     _require_requested_seed_applied(seed, seed_audit)
     assert isinstance(runner.replay, BalancedReplayBuffer)
     resolved_config = _cohort_resolved_config(
@@ -1914,7 +1944,7 @@ def _train_cohort(
     # Teardown is already installed from before the owner existed; this nested
     # context keeps the drive loop covered by the same shared action and restores
     # the earlier handlers when it exits.
-    with _teardown_on_signal(release_owned):
+    with _teardown_on_signal(owner.release):
       iteration_reports, checkpoints = _drive_lifecycle(
         runner,
         max_iterations=max_iterations,
@@ -1979,8 +2009,15 @@ def _train_cohort(
     print(f"[FAIL] {exc}", file=sys.stderr)
     return 1
   finally:
-    release_owned()
-    restore_signals()
+    # Report a failed release rather than letting it replace whatever is already
+    # propagating (a signal's SystemExit, or the original error), and always
+    # restore the handlers even when the release itself failed.
+    try:
+      owner.release()
+    except BaseException as exc:  # noqa: BLE001 - reported, never swallowed
+      print(f"[FAIL] releasing the run failed: {exc}", file=sys.stderr)
+    finally:
+      restore_signals()
 
 
 def _train(

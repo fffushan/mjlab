@@ -595,11 +595,13 @@ two further lifecycle gaps were found and are now fixed:
   a configurable teardown grace so a caller that must stop promptly (an
   operator's signal handler in step 5) is not held by a hung worker.
 
-Remaining before the CLI is runnable, unchanged from §9.2 and confirmed by both
-reviewers: parent-side environmentless construction, parent-side
-`SIGINT`/`SIGTERM` teardown, sharded evaluation, and a real worker-produced
-save/resume round trip. "Steps 2 and 3 are implemented" is not a claim that the
-multi-worker CLI runs yet; it still refuses every explicit worker list.
+Steps 4 and 5 are implemented: the CLI accepts an explicit worker list, builds
+the parent without an environment, evaluates across shards, and tears the pool
+down on `SIGINT`/`SIGTERM`. What has never run is a real worker: the sharded
+end-to-end path needs devices, so every statement here is about the CPU suites
+and the first real exercise is the smoke in 9.4. A real worker-produced
+checkpoint still does not exist, and the transport share of an iteration is
+still uninstrumented (9.7).
 
 ### 9.4 Steps 4 and 5 landed
 
@@ -778,3 +780,62 @@ straight into that call, but no CPU test drives the sharded collection source
 through a full resumed iteration. 486 distillation tests cover the rest: the
 acquisition-window teardown, a teardown that raises, a close that raises, the
 extended contract fields, and the evaluation derivation.
+
+### 9.7 Closure review of both rounds, and the last gaps it found
+
+A third review pass judged every finding of both earlier rounds against the code.
+Its verdicts, which an independent verifier reproduced:
+
+- **Fixed and verified:** the standing-checkpoint blocker; the cross-shard
+  audited-contract comparison; the evaluation-merge refusals; single-close and
+  the preserved exit status; the smoke's evaluation and resume phases; the
+  checkpoint declaration being checked against the stored payload rather than
+  trusted (both subversion attempts are refused with `checkpoint RNG streams do
+  not match live components`).
+- **Still open, now fixed here:** the window between a builder returning its
+  owner and the caller recording it; a close that raised being permanently
+  spent; `reset_provenance` and the requested/effective seed being consumed from
+  worker 0 without comparison; the low-level `reset_rng_derived` declaration
+  being trusted even when a live collector contradicted it; and — the verifier's
+  most valuable find — **worker process-global RNG**, which the environment's own
+  sampling uses (`_uniform_sampling`'s `torch.rand`, the inherited command's
+  `torch.randint`) and which was seeded only at construction and never
+  checkpointed. A resumed sharded iteration would therefore have drawn different
+  environment randomness while every counter still looked right.
+
+What changed: `_RunOwner` replaces the ad-hoc holder — each builder takes the
+owner as soon as it exists, a successful release clears the slot, and a release
+that raises keeps it so the cleanup retries once inside a `try/finally` that
+always restores the signal handlers; workers derive the process-global RNG from
+the same per-call seed as everything else, so the *whole* call is reproducible
+and not just the streams the collector and the command own; the live
+`reset_provenance` record and both seed fields are compared across shards (the
+reset record is wholly shard-independent: policy, per-clip windows, robot
+defaults, DR ranges, no seeds or row counts, so equality is the right test);
+`reset_rng_derived` alongside a live collector is refused at the save.
+
+The evaluation stream's provenance is stated as a bound rather than a slogan: two
+additive formulas can always be made to meet for *some* container, so the claim
+is that they do not meet inside any run this project configures — up to the CLI's
+eight shards and iterations below `EVALUATION_SEED_STRIDE` — and
+`test_collection_and_evaluation_seeds_stay_disjoint` scans that domain instead of
+asserting it.
+
+The suite is at 490 distillation tests, four more than 9.6 recorded; the
+recurring test gap is closed too: a resumed sharded run is now driven through
+a real iteration against a fake parent-side source, and the test asserts that the
+restored counter reaches the collection call (with the runner's own per-iteration
+seed and the resumed reset), which is what the earlier checkpoint-only test could
+not show.
+
+Remaining and honest:
+
+- No CPU test constructs a real environment in a spawned worker, stages a real
+  batch over the queue, or evaluates real shards; the smoke is the first
+  exercise of all three.
+- The transport share of an iteration is still uninstrumented, so 3.4's 10%
+  upgrade trigger cannot be measured by the smoke. The tiny fix is a timing
+  surface on `ShardedCollection.collect` plus a progress line; no format change.
+- `merge_evaluations` still copies a shard's informational settings from shard 0
+  after validating the call and the standing profile; the fields that decide a
+  metric are validated.

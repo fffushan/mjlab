@@ -16,6 +16,7 @@ from mjlab.tasks.tracking.distillation.cohort_setup import (
   GENERATOR_SEED_STRIDE,
   CohortSetup,
   worker_env_seed,
+  worker_evaluation_seed,
   worker_generator_seed,
 )
 from mjlab.tasks.tracking.distillation.reset_policy import make_reset_policy
@@ -106,3 +107,31 @@ def test_build_adapter_derives_the_environment_seed_from_the_worker_index(
   assert recorded[0]["phase_policy"] == "uniform"
   # The reset policy the parent resolved is the one every worker applies.
   assert recorded[0]["reset_policy"] == setup.reset_policy
+
+
+def test_collection_and_evaluation_seeds_stay_disjoint() -> None:
+  """The two derived streams must not meet inside any configured run.
+
+  Evaluation draws its own standing/reference decisions, so a seed that also
+  appears in the collection stream would let an evaluation replay the resets the
+  collection of another iteration had already made.  Both formulas are additive,
+  so a container can always be built that makes them meet; what matters is that
+  no run this project configures reaches one, and that is what this scans rather
+  than asserting.
+  """
+  from mjlab.scripts.distill import _MAX_WORKERS
+
+  collection = {
+    worker_generator_seed(7, iteration, worker)
+    for iteration in range(10_001)  # the plan's iteration budget
+    for worker in range(_MAX_WORKERS)
+  }
+  evaluation = {
+    worker_evaluation_seed(7, iteration, worker)
+    for iteration in range(10_001)
+    for worker in range(_MAX_WORKERS)
+  }
+
+  assert not (collection & evaluation), (
+    "collection and evaluation seeds overlap inside the configured domain"
+  )

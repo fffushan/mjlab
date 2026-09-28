@@ -77,8 +77,13 @@ def worker_evaluation_seed(base_seed: int, iteration: int, worker_index: int) ->
   the decisions the collection of the same iteration already made: a run whose
   evaluation reused the collection stream would score the policy on the very
   resets it had just been trained against.  The offset keeps both streams
-  reproducible from (base seed, iteration, worker) while making them disjoint
-  for every iteration a run can reach.
+  reproducible from (base seed, iteration, worker) and disjoint for any run this
+  project configures -- up to the CLI's ``_MAX_WORKERS`` shards and iterations
+  below
+  ``EVALUATION_SEED_STRIDE``, which is 100x the planned budget.  The bounds are
+  not implicit: ``test_collection_and_evaluation_seeds_stay_disjoint`` scans the
+  reachable domain, because a container can otherwise always be built that makes
+  two additive formulas meet.
   """
   return (
     base_seed

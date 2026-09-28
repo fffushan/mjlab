@@ -496,6 +496,13 @@ class _Worker:
       self.spec.setup.base_seed, request.iteration, self.spec.worker_index
     )
     self.seed_reset_rng(generator_seed)
+    # The environment's own sampling -- reference resampling, and the inherited
+    # command's integer draws -- uses the process-global torch RNG, which a
+    # worker would otherwise carry across calls and could never record in a
+    # sharded checkpoint.  Deriving it from the same call seed is what makes the
+    # *whole* call reproducible after a resume rather than only the streams the
+    # collector and the command own.
+    torch.manual_seed(generator_seed)
     result: CollectionResult = self.collector.collect(
       CollectionConfig(
         steps=request.steps,
@@ -544,6 +551,13 @@ class _Worker:
     # collection of the same iteration, so a policy is never scored on the resets
     # it was just trained against.
     self.seed_reset_rng(
+      worker_evaluation_seed(
+        self.spec.setup.base_seed, request.iteration, self.spec.worker_index
+      )
+    )
+    # Evaluation resets resample references through the same process-global RNG,
+    # so it is derived for this call as well.
+    torch.manual_seed(
       worker_evaluation_seed(
         self.spec.setup.base_seed, request.iteration, self.spec.worker_index
       )

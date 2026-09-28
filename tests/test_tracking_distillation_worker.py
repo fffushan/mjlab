@@ -650,3 +650,75 @@ def test_worker_derives_its_reset_rng_before_it_evaluates(
   assert torch.equal(
     command.state, torch.Generator(device="cpu").manual_seed(derived).get_state()
   )
+
+
+def test_worker_derives_the_process_global_rng_for_each_call(tmp_path) -> None:
+  """The environment's own sampling must be derived too, not carried.
+
+  Reference resampling and the inherited command's integer draws use the
+  process-global torch RNG.  A worker that reseeded only the streams it owns
+  would carry that generator across calls, and a sharded checkpoint records no
+  per-worker global state, so a resumed iteration would draw different
+  environment randomness while every counter still looked right.
+  """
+  draws: list[float] = []
+
+  class _Collector:
+    def collect(self, config, *, reset: bool):
+      draws.append(float(torch.rand(1)))
+      return SimpleNamespace(
+        ticks=1,
+        samples=2,
+        teacher_steps=1,
+        student_steps=1,
+        disagreement_mean=0.0,
+        diagnostics=(),
+        motion_stats=(),
+        boundaries=(),
+        eligible_resets={},
+        initialization_resets={},
+        fresh_data=SimpleNamespace(batch=_batch(2, 0)),
+      )
+
+  spec = _specs(tmp_path, devices=("cpu",))[0]
+  worker = _Worker(spec)
+  worker._adapter = SimpleNamespace(
+    env=SimpleNamespace(
+      command_manager=SimpleNamespace(get_term=lambda name: _fake_command(enabled=True))
+    )
+  )
+  worker._collector = _Collector()
+  worker._student = SimpleNamespace(
+    load_state_dict=lambda state: None,
+    reference_normalizer=SimpleNamespace(freeze=lambda: None),
+    conditioning_normalizer=SimpleNamespace(freeze=lambda: None),
+  )
+
+  def collect(iteration: int) -> None:
+    worker.collect(
+      CollectRequest(
+        call_id=1,
+        iteration=iteration,
+        steps=1,
+        teacher_probability=0.0,
+        reset=True,
+        rollout_latent="mean",
+        weights={},
+      )
+    )
+
+  collect(4)
+  collect(4)
+  collect(5)
+
+  # Same call seed, same first draw: the generator is re-derived, not carried.
+  assert draws[0] == draws[1]
+  # A different iteration derives a different stream.
+  assert draws[0] != draws[2]
+  expected = torch.rand(
+    1,
+    generator=torch.Generator(device="cpu").manual_seed(
+      worker_generator_seed(spec.setup.base_seed, 4, spec.worker_index)
+    ),
+  )
+  assert draws[0] == float(expected)

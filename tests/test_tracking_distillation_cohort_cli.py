@@ -2700,28 +2700,35 @@ def test_signal_teardown_releases_workers_and_restores_handlers() -> None:
   assert signal.getsignal(signal.SIGTERM) == previous
 
 
-def test_release_closes_its_owner_exactly_once() -> None:
-  """One release action serves both the signal path and the final cleanup.
+def test_the_owner_slot_closes_its_owner_exactly_once() -> None:
+  """One slot serves both the signal path and the final cleanup.
 
   The signal handler releases the owner and then raises, and the surrounding
-  finally releases it again.  Without a shared action the second close would run
+  finally releases it again.  Without a shared slot the second close would run
   against an already-closed environment, and an exception raised there would
   replace the SystemExit that carries the operator's exit status.
   """
   closes: list[str] = []
-  owner = SimpleNamespace(close=lambda: closes.append("close"))
-  release = distill._release(owner)
+  owner = distill._RunOwner()
+  owner.take(SimpleNamespace(close=lambda: closes.append("close")))
 
-  release()
-  release()
+  owner.release()
+  owner.release()
 
   assert closes == ["close"]
+  assert owner.is_holding() is False
 
 
-def test_release_tolerates_an_owner_without_close() -> None:
-  """A layout that owns nothing releasable still yields a callable."""
-  release = distill._release(SimpleNamespace())
-  assert release() is None
+def test_the_owner_slot_is_inert_before_it_holds_anything() -> None:
+  """A signal during construction releases nothing and does not fail."""
+  owner = distill._RunOwner()
+  assert owner.is_holding() is False
+  assert owner.release() is None
+
+  # An owner with no close is still releasable, and is still cleared.
+  owner.take(SimpleNamespace())
+  assert owner.release() is None
+  assert owner.is_holding() is False
 
 
 @dataclass(frozen=True)
@@ -2733,8 +2740,13 @@ class _ShardAudit:
   MultiMotionLiveContractAudit -- which a separate case asserts.
   """
 
+  task_id: str
+  teacher_ids: tuple[str, ...]
   joint_names: tuple[str, ...]
   control_period_s: float
+  actor_terms: tuple[str, ...]
+  additional_gravity_policy: str
+  asset: tuple[str, ...]
   semantic_overrides: tuple[str, ...]
   slots: MotionSlotAllocation
   mapping_digest: str
@@ -2761,8 +2773,13 @@ def _shard_description(worker_index: int = 0, **overrides: Any) -> SimpleNamespa
       source_body_count=29,
     ),
     "audit": _ShardAudit(
+      task_id="Mjlab-Tracking-Flat-AgiBot-X2",
+      teacher_ids=("tennis_000",),
       joint_names=("joint_a", "joint_b"),
       control_period_s=0.02,
+      actor_terms=("base_lin_vel",),
+      additional_gravity_policy="none",
+      asset=("asset_evidence",),
       semantic_overrides=(),
       slots=MotionSlotAllocation(
         weights=(1.0,),
@@ -2782,6 +2799,7 @@ def _shard_description(worker_index: int = 0, **overrides: Any) -> SimpleNamespa
     "motion_teacher_codes": {0: 0},
     "sampling_mode": "mixed",
     "reset_policy_enabled": True,
+    "reset_provenance": ("standing-mixture", "provenance-v1"),
   }
   values.update(overrides)
   return SimpleNamespace(**values)
@@ -2834,6 +2852,11 @@ def test_shard_descriptions_must_agree_on_the_whole_cohort_contract() -> None:
     ("audited contract", _with_audit(first, semantic_overrides=("timing changed",))),
     ("audited contract", _with_audit(first, joint_names=("joint_other",))),
     ("audited contract", _with_audit(first, control_period_s=0.01)),
+    ("audited contract", _with_audit(first, actor_terms=("other",))),
+    ("audited contract", _with_audit(first, additional_gravity_policy="doubled")),
+    ("audited contract", _with_audit(first, asset=("other",))),
+    ("audited contract", _with_audit(first, task_id="other-task")),
+    ("audited contract", _with_audit(first, teacher_ids=("tennis_001",))),
     (
       "motion teacher codes",
       SimpleNamespace(**{**vars(first), "motion_teacher_codes": {0: 1}}),
@@ -2842,6 +2865,12 @@ def test_shard_descriptions_must_agree_on_the_whole_cohort_contract() -> None:
     (
       "reset policy enablement",
       SimpleNamespace(**{**vars(first), "reset_policy_enabled": False}),
+    ),
+    # The live reset record is outside the audit and is consumed from worker 0
+    # for the checkpoint, so it is compared too.
+    (
+      "live reset provenance",
+      SimpleNamespace(**{**vars(first), "reset_provenance": ("other",)}),
     ),
   )
   for name, second in cases:
@@ -2949,22 +2978,30 @@ def test_signal_teardown_reports_a_failure_and_keeps_the_exit_status(capsys) -> 
   assert "close failed" in capsys.readouterr().err
 
 
-def test_release_does_not_retry_a_close_that_raised() -> None:
-  """A failed close is reported once; a half-closed owner is not closed twice.
+def test_the_owner_slot_retains_an_owner_whose_close_raised() -> None:
+  """A failed close keeps the owner so the cleanup can retry it once.
 
-  The action is spent before the call, so the invariant that matters -- an owner
-  is never closed twice, and a second close can never replace the SystemExit of
-  a stopped run -- holds even when the first close fails.
+  Clearing the slot before the call would abandon a pool to its watchdog after a
+  single failure, and a failure while releasing must still not replace the exit
+  status of a stopped run.
   """
   calls: list[str] = []
 
   def close() -> None:
     calls.append("close")
-    raise RuntimeError("boom")
+    if len(calls) == 1:
+      raise RuntimeError("boom")
 
-  release = distill._release(SimpleNamespace(close=close))
+  owner = distill._RunOwner()
+  owner.take(SimpleNamespace(close=close))
+
   with pytest.raises(RuntimeError):
-    release()
-  release()
+    owner.release()
+  assert owner.is_holding() is True
 
-  assert calls == ["close"]
+  owner.release()  # the cleanup retries it
+  assert calls == ["close", "close"]
+  assert owner.is_holding() is False
+
+  owner.release()  # and then it is spent
+  assert calls == ["close", "close"]
