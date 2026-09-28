@@ -1,9 +1,51 @@
 # Phase-balanced replay sampling — implementation plan
 
-Status: **proposed; planning only**. No implementation, training, or collection
-is authorized or performed by this document. This is an additive training-side
-sampling change for the accepted M4 cohort path; it is not the diffusion
-milestone and not a new objective.
+Status: **implemented, independently reviewed, and re-review CLEAN**.
+Implemented on branch `fxy/test/tracking-exp` on top of the committed plans
+(`e32afb1df`) and the standing-start work, along the design below. An
+independent fresh-context review (gpt-5.6-luna, max thinking, read-only)
+returned BLOCK with one P1 and four P2s; all five findings were verified
+against source and fixed in the same seam. A targeted re-review (same model,
+fresh context) then verified every finding RESOLVED with file:line evidence,
+found no new defects in the fix blast radius, and returned **CLEAN** —
+including independent re-derivation of the golden-fixture frame bounds and
+the per-motion test's cell arithmetic.
+
+- **P1 (fixed):** the without-replacement per-cell preflight used floors and
+  missed the residual allocation, so cells like (1, 100) with a 3-row draw
+  could truncate a per-cell `randperm` and corrupt counters mid-flight.  The
+  preflight is now exact (`ceil(count/cells) > smallest` refuses the whole
+  draw), without-replacement residuals are distributed as distinct cells
+  (at most +1 per cell) making the preflight provably sufficient, and the
+  `drawn_by_phase_bin` increments moved after all per-cell draws succeed.
+- **P2 (fixed):** enabled stats omitted `retained_by_phase_bin` for empty
+  partitions; they now report all-zero cells so the report shape is stable.
+- **P2 (fixed):** `--phase-bins 0`/negative values bypassed the single-teacher
+  refusal; the flag is now `int | None` (unset default 0) and any explicit
+  value on the single-teacher path is refused.
+- **P2 (fixed):** `_phase_cells` float64 rounding could emit an out-of-range
+  cell for float-hostile frame counts; it now uses exact integer arithmetic
+  with an overflow-guarded clamped fallback.
+- **P2 (fixed):** the default-off test compared the implementation against
+  itself; a pre-change golden fixture
+  (`tests/tracking_distillation_phase_golden.json`, generated from the HEAD
+  implementation before this change) now pins rows, counters, and the RNG
+  stream, plus a per-motion per-cell multi-motion distribution test.
+
+One reviewer sub-claim was classified as not a defect: motion-mixture count
+randomness preceding the per-cell refusal matches the historical partition-
+level refusal convention; counters (the fail-closed invariant) are never
+mutated before a refusal. Evidence after fixes: 414 distillation tests pass
+(21 phase-balanced, 5 cohort-CLI phase tests), changed-file Ruff
+format/lint, `uv run ty check`, and targeted Pyright are clean, and the
+reviewer's exact P1 repro (cells (1,100), sample(3) without replacement)
+was re-run manually: all attempts refused with counters untouched. No
+production training run, commit, or push is part of this state.
+Historical planning content below is unchanged.
+
+Planning date: 2026-09-27. This is an additive training-side sampling change
+for the accepted M4 cohort path; it is not the diffusion milestone and not a
+new objective.
 
 Repository: `/home/agiuser/projects/mjlab`.
 Branch: `fxy/test/tracking-exp`.

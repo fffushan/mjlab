@@ -8,6 +8,22 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added opt-in phase-balanced within-motion replay sampling for the shared
+  cohort path. ``distill train --teacher-ids ... --phase-bins N`` (default 0,
+  disabled) splits each clip's reference-phase axis into ``N`` cells and
+  equalizes every minibatch's within-motion exposure over the clip's non-empty
+  cells, correcting retained-row density skew (long-surviving clip segments
+  accumulate more replay rows than hard-to-reach phases) without changing the
+  configured across-motion mixture. The default keeps the historical
+  density-proportional draw bit-for-bit. Balancing is coverage-only: it cannot
+  invent coverage for phases never collected and stays difficulty-blind
+  (adaptive, loss-aware sampling remains refused on the multi-motion path).
+  ``phase_bins`` is recorded in the resolved configuration
+  (``replay.phase_bins``) and must be reproduced on resume, with checkpoints
+  that predate the option resuming at the documented default 0; the
+  single-teacher path refuses the flag. Per-phase telemetry
+  (``retained_by_phase_bin``/``drawn_by_phase_bin``) is added to replay reports
+  when enabled. See ``docs/source/x2_tennis_distillation.rst``.
 - Added opt-in standing-start distillation for the shared cohort path. Real
   deployment engages from standing, whereas reference-frame-only initialization
   never trains or validates that transition. ``distill train`` accepts

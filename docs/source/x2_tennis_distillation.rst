@@ -188,6 +188,13 @@ separate student is created for the second motion.
      --bootstrap-steps 8 --minibatch-size 32 --replay-capacity 256 \
      --seed 7 --output-dir logs/distillation/m4-smoke
 
+   # Same run with phase-balanced within-motion draws (10 cells per clip).
+   uv run distill train --manifest configs/distillation/x2_tennis.yaml \
+     --repo-root . --teacher-ids "('tennis_000','tennis_001')" \
+     --num-envs 4 --device cpu --max-iterations 4 --collection-steps 8 \
+     --bootstrap-steps 8 --minibatch-size 32 --replay-capacity 256 \
+     --phase-bins 10 --seed 7 --output-dir logs/distillation/m4-phase-balanced
+
    # The same M4 checkpoint, one member pinned as a single-motion environment.
    uv run distill evaluate --manifest configs/distillation/x2_tennis.yaml \
      --repo-root . --teacher-id tennis_001 \
@@ -259,6 +266,22 @@ What M4 constructs
   or repeated teacher ids, and a replay capacity that cannot give each selected
   motion a slot) are validated before any environment is constructed, and a
   failure after the environment exists closes it exactly once.
+* Opt-in phase-balanced within-motion draws: ``--phase-bins N`` (default 0,
+  disabled) splits each clip's ``[0, 1)`` reference-phase axis into ``N``
+  cells and equalizes a draw's within-motion exposure over the clip's
+  non-empty cells (equal floors plus unbiased residual allocation, then
+  uniform per-cell draws in ascending cell order). This corrects retained-row
+  density skew — long-surviving segments of a clip accumulate more replay rows
+  than hard-to-reach phases — without changing the configured across-motion
+  mixture. Balancing equalizes exposure among retained data only: it cannot
+  invent coverage for a phase that was never collected, and it is
+  difficulty-blind by design; adaptive, loss-aware sampling remains refused on
+  the multi-motion path. The option is recorded in the resolved configuration
+  (``replay.phase_bins``) and must be reproduced on resume; checkpoints that
+  predate the option resume with the documented default 0. Passing it with the
+  single-teacher path is refused. Per-phase telemetry
+  (``retained_by_phase_bin``/``drawn_by_phase_bin``) appears in the replay
+  report when enabled.
 
 Reports and cohort identity
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -271,7 +294,10 @@ boundaries, disagreement, and reference-frame coverage). Each iteration and the
 final report also include ``replay`` telemetry: capacity, retained/inserted/drawn
 counts, occupancy, readiness, and per-motion quotas/counters. Replay ``coverage``
 means retained rows divided by that motion's capacity quota, not clip-frame
-coverage. ``evaluate-cohort`` requires a positive step budget and
+coverage. With ``--phase-bins`` enabled, each motion's telemetry also carries
+``retained_by_phase_bin`` and ``drawn_by_phase_bin``, exposing the phase coverage
+skew that motivates the option and the exposure the draws actually deliver.
+``evaluate-cohort`` requires a positive step budget and
 normalizes ``--teacher-ids`` into **manifest order** (a repeated id is refused),
 records the request next to the normalized selection, and pins each motion into
 its own single-motion environment.  The teacher baseline and the student never

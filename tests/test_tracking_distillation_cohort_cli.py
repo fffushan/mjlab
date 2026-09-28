@@ -2096,3 +2096,176 @@ def test_rekey_leaves_a_reference_report_without_provenance_alone() -> None:
 
   assert rekeyed["trial_provenance"] is None
   assert rekeyed["per_motion"][0]["motion_id"] == 4
+
+
+def test_cohort_train_accepts_phase_bins_and_records_it(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+  motion_frames: dict[str, int],
+) -> None:
+  """--phase-bins reaches the live replay and the resolved configuration."""
+  calls: list[dict] = []
+  adapters: list[_MultiAdapter] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters)
+  output_dir = tmp_path / "run"
+
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "2", "--phase-bins", "10", "--output-dir", str(output_dir)],
+  )
+
+  assert code == 0, err
+  report = json.loads(out)
+  assert report["resolved_config"]["replay"]["phase_bins"] == 10
+  # The per-phase telemetry is present in every iteration's replay report.
+  replay_stats = report["replay"]["motions"]
+  assert all("retained_by_phase_bin" in motion for motion in replay_stats)
+  # The default run records the historical policy instead.
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "1", "--output-dir", str(tmp_path / "default")],
+  )
+  assert code == 0, err
+  default_report = json.loads(out)
+  assert default_report["resolved_config"]["replay"]["phase_bins"] == 0
+
+
+def test_cohort_resume_default_phase_bins_zero_is_compatible(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """A checkpoint recorded before --phase-bins resumes with the default 0.
+
+  The stored resolved configuration carries no ``phase_bins`` entry; the
+  comparison must treat that as the documented default (density-proportional
+  within-motion draws) instead of refusing the resume.
+  """
+  calls: list[dict] = []
+  adapters: list[_MultiAdapter] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters)
+  first_dir = tmp_path / "first"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "1", "--output-dir", str(first_dir)],
+  )
+  assert code == 0, err
+  first = first_dir / "checkpoint-final.pt"
+
+  # Rewrite the stored resolved config exactly as a pre-option checkpoint
+  # would look: the replay entry simply predates the key.
+  payload = torch.load(first, map_location="cpu", weights_only=False)
+  stored = payload["resolved_config"]
+  assert "phase_bins" in stored["replay"]
+  del stored["replay"]["phase_bins"]
+  torch.save(payload, first)
+
+  second_dir = tmp_path / "second"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    ["--max-iterations", "2", "--resume", str(first), "--output-dir", str(second_dir)],
+  )
+  assert code == 0, err
+  report = json.loads(out)
+  assert report["iteration"] == 2
+  assert report["resume"]["mismatches"] == []
+  assert report["resolved_config"]["replay"]["phase_bins"] == 0
+
+
+def test_cohort_resume_refuses_a_changed_phase_bins(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """A different phase_bins value is a settings change, not a resume."""
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  first_dir = tmp_path / "first"
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "1",
+      "--phase-bins",
+      "10",
+      "--output-dir",
+      str(first_dir),
+    ],
+  )
+  assert code == 0, err
+  first = first_dir / "checkpoint-final.pt"
+
+  code, out, err = _train_cohort(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    [
+      "--max-iterations",
+      "2",
+      "--phase-bins",
+      "4",
+      "--resume",
+      str(first),
+      "--output-dir",
+      str(tmp_path / "refused"),
+    ],
+  )
+  assert code == 1, (out, err)
+  assert out == ""
+  assert "replay" in err
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_single_teacher_train_refuses_phase_bins(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """--phase-bins exists only on the cohort path; the M3 path refuses it.
+
+  An explicit ``--phase-bins 0`` is still an explicit use of an option the
+  single-teacher replay cannot honor, so it is refused the same way rather
+  than being silently accepted as "the default".
+  """
+  _install_fake_single_adapter(monkeypatch, [], schema)
+  for value in ("10", "0"):
+    code = invoke(
+      monkeypatch,
+      [
+        "distill",
+        "train",
+        "--manifest",
+        str(MANIFEST),
+        "--repo-root",
+        str(REPO_ROOT),
+        "--teacher-id",
+        TEACHER_ID,
+        *_TRAIN_ARGV,
+        "--phase-bins",
+        value,
+        "--max-iterations",
+        "1",
+        "--output-dir",
+        str(tmp_path / "refused"),
+      ],
+    )
+    captured = capsys.readouterr()
+    assert code == 1, (value, captured.err)
+    assert captured.out == ""
+    assert "cohort path" in captured.err
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()

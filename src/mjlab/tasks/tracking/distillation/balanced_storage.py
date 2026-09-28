@@ -59,6 +59,69 @@ class ReplayNotReadyError(ReplayValidationError):
   """A requested draw cannot cover every selected motion yet."""
 
 
+def _phase_cells(
+  reference_frame: torch.Tensor, frame_count: int, phase_bins: int
+) -> torch.Tensor:
+  """Phase cell of each row: ``floor(frame * bins / frames)``.
+
+  Uses exact integer arithmetic whenever ``frame * bins`` cannot overflow
+  int64 (every physically realizable clip), and a clamped float64 fallback
+  beyond that, so the result is provably inside ``[0, phase_bins)`` for any
+  representable validated frame (float rounding can never push the last frame
+  into cell ``bins``, and int64 wraparound is avoided).  Only the *non-empty*
+  cells participate in a balanced draw.
+  """
+  if frame_count <= (2**63 - 1) // phase_bins:
+    return (reference_frame * int(phase_bins)).div(
+      int(frame_count), rounding_mode="floor"
+    )
+  scaled = reference_frame.to(dtype=torch.float64) * (
+    float(phase_bins) / float(frame_count)
+  )
+  return scaled.floor().clamp(max=phase_bins - 1).to(dtype=torch.int64)
+
+
+def _split_count_over_cells(
+  count: int,
+  cell_sizes: torch.Tensor,
+  *,
+  replacement: bool,
+  generator: torch.Generator | None,
+  random_device: torch.device,
+) -> torch.Tensor:
+  """Allocate ``count`` rows over non-empty phase cells, uniform in expectation.
+
+  With replacement, the residual rows go to a multinomial draw among the
+  non-empty cells — the same floor-plus-residual structure the motion mixture
+  uses, so odd and one-row draws keep cell-uniformity in expectation instead
+  of always preferring the first cell.  Without replacement the residual is
+  distributed as ``leftover`` *distinct* cells drawn from a permutation, so a
+  cell receives at most one extra row; combined with the exact preflight in
+  :meth:`BalancedReplayBuffer._validate_without_replacement_cells` this makes
+  every per-cell request satisfiable by construction.
+  """
+  cell_count = int(cell_sizes.numel())
+  counts = torch.full((cell_count,), count // cell_count, dtype=torch.int64)
+  leftover = count - int(counts.sum().item())
+  if leftover:
+    if replacement:
+      probabilities = torch.full(
+        (cell_count,), 1.0 / cell_count, dtype=torch.float64, device=random_device
+      )
+      picks = torch.multinomial(
+        probabilities, leftover, replacement=True, generator=generator
+      )
+      extra = torch.bincount(picks, minlength=cell_count).tolist()
+      counts = counts + torch.tensor([int(value) for value in extra], dtype=torch.int64)
+    else:
+      order = torch.randperm(cell_count, device=random_device, generator=generator)
+      extra = [0] * cell_count
+      for index in order[:leftover].tolist():
+        extra[int(index)] = 1
+      counts = counts + torch.tensor(extra, dtype=torch.int64)
+  return counts
+
+
 def _storage_layout(
   schema: VaeSchema, provenance_enabled: bool = False
 ) -> tuple[tuple[str, int], ...]:
@@ -240,6 +303,8 @@ class MotionReplayStats:
   inserted_by_initialization: dict[str, int] = field(default_factory=dict)
   drawn_by_initialization: dict[str, int] = field(default_factory=dict)
   retained_by_initialization: dict[str, int] = field(default_factory=dict)
+  retained_by_phase_bin: tuple[int, ...] | None = None
+  drawn_by_phase_bin: tuple[int, ...] | None = None
 
   @property
   def coverage(self) -> float:
@@ -251,7 +316,7 @@ class MotionReplayStats:
     return self.retained > 0
 
   def as_dict(self) -> dict[str, Any]:
-    return {
+    result = {
       "motion_id": self.motion_id,
       "weight": self.weight,
       "quota": self.quota,
@@ -263,6 +328,11 @@ class MotionReplayStats:
       "retained_by_initialization": dict(self.retained_by_initialization),
       "coverage": self.coverage,
     }
+    if self.retained_by_phase_bin is not None:
+      result["retained_by_phase_bin"] = list(self.retained_by_phase_bin)
+    if self.drawn_by_phase_bin is not None:
+      result["drawn_by_phase_bin"] = list(self.drawn_by_phase_bin)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +378,7 @@ class _MotionPartition:
   storage: dict[str, torch.Tensor] | None = None
   inserted_by_initialization: dict[str, int] = field(default_factory=dict)
   drawn_by_initialization: dict[str, int] = field(default_factory=dict)
+  drawn_by_phase_bin: list[int] | None = None
 
 
 def _assemble_batch(
@@ -348,6 +419,11 @@ class BalancedReplayBuffer:
   per-motion reference length used to validate every insertion, so a row can
   never be stored under the wrong teacher or an impossible reference frame.
   Motion ids are ordered ascending for deterministic allocation and tie breaks.
+
+  ``phase_bins`` (0, the default, disables phase balancing) splits each clip's
+  ``[0, 1)`` reference-phase axis into that many cells and equalizes a draw's
+  within-motion exposure over the non-empty cells; the default reproduces the
+  historical density-proportional draw exactly.
   """
 
   def __init__(
@@ -361,6 +437,7 @@ class BalancedReplayBuffer:
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     provenance_enabled: bool | None = None,
+    phase_bins: int = 0,
   ) -> None:
     if not isinstance(schema, VaeSchema):
       raise ReplayValidationError("schema must be a VaeSchema")
@@ -389,6 +466,13 @@ class BalancedReplayBuffer:
         raise ReplayValidationError(
           f"frame count for motion {motion_id} must be positive, got {frames}"
         )
+    if (
+      isinstance(phase_bins, bool) or not isinstance(phase_bins, int) or phase_bins < 0
+    ):
+      raise ReplayValidationError(
+        f"phase_bins must be a non-negative integer, got {phase_bins!r}"
+      )
+    self._phase_bins = int(phase_bins)
     self._schema = schema
     self._capacity = quota.total_capacity
     self._device = _canonical_device(device) if device is not None else None
@@ -400,6 +484,9 @@ class BalancedReplayBuffer:
       motion_id: _MotionPartition(motion_id=motion_id, quota=quota.quota_for(motion_id))
       for motion_id in motion_ids
     }
+    if self._phase_bins:
+      for partition in self._partitions.values():
+        partition.drawn_by_phase_bin = [0] * self._phase_bins
 
   @staticmethod
   def _routing_values(
@@ -475,6 +562,11 @@ class BalancedReplayBuffer:
     return self._frame_counts
 
   @property
+  def phase_bins(self) -> int:
+    """Configured within-motion phase-balancing cells; 0 is disabled."""
+    return self._phase_bins
+
+  @property
   def unready_motion_ids(self) -> tuple[int, ...]:
     """Selected motions whose partition holds no retained record yet."""
     return tuple(
@@ -503,27 +595,54 @@ class BalancedReplayBuffer:
       for kind in torch.unique(values[active]).tolist()
     }
 
-  def stats(self) -> tuple[MotionReplayStats, ...]:
-    return tuple(
-      MotionReplayStats(
-        motion_id=motion_id,
-        weight=self._weights[index],
-        quota=self._quota.quotas[index],
-        retained=self._partitions[motion_id].size,
-        inserted=self._partitions[motion_id].inserted,
-        drawn=self._partitions[motion_id].drawn,
-        inserted_by_initialization=dict(
-          self._partitions[motion_id].inserted_by_initialization
-        ),
-        drawn_by_initialization=dict(
-          self._partitions[motion_id].drawn_by_initialization
-        ),
-        retained_by_initialization=self._retained_by_initialization(
-          self._partitions[motion_id]
-        ),
-      )
-      for index, motion_id in enumerate(self._motion_ids)
+  def _retained_by_phase_bin(
+    self, partition: _MotionPartition
+  ) -> tuple[int, ...] | None:
+    """Retained rows per phase cell, or ``None`` when balancing is disabled.
+
+    An enabled-but-empty partition reports all-zero cells rather than omitting
+    the field, so the report shape is stable across partitions.
+    """
+    if not self._phase_bins:
+      return None
+    if partition.storage is None:
+      return (0,) * self._phase_bins
+    frames = partition.storage["reference_frame"]
+    active = _active_indices(partition, frames.device)
+    cells = _phase_cells(
+      frames[active],
+      self._frame_counts[self._motion_ids.index(partition.motion_id)],
+      self._phase_bins,
     )
+    return tuple(
+      int((cells == index).sum().item()) for index in range(self._phase_bins)
+    )
+
+  def stats(self) -> tuple[MotionReplayStats, ...]:
+    result: list[MotionReplayStats] = []
+    for index, motion_id in enumerate(self._motion_ids):
+      partition = self._partitions[motion_id]
+      drawn_by_phase_bin = (
+        tuple(partition.drawn_by_phase_bin)
+        if partition.drawn_by_phase_bin is not None
+        else None
+      )
+      result.append(
+        MotionReplayStats(
+          motion_id=motion_id,
+          weight=self._weights[index],
+          quota=self._quota.quotas[index],
+          retained=partition.size,
+          inserted=partition.inserted,
+          drawn=partition.drawn,
+          inserted_by_initialization=dict(partition.inserted_by_initialization),
+          drawn_by_initialization=dict(partition.drawn_by_initialization),
+          retained_by_initialization=self._retained_by_initialization(partition),
+          retained_by_phase_bin=self._retained_by_phase_bin(partition),
+          drawn_by_phase_bin=drawn_by_phase_bin,
+        )
+      )
+    return tuple(result)
 
   def report(self) -> BalancedReplayReport:
     """Capacity, occupancy, and per-motion coverage/counters."""
@@ -728,21 +847,107 @@ class BalancedReplayBuffer:
     generator: torch.Generator | None,
     random_device: torch.device,
   ) -> torch.Tensor:
-    if replacement:
-      logical = torch.randint(
-        partition.size, (count,), device=random_device, generator=generator
-      )
-    else:
-      logical = torch.randperm(
-        partition.size, device=random_device, generator=generator
-      )[:count]
     storage = partition.storage
     if storage is None:  # pragma: no cover - readiness is checked before drawing
       raise ReplayNotReadyError(
         f"motion {partition.motion_id} has no retained replay records"
       )
-    logical = logical.to(device=storage["reference"].device)
-    return _active_indices(partition, storage["reference"].device)[logical]
+    if not self._phase_bins:
+      if replacement:
+        logical = torch.randint(
+          partition.size, (count,), device=random_device, generator=generator
+        )
+      else:
+        logical = torch.randperm(
+          partition.size, device=random_device, generator=generator
+        )[:count]
+      logical = logical.to(device=storage["reference"].device)
+      return _active_indices(partition, storage["reference"].device)[logical]
+
+    # Phase-balanced draw: spread this motion's rows over its non-empty phase
+    # cells, then draw uniformly inside each cell.  Cells are visited in
+    # ascending cell order so a given generator state is deterministic.
+    frame_count = self._frame_counts[self._motion_ids.index(partition.motion_id)]
+    frames = storage["reference_frame"]
+    active = _active_indices(partition, frames.device)
+    cells = _phase_cells(frames[active], frame_count, self._phase_bins)
+    cell_sizes = torch.bincount(cells, minlength=self._phase_bins)
+    nonempty = torch.nonzero(cell_sizes, as_tuple=False).flatten()
+    allocation = _split_count_over_cells(
+      count,
+      cell_sizes[nonempty],
+      replacement=replacement,
+      generator=generator,
+      random_device=random_device,
+    )
+    logical_parts: list[torch.Tensor] = []
+    for cell_index, per_cell in zip(
+      nonempty.tolist(), allocation.tolist(), strict=True
+    ):
+      if per_cell == 0:
+        continue
+      within = (cells == cell_index).nonzero(as_tuple=False).flatten()
+      if replacement:
+        picks = torch.randint(
+          within.numel(), (per_cell,), device=random_device, generator=generator
+        )
+      else:
+        picks = torch.randperm(
+          within.numel(), device=random_device, generator=generator
+        )[:per_cell]
+      logical_parts.append(within[picks.to(within.device)])
+    logical = (
+      torch.cat(logical_parts)
+      if logical_parts
+      else torch.empty(0, dtype=torch.int64, device=active.device)
+    )
+    # Counters move only after every cell draw succeeded, so a mid-draw
+    # failure can never leave partially incremented statistics behind.
+    if partition.drawn_by_phase_bin is not None:
+      for cell_index, per_cell in zip(
+        nonempty.tolist(), allocation.tolist(), strict=True
+      ):
+        partition.drawn_by_phase_bin[cell_index] += per_cell
+    return active[logical]
+
+  def _validate_without_replacement_cells(
+    self, partition: _MotionPartition, count: int, motion_id: int
+  ) -> None:
+    """Refuse a without-replacement draw whose cells cannot supply their rows.
+
+    The check is exact for the allocation :func:`_split_count_over_cells`
+    performs without replacement — floors of ``count // cells`` plus at most
+    one residual row per cell — so a draw is possible exactly when
+    ``ceil(count / cells) <= smallest cell``.  It runs before any per-motion
+    randomness beyond the motion-mixture counts is consumed and before any
+    counter is mutated, mirroring the whole-batch refusal rule for partitions:
+    never silently reweight an impossible per-cell request.
+    """
+    storage = partition.storage
+    if storage is None:  # pragma: no cover - readiness is checked before drawing
+      raise ReplayNotReadyError(
+        f"motion {partition.motion_id} has no retained replay records"
+      )
+    frames = storage["reference_frame"]
+    active = _active_indices(partition, frames.device)
+    cells = _phase_cells(
+      frames[active],
+      self._frame_counts[self._motion_ids.index(motion_id)],
+      self._phase_bins,
+    )
+    cell_sizes = torch.bincount(cells, minlength=self._phase_bins)
+    nonempty_sizes = cell_sizes[cell_sizes > 0]
+    cell_count = int(nonempty_sizes.numel())
+    per_cell_floor = count // cell_count
+    residual = count - per_cell_floor * cell_count
+    largest_possible = per_cell_floor + (1 if residual else 0)
+    smallest = int(nonempty_sizes.min().item())
+    if largest_possible > smallest:
+      raise ReplayValidationError(
+        f"without-replacement draw asks for up to {largest_possible} rows from a "
+        f"phase cell of motion {motion_id} that retains {smallest}; collect more "
+        f"phases or lower --phase-bins"
+      )
 
   def sample(
     self,
@@ -758,7 +963,9 @@ class BalancedReplayBuffer:
     the row shuffle.  Sampling never updates model statistics.  With
     ``replacement=False`` rows are distinct inside each partition and a
     partition whose randomized count exceeds its occupancy is refused rather
-    than silently reweighted.
+    than silently reweighted.  When ``phase_bins`` is positive, each motion's
+    rows are additionally spread over that clip's non-empty phase cells before
+    the per-cell uniform draws (ascending cell order).
     """
     if (
       not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0
@@ -782,14 +989,20 @@ class BalancedReplayBuffer:
     random_device = _random_device(generator)
     counts = self._draw_counts(batch_size, generator=generator)
     if not replacement:
-      # Refuse before any partition is touched so a rejected draw leaves the
-      # buffer (and its counters) exactly as it was.
+      # Refuse before any per-motion randomness or counter mutation so a
+      # rejected draw leaves the buffer exactly as it was.  The motion-mixture
+      # count draw itself precedes the partition-level refusal identically on
+      # the historical unbalanced path, so that ordering is the convention.
       for motion_id, count in zip(self._motion_ids, counts, strict=True):
         available = self._partitions[motion_id].size
         if count > available:
           raise ReplayValidationError(
             f"without-replacement draw asks for {count} rows from motion "
             f"{motion_id}, which retains {available}"
+          )
+        if self._phase_bins and count > 0:
+          self._validate_without_replacement_cells(
+            self._partitions[motion_id], count, motion_id
           )
     parts: dict[str, list[torch.Tensor]] = {}
     for motion_id, count in zip(self._motion_ids, counts, strict=True):
@@ -1131,6 +1344,9 @@ class BalancedReplayBuffer:
 
     Every partition, quota, weight, and mapping is validated first; this buffer
     keeps its current contents when any part of the candidate is invalid.
+    Restored partitions keep this buffer's configured ``phase_bins`` policy:
+    the policy is replay-construction state, not ring state, so it is validated
+    by the resolved-configuration comparison rather than read from the ring.
     """
     if not isinstance(state, Mapping):
       raise ReplayValidationError("replay state must be a mapping")
@@ -1145,6 +1361,10 @@ class BalancedReplayBuffer:
     self._provenance_enabled = enabled
     self._layout = _storage_layout(self.schema, enabled)
     self._partitions = partitions
+    if self._phase_bins:
+      for partition in partitions.values():
+        if partition.drawn_by_phase_bin is None:
+          partition.drawn_by_phase_bin = [0] * self._phase_bins
     self._size = sum(partition.size for partition in partitions.values())
 
   # Resume seams shared with the single-partition replay buffer.

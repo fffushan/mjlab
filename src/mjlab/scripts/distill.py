@@ -579,6 +579,30 @@ def _resolved_config(
   }
 
 
+def _resume_compatible_value(key: str, stored: Any, requested: Any) -> Any:
+  """Stored value with the documented default for late-added sub-keys.
+
+  A checkpoint recorded before a sub-key existed inside a stored entry stored
+  the older entry verbatim; comparing that verbatim against the newer requested
+  entry would treat the mere absence of the new option as a settings change.
+  The documented default is what the old run actually used, so the missing
+  sub-key is filled in on the stored side before the comparison.  Currently:
+  ``replay.phase_bins`` (cohort entries only) defaults to 0 in checkpoints
+  that predate the option; single-teacher replay entries never carry it, so
+  they are compared verbatim.
+  """
+  if (
+    key == "replay"
+    and isinstance(stored, Mapping)
+    and isinstance(requested, Mapping)
+    and "phase_bins" in requested
+  ):
+    stored_equivalent = dict(stored)
+    stored_equivalent.setdefault("phase_bins", 0)
+    return stored_equivalent
+  return stored
+
+
 def _check_resume_compatibility(
   state: LifecycleState | CohortLifecycleState,
   requested: Mapping[str, Any],
@@ -610,7 +634,7 @@ def _check_resume_compatibility(
       audit["unverified"].append(key)
       continue
     audit["checked"].append(key)
-    if stored[key] != requested[key]:
+    if _resume_compatible_value(key, stored[key], requested[key]) != requested[key]:
       audit["mismatches"].append(key)
   stored_schedule = state.schedule or stored.get("schedule") or {}
   if not stored_schedule:
@@ -759,6 +783,7 @@ def _build_cohort_runner(
   num_envs: int,
   task_id: str | None,
   replay_capacity: int,
+  phase_bins: int,
   minibatch_size: int,
   accumulation_steps: int,
   learning_rate: float,
@@ -847,6 +872,7 @@ def _build_cohort_runner(
       frame_counts={clip.motion_id: int(clip.frames) for clip in adapter.library.clips},
       device=torch.device(device),
       dtype=torch.float32,
+      phase_bins=phase_bins,
     )
     identity = cohort_identity_from_adapter(adapter, replay=replay)
     trainer = VaeDistillationTrainer(
@@ -935,6 +961,7 @@ def _cohort_resolved_config(
       "weights": list(replay.weights),
       "quotas": list(quota.quotas),
       "motion_ids": list(replay.motion_ids),
+      "phase_bins": replay.phase_bins,
     },
     "model": {
       "settings": trainer.model.settings.to_metadata(),
@@ -1296,6 +1323,7 @@ def _train_cohort(
   minibatch_size: int,
   accumulation_steps: int,
   replay_capacity: int,
+  phase_bins: int,
   learning_rate: float,
   beta: float,
   seed: int,
@@ -1332,6 +1360,7 @@ def _train_cohort(
       num_envs=num_envs,
       task_id=task_id,
       replay_capacity=replay_capacity,
+      phase_bins=phase_bins,
       minibatch_size=minibatch_size,
       accumulation_steps=accumulation_steps,
       learning_rate=learning_rate,
@@ -1471,6 +1500,7 @@ def _train(
   minibatch_size: int = 256,
   accumulation_steps: int = 15,
   replay_capacity: int = 16_384,
+  phase_bins: int | None = None,
   learning_rate: float = 5e-4,
   beta: float = 0.01,
   seed: int = 0,
@@ -1498,6 +1528,15 @@ def _train(
   invocation behaves exactly as before.  A cohort run always samples phases
   uniformly and records that policy as an explicit private override, and it
   saves and resumes version-2 cohort checkpoints instead of version-1 ones.
+
+  ``phase_bins`` applies only to the cohort path (``--teacher-ids``): unset
+  (the default) keeps the historical density-proportional within-motion draw,
+  equivalent to an explicit 0; a positive value splits each clip's
+  reference-phase axis into that many cells and equalizes each draw's
+  within-motion exposure over the non-empty cells.  It is recorded in the
+  resolved configuration and must be reproduced on resume.  Passing it with
+  the single-teacher path — including an explicit ``--phase-bins 0`` — is
+  refused, and negative values are refused by the replay constructor.
 
   ``max_iterations`` is the total lifetime iteration budget, including when
   ``resume`` is supplied.  Resume restores replay, normalizers, optimizer, and
@@ -1558,6 +1597,14 @@ def _train(
         "syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
       )
     )
+  resolved_phase_bins = 0 if phase_bins is None else phase_bins
+  if not teacher_ids and phase_bins is not None:
+    return _fail(
+      ValueError(
+        "--phase-bins applies only to the cohort path; use singleton cohort "
+        "syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
+      )
+    )
   if teacher_ids:
     return _train_cohort(
       manifest=manifest,
@@ -1576,6 +1623,7 @@ def _train(
       minibatch_size=minibatch_size,
       accumulation_steps=accumulation_steps,
       replay_capacity=replay_capacity,
+      phase_bins=resolved_phase_bins,
       learning_rate=learning_rate,
       beta=beta,
       seed=seed,
