@@ -4,7 +4,7 @@ Status: **M1–M3 are complete; M4 implementation and bounded CPU integration ar
 Scope: reproduce the conditional-VAE/DAgger stage using existing mjlab tracking teachers; retain a clean interface for later state–latent diffusion.
 Source: `/home/agiuser/Documents/beyondmimic.pdf`, main pp. 18–21 and Fig. 7, supplementary S3/S4 and Table S6.
 
-Related discussion: [general trackers, multimodality, and latent diffusion](beyondmimic_general_tracker_and_diffusion.md) records why we retain specialist teachers now, how a general tracker could be trained, and why tracking does not replace motion planning.
+Related discussion: [general trackers, multimodality, and latent diffusion](beyondmimic_general_tracker_and_diffusion.md) records why we retain specialist teachers now, how a general tracker could be trained, and why tracking does not replace motion planning. An external [BeyondMimic-Reproduction review and comparison](beyondmimic_reproduction_review.md) audits that independent reproduction and compares its stage-2 VAE implementation with ours.
 
 ## Initial teacher cohort selected by the user
 
