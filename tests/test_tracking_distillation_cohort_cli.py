@@ -1690,7 +1690,7 @@ def test_cohort_export_is_refused_explicitly(
   capsys: pytest.CaptureFixture[str],
   schema,
 ) -> None:
-  """A cohort checkpoint is not silently exported as one single-teacher bundle."""
+  """A cohort checkpoint with the singular audit is refused, not reduced."""
   _install_fake_multi_adapter(monkeypatch, [], schema)
   code, _out, err = _train_cohort(
     tmp_path, monkeypatch, capsys, ["--max-iterations", "1"]
@@ -1720,7 +1720,12 @@ def test_cohort_export_is_refused_explicitly(
 
   captured = capsys.readouterr()
   assert code == 1
-  assert "does not support a version-2 M4 cohort checkpoint" in captured.err
+  # The cohort seam needs one audit per manifest member; the singular audit
+  # must never silently reduce the cohort to one teacher.
+  assert (
+    "cohort audit index with --asset-audits" in captured.err
+    or "pass the cohort audit index with --asset-audits" in captured.err
+  )
   assert not (tmp_path / "bundle").exists()
 
 

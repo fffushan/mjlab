@@ -1,9 +1,17 @@
-"""Portable v2 export for the gravity-conditioned distillation VAE.
+"""Portable v2/v3 export for the gravity-conditioned distillation VAE.
 
 The exporter is intentionally offline and strict.  It restores the saved model
 and schema from a checkpoint, requires an independently audited frame/control
 record, and writes two batch-one float32 ONNX graphs plus an immutable motion
 JSON.  No simulator, trainer, optimizer, or replay buffer is constructed.
+
+A version-2 bundle is the single-teacher artifact (:func:`export_bundle`).  A
+version-3 bundle (:func:`export_cohort_bundle`) exports one saved M4 cohort
+checkpoint whose shared student was trained over several teachers: the two
+graphs are written once, stamped with the cohort identity, and each member gets
+its own ``{contract, motion, parity}`` triple.  Every member is audited with the
+same single-teacher audit producer, so a cohort is never certified by one
+selected motion standing in for the rest.
 """
 
 from __future__ import annotations
@@ -26,7 +34,11 @@ from torch import nn
 from mjlab.tasks.tracking.distillation.adapter import validate_live_contract
 from mjlab.tasks.tracking.distillation.checkpoint import (
   CheckpointValidationError,
+  load_cohort_member_inference,
   load_inference_checkpoint,
+)
+from mjlab.tasks.tracking.distillation.cohort_contract import (
+  require_member_matches,
 )
 from mjlab.tasks.tracking.distillation.config import (
   CohortContract,
@@ -38,8 +50,10 @@ from mjlab.tasks.tracking.distillation.model import ConditionalVAE
 from mjlab.tasks.tracking.distillation.vae_config import DecoderMode
 
 BUNDLE_VERSION = 2
+COHORT_BUNDLE_VERSION = 3
 BUNDLE_FORMAT = "mjlab-vae-tracking"
 EXPORT_OPSET = 18
+MAX_COHORT_MEMBERS = 16  # the C++ descriptor parser admits at most 16 members
 
 
 class ExportValidationError(ValueError):
@@ -536,15 +550,27 @@ def _write_graphs(model: ConditionalVAE, directory: Path) -> tuple[Path, Path]:
   return encoder_path, decoder_path
 
 
-def _graph_metadata(path: Path, *, model_id: str, contract_id: str, graph: str) -> None:
+def _graph_metadata(
+  path: Path,
+  *,
+  model_id: str,
+  contract_id: str,
+  graph: str,
+  bundle_version: int = BUNDLE_VERSION,
+) -> None:
   import onnx
 
   proto = onnx.load(path)
   for item in proto.metadata_props:
-    if item.key in {"mjlab_model_id", "mjlab_contract_id", "mjlab_graph"}:
+    if item.key in {
+      "mjlab_model_id",
+      "mjlab_contract_id",
+      "mjlab_graph",
+      "mjlab_bundle_version",
+    }:
       proto.metadata_props.remove(item)
   for key, value in (
-    ("mjlab_bundle_version", str(BUNDLE_VERSION)),
+    ("mjlab_bundle_version", str(bundle_version)),
     ("mjlab_model_id", model_id),
     ("mjlab_contract_id", contract_id),
     ("mjlab_graph", graph),
@@ -785,6 +811,436 @@ def export_bundle(
   return result
 
 
+@dataclass(frozen=True, slots=True)
+class CohortExportResult:
+  """Paths and identities emitted by :func:`export_cohort_bundle`."""
+
+  descriptor: Path
+  encoder: Path
+  decoder: Path
+  members: tuple[Path, ...]
+  model_id: str
+  contract_id: str
+  report: dict[str, Any]
+
+
+def _require_cohort_audit_mapping(
+  asset_audits: Mapping[str, Any] | str | os.PathLike[str],
+  teacher_ids: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+  """Accept exactly one audit per member, keyed by teacher id.
+
+  The accepted input is either an inline mapping (teacher id -> audit object) or
+  a JSON file holding that mapping, optionally with audit objects or paths to
+  audit JSON files.  A missing or extra teacher is refused: a cohort bundle is
+  certified by one audited environment per member, never by a selected motion
+  standing in for the rest.
+  """
+  if isinstance(asset_audits, (str, os.PathLike)):
+    path = Path(cast(str | os.PathLike[str], asset_audits))
+    try:
+      raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+      raise ExportValidationError(
+        f"could not read the cohort asset audit index {path}: {exc}"
+      ) from exc
+  else:
+    raw = dict(asset_audits)
+  if not isinstance(raw, Mapping):
+    raise ExportValidationError("the cohort asset audit index must be a mapping")
+  expected = set(teacher_ids)
+  actual = set(raw)
+  if actual != expected:
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    raise ExportValidationError(
+      "the cohort asset audit index must name every member exactly; missing "
+      f"{missing}, unexpected {extra}"
+    )
+  audits: dict[str, dict[str, Any]] = {}
+  for teacher_id in teacher_ids:
+    audits[teacher_id] = _load_audit(raw[teacher_id])
+  return audits
+
+
+def export_cohort_bundle(
+  checkpoint: str | os.PathLike[str],
+  manifest: str | os.PathLike[str] | CohortContract,
+  output_dir: str | os.PathLike[str],
+  *,
+  repo_root: str | os.PathLike[str] | None = None,
+  asset_audits: Mapping[str, Any] | str | os.PathLike[str],
+) -> CohortExportResult:
+  """Export one saved M4 cohort checkpoint into a version-3 bundle.
+
+  The shared student's graphs are written once and stamped with the cohort
+  identity (model id + cohort contract id); every manifest member contributes
+  its own ``{contract, motion, parity}`` triple in manifest order, which is the
+  order the deployed controller plays them in.  Every member must be covered
+  by exactly one audit produced by :func:`make_export_audit` against a pinned
+  single-teacher environment of that member.
+  """
+  if isinstance(manifest, CohortContract):
+    cohort = manifest
+  else:
+    root = Path(repo_root).resolve() if repo_root is not None else Path.cwd().resolve()
+    cohort = resolve_cohort(load_manifest(Path(manifest), root))
+  teacher_ids = cohort.teacher_ids
+  if not teacher_ids:
+    raise ExportValidationError("the manifest selects no teacher")
+  if len(teacher_ids) > MAX_COHORT_MEMBERS:
+    raise ExportValidationError(
+      f"a version-3 bundle admits at most {MAX_COHORT_MEMBERS} members; the "
+      f"manifest has {len(teacher_ids)}"
+    )
+  for teacher_id in teacher_ids:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", teacher_id):
+      raise ExportValidationError(
+        f"teacher_id {teacher_id!r} is not a safe bundle member name"
+      )
+  audits = _require_cohort_audit_mapping(asset_audits, teacher_ids)
+  try:
+    member_zero = load_cohort_member_inference(Path(checkpoint), cohort, teacher_ids[0])
+  except CheckpointValidationError as exc:
+    raise ExportValidationError(f"cohort checkpoint refused: {exc}") from exc
+  stored = member_zero.cohort
+  for teacher_id in teacher_ids[1:]:
+    try:
+      require_member_matches(stored, cohort, teacher_id)
+    except Exception as exc:  # CohortContractError; re-raised as export refusal
+      raise ExportValidationError(
+        f"cohort member {teacher_id!r} refused: {exc}"
+      ) from exc
+  if tuple(stored.teacher_ids) != teacher_ids:
+    raise ExportValidationError(
+      "the stored cohort member order disagrees with the manifest order"
+    )
+  if member_zero.schema.mode is not DecoderMode.GRAVITY:
+    raise ExportValidationError(
+      "version-3 export supports only the saved gravity decoder schema"
+    )
+  model = member_zero.model
+  schema = member_zero.schema
+  if tuple(schema.joint_order) != cohort.actions.joint_names:
+    raise ExportValidationError(
+      "checkpoint schema joint order disagrees with the cohort contract"
+    )
+  checkpoint_sha = sha256_file(Path(checkpoint))
+
+  # Per-member validation, identical in strength to the v2 single-teacher export.
+  members: list[dict[str, Any]] = []
+  for teacher_id in teacher_ids:
+    teacher = cohort.teacher(teacher_id)
+    if (
+      not math.isclose(teacher.control.control_hz, 50.0, rel_tol=0.0, abs_tol=1e-6)
+      or not math.isclose(teacher.reference.fps, 50.0, rel_tol=0.0, abs_tol=1e-6)
+      or not math.isclose(
+        teacher.control.control_period_s, 0.02, rel_tol=0.0, abs_tol=1e-9
+      )
+    ):
+      raise ExportValidationError(
+        f"version-3 export requires exactly 50 Hz control and reference cadence "
+        f"(teacher {teacher_id!r})"
+      )
+    provenance = _require_audited_provenance(audits[teacher_id], teacher)
+    action_metadata = _action_metadata(audits[teacher_id], teacher)
+    _verify_motion_body_binding(teacher, audits[teacher_id])
+    motion_payload, motion_source_hash = _extract_motion(
+      teacher,
+      joint_order=tuple(schema.joint_order),
+      anchor_index=int(provenance["anchor_body_index"]),
+    )
+    members.append(
+      {
+        "teacher_id": teacher_id,
+        "provenance": provenance,
+        "action_metadata": action_metadata,
+        "motion_payload": motion_payload,
+        "motion_source_hash": motion_source_hash,
+        "teacher": teacher,
+      }
+    )
+
+  # The gains are cohort-common in the training contract, and every member's
+  # audit read them from the same compiled robot; a disagreement means the
+  # audits describe different physical assets and the shared action block
+  # would be a lie for at least one member.  ``asset_identity.path`` is only
+  # the audit snapshot's own file name and is excluded; the content digests
+  # (asset sha256 and compiled evidence digest) must agree.
+  def _physical_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
+    identity = {
+      key: value for key, value in provenance["asset_identity"].items() if key != "path"
+    }
+    return {**provenance, "asset_identity": identity}
+
+  first_action = members[0]["action_metadata"]
+  first_provenance = _physical_provenance(members[0]["provenance"])
+  for member in members[1:]:
+    if member["action_metadata"] != first_action:
+      raise ExportValidationError(
+        f"audited action metadata disagrees between teachers "
+        f"{members[0]['teacher_id']!r} and {member['teacher_id']!r}"
+      )
+    if _physical_provenance(member["provenance"]) != first_provenance:
+      raise ExportValidationError(
+        f"audited sensor/anchor provenance disagrees between teachers "
+        f"{members[0]['teacher_id']!r} and {member['teacher_id']!r}"
+      )
+
+  model_id = _digest(
+    {
+      "checkpoint_sha256": checkpoint_sha,
+      "cohort": {
+        "manifest_name": cohort.manifest.name,
+        "manifest_sha256": cohort.manifest.sha256,
+        "teacher_ids": list(teacher_ids),
+      },
+      "schema": schema.compatibility_metadata(),
+      "settings": member_zero.settings.to_metadata(),
+      "normalizers": {
+        "reference": _normalizer_metadata(model.reference_normalizer),
+        "conditioning": _normalizer_metadata(model.conditioning_normalizer),
+      },
+    }
+  )
+
+  directory = Path(output_dir)
+  directory.mkdir(parents=True, exist_ok=True)
+  bundle_name = f"vae-{cohort.manifest.name}"
+  final = directory / bundle_name
+  descriptor_root = directory / f"{bundle_name}.yaml"
+  if (
+    final.exists()
+    or final.is_symlink()
+    or descriptor_root.exists()
+    or descriptor_root.is_symlink()
+  ):
+    raise ExportValidationError(
+      f"output bundle or descriptor already exists: {final} / {descriptor_root}"
+    )
+  with tempfile.TemporaryDirectory(prefix="vae-cohort-export-", dir=directory) as temp:
+    staging = Path(temp)
+    shared = staging / "shared"
+    shared.mkdir()
+    encoder, decoder = _write_graphs(model, shared)
+
+    common_semantics: dict[str, Any] = {
+      "schema": schema.compatibility_metadata(),
+      "model_settings": member_zero.settings.to_metadata(),
+      "normalizers": {
+        "reference": _normalizer_metadata(model.reference_normalizer),
+        "conditioning": _normalizer_metadata(model.conditioning_normalizer),
+      },
+      "interfaces": {
+        "encoder": {"inputs": {"reference": [1, 68]}, "outputs": {"latent": [1, 32]}},
+        "decoder": {
+          "inputs": {"latent": [1, 32], "conditioning": [1, 99]},
+          "outputs": {"actions": [1, 31]},
+        },
+      },
+      "control": {
+        "control_period_s": float(cohort.control.control_period_s),
+        "control_hz": float(cohort.control.control_hz),
+        "reference_fps": float(cohort.fps),
+        "endpoint": "hold_final_reference_continue_inference",
+      },
+      "action": {
+        "joint_names": list(cohort.actions.joint_names),
+        "scales": [float(x) for x in cohort.actions.joint_scales],
+        "offset": float(cohort.actions.offset),
+        "normalized_semantics": "raw_normalized_joint_position_action",
+        **members[0]["action_metadata"],
+      },
+    }
+    if tuple(schema.joint_order) != tuple(cohort.actions.joint_names):
+      raise ExportValidationError(
+        "checkpoint schema joint order disagrees with the cohort contract"
+      )
+
+    # Per-member contracts: byte-shape v2 (the C++ deployment parser is
+    # unchanged), each carrying the shared student model id and its own
+    # contract id.
+    member_contract_ids: list[str] = []
+    for member in members:
+      teacher = member["teacher"]
+      teacher_id = member["teacher_id"]
+      semantics = {
+        "format": "mjlab-vae-contract",
+        "version": 2,
+        "family": "vae_tracking",
+        "teacher_id": teacher_id,
+        "model_id": model_id,
+        **common_semantics,
+        "provenance": {
+          "checkpoint_sha256": checkpoint_sha,
+          "teacher_artifacts": dict(teacher.hashes),
+          "motion_sha256": member["motion_source_hash"],
+          "sensor_anchor": member["provenance"],
+          "deployment_measurement_requirement": "pelvis_imu_plus_waist_fk",
+          "source_schema": schema.compatibility_metadata(),
+        },
+      }
+      contract_id = _digest(semantics)
+      member_contract_ids.append(contract_id)
+      member_dir = staging / teacher_id
+      member_dir.mkdir()
+      contract = {**semantics, "contract_id": contract_id}
+      (member_dir / "contract.json").write_text(
+        json.dumps(contract, indent=2, sort_keys=True, allow_nan=False) + "\n"
+      )
+      (member_dir / "motion.json").write_text(
+        json.dumps(member["motion_payload"], indent=2, sort_keys=True, allow_nan=False)
+        + "\n"
+      )
+
+    # The cohort identity binds the shared graphs to the exact ordered member
+    # list; the graphs carry this contract id (and only this one).
+    cohort_contract_id = _digest(
+      {
+        "format": "mjlab-vae-contract",
+        "version": 3,
+        "family": "vae_tracking",
+        "model_id": model_id,
+        "cohort": {
+          "name": cohort.manifest.name,
+          "manifest_sha256": cohort.manifest.sha256,
+          "teacher_ids": list(teacher_ids),
+        },
+        "members": [
+          {"teacher_id": member["teacher_id"], "contract_id": contract_id}
+          for member, contract_id in zip(members, member_contract_ids, strict=True)
+        ],
+        **common_semantics,
+      }
+    )
+    _graph_metadata(
+      encoder,
+      model_id=model_id,
+      contract_id=cohort_contract_id,
+      graph="encoder",
+      bundle_version=COHORT_BUNDLE_VERSION,
+    )
+    _graph_metadata(
+      decoder,
+      model_id=model_id,
+      contract_id=cohort_contract_id,
+      graph="decoder",
+      bundle_version=COHORT_BUNDLE_VERSION,
+    )
+
+    # Bundle-relative paths: the contained bundle.json copy keeps the same
+    # convention as the v2 bundle (paths relative to the bundle directory).
+    descriptor_files = {
+      "encoder.onnx": {
+        "path": "shared/encoder.onnx",
+        "sha256": sha256_file(encoder),
+      },
+      "decoder.onnx": {
+        "path": "shared/decoder.onnx",
+        "sha256": sha256_file(decoder),
+      },
+    }
+    descriptor_members: list[dict[str, Any]] = []
+    for member, contract_id in zip(members, member_contract_ids, strict=True):
+      teacher_id = member["teacher_id"]
+      parity = validate_export_parity(
+        ExportResult(
+          descriptor=staging / "bundle.json",
+          contract=staging / teacher_id / "contract.json",
+          motion=staging / teacher_id / "motion.json",
+          encoder=encoder,
+          decoder=decoder,
+          model_id=model_id,
+          contract_id=contract_id,
+          report={},
+        ),
+        model,
+        torch.linspace(-1.0, 1.0, 68, dtype=torch.float32).reshape(1, 68),
+        torch.linspace(-1.0, 1.0, 99, dtype=torch.float32).reshape(1, 99),
+      )
+      parity_path = staging / teacher_id / "parity.json"
+      parity_path.write_text(json.dumps(parity, indent=2, sort_keys=True) + "\n")
+      descriptor_members.append(
+        {
+          "teacher_id": teacher_id,
+          "contract_id": contract_id,
+          "files": {
+            "contract.json": {
+              "path": f"{teacher_id}/contract.json",
+              "sha256": sha256_file(staging / teacher_id / "contract.json"),
+            },
+            "motion.json": {
+              "path": f"{teacher_id}/motion.json",
+              "sha256": sha256_file(staging / teacher_id / "motion.json"),
+            },
+            "parity.json": {
+              "path": f"{teacher_id}/parity.json",
+              "sha256": sha256_file(parity_path),
+            },
+          },
+        }
+      )
+    descriptor = {
+      "format": BUNDLE_FORMAT,
+      "version": COHORT_BUNDLE_VERSION,
+      "policy_id": bundle_name,
+      "family": "vae_tracking",
+      "model_id": model_id,
+      "contract_id": cohort_contract_id,
+      "files": descriptor_files,
+      "members": descriptor_members,
+    }
+    descriptor_path = staging / "bundle.json"
+    descriptor_path.write_text(json.dumps(descriptor, indent=2, sort_keys=True) + "\n")
+
+    def _prefixed(entry: dict[str, str]) -> dict[str, str]:
+      return {**entry, "path": f"{bundle_name}/{entry['path']}"}
+
+    report = {
+      "bundle": str(final),
+      "policy_id": bundle_name,
+      "model_id": model_id,
+      "contract_id": cohort_contract_id,
+      "teacher_ids": list(teacher_ids),
+      "member_contract_ids": list(member_contract_ids),
+      "files": {name: _prefixed(item) for name, item in descriptor_files.items()},
+      "members": [
+        {
+          "teacher_id": member["teacher_id"],
+          **{name: _prefixed(item) for name, item in entry["files"].items()},
+        }
+        for member, entry in zip(members, descriptor_members, strict=True)
+      ],
+      "parity": "pending",
+    }
+    os.replace(staging, final)
+
+  # The store-level descriptor points into the bundle directory.
+  root_descriptor = {
+    **descriptor,
+    "files": {name: _prefixed(item) for name, item in descriptor_files.items()},
+    "members": [
+      {
+        **member,
+        "files": {name: _prefixed(item) for name, item in member["files"].items()},
+      }
+      for member in descriptor_members
+    ],
+  }
+  descriptor_root.write_text(
+    json.dumps(root_descriptor, indent=2, sort_keys=True) + "\n"
+  )
+  return CohortExportResult(
+    descriptor=descriptor_root,
+    encoder=final / "shared" / "encoder.onnx",
+    decoder=final / "shared" / "decoder.onnx",
+    members=tuple(final / member["teacher_id"] for member in members),
+    model_id=model_id,
+    contract_id=cohort_contract_id,
+    report=report,
+  )
+
+
 def validate_export_parity(
   result: ExportResult,
   model: ConditionalVAE,
@@ -844,9 +1300,13 @@ def validate_export_parity(
 __all__ = [
   "BUNDLE_FORMAT",
   "BUNDLE_VERSION",
+  "COHORT_BUNDLE_VERSION",
+  "MAX_COHORT_MEMBERS",
+  "CohortExportResult",
   "ExportResult",
   "ExportValidationError",
   "export_bundle",
+  "export_cohort_bundle",
   "make_export_audit",
   "validate_export_parity",
 ]

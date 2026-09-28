@@ -68,6 +68,7 @@ from mjlab.tasks.tracking.distillation.config import (
 from mjlab.tasks.tracking.distillation.export import (
   ExportValidationError,
   export_bundle,
+  export_cohort_bundle,
 )
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
 from mjlab.tasks.tracking.distillation.parity import (
@@ -2653,42 +2654,64 @@ def _export(
   teacher_id: str = "tennis_000",
   output_dir: Path = Path("rl_model"),
   asset_audit: Path | None = None,
+  asset_audits: Path | None = None,
 ) -> int:
-  """Export a saved gravity VAE after an explicit physical asset audit.
+  """Export an audited gravity VAE checkpoint into a v2 or v3 bundle.
 
-  Only version-1 single-teacher checkpoints are exportable through this seam.
-  A version-2 M4 cohort checkpoint is refused explicitly rather than silently
-  reduced to one teacher: the exported contract records a single teacher's
-  artifacts and motion, and the asset audit producer
-  (``make_export_audit``) validates against one audited single-motion
-  environment, so a cohort member cannot be certified here without a new audit
-  contract.  This is a reported limitation, not a disabled check.
+  A version-1 single-teacher checkpoint exports through ``--asset-audit`` as
+  before.  A version-2/3 M4 cohort checkpoint exports through ``--asset-audits``:
+  a JSON index mapping every manifest member's teacher id to that member's
+  audit file, each produced by ``make_export_audit`` against a pinned
+  single-teacher environment of that member.  A cohort checkpoint with only the
+  singular audit is refused rather than silently reduced to one teacher, and a
+  single-teacher checkpoint ignores ``--asset-audits``.
   """
-  if asset_audit is None:
+  if asset_audit is None and asset_audits is None:
     print(
-      "[FAIL] --asset-audit is required; tensor schema is not physical frame evidence",
+      "[FAIL] --asset-audit (single teacher) or --asset-audits (cohort index) is "
+      "required; tensor schema is not physical frame evidence",
       file=sys.stderr,
     )
     return 1
   try:
     if _is_cohort_checkpoint(checkpoint):
-      raise ExportValidationError(
-        "distill export does not support a version-2 M4 cohort checkpoint. The "
-        "exported bundle records one teacher's artifacts, motion, and sensor "
-        "audit, and the asset audit producer validates one audited "
-        "single-motion environment, so a cohort member cannot be certified "
-        "through this seam. Export the version-1 single-teacher checkpoint "
-        "instead; cohort export needs a new audit contract (reported "
-        "limitation, not a disabled check)."
+      if asset_audits is None:
+        raise ExportValidationError(
+          "this checkpoint is a version-2/3 M4 cohort checkpoint; pass the cohort "
+          "audit index with --asset-audits (one audit per manifest member), not "
+          "the singular --asset-audit"
+        )
+      if asset_audit is not None:
+        raise ExportValidationError(
+          "--asset-audit names one teacher's audit but this checkpoint is a "
+          "cohort artifact; pass --asset-audits instead"
+        )
+      result = export_cohort_bundle(
+        checkpoint,
+        manifest,
+        output_dir,
+        repo_root=repo_root,
+        asset_audits=asset_audits,
       )
-    result = export_bundle(
-      checkpoint,
-      manifest,
-      teacher_id,
-      output_dir,
-      repo_root=repo_root,
-      asset_audit=asset_audit,
-    )
+    else:
+      if asset_audit is None:
+        raise ExportValidationError(
+          "this checkpoint is a version-1 single-teacher artifact; pass its audit "
+          "with --asset-audit"
+        )
+      if asset_audits is not None:
+        raise ExportValidationError(
+          "--asset-audits is the cohort audit index; this checkpoint is a "
+          "version-1 single-teacher artifact that needs --asset-audit"
+        )
+      result = export_bundle(
+        checkpoint,
+        manifest,
+        teacher_id,
+        output_dir,
+        repo_root=repo_root,
+        asset_audit=asset_audit,
+      )
   except (ExportValidationError, DistillationError, CheckpointValidationError) as exc:
     print(f"[FAIL] {exc}", file=sys.stderr)
     return 1

@@ -101,6 +101,40 @@ The successful example produced
 it is not hardware evidence or a deployment authorization.
 
 
+Version-3 cohort bundles
+------------------------
+
+``distill export --asset-audits <index.json>`` exports a saved version-2/3 M4
+cohort checkpoint (one shared student trained over several teachers) through
+``export_cohort_bundle(checkpoint, manifest, output_dir, repo_root=...,\
+asset_audits=...)``.  The index is a JSON object mapping every manifest
+member's teacher id to that member's audit file; each audit is produced by
+``make_export_audit`` against a pinned single-teacher environment of that
+member, exactly as the v2 seam requires.  A missing or extra member is
+refused, and audits that describe different compiled robots (asset identity,
+sensor/anchor provenance, or audited gains) are refused: the shared action and
+sensor blocks must be true for every member.
+
+The layout keeps one shared student and per-member triples::
+
+  vae-x2-tennis-teachers-mixed.yaml    # version-3 descriptor
+  vae-x2-tennis-teachers-mixed/
+    bundle.json                         # contained copy of the descriptor
+    shared/encoder.onnx                 # reference [1,68] -> latent [1,32]
+    shared/decoder.onnx                 # latent [1,32], conditioning [1,99] -> actions [1,31]
+    <teacher-id>/contract.json          # byte-shape v2 member contract
+    <teacher-id>/motion.json            # that teacher's frame-major table
+    <teacher-id>/parity.json            # parity bound to the member contract id
+
+The descriptor's top-level ``model_id``/``contract_id`` are the cohort
+identity stamped into both graphs' metadata; each member entry carries its own
+``contract_id`` (matching that member's ``contract.json``), and the member
+order is the manifest order, which is the order the deployed controller plays
+the members in.  Member contracts remain version-2 shaped so the C++ deployment
+parser is unchanged; they share the student ``model_id`` and differ in teacher
+provenance, motion digest, and contract id.  Parity fixtures are per member
+with the member contract id; the numbers are shared because the graphs are.
+
 ``export_bundle(checkpoint, manifest, teacher_id, output_dir, repo_root=...,\
 asset_audit=...)`` returns an ``ExportResult`` with all paths and IDs.
 ``validate_export_parity(result, inference_model.model, reference, conditioning)``
