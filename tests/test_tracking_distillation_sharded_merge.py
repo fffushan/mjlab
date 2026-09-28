@@ -15,6 +15,7 @@ import torch
 
 from mjlab.tasks.tracking.distillation.collector import (
   CollectionConfig,
+  EvaluationSegment,
   MotionCollectionStats,
   SegmentBoundary,
 )
@@ -24,12 +25,13 @@ from mjlab.tasks.tracking.distillation.sharded_collection import (
   ShardedCollection,
   ShardedCollectionError,
   merge_collection_replies,
+  merge_evaluations,
   merge_motion_stats,
   union_motion_frames,
 )
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBatch
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_SCHEMA
-from mjlab.tasks.tracking.distillation.worker import CollectReply
+from mjlab.tasks.tracking.distillation.worker import CollectReply, EvaluateReply
 
 
 def _batch(rows: int, worker_index: int) -> LabeledReplayBatch:
@@ -511,3 +513,159 @@ def test_sharded_source_invalidates_on_a_pool_failure() -> None:
 
   assert len(replay) == 0
   assert source._requires_reset is True
+
+
+def _segment(
+  env_index: int,
+  *,
+  outcome: str,
+  steps: int = 10,
+  metrics: dict | None = None,
+  motion_id: int = 1,
+) -> EvaluationSegment:
+  return EvaluationSegment(
+    env_index=env_index,
+    segment_id=env_index,
+    generation_id=0,
+    steps=steps,
+    completed=outcome == "reference_complete",
+    failed=outcome == "failure",
+    capped=outcome == "step_cap",
+    metrics=dict(metrics or {}),
+    outcome=outcome,
+    motion_id=motion_id,
+  )
+
+
+def _evaluation(segments, *, steps: int = 10, num_envs: int = 2, settings=None):
+  from mjlab.tasks.tracking.distillation.collector import EvaluationResult
+
+  return EvaluationResult(
+    mode="student",
+    rollout_latent="mean",
+    steps=steps,
+    segments=tuple(segments),
+    metrics={},
+    settings={"num_envs": num_envs, "step_cap": steps, **(settings or {})},
+  )
+
+
+def _evaluate_reply(index: int, segments, **kwargs) -> EvaluateReply:
+  return EvaluateReply(
+    call_id=index + 1, iteration=0, result=_evaluation(segments, **kwargs)
+  )
+
+
+def test_merged_evaluation_recomputes_rates_over_the_union_of_segments() -> None:
+  """Rates must use the union denominator, not an average of shard rates.
+
+  Shard 0 has one completion out of one known segment; shard 1 has one failure
+  out of three known segments.  The true completion rate over the union is
+  1/4.  Averaging the shard rates would report 2/3, and weighting by shard
+  rather than by segment count would report the same wrong number.
+  """
+  shard0 = [_segment(0, outcome="reference_complete")]
+  shard1 = [
+    _segment(0, outcome="failure"),
+    _segment(1, outcome="timeout"),
+    _segment(1, outcome="step_cap"),
+    _segment(0, outcome="reference_complete"),
+  ]
+
+  merged = merge_evaluations([_evaluate_reply(0, shard0), _evaluate_reply(1, shard1)])
+
+  # Hand-computed from the concatenated records: 2 of 5 segments complete, 1 of
+  # 5 known segments failed, 1 of 5 timed out, 1 of 5 capped.
+  assert len(merged.segments) == 5
+  assert merged.metrics["completion_known_segments"] == 3.0
+  assert merged.metrics["completion_rate"] == pytest.approx(2 / 3)
+  assert merged.metrics["failure_rate"] == pytest.approx(1 / 3)
+  assert merged.metrics["timeout_rate"] == pytest.approx(1 / 5)
+  assert merged.metrics["step_cap_rate"] == pytest.approx(1 / 5)
+  assert merged.metrics["reset_rate"] == pytest.approx(0.0)
+  # The derived properties recompute from the merged segments too.
+  assert merged.completion_rate == pytest.approx(2 / 3)
+  assert merged.failure_rate == pytest.approx(1 / 3)
+
+
+def test_merged_evaluation_means_a_metric_over_segments_that_carry_it() -> None:
+  """A per-segment metric is averaged over the segments that reported it."""
+  shard0 = [
+    _segment(0, outcome="timeout", metrics={"tracking_pose_error": 0.1}),
+    _segment(1, outcome="timeout", metrics={"tracking_pose_error": 0.2}),
+  ]
+  shard1 = [
+    _segment(0, outcome="timeout", metrics={"tracking_pose_error": 0.6}),
+    # This segment reports no such metric and must not be counted as a zero.
+    _segment(1, outcome="timeout", metrics={}),
+  ]
+
+  merged = merge_evaluations([_evaluate_reply(0, shard0), _evaluate_reply(1, shard1)])
+
+  assert merged.metrics["tracking_pose_error"] == pytest.approx((0.1 + 0.2 + 0.6) / 3)
+
+
+def test_merged_evaluation_tags_segments_and_sums_the_environment_count() -> None:
+  """Merged segments name their shard, and the cohort size is the union's."""
+  merged = merge_evaluations(
+    [
+      _evaluate_reply(0, [_segment(0, outcome="timeout")], num_envs=2),
+      _evaluate_reply(1, [_segment(1, outcome="timeout")], num_envs=2),
+    ]
+  )
+
+  assert [segment.worker_index for segment in merged.segments] == [0, 1]
+  # Both shards number their own environments from zero, which is exactly why
+  # the shard tag is required to read a merged segment.
+  assert [segment.env_index for segment in merged.segments] == [0, 1]
+  assert merged.settings["num_envs"] == 4
+  assert merged.settings["sharded_workers"] == 2
+  assert merged.trial_window_steps is None
+
+
+def test_merged_evaluation_accepts_an_empty_shard() -> None:
+  """A shard that produced no segment must not invent one or skew a rate.
+
+  An empty shard is a real outcome (its environments never finished a
+  segment), and the union denominators have to reflect the shards that did
+  report rather than the number of shards.
+  """
+  merged = merge_evaluations(
+    [
+      _evaluate_reply(0, []),
+      _evaluate_reply(1, [_segment(0, outcome="reference_complete")]),
+    ]
+  )
+
+  assert len(merged.segments) == 1
+  assert merged.metrics["completion_rate"] == pytest.approx(1.0)
+  assert merged.metrics["timeout_rate"] == pytest.approx(0.0)
+
+
+def test_merged_evaluation_refuses_shards_that_evaluated_differently() -> None:
+  """Segments from different evaluations cannot be pooled into one metric."""
+  with pytest.raises(ShardedCollectionError) as error:
+    merge_evaluations(
+      [
+        _evaluate_reply(0, [_segment(0, outcome="timeout")], steps=10),
+        _evaluate_reply(1, [_segment(0, outcome="timeout")], steps=25),
+      ]
+    )
+  assert "do not describe one evaluation" in str(error.value)
+
+
+def test_merged_evaluation_reports_a_standing_profile_from_shard_settings() -> None:
+  """Trial accounting is applied when the shards ran a standing profile."""
+  merged = merge_evaluations(
+    [
+      _evaluate_reply(
+        0, [_segment(0, outcome="timeout")], settings={"trial_window_steps": 25}
+      ),
+      _evaluate_reply(
+        1, [_segment(0, outcome="failure")], settings={"trial_window_steps": 25}
+      ),
+    ]
+  )
+
+  assert "trial_failure_rate" in merged.metrics
+  assert "trial_window_steps" in merged.settings

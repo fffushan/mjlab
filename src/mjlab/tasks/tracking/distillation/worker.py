@@ -125,6 +125,17 @@ class WorkerEnvironmentDescription:
   reset_policy_enabled: bool
   reset_provenance: Any | None
   sampling_mode: str
+  library: Any = None
+  """Reference library the shard built, for the parent's replay and identity.
+
+  A sharded parent owns no environment, so the clip extents, the audited slot
+  allocation and the motion-to-teacher codes it needs to construct the replay
+  and the cohort identity come from a worker that did build one.
+  """
+  audit: Any = None
+  """Live multi-motion audit the shard produced during construction."""
+  motion_teacher_codes: Any = None
+  """Per-motion teacher codes, the replay's routing table."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,8 +174,6 @@ class EvaluateRequest:
   steps: int
   mode: EvaluationMode
   rollout_latent: RolloutLatent
-  standing_trials: bool
-  trial_window_steps: int
   weights: Mapping[str, torch.Tensor]
 
 
@@ -350,6 +359,9 @@ def describe_environment(
     reset_policy_enabled=enabled,
     reset_provenance=provenance,
     sampling_mode=sampling_mode,
+    library=adapter.library,
+    audit=adapter.audit,
+    motion_teacher_codes=dict(adapter.motion_teacher_codes),
   )
 
 
@@ -490,8 +502,6 @@ class _Worker:
       seed=worker_generator_seed(
         self.spec.setup.base_seed, request.iteration, self.spec.worker_index
       ),
-      standing_trials=request.standing_trials,
-      trial_window_steps=request.trial_window_steps,
     )
     return EvaluateReply(
       call_id=request.call_id, iteration=request.iteration, result=result
@@ -867,8 +877,6 @@ class WorkerPool:
     mode: EvaluationMode,
     steps: int,
     rollout_latent: RolloutLatent,
-    standing_trials: bool,
-    trial_window_steps: int,
     weights: Mapping[str, torch.Tensor],
   ) -> tuple[EvaluateReply, ...]:
     """Evaluate every shard with the same policy state, concurrently."""
@@ -880,8 +888,6 @@ class WorkerPool:
         steps=steps,
         mode=mode,
         rollout_latent=rollout_latent,
-        standing_trials=standing_trials,
-        trial_window_steps=trial_window_steps,
         weights=staged,
       )
       for index in range(len(self.specs))

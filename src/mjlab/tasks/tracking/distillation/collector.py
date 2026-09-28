@@ -272,6 +272,14 @@ class EvaluationSegment:
   """
   start_reason: str | None = None
   """Boundary reason that started this segment, when the command reported one."""
+  worker_index: int | None = None
+  """Shard that produced this segment, or ``None`` for a single-process run.
+
+  ``env_index`` is an index into one shard's environment batch, so a merged
+  segment has to name its shard: without it, row 3 of two different shards
+  would read as the same environment.  The aggregation itself is unaffected —
+  it counts segments, not environments.
+  """
 
 
 def _reason_is_full_reset(reason: str | None) -> bool:
@@ -1356,6 +1364,99 @@ def _event_at(events: Any, index: int, batch: int) -> _BoundaryEvent | None:
   )
 
 
+def aggregate_evaluation_metrics(
+  segments: Sequence[EvaluationSegment],
+  *,
+  standing_trials: bool,
+  trial_window_steps: int,
+) -> dict[str, float]:
+  """Aggregate per-segment evaluation records into the reported metrics.
+
+  Every reported rate, mean and trial bucket is a function of the segment
+  list and these two settings, which is what lets a sharded evaluation
+  concatenate its shards' segments and recompute instead of averaging
+  shard-level results.  Averaging would weight a shard with two segments like
+  one with two hundred, and the trial denominators would not add up across
+  shards at all.
+  """
+  denominator = len(segments)
+  known = [
+    item for item in segments if item.outcome in ("reference_complete", "failure")
+  ]
+  all_metrics: dict[str, float] = {
+    "completion_known_segments": float(len(known)),
+    "timeout_rate": (
+      sum(item.outcome == "timeout" for item in segments) / denominator
+      if denominator
+      else 0.0
+    ),
+    "teleport_rate": (
+      sum(item.outcome == "teleport" for item in segments) / denominator
+      if denominator
+      else 0.0
+    ),
+    "timer_resampled_rate": (
+      sum(item.outcome == "timer_resampled" for item in segments) / denominator
+      if denominator
+      else 0.0
+    ),
+    "reset_rate": (
+      sum(item.outcome == "reset" for item in segments) / denominator
+      if denominator
+      else 0.0
+    ),
+    "step_cap_rate": (
+      sum(item.outcome == "step_cap" for item in segments) / denominator
+      if denominator
+      else 0.0
+    ),
+    "reference_coverage_mean": (
+      sum(item.reference_coverage for item in segments) / denominator
+      if denominator
+      else 0.0
+    ),
+  }
+  if known:
+    all_metrics["completion_rate"] = sum(
+      item.outcome == "reference_complete" for item in known
+    ) / len(known)
+    all_metrics["failure_rate"] = sum(
+      item.outcome == "failure" for item in known
+    ) / len(known)
+  for name in sorted({name for item in segments for name in item.metrics}):
+    values = [item.metrics[name] for item in segments if name in item.metrics]
+    if values:
+      all_metrics[name] = sum(values) / len(values)
+  if standing_trials:
+    trials = standing_trial_buckets(segments, trial_window_steps)
+    all_metrics["trials"] = float(trials["trials"])
+    all_metrics["trial_window_steps"] = float(trials["window_steps"])
+    for name in (
+      "failures_within_window",
+      "failures_after_window",
+      "survived_window",
+      "short_clip_completions",
+      "censored",
+    ):
+      all_metrics[f"trial_{name}"] = float(trials[name])
+    trial_total = trials["trials"]
+    all_metrics["trial_failure_rate"] = (
+      (trials["failures_within_window"] + trials["failures_after_window"]) / trial_total
+      if trial_total
+      else 0.0
+    )
+    all_metrics["trial_failed_within_window_rate"] = (
+      trials["failures_within_window"] / trial_total if trial_total else 0.0
+    )
+    all_metrics["trial_survived_window_rate"] = (
+      trials["survived_window"] / trial_total if trial_total else 0.0
+    )
+    all_metrics["continuation_segments"] = float(
+      sum(not item.is_trial for item in segments)
+    )
+  return all_metrics
+
+
 def evaluate_distillation(
   adapter: _AdapterLike,
   teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
@@ -1632,82 +1733,11 @@ def evaluate_distillation(
         )
       )
 
-    denominator = len(segments)
-    known = [
-      item for item in segments if item.outcome in ("reference_complete", "failure")
-    ]
-    all_metrics: dict[str, float] = {
-      "completion_known_segments": float(len(known)),
-      "timeout_rate": (
-        sum(item.outcome == "timeout" for item in segments) / denominator
-        if denominator
-        else 0.0
-      ),
-      "teleport_rate": (
-        sum(item.outcome == "teleport" for item in segments) / denominator
-        if denominator
-        else 0.0
-      ),
-      "timer_resampled_rate": (
-        sum(item.outcome == "timer_resampled" for item in segments) / denominator
-        if denominator
-        else 0.0
-      ),
-      "reset_rate": (
-        sum(item.outcome == "reset" for item in segments) / denominator
-        if denominator
-        else 0.0
-      ),
-      "step_cap_rate": (
-        sum(item.outcome == "step_cap" for item in segments) / denominator
-        if denominator
-        else 0.0
-      ),
-      "reference_coverage_mean": (
-        sum(item.reference_coverage for item in segments) / denominator
-        if denominator
-        else 0.0
-      ),
-    }
-    if known:
-      all_metrics["completion_rate"] = sum(
-        item.outcome == "reference_complete" for item in known
-      ) / len(known)
-      all_metrics["failure_rate"] = sum(
-        item.outcome == "failure" for item in known
-      ) / len(known)
-    for name in sorted({name for item in segments for name in item.metrics}):
-      values = [item.metrics[name] for item in segments if name in item.metrics]
-      if values:
-        all_metrics[name] = sum(values) / len(values)
-    if standing_trials:
-      trials = standing_trial_buckets(segments, trial_window_steps)
-      all_metrics["trials"] = float(trials["trials"])
-      all_metrics["trial_window_steps"] = float(trials["window_steps"])
-      for name in (
-        "failures_within_window",
-        "failures_after_window",
-        "survived_window",
-        "short_clip_completions",
-        "censored",
-      ):
-        all_metrics[f"trial_{name}"] = float(trials[name])
-      trial_total = trials["trials"]
-      all_metrics["trial_failure_rate"] = (
-        (trials["failures_within_window"] + trials["failures_after_window"])
-        / trial_total
-        if trial_total
-        else 0.0
-      )
-      all_metrics["trial_failed_within_window_rate"] = (
-        trials["failures_within_window"] / trial_total if trial_total else 0.0
-      )
-      all_metrics["trial_survived_window_rate"] = (
-        trials["survived_window"] / trial_total if trial_total else 0.0
-      )
-      all_metrics["continuation_segments"] = float(
-        sum(not item.is_trial for item in segments)
-      )
+    all_metrics = aggregate_evaluation_metrics(
+      segments,
+      standing_trials=standing_trials,
+      trial_window_steps=trial_window_steps,
+    )
     aligned_time = (
       snapshot.metrics.aligned_time if snapshot.metrics is not None else None
     )

@@ -137,18 +137,6 @@ class DistillationRunner:
         "a runner needs exactly one collection source: an in-process collector "
         "or a sharded source"
       )
-    if (
-      self.sharded is not None
-      and self.config.evaluate_every
-      and self.config.evaluation_steps > 0
-    ):
-      # Refused here, at construction, rather than when the first evaluation
-      # interval arrives: a run must not start and then fail an hour in for a
-      # reason knowable before it began.
-      raise RunnerValidationError(
-        "sharded evaluation is not wired yet: this build collects sharded and "
-        "evaluates single-device only, so evaluate_every must be 0"
-      )
     if self.collector is not None and self.collector.replay is not self.trainer.replay:
       raise RunnerValidationError("collector and trainer must share one replay owner")
     if self.config.evaluation_mode == "student" and self.config.evaluate_every:
@@ -269,28 +257,40 @@ class DistillationRunner:
       and self.config.evaluation_steps > 0
     ):
       if self.sharded is not None:
-        raise RunnerValidationError(
-          "sharded evaluation is not wired yet: this build collects sharded and "
-          "evaluates single-device only, so evaluate_every must be 0"
-        )
-      teacher = self.evaluation_teacher or self.collector.teacher
-      student = self.evaluation_student or self.trainer.model
-      try:
-        evaluation = evaluate_distillation(
-          self.collector.adapter,
-          teacher,
-          student,
-          mode=self.config.evaluation_mode,
-          steps=self.config.evaluation_steps,
-          rollout_latent=self.config.rollout_latent,
-          seed=self.config.seed + self.iteration,
-        )
-      finally:
-        # Evaluation resets/steps the shared adapter independently of the
-        # collector.  Never retain the pre-evaluation snapshot for collection,
-        # and record that the next collection must resynchronize with a reset.
-        self.collector.invalidate_snapshot()
-        self._reset_required = True
+        # A sharded run has no adapter to evaluate locally: every worker
+        # evaluates its own environments with the broadcast weights and the
+        # parent merges the retained segment records, so the evaluated cohort
+        # stays the whole run rather than one shard.
+        try:
+          evaluation = self.sharded.evaluate(
+            iteration=self.iteration,
+            mode=self.config.evaluation_mode,
+            steps=self.config.evaluation_steps,
+            rollout_latent=self.config.rollout_latent,
+          )
+        finally:
+          self.collection_source.invalidate_snapshot()
+          self._reset_required = True
+      else:
+        teacher = self.evaluation_teacher or self.collector.teacher
+        student = self.evaluation_student or self.trainer.model
+        try:
+          evaluation = evaluate_distillation(
+            self.collector.adapter,
+            teacher,
+            student,
+            mode=self.config.evaluation_mode,
+            steps=self.config.evaluation_steps,
+            rollout_latent=self.config.rollout_latent,
+            seed=self.config.seed + self.iteration,
+          )
+        finally:
+          # Evaluation resets/steps the shared adapter independently of the
+          # collector.  Never retain the pre-evaluation snapshot for
+          # collection, and record that the next collection must resynchronize
+          # with a reset.
+          self.collector.invalidate_snapshot()
+          self._reset_required = True
     result = LifecycleIteration(
       self.iteration,
       collection,

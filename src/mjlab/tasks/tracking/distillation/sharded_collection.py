@@ -33,8 +33,12 @@ import torch
 from mjlab.tasks.tracking.distillation.collector import (
   CollectionConfig,
   CollectionResult,
+  EvaluationMode,
+  EvaluationResult,
   MotionCollectionStats,
+  RolloutLatent,
   SegmentBoundary,
+  aggregate_evaluation_metrics,
 )
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
@@ -404,6 +408,68 @@ def merge_collection_replies(
   )
 
 
+def merge_evaluations(replies: Sequence[EvaluateReply]) -> EvaluationResult:
+  """Merge shard evaluations into one result by recomputing from segments.
+
+  Segments are concatenated worker-ascending and tagged with their shard, then
+  the same aggregation the single-process path uses recomputes every rate, mean
+  and trial bucket over the union.  That is what makes the merge exact instead
+  of an average of averages: the aggregation is a pure function of the segment
+  list, so rates keep their true denominators across shards and the trial
+  buckets add up.  Averaging shard-level results would weight a shard with two
+  segments like one with two hundred.
+
+  Whether the profile is a standing-trial run is read from the shards'
+  settings, because that is exactly the flag that gated the trial accounting
+  when each shard produced its own result.
+  """
+  if not replies:
+    raise ShardedCollectionError("a merged evaluation needs at least one shard")
+  first = replies[0].result
+  for index, reply in enumerate(replies):
+    result = reply.result
+    if (result.mode, result.rollout_latent, result.steps) != (
+      first.mode,
+      first.rollout_latent,
+      first.steps,
+    ):
+      raise ShardedCollectionError(
+        f"shard {index} evaluated mode={result.mode!r} "
+        f"rollout_latent={result.rollout_latent!r} steps={result.steps} while "
+        f"shard 0 evaluated mode={first.mode!r} "
+        f"rollout_latent={first.rollout_latent!r} steps={first.steps}; their "
+        f"segments do not describe one evaluation"
+      )
+  segments = tuple(
+    replace(segment, worker_index=index)
+    for index, reply in enumerate(replies)
+    for segment in reply.result.segments
+  )
+  standing = "trial_window_steps" in first.settings
+  metrics = aggregate_evaluation_metrics(
+    segments,
+    standing_trials=standing,
+    trial_window_steps=int(first.settings.get("trial_window_steps", 25)),
+  )
+  settings = dict(first.settings)
+  settings["num_envs"] = sum(
+    int(reply.result.settings.get("num_envs", 0)) for reply in replies
+  )
+  settings["sharded_workers"] = len(replies)
+  settings["sharded_metrics"] = (
+    "recomputed from every shard's segments, not averaged from shard results"
+  )
+  return EvaluationResult(
+    mode=first.mode,
+    rollout_latent=first.rollout_latent,
+    steps=first.steps,
+    segments=segments,
+    metrics=metrics,
+    settings=settings,
+    trial_window_steps=first.trial_window_steps,
+  )
+
+
 class ShardedCollection:
   """Parent-side collection source backed by a worker pool.
 
@@ -544,17 +610,35 @@ class ShardedCollection:
     """Device the merged rows must arrive on before they can be inserted."""
     return self.replay.device or torch.device("cpu")
 
-  def evaluate(self) -> tuple[EvaluateReply, ...]:
-    """Evaluate every shard.
+  def evaluate(
+    self,
+    *,
+    iteration: int,
+    mode: EvaluationMode,
+    steps: int,
+    rollout_latent: RolloutLatent,
+  ) -> EvaluationResult:
+    """Evaluate every shard with one policy state and merge their segments.
 
-    Merging the retained per-segment records is the remaining piece of the
-    plan's step 4, so this refuses rather than returning a partial result: a
-    silently single-shard evaluation would look like a valid metric.
+    Each shard evaluates its own environments under the weights the trainer
+    holds, and the parent merges the retained segment records, so the evaluated
+    environment count stays the whole cohort rather than one shard's share.
     """
-    raise ShardedCollectionError(
-      "sharded evaluation is not wired yet: this build collects sharded and "
-      "evaluates single-device only"
+    # A model state dict is not only tensors: a module may publish plain-data
+    # ``_extra_state``, which must travel unchanged.
+    state = self.model.state_dict()
+    weights = {
+      name: value.detach() if isinstance(value, torch.Tensor) else value
+      for name, value in state.items()
+    }
+    replies = self.pool.evaluate(
+      iteration=iteration,
+      mode=mode,
+      steps=steps,
+      rollout_latent=rollout_latent,
+      weights=weights,
     )
+    return merge_evaluations(replies)
 
   def close(self) -> None:
     self.pool.close()

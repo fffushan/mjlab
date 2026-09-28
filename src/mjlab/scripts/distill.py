@@ -14,12 +14,15 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import torch
@@ -28,7 +31,6 @@ import tyro
 import mjlab
 from mjlab.tasks.tracking.distillation.adapter import (
   InitializationKind,
-  MultiMotionDistillationAdapter,
   make_distillation_adapter,
   make_multi_teacher_distillation_adapter,
 )
@@ -48,6 +50,7 @@ from mjlab.tasks.tracking.distillation.checkpoint import (
 from mjlab.tasks.tracking.distillation.cohort_contract import (
   CohortIdentity,
   cohort_identity_from_adapter,
+  cohort_identity_from_parts,
   require_member_matches,
 )
 from mjlab.tasks.tracking.distillation.cohort_setup import CohortSetup
@@ -93,12 +96,15 @@ from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
   RunnerConfig,
 )
+from mjlab.tasks.tracking.distillation.sharded_collection import ShardedCollection
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
+from mjlab.tasks.tracking.distillation.teachers import build_cohort_teacher_bank
 from mjlab.tasks.tracking.distillation.trainer import (
   TrainingConfig,
   VaeDistillationTrainer,
 )
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
+from mjlab.tasks.tracking.distillation.worker import WorkerPool, worker_specs
 
 _COMMANDS = (
   "validate-teachers",
@@ -947,19 +953,7 @@ def _build_cohort_runner(
   later failure closes the already-built environment exactly once instead of
   leaking it (the caller has no runner to close in that case).
   """
-  known = {teacher.id for teacher in cohort.teachers}
-  unknown = [teacher_id for teacher_id in teacher_ids if teacher_id not in known]
-  if unknown:
-    raise DistillationError(f"cohort has no teacher(s) {unknown}")
-  if not teacher_ids:
-    raise DistillationError("a cohort run needs at least one teacher id")
-  if len(set(teacher_ids)) != len(teacher_ids):
-    raise DistillationError(f"duplicate teacher ids {list(teacher_ids)}")
-  if replay_capacity < len(teacher_ids):
-    raise DistillationError(
-      f"--replay-capacity {replay_capacity} cannot give each of the "
-      f"{len(teacher_ids)} selected motions a slot"
-    )
+  _validate_cohort_run(cohort, teacher_ids, replay_capacity)
   # Pure-data configuration validates before a simulator exists.
   training_config = TrainingConfig(
     learning_rate=learning_rate,
@@ -1018,14 +1012,134 @@ def _build_cohort_runner(
     adapter.close()
     raise
   sampling_mode = adapter.env.command_manager.get_term("motion").cfg.sampling_mode
-  return runner, adapter, identity, sampling_mode
+  return runner, adapter, identity, sampling_mode, _seed_audit(adapter)
+
+
+def _build_sharded_cohort_runner(
+  *,
+  cohort: CohortContract,
+  setup: CohortSetup,
+  teacher_ids: tuple[str, ...],
+  device: str,
+  num_envs: int,
+  worker_devices: tuple[str, ...],
+  replay_capacity: int,
+  phase_bins: int,
+  minibatch_size: int,
+  accumulation_steps: int,
+  learning_rate: float,
+  beta: float,
+  seed: int,
+  max_iterations: int,
+  bootstrap_steps: int,
+  collection_steps: int,
+  updates_per_iteration: int,
+  teacher_probability: float,
+  evaluate_every: int,
+  evaluation_steps: int,
+  rollout_latent: RolloutLatent,
+):
+  """Build the sharded M4 cohort run: N worker environments, one parent replay.
+
+  The parent owns no environment in this layout, so the schema, the reference
+  library, the audited slot allocation and the motion-to-teacher codes come from
+  the workers that did build one.  Everything the run does with them — the
+  replay, the trainer, the cohort identity, the checkpoints — is the same code
+  the single-process path uses, on the same values, so a sharded run and a
+  single-process run of one recipe record the same cohort identity.
+
+  Returns the runner, the collection source, the identity, the sampling mode and
+  the seed audit, exactly like the single-process builder.
+  """
+  _validate_cohort_run(cohort, teacher_ids, replay_capacity)
+  training_config = TrainingConfig(
+    learning_rate=learning_rate,
+    beta=beta,
+    accumulation_steps=accumulation_steps,
+    minibatch_size=minibatch_size,
+  )
+  runner_config = RunnerConfig(
+    max_iterations=max_iterations,
+    bootstrap_steps=bootstrap_steps,
+    collection_steps=collection_steps,
+    updates_per_iteration=updates_per_iteration,
+    teacher_probability=teacher_probability,
+    evaluate_every=evaluate_every,
+    evaluation_steps=evaluation_steps,
+    evaluation_mode="student",
+    rollout_latent=rollout_latent,
+    seed=seed,
+  )
+  specs = worker_specs(setup, worker_devices, num_envs=num_envs)
+  pool = WorkerPool(specs)
+  source = None
+  try:
+    pool.start()
+    descriptions = pool.describe()
+    primary = descriptions[0]
+    for index, description in enumerate(descriptions):
+      if description.schema != primary.schema:
+        raise DistillationError(
+          f"worker {index} reported a different observation schema than worker "
+          f"0; the shards would train one model on two contracts"
+        )
+    torch.manual_seed(seed)
+    model = ConditionalVAE(primary.schema, DEFAULT_MODEL_SETTINGS).to(device)
+    weights = {
+      clip.motion_id: float(cohort.teacher(clip.teacher_id).entry.sampling_weight)
+      for clip in primary.library.clips
+    }
+    replay = BalancedReplayBuffer(
+      replay_capacity,
+      primary.schema,
+      weights,
+      teacher_codes=dict(primary.motion_teacher_codes or {}),
+      frame_counts={clip.motion_id: int(clip.frames) for clip in primary.library.clips},
+      device=torch.device(device),
+      dtype=torch.float32,
+      phase_bins=phase_bins,
+    )
+    identity = cohort_identity_from_parts(
+      cohort=cohort,
+      library=primary.library,
+      audit=primary.audit,
+      replay=replay,
+      device=device,
+    )
+    trainer = VaeDistillationTrainer(
+      model,
+      replay,
+      training_config,
+      seed=seed,
+      teacher=build_cohort_teacher_bank(cohort, device=device),
+    )
+    source = ShardedCollection(
+      pool, replay=replay, model=model, descriptions=descriptions
+    )
+    runner = DistillationRunner(None, trainer, runner_config, sharded=source)
+  except BaseException:
+    # The caller never received a source, so releasing the pool is ours to do.
+    if source is not None:
+      source.close()
+    else:
+      pool.close()
+    raise
+  return (
+    runner,
+    source,
+    identity,
+    primary.sampling_mode,
+    _seed_audit(SimpleNamespace(audit=primary.audit)),
+  )
 
 
 def _cohort_resolved_config(
   *,
   manifest: Path,
   repo_root: Path,
-  adapter: MultiMotionDistillationAdapter,
+  sampling_mode: str,
+  reset_policy_dict: Mapping[str, Any],
+  base_task: str,
   identity: CohortIdentity,
   task_id: str | None,
   device: str,
@@ -1059,12 +1173,8 @@ def _cohort_resolved_config(
     "cohort_digest": identity.digest(),
     "mapping_digest": identity.mapping_digest,
     "phase_policy": identity.slots.phase_policy,
-    "reset_policy": getattr(
-      adapter.env.command_manager.get_term("motion"),
-      "reset_policy",
-      ResetPolicy(),
-    ).as_dict(),
-    "task": adapter.cohort.manifest.base_task,
+    "reset_policy": dict(reset_policy_dict),
+    "task": base_task,
     "task_id": task_id,
     "runtime": {
       "device": device,
@@ -1075,9 +1185,7 @@ def _cohort_resolved_config(
       "workers": _workers_identity(worker_devices, num_envs),
     },
     "execution": {"transport": _collection_transport(worker_devices)},
-    "schedule": _schedule_config(
-      runner, adapter.env.command_manager.get_term("motion").cfg.sampling_mode
-    ),
+    "schedule": _schedule_config(runner, sampling_mode),
     "checkpoint_every": checkpoint_every,
     "trainer": {
       "learning_rate": trainer.config.learning_rate,
@@ -1197,6 +1305,72 @@ def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
     if iteration.evaluation is None
     else asdict(iteration.evaluation),
   }
+
+
+def _release(owner):
+  """Return a callable that releases whichever object owns the environment.
+
+  The single-process layout owns one adapter; the sharded layout owns a pool of
+  worker processes.  Both are released by ``close``, so callers that must clean
+  up on failure or on a signal do not branch on which layout is running.
+  """
+  close = getattr(owner, "close", None)
+  return close if callable(close) else (lambda: None)
+
+
+@contextmanager
+def _teardown_on_signal(teardown):
+  """Run ``teardown`` when an operator or scheduler stops the run.
+
+  A sharded run holds worker processes on collection devices.  Without this,
+  Ctrl-C or a scheduler's ``SIGTERM`` would leave them to their own watchdog
+  rather than closing them before the process exits, which is the difference
+  between releasing a GPU promptly and holding it while a collection finishes.
+  Handlers are restored on exit, so the surrounding process keeps its own
+  disposition.
+  """
+  previous: dict[int, Any] = {}
+
+  def handler(signum, _frame):
+    teardown()
+    raise SystemExit(128 + signum)
+
+  for signum in (signal.SIGINT, signal.SIGTERM):
+    try:
+      previous[signum] = signal.getsignal(signum)
+      signal.signal(signum, handler)
+    except ValueError:
+      # Not the main thread: the caller's own teardown still runs.
+      pass
+  try:
+    yield
+  finally:
+    for signum, original in previous.items():
+      signal.signal(signum, original)
+
+
+def _validate_cohort_run(
+  cohort: CohortContract, teacher_ids: tuple[str, ...], replay_capacity: int
+) -> None:
+  """Selection and budget checks shared by both collection layouts.
+
+  Cheap to run and complete before any environment exists, so a typo in a
+  teacher id or an impossible replay capacity never costs a simulator build
+  under either layout.
+  """
+  known = {teacher.id for teacher in cohort.teachers}
+  unknown = [teacher_id for teacher_id in teacher_ids if teacher_id not in known]
+  if unknown:
+    raise DistillationError(f"cohort has no teacher(s) {unknown}")
+  if not teacher_ids:
+    raise DistillationError("a cohort run needs at least one teacher id")
+  if len(set(teacher_ids)) != len(teacher_ids):
+    raise DistillationError(f"duplicate teacher ids {list(teacher_ids)}")
+  if replay_capacity < len(teacher_ids):
+    raise DistillationError(
+      f"--replay-capacity {replay_capacity} cannot give each of the "
+      f"{len(teacher_ids)} selected motions a slot"
+    )
 
 
 def _fail(exc: BaseException) -> int:
@@ -1490,6 +1664,7 @@ def _train_cohort(
   environment is constructed instead of being reinterpreted.
   """
   runner = None
+  primary = None
   try:
     _require_train_settings(report_boundaries, checkpoint_every, progress_every)
     if resume is not None and not _is_cohort_checkpoint(resume):
@@ -1508,37 +1683,72 @@ def _train_cohort(
       reset_policy=reset_policy,
       base_seed=seed,
     )
-    runner, adapter, identity, evaluation_sampling_mode = _build_cohort_runner(
-      cohort=cohort,
-      setup=setup,
-      teacher_ids=teacher_ids,
-      device=device,
-      num_envs=num_envs,
-      task_id=task_id,
-      replay_capacity=replay_capacity,
-      phase_bins=phase_bins,
-      minibatch_size=minibatch_size,
-      accumulation_steps=accumulation_steps,
-      learning_rate=learning_rate,
-      beta=beta,
-      seed=seed,
-      max_iterations=max_iterations,
-      bootstrap_steps=bootstrap_steps,
-      collection_steps=collection_steps,
-      updates_per_iteration=updates_per_iteration,
-      teacher_probability=teacher_probability,
-      evaluate_every=evaluate_every,
-      evaluation_steps=evaluation_steps,
-      rollout_latent=rollout_latent,
-      reset_policy=reset_policy,
-    )
-    seed_audit = _seed_audit(adapter)
+    if worker_devices:
+      primary_build = _build_sharded_cohort_runner(
+        cohort=cohort,
+        setup=setup,
+        teacher_ids=teacher_ids,
+        device=device,
+        num_envs=num_envs,
+        worker_devices=worker_devices,
+        replay_capacity=replay_capacity,
+        phase_bins=phase_bins,
+        minibatch_size=minibatch_size,
+        accumulation_steps=accumulation_steps,
+        learning_rate=learning_rate,
+        beta=beta,
+        seed=seed,
+        max_iterations=max_iterations,
+        bootstrap_steps=bootstrap_steps,
+        collection_steps=collection_steps,
+        updates_per_iteration=updates_per_iteration,
+        teacher_probability=teacher_probability,
+        evaluate_every=evaluate_every,
+        evaluation_steps=evaluation_steps,
+        rollout_latent=rollout_latent,
+      )
+      # The workers built their environments from exactly this policy, and
+      # their live audit is what the cohort identity records.
+      reset_policy_dict = reset_policy.as_dict()
+    else:
+      primary_build = _build_cohort_runner(
+        cohort=cohort,
+        setup=setup,
+        teacher_ids=teacher_ids,
+        device=device,
+        num_envs=num_envs,
+        task_id=task_id,
+        replay_capacity=replay_capacity,
+        phase_bins=phase_bins,
+        minibatch_size=minibatch_size,
+        accumulation_steps=accumulation_steps,
+        learning_rate=learning_rate,
+        beta=beta,
+        seed=seed,
+        max_iterations=max_iterations,
+        bootstrap_steps=bootstrap_steps,
+        collection_steps=collection_steps,
+        updates_per_iteration=updates_per_iteration,
+        teacher_probability=teacher_probability,
+        evaluate_every=evaluate_every,
+        evaluation_steps=evaluation_steps,
+        rollout_latent=rollout_latent,
+        reset_policy=reset_policy,
+      )
+      reset_policy_dict = getattr(
+        primary_build[1].env.command_manager.get_term("motion"),
+        "reset_policy",
+        ResetPolicy(),
+      ).as_dict()
+    runner, primary, identity, evaluation_sampling_mode, seed_audit = primary_build
     _require_requested_seed_applied(seed, seed_audit)
     assert isinstance(runner.replay, BalancedReplayBuffer)
     resolved_config = _cohort_resolved_config(
       manifest=manifest,
       repo_root=repo_root,
-      adapter=adapter,
+      sampling_mode=evaluation_sampling_mode,
+      reset_policy_dict=reset_policy_dict,
+      base_task=cohort.manifest.base_task,
       identity=identity,
       task_id=task_id,
       device=device,
@@ -1571,17 +1781,18 @@ def _train_cohort(
         schedule=resolved_config["schedule"],
       )
 
-    iteration_reports, checkpoints = _drive_lifecycle(
-      runner,
-      max_iterations=max_iterations,
-      checkpoint_every=checkpoint_every,
-      progress_every=progress_every,
-      output_dir=output_dir,
-      report_boundaries=report_boundaries,
-      write_checkpoint=write_checkpoint,
-      device=device,
-      num_envs=num_envs,
-    )
+    with _teardown_on_signal(_release(primary)):
+      iteration_reports, checkpoints = _drive_lifecycle(
+        runner,
+        max_iterations=max_iterations,
+        checkpoint_every=checkpoint_every,
+        progress_every=progress_every,
+        output_dir=output_dir,
+        report_boundaries=report_boundaries,
+        write_checkpoint=write_checkpoint,
+        device=device,
+        num_envs=num_envs,
+      )
     checkpoint = checkpoints[-1]
     payload = {
       "command": " ".join(sys.argv),
@@ -1635,10 +1846,8 @@ def _train_cohort(
     print(f"[FAIL] {exc}", file=sys.stderr)
     return 1
   finally:
-    if runner is not None:
-      close = getattr(runner.collector.adapter, "close", None)
-      if callable(close):
-        close()
+    if primary is not None:
+      _release(primary)()
 
 
 def _train(
@@ -1787,15 +1996,6 @@ def _train(
     resolved_worker_devices = _resolve_worker_devices(worker_devices, num_envs=num_envs)
   except ValueError as exc:
     return _fail(exc)
-  if len(resolved_worker_devices):
-    return _fail(
-      ValueError(
-        "multi-worker collection is not wired into the runner in this build: "
-        f"--worker-devices {list(resolved_worker_devices)} validates and records "
-        "the configuration without sharding it, so it is refused rather than "
-        "silently training on a single device"
-      )
-    )
   if teacher_ids:
     return _train_cohort(
       manifest=manifest,
@@ -1804,6 +2004,7 @@ def _train(
       task_id=task_id,
       device=device,
       num_envs=num_envs,
+      worker_devices=resolved_worker_devices,
       max_iterations=max_iterations,
       bootstrap_steps=bootstrap_steps,
       collection_steps=collection_steps,
@@ -1815,7 +2016,6 @@ def _train(
       accumulation_steps=accumulation_steps,
       replay_capacity=replay_capacity,
       phase_bins=resolved_phase_bins,
-      worker_devices=resolved_worker_devices,
       learning_rate=learning_rate,
       beta=beta,
       seed=seed,

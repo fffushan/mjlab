@@ -1149,7 +1149,36 @@ def cohort_identity_from_adapter(
         f"a cohort identity needs an adapted mixed-slot environment exposing "
         f"{name!r}; got {type(adapter).__name__}"
       )
-  audit = adapter.audit
+  return cohort_identity_from_parts(
+    cohort=adapter.cohort,
+    library=adapter.library,
+    audit=adapter.audit,
+    replay=replay,
+    device=str(adapter.env.device),
+  )
+
+
+def cohort_identity_from_parts(
+  *,
+  cohort: Any,
+  library: Any,
+  audit: Any,
+  replay: ReplayBufferProtocol,
+  device: str,
+) -> CohortIdentity:
+  """Build the identity from one audited environment's parts.
+
+  Split from the adapter form so a sharded run can record the identity its
+  workers' environments actually produced: the parent owns no environment, but
+  each worker builds its environment through the same recipe.  Worker 0's
+  environment seed is the single-process derivation, so a sharded run records
+  the same identity a non-sharded run of the same recipe would record — the
+  per-worker devices and seeds live in the resolved configuration instead.
+
+  The audit is still required evidence: its slot allocation, ordered mapping
+  digest, phase policy and seed provenance are recorded, so a caller cannot
+  claim an allocation the factory did not apply.
+  """
   for name in ("slots", "mapping_digest", "phase_policy", "seed_provenance"):
     if not hasattr(audit, name):
       raise CohortContractError(
@@ -1165,12 +1194,12 @@ def cohort_identity_from_adapter(
   if provenance.requested_seed is None:
     raise CohortContractError("the live audit reports no requested seed")
   return build_cohort_identity(
-    adapter.cohort,
-    adapter.library,
+    cohort,
+    library,
     audit.slots,
     phase_policy=audit.phase_policy,
     replay=replay,
-    device=str(adapter.env.device),
+    device=device,
     requested_seed=int(provenance.requested_seed),
     effective_seed=provenance.effective_seed,
     semantic_overrides=tuple(getattr(audit, "semantic_overrides", ())),

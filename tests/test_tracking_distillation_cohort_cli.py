@@ -10,6 +10,8 @@ weighting of the aggregate report is exercised with a real difference.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -2386,22 +2388,29 @@ def test_cohort_worker_devices_are_refused_before_an_environment_exists(
   assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
 
 
-def test_cohort_multi_worker_is_refused_until_collection_is_sharded(
+def test_cohort_train_dispatches_a_worker_list_to_the_sharded_builder(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   capsys: pytest.CaptureFixture[str],
   schema,
 ) -> None:
-  """A valid multi-worker list is refused instead of silently using one device.
+  """A well-formed worker list reaches the sharded builder, not the local one.
 
-  The list is well formed (two devices, two environments), so it passes
-  validation; the collection pool is not wired into the runner yet, and
-  accepting the flag would collect from one environment while the resolved
-  configuration claimed two workers.  The refusal is therefore explicit and
-  happens before the simulator exists.
+  The sharded path runs real worker processes against real devices and assets,
+  so this pins the dispatch itself: the validated device list and the shared
+  recipe must arrive at the builder that owns the pool, and the single-process
+  builder must not have constructed anything.
   """
   calls: list[dict] = []
-  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  adapters: list[_MultiAdapter] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters)
+  record: list[dict] = []
+
+  def fake_sharded(**kwargs):
+    record.append(kwargs)
+    raise DistillationError("stop after dispatch")
+
+  monkeypatch.setattr(distill, "_build_sharded_cohort_runner", fake_sharded)
   code, out, err = _train_cohort(
     tmp_path,
     monkeypatch,
@@ -2412,14 +2421,19 @@ def test_cohort_multi_worker_is_refused_until_collection_is_sharded(
       "--max-iterations",
       "1",
       "--output-dir",
-      str(tmp_path / "refused"),
+      str(tmp_path / "run"),
     ],
   )
+
   assert code == 1, (out, err)
-  assert out == ""
-  assert "not wired" in err
-  assert calls == []
-  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+  assert "stop after dispatch" in err
+  assert adapters == [], "the single-process builder must not construct a shard"
+  assert len(record) == 1
+  assert record[0]["worker_devices"] == ("cuda:1", "cuda:2")
+  assert record[0]["num_envs"] == 2
+  assert record[0]["setup"].base_seed == 7
+  assert record[0]["setup"].teacher_ids == TEACHER_IDS
+  assert record[0]["cohort"] is not None
 
 
 def test_single_teacher_train_refuses_worker_devices(
@@ -2615,22 +2629,28 @@ def test_cohort_transport_is_recorded_but_not_a_resume_invariant(
   assert report["runtime"]["transport"] == "in-process"
 
 
-def test_single_explicit_worker_device_is_refused(
+def test_a_single_worker_device_is_a_one_worker_layout_not_a_local_run(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   capsys: pytest.CaptureFixture[str],
   schema,
 ) -> None:
-  """An explicit one-device worker list is refused, not silently ignored.
+  """A one-entry list asks for one worker, not for a silent single-device run.
 
-  A singleton list is not "multi-worker" by length, but it still asks for a
-  sharded collection on a named device while the environment is built on the
-  trainer device.  Accepting it records a worker identity no process honors, so
-  every explicit list is refused until the collection pool exists.
+  It was refused outright while the pool did not exist.  Now that it does,
+  treating it as "no workers" would collect on the trainer device while the
+  checkpoint recorded a worker device.
   """
   calls: list[dict] = []
   adapters: list[_MultiAdapter] = []
   _install_fake_multi_adapter(monkeypatch, calls, schema, adapters)
+  record: list[dict] = []
+
+  def fake_sharded(**kwargs):
+    record.append(kwargs)
+    raise DistillationError("stop after dispatch")
+
+  monkeypatch.setattr(distill, "_build_sharded_cohort_runner", fake_sharded)
   code, out, err = _train_cohort(
     tmp_path,
     monkeypatch,
@@ -2641,12 +2661,31 @@ def test_single_explicit_worker_device_is_refused(
       "--max-iterations",
       "1",
       "--output-dir",
-      str(tmp_path / "refused"),
+      str(tmp_path / "run"),
     ],
   )
+
   assert code == 1, (out, err)
-  assert out == ""
-  assert "not wired" in err
-  assert calls == []
+  assert "stop after dispatch" in err
   assert adapters == []
-  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+  assert record[0]["worker_devices"] == ("cuda:1",)
+
+
+def test_signal_teardown_releases_workers_and_restores_handlers() -> None:
+  """SIGINT/SIGTERM must close the pool before the process exits.
+
+  A sharded run holds worker processes on collection devices.  Leaving them to
+  their own watchdog after an operator or scheduler stops the run keeps those
+  devices busy while a collection finishes, so the handler releases them first
+  and restores the process's previous disposition.
+  """
+  released: list[str] = []
+  previous = signal.getsignal(signal.SIGTERM)
+
+  with pytest.raises(SystemExit) as exit_info:
+    with distill._teardown_on_signal(lambda: released.append("closed")):
+      os.kill(os.getpid(), signal.SIGTERM)
+
+  assert released == ["closed"]
+  assert exit_info.value.code == 128 + signal.SIGTERM
+  assert signal.getsignal(signal.SIGTERM) == previous

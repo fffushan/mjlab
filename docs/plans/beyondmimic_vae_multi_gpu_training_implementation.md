@@ -461,10 +461,10 @@ dispatcher restart (`queue/dispatch.sh` is tracked in the repo).
 |---|---|---|
 | 1. Identity and configuration | in the working tree (uncommitted), independently reviewed | `--worker-devices` refuses every explicit list before an environment exists; one compared `runtime.workers` object plus audit-only `execution.transport`; whole-object legacy defaulting; 49 cohort CLI tests and 427 distillation tests pass |
 | 2. Worker and pool | in the working tree (uncommitted), independently reviewed | `worker.py`: request/reply protocol with monotonic call ids, pinned-host staging, bounded waits that also watch the child, fail-closed pool abort, teardown leaving no process, and a child watchdog on reparenting; `cohort_setup.py` holds the construction recipe both paths share; the collector accepts `replay=None` so a worker cannot write the parent's replay |
-| 3. Merge and telemetry | in the working tree (uncommitted), independently reviewed | tick-major merge, atomic insert, exact counter/frame aggregation, segment namespacing, reset telemetry, fail-closed invalidation after a post-reply failure |
+| 3. Merge and telemetry | implemented, independently reviewed, committed | tick-major merge, atomic insert, exact counter/frame aggregation, segment namespacing, reset telemetry, fail-closed invalidation after a post-reply failure |
 | 3. Merge and telemetry | not started | |
-| 4. Sharded evaluation | not started | |
-| 5. CLI reporting and docs | not started | |
+| 4. Sharded evaluation | implemented | each shard evaluates its own environments with the broadcast weights and the parent recomputes every rate, mean and trial bucket from the union of retained segments through the same aggregator the single-process path uses, so denominators add up across shards instead of averaging averages |
+| 5. CLI reporting and docs | implemented, user docs outstanding | the CLI accepts `--worker-devices` and builds the parent side from a worker's `describe` reply (schema, reference library, live audit, motion-teacher codes); `SIGINT`/`SIGTERM` close the pool; the staged refusal is gone. User-facing docs in `docs/source/x2_tennis_distillation.rst` are deliberately untouched while that file carries unrelated uncommitted edits |
 | 6. Smoke and acceptance | not started; needs GPU authorization | |
 
 Backward compatibility is verified against a real artifact, not only fixtures:
@@ -589,3 +589,51 @@ reviewers: parent-side environmentless construction, parent-side
 `SIGINT`/`SIGTERM` teardown, sharded evaluation, and a real worker-produced
 save/resume round trip. "Steps 2 and 3 are implemented" is not a claim that the
 multi-worker CLI runs yet; it still refuses every explicit worker list.
+
+### 9.4 Steps 4 and 5 landed
+
+Everything above is now implemented in the same working tree:
+
+- **Sharded evaluation.** `evaluate_distillation`'s reporting is one pure
+  function of its segment list (`aggregate_evaluation_metrics`), extracted so the
+  sharded merge calls it on the concatenation of every shard's segments rather
+  than averaging shard results. Rates therefore keep their true denominators,
+  trial buckets add up, and `reference_frames_observed`-style distinct counts are
+  not double-counted. Segments carry the shard that produced them.
+- **Parent-side construction.** A worker's `describe` reply now carries the
+  reference library, the live multi-motion audit and the motion-teacher codes, so
+  the parent can build the replay, the cohort identity and the trainer without
+  owning an environment. `cohort_identity_from_parts` makes the identity
+  buildable from those parts; worker 0's environment seed is the single-process
+  derivation, so a sharded run records the identity a single-process run of the
+  same recipe would.
+- **Teardown.** `SIGINT`/`SIGTERM` release the pool before the process exits, in
+  addition to the child-side watcher that covers a killed parent.
+- The staged `--worker-devices` refusal is removed: the flag now selects the
+  sharded builder, and the single-teacher path still refuses it.
+
+What the CPU suites can and cannot prove: the pool, merge, aggregation, refusal
+and dispatch behaviour are covered by 466 distillation tests, but the sharded
+end-to-end path needs real environments. The first real exercise is the smoke
+below, on the 8-card host, which is also what validates env construction through
+the shared recipe, the transport's real cost, and a worker-produced checkpoint.
+
+Smoke command (2 workers, bounded):
+
+```
+.venv/bin/distill train \
+  --manifest configs/distillation/x2_tennis_mixed_v2.yaml \
+  --teacher-ids "('tennis_000','tennis_001','tennis_002','tennis_003_ss','tennis_004_ss','tennis_005_ss','tennis_006_ss','tennis_007_ss')" \
+  --device cuda:0 --worker-devices "('cuda:1','cuda:2')" \
+  --num-envs 8192 --bootstrap-steps 8 --collection-steps 4 \
+  --updates-per-iteration 1 --minibatch-size 1024 --accumulation-steps 2 \
+  --replay-capacity 16384 --phase-bins 10 --max-iterations 2 \
+  --reset-policy standing-mixture --standing-start-fraction 0.25 \
+  --standing-start-window-frames 25 --standing-start-frame-zero-fraction 0.5 \
+  --checkpoint-every 1 --progress-every 1 --seed 7 --output-dir <run dir>
+```
+
+Deliberately small: its job is to prove that two worker processes build their
+environments through the shared recipe, that rows arrive and merge into one
+replay, that a checkpoint is written with the worker identity, and that a resume
+of it is accepted — not to produce a policy.
