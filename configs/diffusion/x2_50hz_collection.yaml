@@ -1,0 +1,33 @@
+# D1 runtime collection configuration.  This is an operational input schema,
+# not the immutable D0 design contract.  The CLI still requires --execute and a
+# concrete --runtime-factory; this file alone never launches a simulator.
+schema_version: mjlab-x2-diffusion-d1-collection-v1
+contract: docs/plans/beyondmimic_diffusion_d0_contract.yaml
+execution_authorized: false
+runtime_factory: null
+frequency_hz: 50
+physics_timestep_seconds: 0.005
+decimation: 4
+pilot:
+  max_trials: 54
+  max_control_transitions: 13500
+  # The collector carries one environment identity end-to-end, so the CLI fails
+  # closed unless this is 1 (the frozen D0 contract's 8 is the outer envelope,
+  # not the D1 pilot budget).
+  max_envs: 1
+  max_gpus: 1
+  max_wall_minutes: 15
+  monitor_inactivity_seconds: 120
+  max_output_mib: 512
+  clean_before_ou: true
+  video: false
+artifacts:
+  vae: logs/distillation/mixed-10k/checkpoint-final.pt
+  recovery_onnx: logs/rsl_rl/agibot_x2_velocity/2026-09-26_02-40-45_x2-tennis-recovery-n25/2026-09-26_02-40-45_x2-tennis-recovery-n25.onnx
+qualification:
+  retained_steps: 125
+  control_steps: 250
+  ou_theta: 0.8
+  ou_mu: 0.0
+  ou_sigma: 0.1
+  ou_dt: 1.0

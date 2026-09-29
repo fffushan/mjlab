@@ -1,0 +1,265 @@
+# Design contract, not an executable training/collector configuration.
+# Paths are relative to the mjlab repository root. Changes require a new revision.
+schema_version: mjlab-x2-state-latent-d0-v1
+decision_date: "2026-09-29"
+status: design_frozen_with_runtime_risk_accepted
+execution_authorized: false
+scope:
+  robot: agibot_x2
+  initial_behavior: three_clip_tennis_continuation
+  later_behavior: in_distribution_sparse_keyframes_then_cost_guidance
+  mirroring: false
+  general_tennis_claim: false
+  reference_repository_revision: 55b37260ce02573e70648111c534b735972a2af4
+
+vae:
+  checkpoint: logs/distillation/mixed-10k/checkpoint-final.pt
+  sha256: 69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117
+  user_confirmed_real_robot_validation: true
+  weights_and_normalizers_frozen: true
+  cohort_manifest: configs/distillation/x2_tennis_mixed.yaml
+  cohort_manifest_sha256: 587550f26345a278f14c350404be11843dca379d708c2a3c418f0aa8340f9b2d
+  cohort_ids: [tennis_000, tennis_001, tennis_002_ss]
+  source_hash_index: logs/diffusion/d0-validation-20260929T062344Z/fresh_source_hashes.txt
+  source_hash_index_sha256: 4fd808e6051fe5c8e75ee1f7a51f019cb65ce550bde5560e53c5ffb4ad994cb7
+  latent_convention: deterministic_encoder_mu_actually_passed_to_decoder
+  dimensions: {encoder_command: 68, conditioning: 99, latent: 32, action: 31}
+  decoder_mode: gravity
+  preserve_embedded_joint_order_action_scale_offset_gains_and_observation_contract: true
+  runtime_adapter_parity_required_in: D1
+
+recovery:
+  onnx: logs/rsl_rl/agibot_x2_velocity/2026-09-26_02-40-45_x2-tennis-recovery-n25/2026-09-26_02-40-45_x2-tennis-recovery-n25.onnx
+  sha256: caf17c38f23ad180829a230a9a3259f14eedd3860dd90a046b8be92d3d047681
+  env_config: logs/rsl_rl/agibot_x2_velocity/2026-09-26_02-40-45_x2-tennis-recovery-n25/params/env.yaml
+  env_config_sha256: 309e8d8e987c9373bc3fe11834147968031c3268115933d2212f083ffa43f1a8
+  command: [0.0, 0.0, 0.0]  # vx, vy, yaw rate; disable heading/random command updates
+  dimensions: {observation: 102, action: 31}
+  observation_history: false
+  trigger: deployed_last_reference_frame_boundary
+  switch_resets_physics: false
+  preserve_policy_specific_observation_action_and_previous_action_handoff_semantics: true
+  training_rows: false
+  executed_vae_latent: null
+
+control:
+  frequency_hz: 50
+  period_seconds: 0.02
+  physics_timestep_seconds: 0.005
+  decimation: 4
+window:
+  past_steps: 8
+  current_index: 8
+  future_steps: 32
+  total_steps: 41
+  require_constant_episode_segment_and_controller: true
+  permit_reset_reference_teleport_or_policy_switch_crossing: false
+  padding: forbidden
+state:
+  backend: simulator_ground_truth
+  hardware_estimator: separate_D6_gate
+  root_body: pelvis
+  tracking_anchor_body: torso_link
+  xml: src/mjlab/asset_zoo/robots/agibot_x2/xmls/x2_ultra.xml
+  xml_sha256: ae0dcbceda3ef74e029e3bf4a9ea24ea8cc58ab44f1518e635653fc79f928125
+  body_order:
+    - pelvis
+    - left_hip_roll_link
+    - left_knee_link
+    - left_ankle_roll_link
+    - right_hip_roll_link
+    - right_knee_link
+    - right_ankle_roll_link
+    - torso_link
+    - left_shoulder_roll_link
+    - left_elbow_link
+    - left_wrist_yaw_link
+    - left_wrist_pitch_link
+    - left_wrist_roll_link
+    - right_shoulder_roll_link
+    - right_elbow_link
+    - right_wrist_yaw_link
+    - right_wrist_pitch_link
+    - right_wrist_roll_link
+    - head_yaw_link
+    - head_pitch_link
+  raw_dimension: 135
+  slices:
+    root_position: [0, 3]
+    root_rot6d: [3, 9]
+    root_linear_velocity: [9, 12]
+    root_angular_velocity: [12, 15]
+    body_positions: [15, 75]
+    body_linear_velocities: [75, 135]
+  raw_quaternion_convention: wxyz
+  rot6d: concatenate_first_matrix_column_then_second
+  root_frame: current_window_center_yaw
+  root_position_and_linear_velocity: subtract_current_then_rotate
+  root_angular_velocity: rotate_without_subtraction
+  body_frame: each_timestep_root_yaw
+  body_position_and_linear_velocity: subtract_same_timestep_root_then_rotate
+  preserve_world_root_context_for_physical_costs: true
+preprocessing:
+  split_before_windows_and_statistics: true
+  group_key: motion_initial_state_and_rollout_family
+  pair_clean_and_perturbed_variants_in_same_group: true
+  merge_exact_duplicate_initial_state_and_phase_groups: true
+  split_fractions: [0.8, 0.1, 0.1]
+  split_seed: 42
+  stats_population: complete_training_window_tokens_before_projection
+  stats_accumulator_dtype: float64
+  variance_ddof: 0
+  std_floor: 1.0e-6
+  normalize_state_and_latent_separately: true
+  projection:
+    formula: "P = vstack(A @ B, I); y = P @ normalized_state"
+    rng: numpy_PCG64
+    seed: 42
+    gaussian_rows: 64
+    gaussian_mean: 0.0
+    gaussian_std: 1.0
+    matrix_generation_dtype: float64
+    root_diagonal_emphasis: 6.0
+    other_diagonal_emphasis: 1.0
+    pseudoinverse_rcond: 1.0e-12
+    persist_matrices_statistics_and_sha256_in_D1: true
+    projected_dimension: 199
+    token_dimension: 231
+  normalize_after_projection: false
+  undo_latent_normalization_before_decode: true
+model:
+  layers: 6
+  width: 512
+  attention_heads: 8
+  ffn_width: 2048
+  activation: gelu
+  normalization: pre_norm
+  dropout: 0.0
+  position_embedding: learned
+  causal_mask: false
+  separate_state_and_latent_noise_embeddings: true
+  prediction: x0
+noise:
+  training_K: 1000
+  clean_index: 0
+  embedding_count: 1001
+  schedule: cosine_alpha_bar_to_clamped_beta_to_cumulative_product
+  cosine_offset: 0.008
+  beta_min: 1.0e-5
+  beta_max: 0.999
+  alpha_bar_clean: 1.0
+  construction_dtype: float64
+  state_and_latent_levels: independent_uniform_integers_0_through_K_per_token
+  state_and_latent_gaussian_noise: separate_independent_draws
+  sampler: ddim
+  eta: 0.0
+  updates: 20
+  endpoints: [1000, 950, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50, 0]
+  denoiser_at_clean_zero: false
+  conditioning: fix_past_states_and_latents_plus_current_state_with_clean_zero_ids
+  unknown_entries: current_latent_and_all_future_entries
+  reapply_clean_values_after_every_jump: true
+startup:
+  mode: actual_vae_history_then_reference_free_handover
+  minimum_actual_pairs: 8
+  fixed_warmup_duration_does_not_certify_initial_stability: true
+  history_from_standing_policy: forbidden
+  reference_or_encoder_after_diffusion_handover: forbidden_except_requested_keyframes
+
+guidance:
+  initial_continuation_strength: 0.0
+  future_guided_mode: input_VJP_through_frozen_denoiser
+  cost_space: inverse_projected_unnormalized_physical_states
+  temporal_reduction: control_period_times_sum_over_target_timesteps_per_trajectory
+  zero_fixed_entry_gradients_before_clipping: true
+  gradient_l2_clip_per_trajectory: 1.0
+  score_correction: "score_guided = score - lambda * sqrt(alpha_bar[k]) * clipped_grad_G"
+  equivalent_x0_correction: "x0_guided = x0_hat - lambda * (1-alpha_bar[k]) * clipped_grad_G"
+  guidance_uses_ddim_stochastic_variance: false
+  positive_task_strengths_weights_and_goals: preregister_in_D4_before_guided_trials
+  deployment_input_VJP_backend: requires_D5_evidence
+
+qualification:
+  seconds_total_from_first_trial_action: 5.0
+  control_steps: 250
+  retained_interval_max_seconds: 2.5
+  retained_interval_max_steps: 125
+  ou: {theta: 0.8, mu: 0.0, sigma: 0.1, dt: 1.0}
+  ou_units: normalized_decoder_action
+  ou_reset_each_trial: true
+  ou_stops_at_step_125_or_ppo_handoff_whichever_first: true
+  endpoint_mode: vae_then_zero_command_standing_if_reference_ends
+  separate_outcome_labels: [vae_only, vae_then_standing]
+  finite_physics_observations_latents_and_actions_required: true
+  # Reuse the standing task's physical fall criterion in BOTH controller phases.
+  physical_fall:
+    source: src/mjlab/envs/mdp/terminations.py
+    source_sha256: 3c0d64bdc9aa69d8fd372f343e47ab6f9da59a77d2efd8e3d860eff2c1ebf68a
+    function: bad_orientation
+    limit_angle_radians: 1.2217304763960306
+    limit_angle_degrees: 70.0
+    condition: "acos(clamp(-root_projected_gravity_z,-1,1)) > limit_angle"
+  # Reference-dependent criteria are NOT physical fall detectors. Reuse while VAE tracks.
+  vae_tracking_rejection:
+    source: src/mjlab/tasks/tracking/mdp/terminations.py
+    source_sha256: 5f88576b5995408a744cde451c7e43982d2f03284cfeebb8856969ca3dc76019
+    anchor_z_absolute_error_m: 0.25
+    anchor_projected_gravity_z_absolute_error: 0.8
+    end_effector_z_absolute_error_m: 0.25
+    end_effector_bodies: [left_ankle_roll_link, right_ankle_roll_link, left_wrist_yaw_link, right_wrist_yaw_link]
+    active_after_ppo_handoff: false
+  reject_any_mid_trial_reset_teleport_or_unexpected_resample: true
+  evaluate_failure_before_success_at_final_post_step: true
+  early_timeout_or_interruption: incomplete_not_success
+  clip_end: handoff_not_failure
+  completed_finite_no_fall_no_tracking_rejection_no_discontinuity: qualified
+  standing_settling_quality: diagnostic_not_certified_by_survival
+  no_new_contact_or_root_height_thresholds_in_v1: true
+  acceptance_does_not_make_ppo_trace_latent_training_data: true
+
+numerical_acceptance:
+  fp64_ddim_oracle_max_abs: 1.0e-12
+  fp64_projection_roundtrip_max_abs: 1.0e-10
+  fp64_frame_roundtrip_max_abs: 1.0e-10
+  fp32_same_backend_decoder_replay: {atol: 1.0e-5, rtol: 1.0e-5}
+  known_values_and_noise_ids: exact
+  reset_switch_split_leakage_count: 0
+  nonfinite_accepted_rows: 0
+  bf16_fp16_deployment_parity: separate_D5_gate_no_implicit_approval
+  closed_loop_diffusion_quality_tolerances: preregister_in_D3_against_matched_baseline
+
+pilot_budget:
+  status: designed_not_launched_requires_D1_execution_authorization
+  phases: clean_first_then_matched_OU
+  seeds: [0, 1, 2]
+  start_phase_fractions: [0.1, 0.5, 0.8]
+  start_frame_rule: floor_fraction_times_N_minus_1
+  cohort_members: 3
+  clean_trials: 27
+  perturbed_trials: 27
+  max_total_trials_including_failures: 54
+  retries_outside_budget: false
+  max_simulated_seconds_sum_over_environments: 270
+  max_control_transitions: 13500
+  max_envs: 8
+  max_gpus: 1
+  default_resource: separately_allocated_GenieStudio_managed_container
+  bare_metal_fleet_authorized: false
+  max_wall_minutes_including_warmup_compilation: 15
+  monitor_inactivity_seconds: 120
+  max_output_mib: 512
+  video: false
+  automatic_bulk_collection_or_training: false
+  stop_before_OU_if_any_motion_lacks_clean_qualified_window_or_successful_handoff: true
+  any_schema_parity_or_data_integrity_failure_stops_pilot: true
+  physical_or_tracking_failures: reject_trial_and_report_no_silent_replacement
+  budget_exhaustion: report_partial_not_increase_automatically
+
+runtime_risk:
+  user_accepts_prototype_before_50hz_replanning_is_demonstrated: true
+  action_and_target_planner_frequency_hz: 50
+  end_to_end_deadline_ms: 20
+  initial_simulation_may_run_slower_than_wall_clock: true
+  forbid_silent_rate_horizon_backbone_or_step_reduction: true
+  sustained_guided_and_unguided_timing_and_stale_plan_safety: D5_gate
+  hardware_execution: separate_authorization
