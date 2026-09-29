@@ -1,0 +1,129 @@
+# Mixed cohort v3: fifteen standing-capable tennis teachers.
+#
+# Successor to x2_tennis_mixed_v2.yaml. Two changes, nothing else:
+#   - UPGRADES: tennis_005_ss / tennis_006_ss / tennis_007_ss were mid-training
+#     freezes (26000 / 25000 / 22500). Their source runs have since COMPLETED, so
+#     they are replaced by final-iteration teachers named tennis_005 / _006 / _007
+#     (29999 of 30000 saved), matching how tennis_002 superseded tennis_002_ss.
+#     The superseded *_ss directories are left on disk untouched.
+#   - NEW MOTIONS: eight teachers existed for motions 000-007; motions 008, 009,
+#     010, 011, 013, 014 and 015 are added (motion 012 does not exist). Each is a
+#     completed 30k standing-start run, frozen into logs/distillation/teachers/.
+#
+# robot, base_task, version and sampling_weight are deliberately IDENTICAL to v2,
+# so a run from this manifest differs from the 8-teacher v2 runs in teacher count
+# and motion coverage only (15 members, one per distinct motion, under the
+# exporter's 16-member ceiling).
+#
+# v2 remains valid and unchanged: the 16384/8192 sharded runs and their cohort
+# evaluations pin its manifest_sha256 and artifact digests.
+version: 1
+name: x2-tennis-teachers-mixed-v3
+robot: agibot_x2
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations
+teachers:
+- id: tennis_000
+  checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/model_29999.pt
+  motion: data/tennis/single_000_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/env.yaml
+  agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/params/agent.yaml
+  onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_000/2026-09-23_21-24-56.onnx
+  sampling_weight: 1.0
+- id: tennis_001
+  checkpoint: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/model_29999.pt
+  motion: data/tennis/single_001_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/env.yaml
+  agent_config: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/params/agent.yaml
+  onnx: logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations/tennis_001/2026-09-23_19-28-08.onnx
+  sampling_weight: 1.0
+- id: tennis_002
+  checkpoint: logs/distillation/teachers/tennis_002/model_29999.pt
+  motion: data/tennis/single_002_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_002/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_002/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_002/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_003_ss
+  checkpoint: logs/distillation/teachers/tennis_003_ss/model_29999.pt
+  motion: data/tennis/single_003_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_003_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_003_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_003_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_004_ss
+  checkpoint: logs/distillation/teachers/tennis_004_ss/model_29999.pt
+  motion: data/tennis/single_004_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_004_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_004_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_004_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_005
+  checkpoint: logs/distillation/teachers/tennis_005/model_29999.pt
+  motion: data/tennis/single_005_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_005/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_005/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_005/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_006
+  checkpoint: logs/distillation/teachers/tennis_006/model_29999.pt
+  motion: data/tennis/single_006_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_006/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_006/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_006/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_007
+  checkpoint: logs/distillation/teachers/tennis_007/model_29999.pt
+  motion: data/tennis/single_007_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_007/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_007/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_007/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_008_ss
+  checkpoint: logs/distillation/teachers/tennis_008_ss/model_29999.pt
+  motion: data/tennis/single_008_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_008_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_008_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_008_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_009_ss
+  checkpoint: logs/distillation/teachers/tennis_009_ss/model_29999.pt
+  motion: data/tennis/single_009_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_009_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_009_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_009_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_010_ss
+  checkpoint: logs/distillation/teachers/tennis_010_ss/model_29999.pt
+  motion: data/tennis/single_010_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_010_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_010_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_010_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_011_ss
+  checkpoint: logs/distillation/teachers/tennis_011_ss/model_29999.pt
+  motion: data/tennis/single_011_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_011_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_011_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_011_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_013_ss
+  checkpoint: logs/distillation/teachers/tennis_013_ss/model_29999.pt
+  motion: data/tennis/single_013_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_013_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_013_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_013_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_014_ss
+  checkpoint: logs/distillation/teachers/tennis_014_ss/model_29999.pt
+  motion: data/tennis/single_014_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_014_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_014_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_014_ss/model_29999.onnx
+  sampling_weight: 1.0
+- id: tennis_015_ss
+  checkpoint: logs/distillation/teachers/tennis_015_ss/model_29999.pt
+  motion: data/tennis/single_015_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/tennis_015_ss/params/env.yaml
+  agent_config: logs/distillation/teachers/tennis_015_ss/params/agent.yaml
+  onnx: logs/distillation/teachers/tennis_015_ss/model_29999.onnx
+  sampling_weight: 1.0
