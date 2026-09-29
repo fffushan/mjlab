@@ -299,3 +299,68 @@ draws bitwise, phase-balanced draws equalize expected per-cell exposure for
 non-empty cells with documented deterministic ordering, per-phase statistics
 are reported, old checkpoints resume, and the tests/lint/type gates above
 pass. No production training run, commit, or push is part of this milestone.
+
+## 8. Outcome and decision (2026-09-29)
+
+**Decision: keep `--phase-bins` disabled by default.** The feature is
+implemented, reviewed, tested, recorded in the resolved configuration, and
+stays available as an opt-in; it is not to be enabled in default or production
+configurations pending further evidence. No code or configuration change is
+required, because the default is already `phase_bins = 0`
+(`BalancedReplayBuffer`, `balanced_storage.py`) and no configuration file sets
+it.
+
+Evidence gathered after the milestone above:
+
+- **Training A/B** (container host, three teachers, 10 000 iterations each; the
+  only recorded difference between the runs is `replay.phase_bins`): runs
+  `runs/distill_x2_tennis_mixed/20260927T160826Z` (baseline) and
+  `runs/distill_x2_tennis_mixed/phase-balanced-20260928T083641Z`. The sampler
+  engaged exactly - `drawn_by_phase_bin` equal to four significant figures,
+  ~43.69 M per bin per motion - yet total loss is indistinguishable (mean over
+  the final 1000 iterations 0.1743 vs 0.1741). From iteration ~2000 the
+  phase-binned run holds ~+3 % latent KL (5.66 vs 5.50) against ~-2.5 %
+  reconstruction (0.1164 vs 0.1195), cancelling under beta = 0.01, at ~+5 %
+  wall-clock (3.76 vs 3.58 s/iter).
+- **Cohort evaluation** (`distill evaluate-cohort`, 512 steps, seed 0, one
+  pinned environment per motion per mode; run dirs
+  `runs/distill_x2_tennis_mixed/cohort-eval-20260929T034722Z`,
+  `cohort-eval-training-reset-20260929T040037Z`,
+  `cohort-eval-standing2-20260929T041444Z`):
+  - Pinned start (first session): phase-balanced showed ~12 % lower action
+    disagreement and a per-motion redistribution, motions 0-1 better by
+    ~0.013-0.016 m and motion 2 worse by ~0.022 m.
+  - **Those aggregate gaps are not interpretable.** A same-flag control re-run
+    of that cell in a later session did not reproduce the earlier one: the
+    teacher columns, computed from identical artifacts under identical flags,
+    differed by ~1e-3 and the students by ~6-7e-4. Cross-session
+    reproducibility of `evaluate-cohort` is therefore ~1e-3, and the aggregate
+    differences (about 1.5e-3) sit at that floor. This is an open defect worth
+    fixing before any smaller difference is trusted.
+  - Training regime (`--sampling-mode uniform`, the runs' own
+    `phase_policy: uniform`): the pinned-start advantage does not survive -
+    macro anchor 0.12472 (phase-balanced) vs 0.12291 (baseline), disagreement
+    0.05277 vs 0.05314 (0.7 %, i.e. noise), motion 0's advantage inverts, and
+    motion 2 is not the hard motion here at all (anchor 0.124 vs 0.279
+    pinned).
+  - Standing branch (student-only: the evaluator refuses `both` for standing
+    profiles and refuses `--reset-profile` together with `--sampling-mode`;
+    `reset_window_frames` 25 equals the training window): with the mixture's
+    standing fraction pinned to 1.0, phase-balanced is consistently closer to
+    its teacher in action disagreement (-13 % to -15 %, every motion, both
+    profiles) but consistently worse on motion 2 tracking (+0.038 frame-zero,
+    +0.021 within-window).
+  - Weighted to the training mixture (0.75 x uniform + 0.125 x standing-start
+    + 0.125 x standing-window, matching `standing_start_fraction` 0.25 and
+    frame-zero fraction 0.5), on absolute student levels: anchor 0.11970 vs
+    0.11596 (+3.2 %), pose +2.7 %, disagreement -3.5 %, heading and
+    root-relative inside noise. That is about 4x the noise floor from a single
+    seed - a mild tilt at best.
+- **The one effect robust across regimes is a harm**: motion 2 degrades under
+  phase-balanced sampling in three separate regimes (pinned start and both
+  standing profiles), by 2-4x the noise floor.
+
+What would reopen the decision: a second seed at both settings; a fixed,
+bit-reproducible cohort evaluation; and policy-quality evidence (sim2sim or
+hardware tracking, especially foot-ground behaviour) rather than loss or
+tracking level.
