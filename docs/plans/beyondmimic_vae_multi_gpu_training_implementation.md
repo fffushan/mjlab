@@ -155,6 +155,12 @@ whether or not the run was interrupted before it. The persistent per-worker
 stream a single-process collector uses would have to be saved and restored for
 each worker, which the version-2 checkpoint has no place for.
 
+A note on what these guarantees cover, because it is easy to read more into them
+than they say: the derived seeds make a *resume* reproduce collection, and make
+shards distinct from one another. They do **not** make two separate runs of the
+same configuration produce an identical loss trajectory. Measured 2026-09-29 --
+see 9.10.
+
 The motion command's **standing-reset** generator is derived the same way, and
 it is a second stream rather than the same one: it decides standing-versus-
 reference for every full-reset row, so the collection of iteration `k` derives
@@ -928,9 +934,36 @@ are overwhelmingly idle. Three consequences:
    therefore *phase* timing (collect, merge, train, evaluate), not transport
    alone -- which is also why the missing instrumentation in 9.7 is now worth
    more than it was.
-3. **Throughput has headroom**: the same three cards should absorb several times
-   the work per iteration (more steps, more updates, more environments) before
-   compute becomes the limit.
+3. **Throughput headroom -- corrected 2026-09-29 after direct measurement.** The
+   original reading ("the same three cards should absorb several times the work
+   per iteration (more steps, more updates, more environments) before compute
+   becomes the limit") holds as an untested hypothesis for *more steps and more
+   updates*, but it is **wrong for more environments**, which has since been
+   measured. Five 200-iteration runs with the 15-teacher v3 cohort
+   (`runs/distill_x2_tennis_mixed/v3-*` on the NAS):
+
+   | layout | s/iter | rows/s |
+   |---|---|---|
+   | 8192 envs, 1 card (trainer co-located) | 4.54 | 57.7k |
+   | 16384 envs, 3 cards (trainer on its own card) | 4.86 | 108.0k |
+   | 16384 envs, 2 cards (trainer co-located with worker 0) | 4.66 | 112.6k |
+   | 24576 envs, 3 cards (trainer co-located) | 7.07 | 111.2k |
+   | 16384 envs, 1 card | 5.85 | 89.6k |
+
+   Adding a third card at a fixed 16384 environments bought nothing once the
+   trainer shared a worker's card (4.86 to 4.66 s/iter, while the card given its
+   own learner idled at 4.3% utilisation), and raising collection to 24576
+   environments gained nothing either -- 1.5x the rows for 1.52x the time, with
+   host-side CPU doubling from 4.4 to 9.1 cores. The ceiling is therefore the
+   **single host-side learner process** (merge, transport and the optimiser step
+   all execute there), not the GPUs, which stay at 30-46% duty cycle throughout.
+   Duty cycle does rise with environments per step *within* one card (37.5% to
+   45.8% mean from 8192 to 16384, peak 70%), so environments-per-step is a real
+   efficiency lever; it simply does not scale across workers. Practical
+   consequence for the target run: extra cards cannot shorten a
+   fixed-iteration run, and the efficient layouts are one card, or a second card
+   used as a worker with the trainer sharing it. Still unmeasured: whether more
+   collection *steps* or more *updates* per iteration move the same ceiling.
 
 One wart found by the third phase: the resume-invariant refusal happens *after*
 the workers and their environments are built, because the full resolved-config
@@ -938,3 +971,48 @@ comparison needs the constructed runner. A resume with a changed worker list
 therefore pays a full environment build before being refused. The outcome is
 correct and fail-closed; making it cheap means comparing the stored `runtime`
 record early, before any builder runs.
+
+### 9.10 Training is not reproducible across runs at the loss level (measured 2026-09-29)
+
+Two runs on the 8-card host with the **same** recipe -- the 15-teacher v3
+manifest, 8192 environments on one card, `standing-mixture` resets,
+`phase-bins` off, seed 7 -- printed at iteration 200:
+
+| run | `[progress]` line at iteration 200 | elapsed |
+|---|---|---|
+| 200-iteration test, `v3-8192-1gpu-200-20260929T095810Z` | `loss=2.2016 disagreement=0.1839` | 908.0 s (4.54 s/iter) |
+| real 10k run, `v3-8192-1gpu-10000-20260929T133249Z` | `loss=2.1648 disagreement=0.1823` | 906.0 s (4.53 s/iter) |
+
+It is the same statistic on both lines, so no reporting-convention trap (the
+`[progress]` loss is not the report's `total_loss`) is involved. The wall clock
+reproduces to **0.2%** -- the same work in the same time -- while the loss
+differs by **1.7%** and the disagreement by 0.9%. Everything that is a rate, a
+memory footprint or a plumbing outcome reproduces; the optimisation trajectory
+does not.
+
+**What this invalidates.** Any single-seed comparison whose effect is smaller
+than a few percent. In particular, the target-versus-ablation pair (16384
+versus 8192 environments, eight teachers) ended with a **0.5%** `total_loss`
+edge to 16384, and that gap is *below* this floor: it cannot be read as an
+effect of environment count. This agrees with the independent cohort evaluation
+of the two students, which found direction-inverting per-motion results and
+declined a quality verdict. The larger mid-run gaps seen earlier (about 2%) sit
+*at* the floor rather than outside it, so they are not evidence either.
+
+**Consequences for method.** A claimed teacher-count, environment-count or
+sampling effect of a few percent needs several seeds, a matched statistic with
+its own measured noise floor, or a behavioural (cohort-evaluation or sim2sim)
+measurement -- not one run against another. "No difference detected" is the
+defensible conclusion at one seed, and `--phase-bins` was kept disabled on
+exactly that basis. The endpoint figure of a completed run is a mean over the
+final 1000 iterations, a steadier statistic than the single line compared here,
+but steadier is not unbiased: it does not cancel the run-to-run offset.
+
+**Residual uncertainty.** This is one paired observation at one iteration. A
+report-level confirmation (the 200-iteration mean `total_loss` from both runs'
+`train-report.json`) would turn the floor from a point into a distribution, and
+it is cheap; it has not been run.
+
+Sources: `runs/distill_x2_tennis_mixed/v3-8192-1gpu-200-20260929T095810Z/run.log`
+and `.../v3-8192-1gpu-10000-20260929T133249Z/run.log` on the NAS, read
+2026-09-29.
