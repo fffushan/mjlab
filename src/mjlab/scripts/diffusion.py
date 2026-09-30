@@ -14,9 +14,10 @@ import argparse
 import hashlib
 import importlib
 import json
+import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
 
@@ -592,6 +593,439 @@ def _command_collect(args: argparse.Namespace) -> int:
   return 0
 
 
+def _build_seeded_model(
+  settings: Any, seed: int, constructor: Callable[[Any], Any]
+) -> Any:
+  """Construct a model only after applying the trainer's deterministic seed."""
+  from mjlab.tasks.tracking.diffusion.trainer import _set_seed
+
+  _set_seed(seed)
+  return constructor(settings)
+
+
+def _attach_dataset_identity(
+  dataset: Any,
+  *,
+  base_identity: dict[str, Any],
+  split: str,
+  motion_ids: tuple[str, ...] | None,
+  limit: int | None = None,
+) -> Any:
+  """Attach the same full source identity used by cached datasets."""
+  dataset.dataset_identity = {
+    **base_identity,
+    "split": split,
+    "motion_ids": None if motion_ids is None else list(motion_ids),
+    "limit": limit,
+  }
+  return dataset
+
+
+def _checkpoint_motion_ids(identity: Any) -> tuple[str, ...] | None:
+  """Read and normalize the motion filter persisted in a checkpoint."""
+  raw_motion_ids = identity.get("motion_ids")
+  if raw_motion_ids is None:
+    return None
+  if not isinstance(raw_motion_ids, (list, tuple)):
+    raise ValueError("checkpoint motion identity is malformed")
+  motion_ids = tuple(sorted({str(value) for value in raw_motion_ids}))
+  if any(not value for value in motion_ids):
+    raise ValueError("checkpoint motion identity contains an empty id")
+  return motion_ids
+
+
+def _command_train(args: argparse.Namespace) -> int:
+  """Build cached D1 windows and run one explicitly bounded D2 training job."""
+  try:
+    import math
+
+    if args.device == "cuda:0":
+      os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    import numpy as np
+    import torch
+
+    from mjlab.tasks.tracking.diffusion.checkpoint import CheckpointError
+    from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
+    from mjlab.tasks.tracking.diffusion.model import (
+      DenoiserSettings,
+      StateLatentTransformer,
+    )
+    from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule
+    from mjlab.tasks.tracking.diffusion.trainer import DiffusionTrainer
+    from mjlab.tasks.tracking.diffusion.training_config import (
+      TrainingConfig,
+      TrainingConfigError,
+    )
+    from mjlab.tasks.tracking.diffusion.window_dataset import (
+      DatasetSource,
+      TokenWindowDataset,
+      _projection_identity,
+      _source_dataset_hash,
+      build_token_cache,
+      iter_window_provenance,
+      load_window_records,
+    )
+
+    config = TrainingConfig.from_yaml(args.config)
+    try:
+      import yaml
+
+      raw_config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+      raise ValueError(f"could not read training config contract field: {exc}") from exc
+    if isinstance(raw_config, dict) and raw_config.get("contract") is not None:
+      declared_contract = Path(str(raw_config["contract"]))
+      if not declared_contract.is_absolute():
+        declared_contract = Path.cwd() / declared_contract
+      if declared_contract.resolve() != Path(args.contract).resolve():
+        raise ValueError(
+          "training config contract path disagrees with --contract: "
+          f"{raw_config['contract']!r}"
+        )
+    if args.max_updates is None and args.epochs is None and config.max_updates is None:
+      raise TrainingConfigError(
+        "train requires an explicit --max-updates, --epochs, or config max_updates"
+      )
+    if args.max_updates is not None:
+      config = replace(config, max_updates=args.max_updates)
+    if args.epochs is not None:
+      config = replace(config, epochs=args.epochs)
+    config.validate(allow_long_run=args.allow_long_run)
+
+    contract = DiffusionContract.from_yaml(args.contract)
+    source = DatasetSource.resolve(args.dataset_dir, contract_path=args.contract)
+    loaded = source.load()
+    schedule = DiffusionSchedule.from_contract(contract)
+    selected_motions = (
+      tuple(sorted({str(value) for value in args.motion_id}))
+      if args.motion_id
+      else None
+    )
+    output_dir = Path(args.out)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_hash = _source_dataset_hash(source, loaded)
+    projection_hash = _projection_identity(loaded.projection)
+    base_identity = {
+      "directory": str(source.directory),
+      "assignments_hash": loaded.assignments.sha256(),
+      "split_coverage": loaded.index.coverage(),
+      "source_dataset_hash": source_hash,
+      "contract_hash": contract.identity_hash(),
+      "projection_hash": projection_hash,
+      "projection_hashes": {
+        "matrix": loaded.projection.matrix_sha256,
+        "pseudoinverse": loaded.projection.pseudoinverse_sha256,
+        "statistics": loaded.projection.statistics_sha256,
+      },
+    }
+
+    def make_dataset(split: str) -> tuple[Any, list[Any], Path | None]:
+      if args.cache_tokens:
+        if selected_motions:
+          suffix = hashlib.sha256(
+            "\\0".join(sorted(selected_motions)).encode("utf-8")
+          ).hexdigest()[:12]
+        else:
+          suffix = "all"
+        path = output_dir / f"tokens-{split}-{suffix}.npy"
+        cache_path, cache_count = build_token_cache(
+          source,
+          split,
+          path,
+          motion_ids=selected_motions,
+        )
+        provenance = list(
+          iter_window_provenance(
+            loaded,
+            split,
+            motion_ids=selected_motions,
+          )
+        )
+        if len(provenance) != cache_count:
+          raise RuntimeError(
+            f"token cache count changed while collecting {split} provenance"
+          )
+        dataset = TokenWindowDataset(
+          cache_path,
+          provenance,
+          source=source,
+          split=split,
+          motion_ids=selected_motions,
+        )
+        return dataset, provenance, cache_path
+
+      records = load_window_records(
+        loaded,
+        split,
+        motion_ids=selected_motions,
+      )
+      if records:
+        values = torch.from_numpy(np.stack([record.tokens for record in records]))
+      else:
+        values = torch.empty((0, 41, 231), dtype=torch.float32)
+      dataset = _attach_dataset_identity(
+        torch.utils.data.TensorDataset(values),
+        base_identity=base_identity,
+        split=split,
+        motion_ids=selected_motions,
+      )
+      dataset.records = records
+      return dataset, records, None
+
+    train_dataset, train_records, train_cache = make_dataset("train")
+    validation_dataset, _, validation_cache = make_dataset("validation")
+    test_dataset, _, test_cache = make_dataset("test")
+    if len(train_dataset) == 0:
+      raise ValueError("training split is empty after motion filtering")
+
+    micro_batches = math.ceil(len(train_dataset) / config.microbatch_size)
+    updates_per_epoch = math.ceil(micro_batches / config.gradient_accumulation_steps)
+    resolved_updates = config.validate_resolved_updates(
+      updates_per_epoch, allow_long_run=args.allow_long_run
+    )
+    settings = DenoiserSettings.from_contract(contract, training_k=schedule.training_k)
+    model = _build_seeded_model(settings, config.seed, StateLatentTransformer)
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+      raise RuntimeError("CUDA device requested but CUDA is unavailable")
+    device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+    cache_paths = [
+      path for path in (train_cache, validation_cache, test_cache) if path is not None
+    ]
+    cache_bytes = sum(path.stat().st_size for path in cache_paths if path.is_file())
+    train_identity = getattr(train_dataset, "dataset_identity", None)
+    if not isinstance(train_identity, dict):
+      train_identity = {
+        **base_identity,
+        "split": "train",
+        "motion_ids": None if selected_motions is None else list(selected_motions),
+        "limit": None,
+      }
+    preamble = {
+      "config_sha256": config.sha256(),
+      "contract_identity": contract.identity_hash(),
+      "dataset_identity": train_identity,
+      "cache_paths": [str(path) for path in cache_paths],
+      "cache_bytes": cache_bytes,
+      "planned_optimizer_updates": resolved_updates,
+      "updates_per_epoch": updates_per_epoch,
+      "effective_batch_size": config.effective_batch_size,
+      "evaluation_split": config.eval_split,
+      "device": str(device),
+      "device_name": device_name,
+      "train_windows": len(train_records),
+    }
+    print(json.dumps(preamble, indent=2, sort_keys=True))
+    trainer = DiffusionTrainer(
+      config=config,
+      contract=contract,
+      schedule=schedule,
+      model=model,
+      train_dataset=train_dataset,
+      eval_datasets={
+        "validation": validation_dataset,
+        "test": test_dataset,
+      },
+      output_dir=output_dir,
+      device=device,
+      resume=args.resume,
+    )
+    result = trainer.train()
+    payload = {
+      **preamble,
+      "global_step": result.global_step,
+      "epochs_completed": result.epochs_completed,
+      "best_validation_loss": result.best_validation_loss,
+      "best_evaluation_loss": result.best_validation_loss,
+      "evaluation_split": config.eval_split,
+      "final_train_loss": result.final_train_loss,
+      "metrics_path": str(result.metrics_path),
+      "checkpoint_paths": {
+        name: str(path) for name, path in result.checkpoint_paths.items()
+      },
+      "note": "bounded engineering training; no model-quality claim",
+    }
+    if args.json is not None:
+      _json_write(args.json, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+  except (CheckpointError, OSError, RuntimeError, ValueError, TypeError) as exc:
+    print(f"train: {exc}", file=sys.stderr)
+    return 1
+
+
+def _command_evaluate_offline(args: argparse.Namespace) -> int:
+  """Load a run checkpoint and score held-out windows without a simulator."""
+  try:
+    import torch
+
+    from mjlab.tasks.tracking.diffusion.checkpoint import load_checkpoint
+    from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
+    from mjlab.tasks.tracking.diffusion.evaluation import evaluate_generation
+    from mjlab.tasks.tracking.diffusion.model import (
+      DenoiserSettings,
+      StateLatentTransformer,
+    )
+    from mjlab.tasks.tracking.diffusion.schedule import (
+      DiffusionSchedule,
+      build_inference_grid,
+    )
+    from mjlab.tasks.tracking.diffusion.trainer import ExponentialMovingAverage
+    from mjlab.tasks.tracking.diffusion.training_config import (
+      TrainingConfig,
+      TrainingConfigError,
+    )
+    from mjlab.tasks.tracking.diffusion.window_dataset import (
+      DatasetSource,
+      _source_dataset_hash,
+      load_window_records,
+    )
+
+    run_dir = Path(args.run)
+    checkpoint_path = (
+      Path(args.checkpoint)
+      if args.checkpoint is not None
+      else run_dir / "checkpoint-best.pt"
+    )
+    if not checkpoint_path.is_file():
+      fallback = run_dir / "checkpoint-last.pt"
+      raise FileNotFoundError(
+        f"checkpoint not found: {checkpoint_path}; pass --checkpoint {fallback} explicitly"
+      )
+    contract = DiffusionContract.from_yaml(args.contract)
+    schedule = DiffusionSchedule.from_contract(contract)
+    settings = DenoiserSettings.from_contract(contract, training_k=schedule.training_k)
+    model = StateLatentTransformer(settings)
+    ema = ExponentialMovingAverage(model)
+    device = torch.device(args.device)
+    state = load_checkpoint(
+      checkpoint_path,
+      model=model,
+      ema=ema,
+      map_location=device,
+    )
+    recorded_split = state.selection_split
+    if recorded_split is None:
+      recorded_split = getattr(state, "best_metric_split", None)
+    is_last_checkpoint = checkpoint_path.name == "checkpoint-last.pt"
+    if recorded_split == "test" and not is_last_checkpoint:
+      field = (
+        "selection_split" if state.selection_split is not None else "best_metric_split"
+      )
+      fallback = run_dir / "checkpoint-last.pt"
+      raise ValueError(
+        f"checkpoint {field}='test' is reserved for the final report; "
+        f"pass --checkpoint {fallback} explicitly"
+      )
+    if state.contract_identity != contract.identity_hash():
+      raise ValueError("checkpoint contract identity mismatch")
+    if state.schedule_identity != schedule.identity_hash():
+      raise ValueError("checkpoint schedule identity mismatch")
+    dataset_path = state.dataset_identity.get("directory")
+    if not isinstance(dataset_path, str) or not dataset_path:
+      raise ValueError("checkpoint does not record a dataset directory")
+    source = DatasetSource.resolve(dataset_path, contract_path=args.contract)
+    loaded = source.load()
+    if Path(dataset_path).resolve() != source.directory.resolve():
+      raise ValueError("checkpoint dataset directory could not be resolved")
+    expected_identity = state.dataset_identity
+    actual_projection_hashes = {
+      "matrix": loaded.projection.matrix_sha256,
+      "pseudoinverse": loaded.projection.pseudoinverse_sha256,
+      "statistics": loaded.projection.statistics_sha256,
+    }
+    if expected_identity.get("source_dataset_hash") != _source_dataset_hash(
+      source, loaded
+    ):
+      raise ValueError("checkpoint dataset source identity mismatch")
+    if expected_identity.get("assignments_hash") != loaded.assignments.sha256():
+      raise ValueError("checkpoint assignments identity mismatch")
+    if expected_identity.get("split_coverage") != loaded.index.coverage():
+      raise ValueError("checkpoint split coverage mismatch")
+    if expected_identity.get("contract_hash") != contract.identity_hash():
+      raise ValueError("checkpoint dataset contract identity mismatch")
+    if expected_identity.get("projection_hashes") != actual_projection_hashes:
+      raise ValueError("checkpoint projection identity mismatch")
+    try:
+      config = TrainingConfig.from_mapping(state.config)
+    except TrainingConfigError:
+      # Checkpoints written before F1 stored ``eval_split=test``.  That legacy
+      # field is only used here for the evaluation seed; it never authorizes a
+      # new trainer configuration or model-selection decision.
+      if state.selection_split is not None or state.config.get("eval_split") != "test":
+        raise
+      config = TrainingConfig.from_mapping({**state.config, "eval_split": "validation"})
+    motion_ids = _checkpoint_motion_ids(expected_identity)
+    records = load_window_records(
+      loaded,
+      args.split,
+      motion_ids=motion_ids,
+      limit=args.max_windows,
+    )
+    if state.ema_state is not None:
+      ema.copy_to(model)
+    # Keep the CLI explicit about device placement; ``evaluate_generation``
+    # also enforces it at the API boundary.
+    model.to(device)
+    diagnostics_path = run_dir / f"generation-{args.split}.json"
+    report = evaluate_generation(
+      model,
+      schedule=schedule,
+      grid=build_inference_grid(schedule, contract=contract),
+      records=records,
+      projection=loaded.projection,
+      contract=contract,
+      seed=config.eval_seed,
+      device=device,
+      max_windows=args.max_windows,
+      diagnostics_path=diagnostics_path,
+      split=args.split,
+    )
+    payload = report.as_dict()
+    payload["selection_split"] = state.selection_split
+    payload["best_metric_split"] = getattr(state, "best_metric_split", None)
+    payload["test_selection_provenance"] = recorded_split == "test"
+    payload["checkpoint"] = str(checkpoint_path)
+    payload["dataset"] = str(source.directory)
+    payload["device"] = str(device)
+    if device.type == "cuda":
+      payload["device_name"] = torch.cuda.get_device_name(device)
+    if report.windows == 0 and args.max_windows != 0:
+      print(
+        f"evaluate-offline: split {args.split!r}: no windows were selected",
+        file=sys.stderr,
+      )
+      return 1
+    if args.json is not None:
+      _json_write(args.json, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+  except (OSError, RuntimeError, ValueError, TypeError) as exc:
+    print(f"evaluate-offline: {exc}", file=sys.stderr)
+    return 1
+
+
+def _command_audit(args: argparse.Namespace) -> int:
+  """Run identity and token/provenance diagnostics against a D1 dataset."""
+  try:
+    from mjlab.tasks.tracking.diffusion.evaluation import audit_dataset
+    from mjlab.tasks.tracking.diffusion.window_dataset import DatasetSource
+
+    source = DatasetSource.resolve(args.dataset_dir, contract_path=args.contract)
+    payload = audit_dataset(source)
+    if args.json is not None:
+      _json_write(args.json, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if payload.get("ok") is True else 1
+  except (OSError, RuntimeError, ValueError, TypeError) as exc:
+    payload = {"ok": False, "dataset": str(args.dataset_dir), "error": str(exc)}
+    if args.json is not None:
+      _json_write(args.json, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="diffusion",
@@ -649,6 +1083,46 @@ def build_parser() -> argparse.ArgumentParser:
   collect.add_argument("--monitor-inactivity-seconds", type=int, default=120)
   collect.add_argument("--max-output-mib", type=int, default=512)
   collect.set_defaults(handler=_command_collect)
+
+  train = commands.add_parser("train", help="run explicitly bounded D2 training")
+  train.add_argument("--dataset-dir", type=Path, required=True)
+  train.add_argument("--config", type=Path, required=True)
+  train.add_argument("--out", type=Path, required=True)
+  train.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT_PATH)
+  train.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
+  budget = train.add_mutually_exclusive_group()
+  budget.add_argument("--max-updates", type=int)
+  budget.add_argument("--epochs", type=int)
+  train.add_argument("--motion-id", action="append", default=[])
+  train.add_argument("--resume", type=Path)
+  train.add_argument(
+    "--cache-tokens",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+  )
+  train.add_argument("--allow-long-run", action="store_true")
+  train.add_argument("--json", type=Path)
+  train.set_defaults(handler=_command_train)
+
+  evaluate = commands.add_parser(
+    "evaluate-offline", help="score a checkpoint without constructing a simulator"
+  )
+  evaluate.add_argument("--run", type=Path, required=True)
+  evaluate.add_argument(
+    "--split", choices=("train", "validation", "test"), default="test"
+  )
+  evaluate.add_argument("--checkpoint", type=Path)
+  evaluate.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT_PATH)
+  evaluate.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
+  evaluate.add_argument("--max-windows", type=int)
+  evaluate.add_argument("--json", type=Path)
+  evaluate.set_defaults(handler=_command_evaluate_offline)
+
+  audit = commands.add_parser("audit", help="audit a D1 dataset offline")
+  audit.add_argument("--dataset-dir", type=Path, required=True)
+  audit.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT_PATH)
+  audit.add_argument("--json", type=Path)
+  audit.set_defaults(handler=_command_audit)
   return parser
 
 

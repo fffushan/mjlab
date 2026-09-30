@@ -11,6 +11,12 @@ from .adapter import (
   PpoObservation,
   VaeObservation,
 )
+from .checkpoint import (
+  CheckpointError,
+  CheckpointState,
+  load_checkpoint,
+  save_checkpoint,
+)
 from .collector import CollectionResult, CollectorError, DiffusionCollector, TrialSpec
 from .contract import (
   DEFAULT_CONTRACT,
@@ -29,6 +35,15 @@ from .dataset import (
   fit_training_statistics,
   grouped_split,
 )
+from .model import DenoiserSettings, StateLatentTransformer
+from .noising import (
+  NoisedPair,
+  add_independent_noise,
+  apply_clean_mask,
+  clean_mask,
+  sample_levels,
+  x0_target,
+)
 from .policies import OUProcess, PolicyAction, PolicyError, make_policy_action
 from .projection import (
   FeatureStats,
@@ -43,6 +58,19 @@ from .qualification import (
   QualificationTracker,
   StepEvidence,
   parse_step_evidence,
+)
+from .sampler import (
+  SamplerConditions,
+  SamplerConfig,
+  SamplerDiagnostics,
+  sample_trajectory,
+)
+from .schedule import (
+  DiffusionSchedule,
+  InferenceGrid,
+  ScheduleError,
+  build_inference_grid,
+  build_schedule,
 )
 from .state import (
   StateValidationError,
@@ -61,18 +89,60 @@ from .storage import (
   VaeRow,
   validate_monotonic_timestamps,
 )
+from .trainer import (
+  DiffusionTrainer,
+  ExponentialMovingAverage,
+  TrainerError,
+  TrainResult,
+)
+from .training_config import (
+  TrainingConfig,
+  TrainingConfigError,
+  ema_decay,
+  warmup_cosine_learning_rate,
+)
+from .window_dataset import (
+  DatasetSource,
+  LoadedDataset,
+  TokenWindowDataset,
+  WindowCacheError,
+  WindowProvenance,
+  WindowRecord,
+  build_token_cache,
+  iter_window_provenance,
+  load_window_records,
+  sampling_weights,
+)
 
 __all__ = [
   "ActionContract",
   "AdapterError",
   "CallbackEnvironmentAdapter",
   "CollectionResult",
+  "CheckpointError",
+  "CheckpointState",
+  "load_checkpoint",
+  "save_checkpoint",
   "CollectorError",
   "DiffusionEnvironment",
   "DiffusionCollector",
   "FrozenPpoRecoveryPolicy",
   "FrozenVaePolicy",
   "OUProcess",
+  "DiffusionSchedule",
+  "DenoiserSettings",
+  "InferenceGrid",
+  "NoisedPair",
+  "SamplerConditions",
+  "SamplerConfig",
+  "SamplerDiagnostics",
+  "ScheduleError",
+  "StateLatentTransformer",
+  "add_independent_noise",
+  "apply_clean_mask",
+  "build_inference_grid",
+  "build_schedule",
+  "clean_mask",
   "PpoObservation",
   "PostStepBundle",
   "PolicyAction",
@@ -116,4 +186,25 @@ __all__ = [
   "world_to_hybrid",
   "make_policy_action",
   "parse_step_evidence",
+  "sample_levels",
+  "sample_trajectory",
+  "TrainingConfig",
+  "TrainingConfigError",
+  "ema_decay",
+  "warmup_cosine_learning_rate",
+  "DiffusionTrainer",
+  "ExponentialMovingAverage",
+  "TrainResult",
+  "TrainerError",
+  "DatasetSource",
+  "LoadedDataset",
+  "TokenWindowDataset",
+  "WindowCacheError",
+  "WindowProvenance",
+  "WindowRecord",
+  "build_token_cache",
+  "iter_window_provenance",
+  "load_window_records",
+  "sampling_weights",
+  "x0_target",
 ]
