@@ -571,6 +571,20 @@ Parent evidence root:
 
 M4 member playback uses the existing viewers, but no live GUI was exercised.
 Version-2 cohort export remains an explicit unsupported operation; version-1
-export is preserved. CPU tests and alias fixes are not GPU validation. The next
-step is to agree the two-teacher training resource budget and then evaluate saved
-checkpoints per motion; do not start that job automatically.
+export is preserved. CPU tests and alias fixes are not GPU validation.
+
+### Post-acceptance disposition — M4 complete baseline
+
+The completed `mixed-10k` three-teacher run and the matched per-motion quality
+matrix (three seeds, `start` and `uniform`, teacher/student mode) establish that
+the M4 pipeline is working and produces a valid shared VAE student baseline.
+The student did not introduce extra failure outcomes relative to the matched
+teachers. Some per-motion error gaps exceed the provisional 10% engineering
+target, so strict policy-quality optimization is explicitly deferred rather than
+called a pipeline failure. Standing-start transition quality, export, sim2sim,
+and hardware readiness remain unassessed. M5 is the next process stage.
+
+X2 symmetry augmentation is aborted for this project: the observed sim-to-real
+gap does not justify synthetic mirrored teacher labels. Future cohorts use
+manually selected balanced reference motions and user-qualified teachers.
+The existing M4 implementation and artifacts remain unchanged.

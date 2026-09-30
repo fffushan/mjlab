@@ -1,10 +1,10 @@
 # BeyondMimic VAE distillation: proposed architecture
 
-Status: **M1–M3 are complete; M4 implementation and bounded CPU integration are parent-accepted**, with the inherited repository-check exceptions in the [M4 acceptance record](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27). Multi-teacher policy quality is not yet established. The [M4 plan](beyondmimic_vae_m4_implementation.md) defines the current two-teacher scope, serial `ds-oc/deepseek-flash` ownership, 20-minute supervision, and parent-run acceptance. Gravity remains the default with explicit opt-in anchor/combined schemas. New M4 production training, diffusion, and hardware work remain outside this implementation authorization. See [implementation plan and acceptance records](beyondmimic_vae_implementation.md). Historical observations and proposals below are not new validation claims.
+Status: **M1–M4 are complete; M4's multi-teacher pipeline and a valid student baseline are accepted.** Strict policy-quality optimization is future fine-tuning work. M5 now covers reproduction/export/sim2sim validation; hardware remains separately authorized. X2 symmetry augmentation has been aborted for this project because the observed sim-to-real gap does not justify synthetic mirrored teacher labels. Future cohorts use manually selected balanced reference motions and user-qualified teachers. See [implementation plan and acceptance records](beyondmimic_vae_implementation.md). Historical observations and proposals below are not new validation claims.
 Scope: reproduce the conditional-VAE/DAgger stage using existing mjlab tracking teachers; retain a clean interface for later state–latent diffusion.
 Source: `/home/agiuser/Documents/beyondmimic.pdf`, main pp. 18–21 and Fig. 7, supplementary S3/S4 and Table S6.
 
-Related discussion: [general trackers, multimodality, and latent diffusion](beyondmimic_general_tracker_and_diffusion.md) records why we retain specialist teachers now, how a general tracker could be trained, and why tracking does not replace motion planning. An external [BeyondMimic-Reproduction review and comparison](beyondmimic_reproduction_review.md) audits that independent reproduction and compares its stage-2 VAE implementation with ours.
+Related discussion: [general trackers, multimodality, and latent diffusion](beyondmimic_general_tracker_and_diffusion.md) records why we retain specialist teachers now, how a general tracker could be trained, and why tracking does not replace motion planning. An external [BeyondMimic-Reproduction review and comparison](beyondmimic_reproduction_review.md) audits that independent reproduction and compares its stage-2 VAE implementation with ours. The later [50 Hz diffusion reproduction plan (DDPM training / DDIM inference)](beyondmimic_diffusion_reproduction.md) covers state–latent collection, generation, guidance, and runtime validation; it is a proposal, not authorization to change this VAE or start diffusion jobs.
 
 ## Initial teacher cohort selected by the user
 
@@ -225,14 +225,14 @@ Bake neural normalization into exports and ship schemas, frame/ordering/action m
 1. **Teacher parity:** loaded teacher actions match the existing inference path; its rollout reproduces the known baseline under the selected configuration.
 2. **One-teacher student:** overfit/check a small batch, then execute full clips and phase-start rollouts using only the VAE. Test both mean and sampled latents.
 3. **Multi-teacher student:** evaluate every motion separately under matched seeds/perturbations; no strong motion may hide a failing one in an aggregate score.
-4. **Export parity:** PyTorch/ONNX agreement, normalizer/schema/frame correctness, and target CPU inference budget.
+4. **Export parity:** PyTorch/ONNX agreement, normalizer/schema/frame correctness, and action/frame metadata correctness.
 5. **Deployment validation:** sim2sim, then separately authorized hardware validation, before accepting the controller for real use.
 
 Primary metrics: completion/survival, per-body/anchor tracking error, action-rate/jitter, joint-limit/torque saturation, and failures per reference segment. Secondary metrics: per-motion/joint action MSE, KL, posterior statistics/active latent dimensions, reconstruction under swapped/ablated latents, and buffer coverage.
 
 A small MSE alone is not success. Confirm the decoder genuinely uses the latent; a proprioception-only shortcut can look acceptable on repetitive motions while failing to provide a useful command space. Set quantitative tolerances relative to measured teacher baselines before the first acceptance run rather than inventing paper-reported thresholds.
 
-Symmetry augmentation is part of the paper's target recipe. Add it after the unaugmented pipeline passes basic correctness gates, with robot-specific left/right permutations and sign/frame transforms for the complete reference/proprioception/action tuple, and verify the mapping is physically appropriate. Report its absence as a reproduction deviation until enabled.
+**Symmetry augmentation disposition:** **aborted for this X2 project.** Although it is part of the paper's target recipe, the current sim-to-real gap makes synthetic mirrored teacher labels an unvalidated assumption. Do not add mirrored samples to the accepted M4 baseline or treat symmetry as an M5 acceptance gate. Use manually selected balanced reference motions and user-qualified teachers for future cohorts instead.
 
 ## 5. Boundary to future diffusion
 
@@ -267,7 +267,7 @@ Implementation gates, not autonomous work instructions:
 1. Select one robot/cohort; implement manifest validation and teacher parity.
 2. Implement VAE plus one-teacher DAgger against the existing single-motion environment.
 3. Add the motion library, multi-motion command, routing, and balanced replay; retain one-teacher tests.
-4. Add symmetry, complete evaluation, and standalone encoder/decoder export.
-5. Only after acceptance, design the diffusion collector/trainer.
+4. Complete evaluation, latent-use diagnostics, and standalone encoder/decoder export.
+5. Only after acceptance, design the diffusion collector/trainer. Hardware validation remains a separate authorization.
 
 Resolved user inputs: AgiBot X2, `tennis_000` and `tennis_001`, their corresponding `data/tennis/` motions, and original saved environment/agent configurations; see the initial-cohort section. No missing-config blocker remains. Teacher inference/rollout parity and physical sensor-frame checks belong to implementation validation. Confirm availability/frame of the additional projected-gravity student input during deployment.

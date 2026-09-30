@@ -21,10 +21,15 @@ native single-teacher collector, trainer, checkpoint lifecycle, and ``distill
 train``/``distill evaluate`` commands, and M4 adds one shared student over the
 multi-motion ``--teacher-ids`` cohort with per-motion balanced replay,
 version-2 cohort checkpoints, and a bounded ``distill evaluate-cohort``
-command.** M3 and M4 remain implementation and smoke-validation surfaces: they
-do not claim policy quality, production training, hardware readiness,
-diffusion, or multi-motion deployment qualification. Single-teacher defaults and
-version-1 artifacts are preserved unchanged.
+command.** M4 is now accepted as a working pipeline and valid student-baseline
+milestone; the remaining performance gaps are future fine-tuning work, not a
+pipeline failure. M5 covers latent diagnostics, complete evaluation, separate
+encoder/decoder export, PyTorch/ONNX parity, and sim2sim. X2
+symmetry augmentation is aborted because the observed sim-to-real gap makes
+synthetic mirrored teacher labels unvalidated; future cohorts use manually
+selected balanced reference motions and user-qualified teachers. Hardware,
+diffusion, and deployment qualification remain separate gates. Single-teacher
+defaults and version-1 artifacts are preserved unchanged.
 
 A standing-start extension is documented below. It is opt-in on the cohort path;
 ordinary M3/M4 reference-start behavior remains the default and is not inferred from

@@ -2,11 +2,31 @@
 Changelog
 =========
 
-Upcoming version (not yet released)
------------------------------------
-
 Added
 ^^^^^
+
+- Added an offline X2 tennis reference generator that copies clips 000–020
+  (012 is absent) into ``data/tennis/guard040_linear05/`` with 0.5-second
+  linear root-position/joint transitions to motion 040's initial guard pose,
+  yaw-aligned per endpoint, SLERP root rotation and FK-derived body poses.
+  `scripts/render_x2_tennis_guard_gifs.py` renders each clip and the 20-clip
+  entry/exit comparison as GIFs.
+  Original reference files and frozen teacher assets remain unchanged;
+  reference generation does not validate balance or permit using existing
+  teachers against changed motion hashes. An offline MuJoCo renderer
+  generates one annotated GIF per clip that plays at real time, plus a 20-clip
+  transition comparison (2x slow) under `data/tennis/guard040_linear05/renders/`;
+  these are kinematic previews, not controller or balance rollouts.
+
+- Added the D1 diffusion integration CLI (`diffusion`) with fail-closed frozen
+  artifact preflight, explicit bounded collection via a concrete runtime
+  factory, grouped window indexing, train-only statistics persistence, shard
+  inspection, and offline action/latent replay diagnostics. Help and offline
+  commands do not construct an environment; collection requires `--execute`
+  and cannot override the immutable D0 execution record. See
+  `docs/plans/beyondmimic_diffusion_d1_implementation.md`.
+- Added the non-authorizing 50 Hz collection input at
+  `configs/diffusion/x2_50hz_collection.yaml`.
 
 - Added opt-in phase-balanced within-motion replay sampling for the shared
   cohort path. ``distill train --teacher-ids ... --phase-bins N`` (default 0,

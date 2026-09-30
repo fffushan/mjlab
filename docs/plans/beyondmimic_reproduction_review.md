@@ -16,6 +16,7 @@ Related documents:
 - [Implementation milestones](beyondmimic_vae_implementation.md)
 - [M4 implementation and acceptance](beyondmimic_vae_m4_implementation.md)
 - [General tracker and latent diffusion discussion](beyondmimic_general_tracker_and_diffusion.md)
+- [Later 50 Hz diffusion reproduction plan and stage-3 source audit](beyondmimic_diffusion_reproduction.md): selects DDPM-style training with DDIM inference, distinguishes sampler semantics, audits startup/history and dataset splitting, and defines the proposed X2 adaptation. The historical stage-2 comparison below is not evidence of stage-3 closed-loop performance.
 
 ## 1. The reviewed repository's structure
 
@@ -61,8 +62,8 @@ Stage 2 (conditional action VAE distillation, `src/beyondmimic_repro/stage2/`):
 
 Stage 3 (`src/beyondmimic_repro/stage3/`) covers the paper's diffusion half:
 `StateLatentTransformer` (embedding 512, 8 heads, 6 layers, 20 denoising
-steps, independent per-token state/latent noise levels), DDIM-style noising
-with x0 prediction, guidance costs matching paper S5–S8 (joystick, waypoint
+steps, independent per-token state/latent noise levels), DDPM-style forward noising
+with x0 prediction and DDIM-style reverse sampling, guidance costs matching paper S5–S8 (joystick, waypoint
 with position-to-velocity blending, SDF obstacle barrier), and the
 receding-horizon `DiffusionVAEPolicyFrontend` that denoises, extracts the
 current latent, and decodes with up-to-date proprioception.
@@ -178,8 +179,7 @@ normalizers to data but produces fewer durable intermediate artifacts.
    emphasis projection, per-token noise levels, guidance costs S5–S8,
    receding-horizon frontend); we have none yet, deliberately, until the VAE
    and latent convention freeze.
-7. Export: ours is ahead (encoder/decoder ONNX, schema metadata, parity
-   tests, CPU budget); the repro's stage 2 has no ONNX export path.
+7. Export: ours is ahead (encoder/decoder ONNX, schema metadata, parity tests); the repro's stage 2 has no ONNX export path.
 8. The repro's OU `dt` bug (§2.2) is directly relevant to our future
    diffusion-data collection: do not copy `dt = 1/frequency_hz`; the paper's
    Δt = 1.0 is per control step.
@@ -190,8 +190,7 @@ For our continuation (M5 and the diffusion phase):
 
 - Phase-balanced (motion, phase-bin) sampling in the trainer, alongside our
   collection-side phase control — a small addition to `balanced_storage.py`.
-- Sagittal-symmetry implementation as the M5 structural reference, re-derived
-  for X2 joints and frames.
+- X2 sagittal-symmetry augmentation was considered for M5 but is **aborted for this project**. The observed sim-to-real gap makes synthetic mirrored teacher labels an unvalidated assumption. Future cohorts will use manually selected balanced reference motions and user-qualified teachers instead.
 - Persisting validated DAgger rounds as schema'd artifacts, like the repro's
   NPZ contracts, for auditability across collection sessions.
 - Their NumPy weighted sampler for very large replays (>2^24 samples), if our

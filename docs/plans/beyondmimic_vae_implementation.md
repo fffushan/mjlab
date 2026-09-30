@@ -2,7 +2,7 @@
 
 Architecture: [beyondmimic_vae_distillation.md](beyondmimic_vae_distillation.md).
 Repository: `/home/agiuser/projects/mjlab`.
-Current status: **M1–M3 are complete; M4 implementation and bounded CPU integration are parent-accepted**, with explicit inherited repository-check exceptions. See [M4 acceptance and evidence](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27). Multi-teacher policy-quality training/evaluation remains the next, separately budgeted step; the five-iteration smoke is not a usable policy. The user accepted moving on after the single-teacher training/evaluation work, including the completed 4096-env 10,000-iteration run. Follow the [M4 plan](beyondmimic_vae_m4_implementation.md): serial `ds-oc/deepseek-flash` component workers, 20-minute parent supervision, balanced two-motion collection/replay, and parent acceptance. M4 production training, diffusion, and hardware work remain separate. Earlier milestone sections below retain their historical acceptance boundaries.
+Current status: **M1–M4 are complete; M4's multi-teacher pipeline and a valid three-teacher student baseline are accepted**, with strict policy-quality optimization explicitly deferred. See [M4 acceptance and evidence](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27). M5 is the next process stage: reproduction/export/sim2sim validation. Hardware remains separately authorized, and flexible teacher cohorts remain a later proposed extension. Earlier milestone sections below retain their historical acceptance boundaries.
 
 ## M1 acceptance record — 2026-09-26
 
@@ -39,7 +39,7 @@ Each run now has original `params/env.yaml` and `params/agent.yaml`. The corresp
 | **M2: latent policy core** | Named reference/decoder-conditioning views, conditional VAE, normalizers, loss, bounded labeled replay | M1 | Gravity default: 68 reference, 99 conditioning, 32 latent, 31 actions, no reference bypass; explicit opt-in anchor/combined schemas; CPU gradient/loss/storage tests |
 | **M3: single-teacher DAgger** | Collector/runner, checkpoint/resume, first-class train/evaluate CLI for `tennis_000` | M2 | Correct observation/action/reset alignment; deterministic teacher rollout baseline; bounded smoke training; student-only evaluation |
 | **M4: shared two-motion controller** | Motion library, multi-motion command, teacher routing and balanced replay/collection | M3 | No clip-boundary leakage; both teachers correctly routed; per-motion evaluation of one shared student |
-| **M5: reproduction and deployment package** | Verified symmetry augmentation, complete evaluation, separate ONNX encoder/decoder and metadata | M4 | PyTorch/ONNX parity, latent-use tests, CPU inference budget, sim2sim validation; hardware requires separate authorization |
+| **M5: reproduction and deployment package** | Complete evaluation, latent-use diagnostics, separate ONNX encoder/decoder and metadata | M4 | PyTorch/ONNX parity, sim2sim validation; target-device timing and hardware require separate authorization |
 
 Diffusion collection/training/guidance is a later project phase. Freeze the accepted VAE, normalization, schema, and latent convention before collecting its sequence dataset.
 
@@ -154,14 +154,24 @@ Follow the [bounded M3 plan](beyondmimic_vae_m3_implementation.md), including ex
 
 Integrate with the existing single-motion environment before adding multi-motion commands. Establish the deterministic teacher rollout baseline and physical sensor frames. Snapshot before stepping, use executed previous actions, retain valid pre-failure labels, handle auto-reset and motion-end segments, and implement optional teacher bootstrap/mixing followed by student-only collection. Add resumable checkpoints, logging, evaluation, and bounded resource-configurable smoke runs. Large training runs need a separately specified device/environment/iteration budget.
 
-### M4: multi-motion training — implementation/smoke accepted
+### M4: multi-motion training — complete functional baseline
 
-The [parent acceptance record](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27) separates passing integration evidence, inherited repository-check failures, and remaining multi-teacher policy-quality work. No production M4 training or commit was performed.
+M4 is complete as a functional multi-teacher distillation milestone. The shared
+cohort pipeline, balanced collection/replay, checkpoint lifecycle, playback, and
+per-motion evaluation are accepted. The completed `mixed-10k` checkpoint is a
+valid student baseline; strict per-motion policy-quality targets were not treated
+as a blocker and remain future fine-tuning work. The final matched evaluation and
+its residual risks are recorded in the M4 acceptance document.
 
-Follow the [detailed M4 plan](beyondmimic_vae_m4_implementation.md) for current scope, contracts, exclusive component ownership, validation, and 20-minute supervision. It explicitly selects stratified per-motion environment slots and uniform phase sampling for the first baseline; new large training runs require a separate resource budget.
+### M5: reproduction and deployment validation
 
-Add motion-indexed reference storage and command/reset handling, no cross-clip indexing or accidental motion-ID leaks into the decoder, equal initial motion weights, and motion-balanced bounded replay. One shared VAE trains on both teachers. Require per-motion baseline-relative evaluation, not only aggregate reward/MSE.
-
-### M5: export and reproduction validation
-
-Add physically verified X2 left/right symmetry for all reference/proprio/action fields, latent-use diagnostics, deterministic/sample rollout comparisons, separate encoder/decoder exports with frozen normalizers and full metadata, and sim2sim integration. CPU latency and hardware deployment are measured separately; numerical export parity is not hardware safety evidence.
+M5 covers complete deterministic/sampled evaluation, latent-use diagnostics,
+separate encoder/decoder export with frozen normalizers and full metadata,
+PyTorch/ONNX parity, and sim2sim validation. A generic CPU inference budget is
+**removed for this project** because the intended platform is Nvidia Orin; any
+Orin-specific latency measurement belongs to separately authorized deployment
+validation. X2 symmetry augmentation is **aborted for this project**: the
+observed sim-to-real gap makes synthetic mirrored teacher labels an unvalidated
+data assumption. Future cohorts will instead use manually selected balanced
+reference motions and user-qualified teachers. Hardware validation remains
+separately authorized.
