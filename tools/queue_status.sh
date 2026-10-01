@@ -289,7 +289,7 @@ case "${MODE:-status}" in
       tmux kill-session -t queue-dispatch
       sleep 1
     fi
-    EXCLUDE_GPUS="$RESTART_EXCLUDE" tmux new-session -d -s queue-dispatch "bash $QUEUE/dispatch.sh"
+    EXCLUDE_GPUS="$RESTART_EXCLUDE" tmux new-session -d -s queue-dispatch "EXCLUDE_GPUS=$RESTART_EXCLUDE bash $QUEUE/dispatch.sh"
     echo "dispatcher restarted (exclude_gpus=${RESTART_EXCLUDE:-none}; running jobs untouched)"
     ;;
   stop)
