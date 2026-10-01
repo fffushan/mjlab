@@ -95,6 +95,22 @@ if [ "$TASK" = "diffusion-no-mixtures" ]; then
     --json "$DIFFUSION_OUT/train.json"
 fi
 
+if [ "$TASK" = "vae" ]; then
+  case "$ITERS" in
+    ''|*[!0-9]*) echo "[error] VAE max-iterations must be a positive integer: $ITERS" >&2; exit 2 ;;
+  esac
+  if [ "$ITERS" -le 0 ]; then
+    echo "[error] VAE max-iterations must be positive: $ITERS" >&2
+    exit 2
+  fi
+  cd "$REPO"
+  echo "[vae] distillation training for $ITERS iterations"
+  exec "$REPO/.venv/bin/distill" train \
+    --repo-root "$REPO" \
+    --max-iterations "$ITERS" \
+    "${EXTRA[@]}"
+fi
+
 # ---------------------------------------------------------------- motion file
 MOTION="${MOTION_FILE:-}"
 if [ -z "$MOTION" ] && [ ${#EXTRA[@]} -gt 0 ]; then
