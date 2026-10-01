@@ -82,3 +82,40 @@ Some style guidelines to follow:
   - Use functions and fixtures; do not use test classes.
   - Favor targeted, efficient tests over exhaustive edge-case coverage.
   - Prefer running individual tests rather than the full test suite to improve iteration speed.
+
+## Remote training queue monitor
+
+`tools/queue_status.sh` monitors and manages the remote GPU training queue. Pass
+an SSH command as one quoted argument, for example:
+
+```sh
+REMOTE='ssh -p 31505 fushan@10.14.64.37'
+
+# Show queue states, progress and GPU occupancy.
+tools/queue_status.sh "$REMOTE"
+
+# Show the queued command rows, dispatcher diagnostics and recent log entries.
+tools/queue_status.sh --jobs --dispatch --tail 50 "$REMOTE"
+```
+
+The default operation is read-only. `--stop` stops only the queue dispatcher;
+training jobs already running in their tmux sessions continue. `--remove JOB_ID`
+removes a non-running job row from `jobs.tsv` and retains its state and batch
+artifacts; it refuses to stop or remove an active job.
+
+To enqueue a job, put the remote SSH specification before `--`; every argument
+after `--` is forwarded to `/home/fushan/mjlab/run_task.sh` without
+queue-specific task parsing:
+
+```sh
+tools/queue_status.sh \\
+  --add inc004 "$REMOTE" -- \\
+  Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations \\
+  30000 tennis/single_004_zhanghongyu_agibot_x2_tracking.npz
+```
+
+Extra or future `run_task.sh` arguments can be passed the same way. The wrapper
+shell-quotes them when writing `jobs.tsv`, preserving argument boundaries when
+the dispatcher executes the command. The queue ID is the only task metadata
+validated by the wrapper; it must be a safe identifier because it is used in
+state filenames and the automatically generated `train_<JOB_ID>` tmux session.

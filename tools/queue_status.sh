@@ -7,6 +7,11 @@
 #   queue_status.sh 'ssh -p 31505 fushan@10.14.64.37'
 # The leading 'ssh' is optional; without -p the port defaults to 22.
 #
+# Queue mutations:
+#   --add JOB_ID REMOTE_SPEC -- RUN_TASK_ARG...
+#   --remove JOB_ID REMOTE_SPEC
+# Everything after the add separator is forwarded to run_task.sh unchanged.
+#
 # The queue itself lives on the remote server in ~/mjlab/queue/:
 #   dispatch.sh   the polling dispatcher (runs in tmux session 'queue-dispatch')
 #   jobs.tsv      one job per row: id<TAB>session<TAB>command
@@ -18,10 +23,14 @@
 # This wrapper is read-only by default: it just SSHes in and runs the remote
 # status.sh, so it works even if the queue files were never copied locally.
 #
-#   --stop        run the remote stop.sh instead (idempotent: safe to re-run)
-#   --jobs        also print the remote jobs.tsv (the queued job list)
-#   --tail N      also print the last N lines of the remote queue.log
-#   --dispatch    also print dispatcher/tmux/process status
+#   --add ID REMOTE -- RUN_TASK_ARG...
+#                append a job running /home/fushan/mjlab/run_task.sh with exactly
+#                the forwarded arguments; its session is train_ID
+#   --remove ID  remove a non-running job row; state/batch artifacts are retained
+#   --stop       run the remote stop.sh instead (idempotent: safe to re-run)
+#   --jobs       also print the remote jobs.tsv (the queued job list)
+#   --tail N     also print the last N lines of the remote queue.log
+#   --dispatch   also print dispatcher/tmux/process status
 #
 # Exit status: 0 ok, 2 usage error, 3 SSH/scan failure.
 
@@ -31,6 +40,10 @@ MODE=status
 SHOW_JOBS=0
 SHOW_DISPATCH=0
 LOG_TAIL=0
+ADD_ID=""
+ADD_ARGS=()
+ADD_COMMAND_B64=""
+REMOVE_ID=""
 REMOTE_SPEC=""
 REMOTE=""
 PORT=22
@@ -44,8 +57,11 @@ Usage: $SCRIPT_NAME [OPTIONS] 'ssh -p PORT user@host'
                   'ssh -p 31505 fushan@10.14.64.37'
                 The leading 'ssh' is optional; without -p the port defaults to 22.
 
-  --stop        Run the remote queue stop.sh (stop queueing; running jobs keep
-                going). Idempotent -- safe to re-run.
+  --add ID REMOTE -- ARGS...
+                Add a job. ARGS are forwarded verbatim to run_task.sh.
+                REMOTE is the quoted SSH spec; -- separates it from ARGS.
+  --remove ID   Remove a non-running job row. Running jobs are refused.
+  --stop        Run the remote queue stop.sh (running jobs keep going).
   --jobs        Also print the remote jobs.tsv (current queued job list).
   --tail N      Also print the last N lines of the remote queue.log.
   --dispatch    Also print tmux/process status for the dispatcher.
@@ -56,7 +72,32 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --stop) MODE=stop; shift ;;
+    --add)
+      if [ "$MODE" != status ]; then
+        echo "error: --add cannot be combined with another queue action" >&2; exit 2
+      fi
+      if [ $# -lt 4 ] || [ "$4" != "--" ]; then
+        echo "error: --add syntax is --add ID 'ssh ...' -- RUN_TASK_ARG..." >&2; exit 2
+      fi
+      MODE=add
+      ADD_ID="$2"
+      REMOTE_SPEC="$3"
+      ADD_ARGS=("${@:5}")
+      # The remaining arguments belong to run_task.sh, not this wrapper.
+      shift $(( $# )) ;;
+    --remove)
+      if [ "$MODE" != status ]; then
+        echo "error: --remove cannot be combined with another queue action" >&2; exit 2
+      fi
+      if [ $# -lt 3 ]; then
+        echo "error: --remove needs a job ID and a remote spec" >&2; exit 2
+      fi
+      MODE=remove; REMOVE_ID="$2"; shift 2 ;;
+    --stop)
+      if [ "$MODE" != status ]; then
+        echo "error: --stop cannot be combined with another queue action" >&2; exit 2
+      fi
+      MODE=stop; shift ;;
     --jobs) SHOW_JOBS=1; shift ;;
     --tail)
       LOG_TAIL="${2:?--tail needs a number of lines}"
@@ -83,6 +124,25 @@ while [ $# -gt 0 ]; do
        REMOTE_SPEC="$1"; shift ;;
   esac
 done
+
+if [ "$MODE" = add ]; then
+  if ! [[ "$ADD_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "error: invalid job ID '$ADD_ID'" >&2; exit 2
+  fi
+  ADD_COMMAND="bash /home/fushan/mjlab/run_task.sh"
+  for arg in "${ADD_ARGS[@]}"; do
+    printf -v quoted_arg '%q' "$arg"
+    ADD_COMMAND+=" $quoted_arg"
+  done
+  ADD_COMMAND_B64=$(printf '%s' "$ADD_COMMAND" | base64 | tr -d '\n')
+elif [ "$MODE" = remove ]; then
+  if [ -z "$REMOVE_ID" ] || [[ "$REMOVE_ID" == *$'\t'* || "$REMOVE_ID" == *$'\n'* ]]; then
+    echo "error: --remove needs a non-empty job ID without tabs/newlines" >&2; exit 2
+  fi
+  if ! [[ "$REMOVE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "error: invalid job ID '$REMOVE_ID'" >&2; exit 2
+  fi
+fi
 
 if [ -z "$REMOTE_SPEC" ]; then usage >&2; exit 2; fi
 
@@ -150,6 +210,63 @@ case "${MODE:-status}" in
       exit 3
     fi
     ;;
+  add)
+    if [ ! -f "$QUEUE/jobs.tsv" ]; then
+      echo "error: jobs.tsv is missing: $QUEUE/jobs.tsv" >&2
+      exit 3
+    fi
+    if ! ADD_COMMAND=$(printf '%s' "$ADD_COMMAND_B64" | base64 -d); then
+      echo "error: could not decode forwarded run_task.sh arguments" >&2
+      exit 3
+    fi
+    if [ -z "$ADD_COMMAND" ]; then
+      echo "error: empty run_task.sh command" >&2
+      exit 2
+    fi
+    session="train_$ADD_ID"
+    exec 9>"$QUEUE/jobs.tsv.lock"
+    flock -x 9
+    if awk -F "\\t" -v id="$ADD_ID" "\$1 == id {found=1} END {exit !found}" "$QUEUE/jobs.tsv"; then
+      echo "error: job ID already exists in jobs.tsv: $ADD_ID" >&2
+      exit 4
+    fi
+    if [ -e "$QUEUE/state/$ADD_ID.state" ] || [ -e "$QUEUE/batch.$ADD_ID" ]; then
+      echo "error: job ID has existing queue state/artifacts: $ADD_ID" >&2
+      exit 4
+    fi
+    if tmux has-session -t "$session" 2>/dev/null; then
+      echo "error: tmux session already exists: $session" >&2
+      exit 4
+    fi
+    printf "%s\t%s\t%s\n" "$ADD_ID" "$session" "$ADD_COMMAND" >> "$QUEUE/jobs.tsv"
+    echo "job appended: $ADD_ID (session=$session)"
+    bash "$QUEUE/status.sh"
+    ;;
+  remove)
+    if [ ! -f "$QUEUE/jobs.tsv" ]; then
+      echo "error: jobs.tsv is missing: $QUEUE/jobs.tsv" >&2
+      exit 3
+    fi
+    state=$(cat "$QUEUE/state/$REMOVE_ID.state" 2>/dev/null || echo pending)
+    case "$state" in
+      running|started)
+        echo "error: refusing to remove active job $REMOVE_ID (state=$state); running jobs are not stopped" >&2
+        exit 4
+        ;;
+    esac
+    exec 9>"$QUEUE/jobs.tsv.lock"
+    flock -x 9
+    tmp=$(mktemp "$QUEUE/jobs.tsv.remove.XXXXXX") || exit 3
+    if ! awk -F "\\t" -v id="$REMOVE_ID" "BEGIN { found=0 } \$1 == id { found=1; next } { print } END { exit !found }" \
+      "$QUEUE/jobs.tsv" > "$tmp"; then
+      rm -f "$tmp"
+      echo "error: job ID not found in jobs.tsv: $REMOVE_ID" >&2
+      exit 4
+    fi
+    mv "$tmp" "$QUEUE/jobs.tsv"
+    echo "job removed from queue: $REMOVE_ID (state=$state; artifacts retained)"
+    bash "$QUEUE/status.sh"
+    ;;
   stop)
     if [ -x "$QUEUE/stop.sh" ]; then
       bash "$QUEUE/stop.sh"
@@ -157,6 +274,10 @@ case "${MODE:-status}" in
       echo "queue dir exists but stop.sh is missing: $QUEUE" >&2
       exit 3
     fi
+    ;;
+  *)
+    echo "error: unsupported queue action: ${MODE:-status}" >&2
+    exit 2
     ;;
 esac
 
@@ -196,7 +317,7 @@ fi
 # ---------------------------------------------------------------------------
 # Run it
 # ---------------------------------------------------------------------------
-if ! "${SSH_CMD[@]}" "MODE=$MODE SHOW_JOBS=$SHOW_JOBS LOG_TAIL=$LOG_TAIL SHOW_DISPATCH=$SHOW_DISPATCH bash -s" <<< "$REMOTE_SCRIPT"; then
+if ! "${SSH_CMD[@]}" "MODE=$MODE SHOW_JOBS=$SHOW_JOBS LOG_TAIL=$LOG_TAIL SHOW_DISPATCH=$SHOW_DISPATCH ADD_ID=$ADD_ID ADD_COMMAND_B64=$ADD_COMMAND_B64 REMOVE_ID=$REMOVE_ID bash -s" <<< "$REMOTE_SCRIPT"; then
   echo "error: remote command failed (SSH reachable? queue present?)" >&2
   exit 3
 fi
