@@ -969,6 +969,11 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     # also enforces it at the API boundary.
     model.to(device)
     diagnostics_path = run_dir / f"generation-{args.sampler}-{args.split}.json"
+    reverse_diagnostics_path = (
+      run_dir / f"reverse-diagnostic-{args.split}.json"
+      if args.reverse_diagnostic
+      else None
+    )
     report = evaluate_generation(
       model,
       schedule=schedule,
@@ -982,6 +987,7 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       diagnostics_path=diagnostics_path,
       split=args.split,
       sampler_kind=args.sampler,
+      reverse_diagnostics_path=reverse_diagnostics_path,
     )
     payload = report.as_dict()
     payload["sampler"] = args.sampler
@@ -1122,6 +1128,11 @@ def build_parser() -> argparse.ArgumentParser:
     choices=("ddim", "ddpm"),
     default="ddim",
     help="reverse sampler; ddpm runs all 1000 adjacent training levels",
+  )
+  evaluate.add_argument(
+    "--reverse-diagnostic",
+    action="store_true",
+    help="record correctly-noised versus evolving x0 errors per DDIM level",
   )
   evaluate.add_argument("--json", type=Path)
   evaluate.set_defaults(handler=_command_evaluate_offline)

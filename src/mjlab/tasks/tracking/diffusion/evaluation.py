@@ -25,6 +25,7 @@ from .sampler import (
   SamplerConfig,
   sample_trajectory,
   sample_trajectory_ddpm,
+  sample_trajectory_trace,
 )
 from .schedule import DiffusionSchedule, InferenceGrid
 from .window_dataset import (
@@ -308,6 +309,7 @@ def evaluate_generation(
   diagnostics_path: str | Path | None = None,
   split: str | None = None,
   sampler_kind: str = "ddim",
+  reverse_diagnostics_path: str | Path | None = None,
 ) -> GenerationReport:
   """Score conditioned DDIM generation against the specified baselines.
 
@@ -321,6 +323,8 @@ def evaluate_generation(
     raise ValueError("max_windows must be non-negative")
   if sampler_kind not in {"ddim", "ddpm"}:
     raise ValueError("sampler_kind must be 'ddim' or 'ddpm'")
+  if reverse_diagnostics_path is not None and sampler_kind != "ddim":
+    raise ValueError("reverse diagnostics require sampler_kind='ddim'")
   projection_contract = getattr(projection, "contract", None)
   if projection_contract is not None and hasattr(projection_contract, "identity_hash"):
     if projection_contract.identity_hash() != contract.identity_hash():
@@ -373,6 +377,10 @@ def evaluate_generation(
   accumulator = _MetricAccumulator()
   sampler_config = SamplerConfig(grid=grid)
   ddpm_generator = _cpu_generator(seed)
+  reverse_noise_generator = _cpu_generator(seed + 1)
+  reverse_accumulator = (
+    _MetricAccumulator() if reverse_diagnostics_path is not None else None
+  )
   model_was_training = bool(getattr(model, "training", False))
   if hasattr(model, "eval"):
     model.eval()
@@ -384,7 +392,50 @@ def evaluate_generation(
         clean = torch.from_numpy(selected_tokens[start:stop]).to(
           device=torch_device, dtype=torch.float32
         )
-        if sampler_kind == "ddpm":
+        if reverse_accumulator is not None:
+          generated, traces, _ = sample_trajectory_trace(
+            model,
+            schedule=schedule,
+            conditions=SamplerConditions(clean, mask),
+            config=sampler_config,
+            generator=sampler_generator,
+          )
+          for trace in traces:
+            source = trace.source_id
+            alpha = schedule.alpha_bars_torch(device=clean.device, dtype=clean.dtype)[
+              source
+            ]
+            reference_noise = torch.randn(
+              clean.shape,
+              generator=reverse_noise_generator,
+              device="cpu",
+              dtype=clean.dtype,
+            ).to(clean.device)
+            reference = apply_clean_mask(
+              torch.sqrt(alpha) * clean + torch.sqrt(1.0 - alpha) * reference_noise,
+              clean,
+              mask,
+            )
+            reference_x0 = model(reference, trace.step_ids)
+            target = clean.detach().cpu().numpy().astype(np.float64)
+            unknown = (~mask).detach().cpu().numpy().astype(bool)
+            unknown = np.broadcast_to(unknown, target.shape).copy()
+            for label, prediction in (
+              ("correctly_noised", reference_x0),
+              ("evolving", trace.x0_hat),
+            ):
+              prediction_np = prediction.detach().cpu().numpy().astype(np.float64)
+              _add_error_metrics(
+                reverse_accumulator,
+                f"{label}_step_{source}",
+                prediction_np,
+                target,
+                unknown,
+                physical_prediction=_physical_tokens(projection, prediction_np),
+                physical_target=_physical_tokens(projection, target),
+                physical_prefix=f"{label}_physical_step_{source}",
+              )
+        elif sampler_kind == "ddpm":
           generated, _ = sample_trajectory_ddpm(
             model,
             schedule=schedule,
@@ -465,6 +516,38 @@ def evaluate_generation(
   finally:
     if hasattr(model, "train"):
       model.train(model_was_training)
+
+  if reverse_accumulator is not None:
+    reverse_values = reverse_accumulator.values()
+    reverse_report = {
+      "kind": "reverse_level_diagnostic",
+      "sampler": "ddim",
+      "split": split,
+      "windows": target_count,
+      "seed": int(seed),
+      "reference_noise_seed": int(seed + 1),
+      "steps": [],
+    }
+    for source in grid.source_ids:
+      step: dict[str, object] = {"source_id": int(source)}
+      for label in ("correctly_noised", "evolving"):
+        prefix = f"{label}_step_{source}"
+        physical_prefix = f"{label}_physical_step_{source}"
+        step[label] = {
+          "normalized_state_mse": reverse_values.get(f"{prefix}_unknown_state_mse"),
+          "normalized_latent_mse": reverse_values.get(f"{prefix}_unknown_latent_mse"),
+          "normalized_token_mse": reverse_values.get(f"{prefix}_unknown_token_mse"),
+          "physical_state_mse": reverse_values.get(
+            f"{physical_prefix}_unknown_state_mse"
+          ),
+          "physical_latent_mse": reverse_values.get(
+            f"{physical_prefix}_unknown_latent_mse"
+          ),
+        }
+      reverse_report["steps"].append(step)
+    reverse_path = Path(reverse_diagnostics_path)
+    reverse_path.parent.mkdir(parents=True, exist_ok=True)
+    reverse_path.write_text(json.dumps(reverse_report, indent=2, sort_keys=True) + "\n")
 
   metrics = accumulator.values()
   aliases = {

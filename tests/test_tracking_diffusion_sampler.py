@@ -11,6 +11,7 @@ from mjlab.tasks.tracking.diffusion.sampler import (
   SamplerConfig,
   sample_trajectory,
   sample_trajectory_ddpm,
+  sample_trajectory_trace,
 )
 from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule, InferenceGrid
 
@@ -158,6 +159,31 @@ def test_ddpm_runs_all_adjacent_levels_and_reapplies_conditions() -> None:
     assert torch.equal(ids[0, 8, 1], torch.tensor(source))
     assert torch.equal(ids[0, 9:, :], torch.full_like(ids[0, 9:, :], source))
 
+
+def test_ddim_trace_records_each_evolving_input_and_prediction() -> None:
+  schedule = DiffusionSchedule.build()
+  grid = InferenceGrid.uniform(schedule)
+  conditions = _conditions()
+  denoiser = _OracleDenoiser(conditions.clean_tokens)
+  result, traces, diagnostics = sample_trajectory_trace(
+    denoiser,
+    schedule=schedule,
+    conditions=conditions,
+    config=SamplerConfig(grid),
+    generator=torch.Generator().manual_seed(29),
+  )
+  assert result.shape == conditions.clean_tokens.shape
+  assert len(traces) == 20
+  assert tuple(trace.source_id for trace in traces) == tuple(range(1000, 0, -50))
+  assert all(
+    trace.sample_before.shape == conditions.clean_tokens.shape for trace in traces
+  )
+  assert all(trace.x0_hat.shape == conditions.clean_tokens.shape for trace in traces)
+  assert all(trace.step_ids.shape == (1, 41, 2) for trace in traces)
+  assert diagnostics.denoiser_calls == 20
+
+
+def test_non_frozen_grid_is_rejected_before_sampling() -> None:
   schedule = DiffusionSchedule.build()
   source_ids = tuple(range(1000, 0, -50))
   destination_ids = tuple(range(949, 48, -50)) + (0,)

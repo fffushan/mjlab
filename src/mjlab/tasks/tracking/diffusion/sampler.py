@@ -372,9 +372,44 @@ def sample_trajectory(
   return sample, diagnostics
 
 
-__all__ = [
-  "SamplerConditions",
-  "SamplerConfig",
-  "SamplerDiagnostics",
-  "sample_trajectory",
-]
+@dataclass(frozen=True, slots=True)
+class ReverseStepTrace:
+  """Inputs and clean-token prediction observed at one DDIM source level."""
+
+  source_id: int
+  sample_before: Tensor
+  step_ids: Tensor
+  x0_hat: Tensor
+
+
+def sample_trajectory_trace(
+  denoiser: Any,
+  *,
+  schedule: DiffusionSchedule,
+  conditions: SamplerConditions | Mapping[str, Tensor] | Any,
+  config: SamplerConfig,
+  generator: torch.Generator,
+) -> tuple[Tensor, tuple[ReverseStepTrace, ...], SamplerDiagnostics]:
+  """Run DDIM and retain each evolving input and x0 prediction."""
+  traces: list[ReverseStepTrace] = []
+
+  def traced_denoiser(sample: Tensor, step_ids: Tensor) -> Tensor:
+    x0_hat = denoiser(sample, step_ids)
+    traces.append(
+      ReverseStepTrace(
+        source_id=int(step_ids[0, -1, 0].item()),
+        sample_before=sample.detach().clone(),
+        step_ids=step_ids.detach().clone(),
+        x0_hat=x0_hat.detach().clone(),
+      )
+    )
+    return x0_hat
+
+  result, diagnostics = sample_trajectory(
+    traced_denoiser,
+    schedule=schedule,
+    conditions=conditions,
+    config=config,
+    generator=generator,
+  )
+  return result, tuple(traces), diagnostics

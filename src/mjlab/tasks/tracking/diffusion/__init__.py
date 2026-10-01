@@ -60,11 +60,13 @@ from .qualification import (
   parse_step_evidence,
 )
 from .sampler import (
+  ReverseStepTrace,
   SamplerConditions,
   SamplerConfig,
   SamplerDiagnostics,
   sample_trajectory,
   sample_trajectory_ddpm,
+  sample_trajectory_trace,
 )
 from .schedule import (
   DiffusionSchedule,
@@ -137,8 +139,10 @@ __all__ = [
   "SamplerConditions",
   "SamplerConfig",
   "SamplerDiagnostics",
+  "ReverseStepTrace",
   "sample_trajectory",
   "sample_trajectory_ddpm",
+  "sample_trajectory_trace",
   "ScheduleError",
   "StateLatentTransformer",
   "add_independent_noise",
