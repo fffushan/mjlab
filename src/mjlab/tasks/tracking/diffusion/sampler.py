@@ -52,6 +52,144 @@ class SamplerDiagnostics:
   initial_noise_norm: dict[str, float]
 
 
+def _validate_conditions_and_noise(
+  conditions: SamplerConditions | Mapping[str, Tensor] | Any,
+  *,
+  generator: torch.Generator,
+  initial_noise_scale: float,
+) -> tuple[Tensor, Tensor, bool, Tensor, int, dict[str, float]]:
+  """Prepare a masked initial Gaussian sample shared by sampler variants."""
+  clean_tokens, clean_mask = _condition_values(conditions)
+  clean_batched, mask_batched, squeezed = _as_batched(clean_tokens, clean_mask)
+  batch, _, token_dimension = clean_batched.shape
+  state_dimension = _infer_state_dimension(mask_batched)
+  if state_dimension >= token_dimension:
+    raise ValueError("clean mask does not leave a latent slice")
+  noise = (
+    _randn(
+      clean_batched.shape,
+      generator=generator,
+      device=clean_batched.device,
+      dtype=clean_batched.dtype,
+    )
+    * initial_noise_scale
+  )
+  sample = apply_clean_mask(noise, clean_batched, mask_batched)
+  return (
+    clean_batched,
+    mask_batched,
+    squeezed,
+    sample,
+    state_dimension,
+    _initial_norms(noise, state_dimension),
+  )
+
+
+def _step_ids(
+  *,
+  source: int,
+  fixed_state: Tensor,
+  fixed_latent: Tensor,
+) -> Tensor:
+  """Build per-slice timestep IDs for one reverse call."""
+  batch, sequence = fixed_state.shape
+  step_ids = torch.full(
+    (batch, sequence, 2),
+    source,
+    dtype=torch.long,
+    device=fixed_state.device,
+  )
+  step_ids[..., 0] = torch.where(
+    fixed_state, torch.zeros_like(step_ids[..., 0]), step_ids[..., 0]
+  )
+  step_ids[..., 1] = torch.where(
+    fixed_latent, torch.zeros_like(step_ids[..., 1]), step_ids[..., 1]
+  )
+  return step_ids
+
+
+def sample_trajectory_ddpm(
+  denoiser: Any,
+  *,
+  schedule: DiffusionSchedule,
+  conditions: SamplerConditions | Mapping[str, Tensor] | Any,
+  generator: torch.Generator,
+  initial_noise_scale: float = 1.0,
+) -> tuple[Tensor, SamplerDiagnostics]:
+  """Run all 1000 adjacent stochastic DDPM reverse steps.
+
+  The denoiser predicts ``x0``.  Each reverse update uses the standard DDPM
+  posterior q(x_{t-1} | x_t, x0_hat), including posterior noise for t > 1.
+  The D0 clean conditioning mask is retained after every update so this is a
+  sampler-only ablation against the existing hard-inpainting semantics.
+  """
+  if schedule.training_k != 1000:
+    raise ValueError("the DDPM ablation requires the frozen 1000-level schedule")
+  if not torch.isfinite(torch.tensor(initial_noise_scale)):
+    raise ValueError("initial_noise_scale must be finite")
+  if initial_noise_scale < 0.0:
+    raise ValueError("initial_noise_scale must be non-negative")
+
+  clean_batched, mask_batched, squeezed, sample, state_dimension, initial_norms = (
+    _validate_conditions_and_noise(
+      conditions,
+      generator=generator,
+      initial_noise_scale=initial_noise_scale,
+    )
+  )
+  batch, _sequence, _ = sample.shape
+  fixed_state = mask_batched[..., :state_dimension].all(dim=-1)
+  fixed_latent = mask_batched[..., state_dimension:].all(dim=-1)
+  alpha_bars = schedule.alpha_bars_torch(device=sample.device, dtype=sample.dtype)
+  betas = torch.as_tensor(schedule.betas, device=sample.device, dtype=sample.dtype)
+  seen: list[int] = []
+
+  for source in range(schedule.training_k, 0, -1):
+    step_ids = _step_ids(
+      source=source,
+      fixed_state=fixed_state,
+      fixed_latent=fixed_latent,
+    )
+    x0_hat = denoiser(sample, step_ids)
+    if not isinstance(x0_hat, Tensor) or x0_hat.shape != sample.shape:
+      raise ValueError("denoiser must return a tensor with the token input shape")
+    seen.append(source)
+
+    beta_t = betas[source - 1]
+    alpha_t = 1.0 - beta_t
+    alpha_bar_t = alpha_bars[source]
+    alpha_bar_prev = alpha_bars[source - 1]
+    denominator = 1.0 - alpha_bar_t
+    posterior_mean = (
+      beta_t * torch.sqrt(alpha_bar_prev) / denominator * x0_hat
+      + (1.0 - alpha_bar_prev) * torch.sqrt(alpha_t) / denominator * sample
+    )
+    posterior_variance = beta_t * (1.0 - alpha_bar_prev) / denominator
+    if source > 1:
+      reverse_noise = _randn(
+        sample.shape,
+        generator=generator,
+        device=sample.device,
+        dtype=sample.dtype,
+      )
+      jumped = posterior_mean + torch.sqrt(posterior_variance) * reverse_noise
+    else:
+      jumped = posterior_mean
+    sample = apply_clean_mask(jumped, clean_batched, mask_batched)
+
+  diagnostics = SamplerDiagnostics(
+    denoiser_calls=len(seen),
+    jumps=len(seen),
+    source_ids_returned=tuple(seen),
+    step_ids_seen=tuple(seen),
+    final_index=0,
+    initial_noise_norm=initial_norms,
+  )
+  if squeezed:
+    return sample[0], diagnostics
+  return sample, diagnostics
+
+
 def _randn(
   shape: torch.Size | tuple[int, ...],
   *,

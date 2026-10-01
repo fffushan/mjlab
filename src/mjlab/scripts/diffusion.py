@@ -968,7 +968,7 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     # Keep the CLI explicit about device placement; ``evaluate_generation``
     # also enforces it at the API boundary.
     model.to(device)
-    diagnostics_path = run_dir / f"generation-{args.split}.json"
+    diagnostics_path = run_dir / f"generation-{args.sampler}-{args.split}.json"
     report = evaluate_generation(
       model,
       schedule=schedule,
@@ -981,8 +981,10 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       max_windows=args.max_windows,
       diagnostics_path=diagnostics_path,
       split=args.split,
+      sampler_kind=args.sampler,
     )
     payload = report.as_dict()
+    payload["sampler"] = args.sampler
     payload["selection_split"] = state.selection_split
     payload["best_metric_split"] = getattr(state, "best_metric_split", None)
     payload["test_selection_provenance"] = recorded_split == "test"
@@ -1115,6 +1117,12 @@ def build_parser() -> argparse.ArgumentParser:
   evaluate.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT_PATH)
   evaluate.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu")
   evaluate.add_argument("--max-windows", type=int)
+  evaluate.add_argument(
+    "--sampler",
+    choices=("ddim", "ddpm"),
+    default="ddim",
+    help="reverse sampler; ddpm runs all 1000 adjacent training levels",
+  )
   evaluate.add_argument("--json", type=Path)
   evaluate.set_defaults(handler=_command_evaluate_offline)
 

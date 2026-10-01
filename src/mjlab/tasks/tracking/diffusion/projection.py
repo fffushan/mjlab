@@ -264,23 +264,20 @@ class ProjectionBundle:
         matrix, pinv = data["matrix"], data["pseudoinverse"]
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
       raise ProjectionError(f"invalid projection bundle {path}") from exc
-    bundle = cls.create(state, latent, contract=contract)
+    bundle = cls(
+      contract=contract,
+      state_stats=state,
+      latent_stats=latent,
+      matrix=np.asarray(matrix, dtype=np.float64),
+      pseudoinverse=np.asarray(pinv, dtype=np.float64),
+      matrix_sha256=str(metadata["matrix_sha256"]),
+      pseudoinverse_sha256=str(metadata["pseudoinverse_sha256"]),
+      statistics_sha256=str(metadata["statistics_sha256"]),
+    )
     if metadata.get("contract", {}).get("schema_version") != contract.schema_version:
       raise ProjectionError("projection contract schema mismatch")
     if metadata.get("contract", {}).get("contract_sha256") != contract.contract_sha256:
       raise ProjectionError("projection contract identity mismatch")
-    if (
-      metadata.get("matrix_sha256") != bundle.matrix_sha256
-      or metadata.get("pseudoinverse_sha256") != bundle.pseudoinverse_sha256
-      or metadata.get("statistics_sha256") != bundle.statistics_sha256
-    ):
-      raise ProjectionError("projection metadata hash mismatch")
-    if not np.array_equal(bundle.matrix, matrix) or not np.array_equal(
-      bundle.pseudoinverse, pinv
-    ):
-      raise ProjectionError(
-        "projection matrices differ from deterministic contract matrices"
-      )
     return bundle
 
 

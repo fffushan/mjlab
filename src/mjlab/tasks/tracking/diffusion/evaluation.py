@@ -20,7 +20,12 @@ from torch import Tensor
 from .contract import DiffusionContract
 from .noising import apply_clean_mask, clean_mask
 from .projection import ProjectionBundle
-from .sampler import SamplerConditions, SamplerConfig, sample_trajectory
+from .sampler import (
+  SamplerConditions,
+  SamplerConfig,
+  sample_trajectory,
+  sample_trajectory_ddpm,
+)
 from .schedule import DiffusionSchedule, InferenceGrid
 from .window_dataset import (
   DatasetSource,
@@ -302,6 +307,7 @@ def evaluate_generation(
   max_windows: int | None = None,
   diagnostics_path: str | Path | None = None,
   split: str | None = None,
+  sampler_kind: str = "ddim",
 ) -> GenerationReport:
   """Score conditioned DDIM generation against the specified baselines.
 
@@ -313,6 +319,8 @@ def evaluate_generation(
   """
   if max_windows is not None and max_windows < 0:
     raise ValueError("max_windows must be non-negative")
+  if sampler_kind not in {"ddim", "ddpm"}:
+    raise ValueError("sampler_kind must be 'ddim' or 'ddpm'")
   projection_contract = getattr(projection, "contract", None)
   if projection_contract is not None and hasattr(projection_contract, "identity_hash"):
     if projection_contract.identity_hash() != contract.identity_hash():
@@ -364,6 +372,7 @@ def evaluate_generation(
   prior_generator = _cpu_generator(seed)
   accumulator = _MetricAccumulator()
   sampler_config = SamplerConfig(grid=grid)
+  ddpm_generator = _cpu_generator(seed)
   model_was_training = bool(getattr(model, "training", False))
   if hasattr(model, "eval"):
     model.eval()
@@ -375,13 +384,21 @@ def evaluate_generation(
         clean = torch.from_numpy(selected_tokens[start:stop]).to(
           device=torch_device, dtype=torch.float32
         )
-        generated, _ = sample_trajectory(
-          model,
-          schedule=schedule,
-          conditions=SamplerConditions(clean, mask),
-          config=sampler_config,
-          generator=sampler_generator,
-        )
+        if sampler_kind == "ddpm":
+          generated, _ = sample_trajectory_ddpm(
+            model,
+            schedule=schedule,
+            conditions=SamplerConditions(clean, mask),
+            generator=ddpm_generator,
+          )
+        else:
+          generated, _ = sample_trajectory(
+            model,
+            schedule=schedule,
+            conditions=SamplerConditions(clean, mask),
+            config=sampler_config,
+            generator=sampler_generator,
+          )
         prior_noise = torch.randn(
           clean.shape,
           generator=prior_generator,

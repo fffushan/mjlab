@@ -64,6 +64,7 @@ from .sampler import (
   SamplerConfig,
   SamplerDiagnostics,
   sample_trajectory,
+  sample_trajectory_ddpm,
 )
 from .schedule import (
   DiffusionSchedule,
@@ -136,6 +137,8 @@ __all__ = [
   "SamplerConditions",
   "SamplerConfig",
   "SamplerDiagnostics",
+  "sample_trajectory",
+  "sample_trajectory_ddpm",
   "ScheduleError",
   "StateLatentTransformer",
   "add_independent_noise",

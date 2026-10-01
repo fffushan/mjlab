@@ -10,6 +10,7 @@ from mjlab.tasks.tracking.diffusion.sampler import (
   SamplerConditions,
   SamplerConfig,
   sample_trajectory,
+  sample_trajectory_ddpm,
 )
 from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule, InferenceGrid
 
@@ -127,7 +128,36 @@ def test_ddim_seed_reproducibility_and_clean_reapplication() -> None:
   )
 
 
-def test_non_frozen_grid_is_rejected_before_sampling() -> None:
+def test_ddpm_runs_all_adjacent_levels_and_reapplies_conditions() -> None:
+  schedule = DiffusionSchedule.build()
+  conditions = _conditions()
+  denoiser = _OracleDenoiser(conditions.clean_tokens)
+  result, diagnostics = sample_trajectory_ddpm(
+    denoiser,
+    schedule=schedule,
+    conditions=conditions,
+    generator=torch.Generator().manual_seed(23),
+  )
+  assert result.shape == conditions.clean_tokens.shape
+  assert diagnostics.denoiser_calls == 1000
+  assert diagnostics.jumps == 1000
+  assert diagnostics.source_ids_returned == tuple(range(1000, 0, -1))
+  assert diagnostics.step_ids_seen == tuple(range(1000, 0, -1))
+  assert diagnostics.final_index == 0
+  assert torch.equal(
+    result[0][conditions.clean_mask], conditions.clean_tokens[0][conditions.clean_mask]
+  )
+  assert len(denoiser.step_ids) == 1000
+  for source, ids in zip(
+    (1000, 999, 1),
+    (denoiser.step_ids[0], denoiser.step_ids[1], denoiser.step_ids[-1]),
+    strict=True,
+  ):
+    assert torch.equal(ids[0, :8], torch.zeros_like(ids[0, :8]))
+    assert torch.equal(ids[0, 8, 0], torch.tensor(0))
+    assert torch.equal(ids[0, 8, 1], torch.tensor(source))
+    assert torch.equal(ids[0, 9:, :], torch.full_like(ids[0, 9:, :], source))
+
   schedule = DiffusionSchedule.build()
   source_ids = tuple(range(1000, 0, -50))
   destination_ids = tuple(range(949, 48, -50)) + (0,)
