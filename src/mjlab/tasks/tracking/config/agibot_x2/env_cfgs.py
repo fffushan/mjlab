@@ -20,7 +20,7 @@ from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensorCfg, ContactMatch, ContactSensorCfg, ObjRef
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
-from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
+from mjlab.tasks.tracking.tracking_env_cfg import VELOCITY_RANGE, make_tracking_env_cfg
 
 # The 12 collision spheres per foot in the ankle-roll body.
 _FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
@@ -374,6 +374,46 @@ def agibot_x2_flat_tracking_standing_start_env_cfg(
   motion_cmd = cfg.commands["motion"]
   assert isinstance(motion_cmd, MotionCommandCfg)
   motion_cmd.standing_start_prob = 0.0 if play else 0.3
+  return cfg
+
+
+def agibot_x2_flat_tracking_increated_perturbations_env_cfg(
+  play: bool = False,
+  anchor_body_name: str = "torso_link",
+  imu_source: X2TrackingImuSource = "pelvis",
+) -> ManagerBasedRlEnvCfg:
+  """X2 standing-start tracking with the G1-sized motion perturbations.
+
+  This keeps the X2 robot, observations, rewards, domain randomization and
+  standing-start behavior, while replacing only the reduced RSI and push
+  ranges with the corresponding magnitudes from the Unitree G1 tracking task.
+  Play mode retains the standing-start task's deterministic no-RSI behavior.
+  """
+  cfg = agibot_x2_flat_tracking_standing_start_env_cfg(
+    play=play,
+    anchor_body_name=anchor_body_name,
+    imu_source=imu_source,
+  )
+  if play:
+    return cfg
+
+  motion_cmd = cfg.commands["motion"]
+  assert isinstance(motion_cmd, MotionCommandCfg)
+  motion_cmd.pose_range = {
+    "x": (-0.05, 0.05),
+    "y": (-0.05, 0.05),
+    "z": (-0.01, 0.01),
+    "roll": (-0.1, 0.1),
+    "pitch": (-0.1, 0.1),
+    "yaw": (-0.2, 0.2),
+  }
+  motion_cmd.velocity_range = dict(VELOCITY_RANGE)
+  motion_cmd.joint_position_range = (-0.1, 0.1)
+
+  push = cfg.events.get("push_robot")
+  if push is not None:
+    push.interval_range_s = (1.0, 3.0)
+    push.params["velocity_range"] = dict(VELOCITY_RANGE)
   return cfg
 
 

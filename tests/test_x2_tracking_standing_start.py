@@ -21,6 +21,7 @@ import torch
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
 from mjlab.tasks.tracking.config.agibot_x2.env_cfgs import (
   agibot_x2_flat_tracking_correlated_dr_env_cfg,
+  agibot_x2_flat_tracking_increated_perturbations_env_cfg,
   agibot_x2_flat_tracking_standing_start_env_cfg,
 )
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
@@ -37,6 +38,9 @@ REDUCED_TASK = (
 )
 # Any real tennis motion: 359 frames @ 50 fps, bin 0 = frames 0-44 > 25.
 MOTION_FILE = Path("data/tennis/single_093_zhanghongyu_agibot_x2_tracking.npz")
+INCREATED_TASK = (
+  "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations"
+)
 
 
 def motion_cfg(cfg) -> MotionCommandCfg:
@@ -45,9 +49,39 @@ def motion_cfg(cfg) -> MotionCommandCfg:
   return motion
 
 
-##
-# Configuration contracts.
-##
+def test_increated_task_uses_g1_motion_perturbation_magnitudes() -> None:
+  """The X2 variant keeps its standing-start task but uses G1-sized RSI/pushes."""
+  from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
+
+  x2 = agibot_x2_flat_tracking_increated_perturbations_env_cfg()
+  g1 = unitree_g1_flat_tracking_env_cfg(has_state_estimation=False)
+  x2_motion = motion_cfg(x2)
+  g1_motion = motion_cfg(g1)
+
+  assert x2_motion.pose_range == g1_motion.pose_range
+  assert x2_motion.velocity_range == g1_motion.velocity_range
+  assert x2_motion.joint_position_range == g1_motion.joint_position_range
+  assert x2_motion.standing_start_prob == 0.3
+  assert x2_motion.standing_start_window_frames == 25
+
+  x2_push = x2.events["push_robot"]
+  g1_push = g1.events["push_robot"]
+  assert x2_push.interval_range_s == g1_push.interval_range_s
+  assert x2_push.params["velocity_range"] == g1_push.params["velocity_range"]
+
+
+def test_increated_task_is_registered_and_play_keeps_rsi_disabled() -> None:
+  assert INCREATED_TASK in list_tasks()
+  assert load_rl_cfg(INCREATED_TASK).experiment_name == (
+    "agibot_x2_tracking_increated_perturbations"
+  )
+
+  play = load_env_cfg(INCREATED_TASK, play=True)
+  play_motion = motion_cfg(play)
+  assert play_motion.pose_range == {}
+  assert play_motion.velocity_range == {}
+  assert play_motion.sampling_mode == "start"
+  assert play_motion.standing_start_prob == 0.0
 
 
 def test_task_is_registered_with_isolated_experiment_directory() -> None:
