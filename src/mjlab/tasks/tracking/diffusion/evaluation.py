@@ -23,11 +23,12 @@ from .projection import ProjectionBundle
 from .sampler import (
   SamplerConditions,
   SamplerConfig,
+  ddim_jump,
   sample_trajectory,
   sample_trajectory_ddpm,
   sample_trajectory_trace,
 )
-from .schedule import DiffusionSchedule, InferenceGrid
+from .schedule import DiffusionSchedule, InferenceGrid, build_inference_grid
 from .window_dataset import (
   DatasetSource,
   LoadedDataset,
@@ -41,8 +42,8 @@ from .window_dataset import (
   load_window_records,
 )
 
-_STATE_WIDTH = 199
-_TOKEN_WIDTH = 231
+_STATE_WIDTH = DiffusionContract().state_dimension
+_TOKEN_WIDTH = DiffusionContract().token_dimension
 _HORIZON_BUCKETS = (
   ("9_16", 9, 17),
   ("17_24", 17, 25),
@@ -164,11 +165,13 @@ def _cpu_generator(seed: int) -> torch.Generator:
   return torch.Generator(device="cpu").manual_seed(int(seed))
 
 
-def _as_record_tokens(record: Any) -> np.ndarray:
+def _as_record_tokens(
+  record: Any, *, expected_shape: tuple[int, int] = (41, _TOKEN_WIDTH)
+) -> np.ndarray:
   """Read and validate one record's token array without changing its values."""
   tokens = np.asarray(record.tokens, dtype=np.float32)
-  if tokens.shape != (41, _TOKEN_WIDTH) or not np.isfinite(tokens).all():
-    raise ValueError("generation records must contain finite [41, 231] tokens")
+  if tokens.shape != expected_shape or not np.isfinite(tokens).all():
+    raise ValueError(f"generation records must contain finite {expected_shape} tokens")
   return tokens
 
 
@@ -295,6 +298,288 @@ def _add_horizon_metrics(
     )
 
 
+def _window_distribution(values: np.ndarray) -> dict[str, float | int]:
+  """Summarize one scalar error per validation window."""
+  values = np.asarray(values, dtype=np.float64)
+  if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+    raise ValueError("pathwise errors must be finite, non-empty window vectors")
+  return {
+    "windows": int(values.size),
+    "mean": float(values.mean()),
+    "median": float(np.percentile(values, 50)),
+    "p90": float(np.percentile(values, 90)),
+    "p95": float(np.percentile(values, 95)),
+    "max": float(values.max()),
+  }
+
+
+def _window_mse(
+  prediction: np.ndarray, target: np.ndarray, selection: np.ndarray
+) -> np.ndarray:
+  """Compute one masked MSE for each leading window."""
+  squared = np.square(prediction - target, dtype=np.float64)
+  selected = np.asarray(selection, dtype=bool)
+  counts = selected.reshape(selected.shape[0], -1).sum(axis=1)
+  if np.any(counts == 0):
+    raise ValueError("pathwise feature group has no unknown entries")
+  return (squared * selected).reshape(selected.shape[0], -1).sum(axis=1) / counts
+
+
+def _pathwise_error_values(
+  prediction: np.ndarray,
+  target: np.ndarray,
+  unknown: np.ndarray,
+  projection: ProjectionBundle,
+) -> dict[str, np.ndarray]:
+  """Return one masked MSE per leading window for each feature group."""
+  groups: dict[str, tuple[np.ndarray, np.ndarray]] = {
+    "normalized_state": (
+      prediction[..., :_STATE_WIDTH],
+      target[..., :_STATE_WIDTH],
+    ),
+    "normalized_latent": (prediction[..., _STATE_WIDTH:], target[..., _STATE_WIDTH:]),
+  }
+  selections = {
+    "normalized_state": unknown[..., :_STATE_WIDTH],
+    "normalized_latent": unknown[..., _STATE_WIDTH:],
+  }
+  output = {
+    name: _window_mse(value, reference, selections[name])
+    for name, (value, reference) in groups.items()
+  }
+  physical_prediction = _physical_tokens(projection, prediction)
+  physical_target = _physical_tokens(projection, target)
+  physical_state_unknown = np.any(unknown[..., :_STATE_WIDTH], axis=-1, keepdims=True)
+  output["physical_recovered_state"] = _window_mse(
+    physical_prediction[0],
+    physical_target[0],
+    np.broadcast_to(physical_state_unknown, physical_prediction[0].shape),
+  )
+  output["physical_recovered_latent"] = _window_mse(
+    physical_prediction[1],
+    physical_target[1],
+    unknown[..., _STATE_WIDTH:],
+  )
+  return output
+
+
+def evaluate_pathwise_transition_diagnostic(
+  model: Any,
+  *,
+  schedule: DiffusionSchedule,
+  grid: InferenceGrid,
+  records: Sequence[WindowRecord],
+  projection: ProjectionBundle,
+  contract: DiffusionContract,
+  seed: int,
+  device: str | torch.device,
+  diagnostics_path: str | Path,
+  max_windows: int | None = None,
+) -> dict[str, object]:
+  """Compare a DDIM path and matched forward marginals under one epsilon.
+
+  The sampler starts from pure Gaussian noise, exactly as production DDIM does.
+  The reference at every source and destination is the correctly noised clean
+  future using the same per-window/token epsilon, with known entries clamped.
+  """
+  if max_windows is not None and max_windows < 0:
+    raise ValueError("max_windows must be non-negative")
+  if max_windows is not None:
+    selected = tuple(records[:max_windows])
+  else:
+    selected = tuple(records)
+  if not selected:
+    raise ValueError("pathwise transition diagnostic requires at least one window")
+  if grid != build_inference_grid(schedule):
+    raise ValueError("pathwise transition diagnostic requires the frozen 20-level grid")
+  torch_device = torch.device(device)
+  if torch_device.type == "cuda" and not torch.cuda.is_available():
+    raise RuntimeError("CUDA device requested for pathwise diagnostic but unavailable")
+  if hasattr(model, "to"):
+    model.to(torch_device)
+  mask = clean_mask(
+    current_index=contract.current_index,
+    state_dimension=contract.projected_state_dimension,
+    token_dimension=contract.token_dimension,
+    device=torch_device,
+  )
+  fixed_state = mask[..., :_STATE_WIDTH].all(dim=-1)
+  fixed_latent = mask[..., _STATE_WIDTH:].all(dim=-1)
+  alpha_bars = schedule.alpha_bars_torch(device=torch_device, dtype=torch.float32)
+  transition_values: list[dict[str, Any]] = [
+    {
+      "source_level": int(source),
+      "destination_level": int(destination),
+      "values": {
+        name: {}
+        for name in (
+          "evolving_vs_q_source",
+          "evolving_x0_error",
+          "correctly_noised_x0_error",
+          "destination_vs_q_destination",
+        )
+      },
+    }
+    for source, destination in zip(grid.source_ids, grid.destination_ids, strict=True)
+  ]
+  epsilon_generator = _cpu_generator(seed)
+  model_was_training = bool(getattr(model, "training", False))
+  if hasattr(model, "eval"):
+    model.eval()
+  try:
+    with torch.no_grad():
+      for start in range(0, len(selected), 32):
+        stop = min(len(selected), start + 32)
+        tokens = np.stack(
+          [_as_record_tokens(record) for record in selected[start:stop]]
+        )
+        clean = torch.from_numpy(tokens).to(device=torch_device, dtype=torch.float32)
+        batch_unknown = np.broadcast_to(
+          (~mask).detach().cpu().numpy().astype(bool), tokens.shape
+        ).copy()
+        epsilon = torch.randn(
+          clean.shape,
+          generator=epsilon_generator,
+          device="cpu",
+          dtype=clean.dtype,
+        ).to(torch_device)
+        sample = apply_clean_mask(epsilon, clean, mask)
+        for index, (source, destination) in enumerate(
+          zip(grid.source_ids, grid.destination_ids, strict=True)
+        ):
+          step_ids = torch.full(
+            (clean.shape[0], clean.shape[1], 2),
+            int(source),
+            dtype=torch.long,
+            device=torch_device,
+          )
+          step_ids[..., 0] = torch.where(
+            fixed_state, torch.zeros_like(step_ids[..., 0]), step_ids[..., 0]
+          )
+          step_ids[..., 1] = torch.where(
+            fixed_latent, torch.zeros_like(step_ids[..., 1]), step_ids[..., 1]
+          )
+          alpha_source = alpha_bars[source]
+          q_source = apply_clean_mask(
+            torch.sqrt(alpha_source) * clean + torch.sqrt(1.0 - alpha_source) * epsilon,
+            clean,
+            mask,
+          )
+          evolving_x0 = model(sample, step_ids)
+          correctly_noised_x0 = model(q_source, step_ids)
+          if not isinstance(evolving_x0, Tensor) or evolving_x0.shape != clean.shape:
+            raise ValueError("denoiser returned an invalid pathwise x0 shape")
+          if (
+            not isinstance(correctly_noised_x0, Tensor)
+            or correctly_noised_x0.shape != clean.shape
+          ):
+            raise ValueError("denoiser returned an invalid matched x0 shape")
+          destination_sample = apply_clean_mask(
+            ddim_jump(
+              sample,
+              evolving_x0,
+              schedule=schedule,
+              source=int(source),
+              destination=int(destination),
+            ),
+            clean,
+            mask,
+          )
+          alpha_destination = alpha_bars[destination]
+          q_destination = apply_clean_mask(
+            torch.sqrt(alpha_destination) * clean
+            + torch.sqrt(1.0 - alpha_destination) * epsilon,
+            clean,
+            mask,
+          )
+          arrays = {
+            "evolving_vs_q_source": (
+              sample.detach().cpu().numpy(),
+              q_source.detach().cpu().numpy(),
+            ),
+            "evolving_x0_error": (
+              evolving_x0.detach().cpu().numpy(),
+              tokens,
+            ),
+            "correctly_noised_x0_error": (
+              correctly_noised_x0.detach().cpu().numpy(),
+              tokens,
+            ),
+            "destination_vs_q_destination": (
+              destination_sample.detach().cpu().numpy(),
+              q_destination.detach().cpu().numpy(),
+            ),
+          }
+          value_store = transition_values[index]["values"]
+          assert isinstance(value_store, dict)
+          for name, (prediction, target) in arrays.items():
+            values = _pathwise_error_values(
+              prediction, target, batch_unknown, projection
+            )
+            group_store = value_store[name]
+            assert isinstance(group_store, dict)
+            for group, vector in values.items():
+              stored = group_store.setdefault(group, [])
+              assert isinstance(stored, list)
+              stored.append(vector)
+          sample = destination_sample
+  finally:
+    if hasattr(model, "train"):
+      model.train(model_was_training)
+
+  transitions: list[dict[str, object]] = []
+  for transition in transition_values:
+    value_store = transition["values"]
+    assert isinstance(value_store, dict)
+    transitions.append(
+      {
+        "source_level": transition["source_level"],
+        "destination_level": transition["destination_level"],
+        "errors": {
+          name: {
+            group: _window_distribution(np.concatenate(group_values))
+            for group, group_values in groups.items()
+          }
+          for name, groups in value_store.items()
+        },
+      }
+    )
+
+  payload: dict[str, object] = {
+    "kind": "pathwise_matched_noise_transition_diagnostic",
+    "sampler": "ddim",
+    "start_level": 1000,
+    "grid_source_ids": [int(value) for value in grid.source_ids],
+    "grid_destination_ids": [int(value) for value in grid.destination_ids],
+    "windows": len(selected),
+    "seed": int(seed),
+    "noise_coupling": {
+      "epsilon_per_window_token": True,
+      "shared_across_levels": True,
+      "known_entries_clamped_after_initialization_and_each_jump": True,
+    },
+    "initialization": {
+      "level_1000": {
+        "sampler": "pure_gaussian_epsilon_then_known_entry_clamp",
+        "marginal": "sqrt(alpha_bar_1000) * x0 + sqrt(1-alpha_bar_1000) * epsilon",
+        "alpha_bar": float(alpha_bars[1000].item()),
+        "difference": "pure Gaussian omits the small clean signal and uses unit noise scale",
+      },
+      "level_950": {
+        "existing_start_950_sampler": "pure_gaussian_epsilon_then_known_entry_clamp",
+        "proper_marginal": "sqrt(alpha_bar_950) * x0 + sqrt(1-alpha_bar_950) * epsilon",
+        "alpha_bar": float(alpha_bars[950].item()),
+        "difference": "pure Gaussian is not q(x_950|x0,epsilon); it omits signal and uses unit noise scale",
+      },
+    },
+    "transitions": transitions,
+  }
+  path = Path(diagnostics_path)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+  return payload
+
+
 def evaluate_generation(
   model: Any,
   *,
@@ -311,6 +596,7 @@ def evaluate_generation(
   sampler_kind: str = "ddim",
   start_level: int = 1000,
   reverse_diagnostics_path: str | Path | None = None,
+  pathwise_transition_diagnostics_path: str | Path | None = None,
 ) -> GenerationReport:
   """Score conditioned DDIM generation against the specified baselines.
 
@@ -330,6 +616,12 @@ def evaluate_generation(
     raise ValueError("reverse diagnostics require the default 1000-level DDIM path")
   if sampler_kind == "ddpm" and start_level != 1000:
     raise ValueError("start_level is only supported for DDIM")
+  if pathwise_transition_diagnostics_path is not None and (
+    sampler_kind != "ddim" or start_level != 1000
+  ):
+    raise ValueError(
+      "pathwise transition diagnostics require the default 1000-level DDIM path"
+    )
   projection_contract = getattr(projection, "contract", None)
   if projection_contract is not None and hasattr(projection_contract, "identity_hash"):
     if projection_contract.identity_hash() != contract.identity_hash():
@@ -391,6 +683,19 @@ def evaluate_generation(
     model.eval()
 
   try:
+    if pathwise_transition_diagnostics_path is not None:
+      evaluate_pathwise_transition_diagnostic(
+        model,
+        schedule=schedule,
+        grid=grid,
+        records=selected,
+        projection=projection,
+        contract=contract,
+        seed=seed,
+        device=torch_device,
+        diagnostics_path=pathwise_transition_diagnostics_path,
+        max_windows=None,
+      )
     with torch.no_grad():
       for start in range(0, target_count, 32):
         stop = min(target_count, start + 32)
@@ -549,7 +854,10 @@ def evaluate_generation(
             f"{physical_prefix}_unknown_latent_mse"
           ),
         }
-      reverse_report["steps"].append(step)
+      steps = reverse_report["steps"]
+      assert isinstance(steps, list)
+      steps.append(step)
+    assert reverse_diagnostics_path is not None
     reverse_path = Path(reverse_diagnostics_path)
     reverse_path.parent.mkdir(parents=True, exist_ok=True)
     reverse_path.write_text(json.dumps(reverse_report, indent=2, sort_keys=True) + "\n")
@@ -720,7 +1028,9 @@ def audit_dataset(source: DatasetSource | LoadedDataset) -> dict[str, object]:
   """Audit pilot/bulk D1 identity, coverage, token slices and phase provenance."""
   loaded, source_obj, directory = _audit_source(source)
   coverage = loaded.index.coverage()
-  moments = _Moments(_TOKEN_WIDTH)
+  state_width = loaded.contract.projected_state_dimension
+  token_width = loaded.contract.token_dimension
+  moments = _Moments(token_width)
   motion_phase: dict[str, dict[str, dict[str, dict[str, float | int]]]] = {}
   motion_phase_total: dict[str, dict[str, dict[str, float | int]]] = {}
   noise_norms: list[float] = []
@@ -730,8 +1040,10 @@ def audit_dataset(source: DatasetSource | LoadedDataset) -> dict[str, object]:
     records = load_window_records(loaded, split)
     split_counts[split] = len(records)
     for record in records:
-      tokens = _as_record_tokens(record)
-      moments.update(tokens.reshape(-1, _TOKEN_WIDTH))
+      tokens = _as_record_tokens(
+        record, expected_shape=(loaded.contract.window_steps, token_width)
+      )
+      moments.update(tokens.reshape(-1, token_width))
       finite_windows += int(np.isfinite(tokens).all())
       motion = str(record.motion_id)
       phase = str(record.phase or "unknown")
@@ -824,9 +1136,20 @@ def audit_dataset(source: DatasetSource | LoadedDataset) -> dict[str, object]:
     "token_statistics": {
       "windows": sum(split_counts.values()),
       "tokens": moments.count,
-      "projected_rows": moments.summary(0, 64),
-      "identity_rows": moments.summary(64, 199),
-      "latent": moments.summary(199, 231),
+      **(
+        {
+          "projected_rows": moments.summary(0, loaded.contract.projection_rows),
+          "identity_rows": moments.summary(
+            loaded.contract.projection_rows, state_width
+          ),
+          "latent": moments.summary(state_width, token_width),
+        }
+        if loaded.contract.projection_rows
+        else {
+          "normalized_state": moments.summary(0, state_width),
+          "normalized_latent": moments.summary(state_width, token_width),
+        }
+      ),
     },
     "noise_level_sanity": {
       "forward_diffusion_levels": "trainer samples independent integers in [0, 1000]",

@@ -18,6 +18,7 @@ from mjlab.tasks.tracking.diffusion.trainer import (
   DiffusionTrainer,
   ExponentialMovingAverage,
   TrainerError,
+  _metrics,
 )
 from mjlab.tasks.tracking.diffusion.training_config import (
   TrainingConfig,
@@ -27,12 +28,29 @@ from mjlab.tasks.tracking.diffusion.training_config import (
 )
 
 
+def test_metrics_report_unknown_entries_not_clean_conditioning() -> None:
+  prediction = torch.zeros((1, 41, 167))
+  target = torch.zeros_like(prediction)
+  prediction[:, 9:, :135] = 2.0
+  unknown = torch.zeros((41, 167), dtype=torch.bool)
+  unknown[9:, :135] = True
+  metrics = _metrics(
+    prediction,
+    target,
+    torch.zeros((1, 41), dtype=torch.long),
+    torch.zeros((1, 41), dtype=torch.long),
+    unknown,
+  )
+  assert metrics["unknown_state_mse"] == 4.0
+  assert metrics["state_mse"] > metrics["unknown_state_mse"] / 2
+
+
 class SyntheticWindows(Dataset[tuple[Tensor, Tensor, int]]):
   """Small well-formed token fixtures with explicit phase sampling weights."""
 
   def __init__(self, count: int = 5, *, identity: str = "synthetic-v1") -> None:
     generator = torch.Generator().manual_seed(31)
-    self.tokens = torch.randn((count, 41, 231), generator=generator)
+    self.tokens = torch.randn((count, 41, 167), generator=generator)
     self.weights = np.asarray([1.0, 1.0, 2.0, 2.0, 1.0][:count])
     self.dataset_identity = {
       "directory": identity,
@@ -60,7 +78,7 @@ class TinyDenoiser(nn.Module):
 
   def __init__(self) -> None:
     super().__init__()
-    self.linear = nn.Linear(231, 231)
+    self.linear = nn.Linear(167, 167)
 
   def forward(self, tokens: Tensor, step_ids: Tensor) -> Tensor:
     del step_ids
@@ -72,7 +90,7 @@ class ConstantDenoiser(nn.Module):
 
   def __init__(self) -> None:
     super().__init__()
-    self.value = nn.Parameter(torch.zeros((1, 41, 231)))
+    self.value = nn.Parameter(torch.zeros((1, 41, 167)))
 
   def forward(self, tokens: Tensor, step_ids: Tensor) -> Tensor:
     del step_ids
@@ -173,7 +191,7 @@ def test_config_rejects_unbounded_invocation_and_contract_drift() -> None:
 
 
 def test_tiny_fixed_window_overfits_x0_objective(tmp_path) -> None:
-  target = torch.full((1, 41, 231), 0.25)
+  target = torch.full((1, 41, 167), 0.25)
   config = TrainingConfig(
     epochs=200,
     max_updates=100,
@@ -226,7 +244,7 @@ def test_empty_evaluation_split_is_not_a_best_checkpoint(tmp_path) -> None:
   )
   trainer.eval_datasets = {
     "validation": torch.utils.data.TensorDataset(
-      torch.empty((0, 41, 231), dtype=torch.float32)
+      torch.empty((0, 41, 167), dtype=torch.float32)
     )
   }
   result = trainer.train()

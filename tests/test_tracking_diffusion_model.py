@@ -14,9 +14,9 @@ from mjlab.tasks.tracking.diffusion.model import (
 
 def test_frozen_model_shape_parameter_count_and_finite_output() -> None:
   model = StateLatentTransformer(DenoiserSettings())
-  assert model.parameter_count() == 20_197_607
+  assert model.parameter_count() == 20_132_007
   model.train()
-  tokens = torch.randn((1, 41, 231), dtype=torch.float32)
+  tokens = torch.randn((1, 41, 167), dtype=torch.float32)
   ids = torch.zeros((1, 41, 2), dtype=torch.long)
   first = model(tokens, ids)
   second = model(tokens, ids)
@@ -34,7 +34,7 @@ def test_invalid_step_ids_are_rejected() -> None:
   model = StateLatentTransformer(
     DenoiserSettings(width=32, layers=1, attention_heads=4, ffn_width=64)
   )
-  tokens = torch.randn((1, 41, 231))
+  tokens = torch.randn((1, 41, 167))
   valid = torch.zeros((1, 41, 2), dtype=torch.long)
   invalid_low = valid.clone()
   invalid_low[0, 0, 0] = -1
@@ -52,7 +52,7 @@ def test_token_40_influences_token_0_without_causal_mask() -> None:
     DenoiserSettings(width=32, layers=1, attention_heads=4, ffn_width=64)
   )
   model.eval()
-  tokens = torch.randn((1, 41, 231))
+  tokens = torch.randn((1, 41, 167))
   ids = torch.zeros((1, 41, 2), dtype=torch.long)
   with torch.no_grad():
     baseline = model(tokens, ids)
@@ -67,7 +67,7 @@ def test_gradients_reach_every_parameter() -> None:
   model = StateLatentTransformer(
     DenoiserSettings(width=32, layers=1, attention_heads=4, ffn_width=64)
   )
-  tokens = torch.randn((2, 41, 231), requires_grad=False)
+  tokens = torch.randn((2, 41, 167), requires_grad=False)
   ids = torch.randint(0, 1001, (2, 41, 2), dtype=torch.long)
   model(tokens, ids).square().mean().backward()
   assert all(parameter.grad is not None for parameter in model.parameters())

@@ -35,7 +35,7 @@ from .dataset import (
   fit_training_statistics,
   grouped_split,
 )
-from .model import DenoiserSettings, StateLatentTransformer
+from .migration import rebuild_no_mixture_dataset
 from .noising import (
   NoisedPair,
   add_independent_noise,
@@ -170,6 +170,7 @@ __all__ = [
   "FeatureStats",
   "ProjectionBundle",
   "ProjectionError",
+  "rebuild_no_mixture_dataset",
   "ShardStore",
   "ShardWriter",
   "SplitAssignments",

@@ -141,10 +141,11 @@ def test_evaluate_offline_refuses_legacy_best_selected_on_test(
   assert "checkpoint-last.pt" in error
 
 
+@pytest.mark.parametrize("projected_representation", [False, True])
 def test_evaluate_offline_allows_legacy_last_but_flags_test_provenance(
-  tmp_path: Path, monkeypatch, capsys
+  tmp_path: Path, monkeypatch, capsys, projected_representation: bool
 ) -> None:
-  """`last` was never selected on anything, so it stays evaluable -- but flagged."""
+  """Legacy selection metadata is supported only with a compatible representation."""
   from mjlab.tasks.tracking.diffusion import checkpoint as checkpoint_module
   from mjlab.tasks.tracking.diffusion import evaluation as evaluation_module
   from mjlab.tasks.tracking.diffusion import model as model_module
@@ -152,6 +153,8 @@ def test_evaluate_offline_allows_legacy_last_but_flags_test_provenance(
 
   contract = DiffusionContract.from_yaml(
     Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml")
+    if projected_representation
+    else diffusion.DEFAULT_CONTRACT_PATH
   )
   schedule = DiffusionSchedule.from_contract(contract)
   dataset_dir = tmp_path / "dataset"
@@ -234,7 +237,11 @@ def test_evaluate_offline_allows_legacy_last_but_flags_test_provenance(
       "0",
     ]
   )
-  out = capsys.readouterr().out
-  assert code == 0
-  assert '"selection_split": null' in out
-  assert '"test_selection_provenance": true' in out
+  captured = capsys.readouterr()
+  if projected_representation:
+    assert code == 1
+    assert "legacy projected checkpoints require explicit migration" in captured.err
+  else:
+    assert code == 0
+    assert '"selection_split": null' in captured.out
+    assert '"test_selection_provenance": true' in captured.out

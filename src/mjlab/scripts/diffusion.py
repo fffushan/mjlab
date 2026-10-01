@@ -23,7 +23,9 @@ from typing import Any, Callable, Sequence, cast
 
 from mjlab.tasks.tracking.diffusion.runtime import CollectionRequest, RuntimeBundle
 
-DEFAULT_CONTRACT_PATH = Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml")
+DEFAULT_CONTRACT_PATH = Path(
+  "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
+)
 DEFAULT_CONFIG_PATH = Path("configs/diffusion/x2_50hz_collection.yaml")
 # Hard collection ceilings the CLI will not exceed.  The *pilot* budget (54
 # trials / 13500 transitions / 15 min) is the frozen D0 contract and
@@ -763,7 +765,7 @@ def _command_train(args: argparse.Namespace) -> int:
       if records:
         values = torch.from_numpy(np.stack([record.tokens for record in records]))
       else:
-        values = torch.empty((0, 41, 231), dtype=torch.float32)
+        values = torch.empty((0, 41, 167), dtype=torch.float32)
       dataset = _attach_dataset_identity(
         torch.utils.data.TensorDataset(values),
         base_identity=base_identity,
@@ -904,6 +906,7 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       model=model,
       ema=ema,
       map_location=device,
+      expected_contract_identity=contract.identity_hash(),
     )
     recorded_split = state.selection_split
     if recorded_split is None:
@@ -919,7 +922,10 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
         f"pass --checkpoint {fallback} explicitly"
       )
     if state.contract_identity != contract.identity_hash():
-      raise ValueError("checkpoint contract identity mismatch")
+      raise ValueError(
+        "checkpoint contract identity differs from the active no-mixture "
+        "representation; legacy projected checkpoints require explicit migration and retraining"
+      )
     if state.schedule_identity != schedule.identity_hash():
       raise ValueError("checkpoint schedule identity mismatch")
     dataset_path = state.dataset_identity.get("directory")
@@ -979,6 +985,13 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       if args.reverse_diagnostic
       else None
     )
+    pathwise_transition_path = (
+      Path(args.pathwise_output)
+      if args.pathwise_output is not None
+      else run_dir / f"pathwise-transition-diagnostic-{args.split}.json"
+      if args.pathwise_transition_diagnostic
+      else None
+    )
     report = evaluate_generation(
       model,
       schedule=schedule,
@@ -994,6 +1007,7 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       sampler_kind=args.sampler,
       start_level=args.start_level,
       reverse_diagnostics_path=reverse_diagnostics_path,
+      pathwise_transition_diagnostics_path=pathwise_transition_path,
     )
     payload = report.as_dict()
     payload["sampler"] = args.sampler
@@ -1001,6 +1015,9 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     payload["selection_split"] = state.selection_split
     payload["best_metric_split"] = getattr(state, "best_metric_split", None)
     payload["test_selection_provenance"] = recorded_split == "test"
+    payload["pathwise_transition_diagnostic"] = (
+      str(pathwise_transition_path) if pathwise_transition_path is not None else None
+    )
     payload["checkpoint"] = str(checkpoint_path)
     payload["dataset"] = str(source.directory)
     payload["device"] = str(device)
@@ -1018,6 +1035,26 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     return 0
   except (OSError, RuntimeError, ValueError, TypeError) as exc:
     print(f"evaluate-offline: {exc}", file=sys.stderr)
+    return 1
+
+
+def _command_migrate_no_mixtures(args: argparse.Namespace) -> int:
+  """Explicitly rebuild a derived no-mixture dataset from a D0 raw store."""
+  try:
+    from mjlab.tasks.tracking.diffusion.migration import rebuild_no_mixture_dataset
+
+    payload = rebuild_no_mixture_dataset(
+      args.source_directory,
+      args.destination_directory,
+      source_contract=args.source_contract,
+      contract_path=args.contract,
+    )
+    if args.json is not None:
+      _json_write(args.json, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+  except (OSError, RuntimeError, ValueError, TypeError) as exc:
+    print(f"migrate-no-mixtures: {exc}", file=sys.stderr)
     return 1
 
 
@@ -1148,8 +1185,33 @@ def build_parser() -> argparse.ArgumentParser:
     action="store_true",
     help="record correctly-noised versus evolving x0 errors per DDIM level",
   )
+  evaluate.add_argument(
+    "--pathwise-transition-diagnostic",
+    action="store_true",
+    help="record matched-epsilon DDIM transition errors by feature group",
+  )
+  evaluate.add_argument(
+    "--pathwise-output",
+    type=Path,
+    help="output path for the opt-in pathwise transition report",
+  )
   evaluate.add_argument("--json", type=Path)
   evaluate.set_defaults(handler=_command_evaluate_offline)
+
+  migrate = commands.add_parser(
+    "migrate-no-mixtures",
+    help="explicitly rebuild a no-mixture dataset from a legacy D0 raw store",
+  )
+  migrate.add_argument("--source-directory", type=Path, required=True)
+  migrate.add_argument("--destination-directory", type=Path, required=True)
+  migrate.add_argument(
+    "--source-contract",
+    type=Path,
+    default=Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml"),
+  )
+  migrate.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT_PATH)
+  migrate.add_argument("--json", type=Path)
+  migrate.set_defaults(handler=_command_migrate_no_mixtures)
 
   audit = commands.add_parser("audit", help="audit a D1 dataset offline")
   audit.add_argument("--dataset-dir", type=Path, required=True)

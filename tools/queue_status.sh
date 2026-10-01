@@ -40,6 +40,7 @@ MODE=status
 SHOW_JOBS=0
 SHOW_DISPATCH=0
 LOG_TAIL=0
+RESTART_EXCLUDE=""
 ADD_ID=""
 ADD_ARGS=()
 ADD_COMMAND_B64=""
@@ -62,7 +63,8 @@ Usage: $SCRIPT_NAME [OPTIONS] 'ssh -p PORT user@host'
                 REMOTE is the quoted SSH spec; -- separates it from ARGS.
   --remove ID   Remove a non-running job row. Running jobs are refused.
   --stop        Run the remote queue stop.sh (running jobs keep going).
-  --jobs        Also print the remote jobs.tsv (current queued job list).
+  --restart     Restart only the dispatcher; running jobs keep going.
+  --exclude-gpus LIST  Dispatcher exclusion list for --restart (use 'none' for all GPUs).
   --tail N      Also print the last N lines of the remote queue.log.
   --dispatch    Also print tmux/process status for the dispatcher.
 
@@ -98,6 +100,18 @@ while [ $# -gt 0 ]; do
         echo "error: --stop cannot be combined with another queue action" >&2; exit 2
       fi
       MODE=stop; shift ;;
+    --restart)
+      if [ "$MODE" != status ]; then
+        echo "error: --restart cannot be combined with another queue action" >&2; exit 2
+      fi
+      MODE=restart; shift ;;
+    --exclude-gpus)
+      if [ "$MODE" != restart ] || [ $# -lt 2 ]; then
+        echo "error: --exclude-gpus is only valid after --restart" >&2; exit 2
+      fi
+      RESTART_EXCLUDE="$2"
+      [ "$RESTART_EXCLUDE" = "none" ] && RESTART_EXCLUDE=""
+      shift 2 ;;
     --jobs) SHOW_JOBS=1; shift ;;
     --tail)
       LOG_TAIL="${2:?--tail needs a number of lines}"
@@ -267,6 +281,18 @@ case "${MODE:-status}" in
     echo "job removed from queue: $REMOVE_ID (state=$state; artifacts retained)"
     bash "$QUEUE/status.sh"
     ;;
+  restart)
+    if [ ! -f "$QUEUE/dispatch.sh" ]; then
+      echo "error: dispatch.sh is missing: $QUEUE/dispatch.sh" >&2
+      exit 3
+    fi
+    if tmux has-session -t queue-dispatch 2>/dev/null; then
+      tmux kill-session -t queue-dispatch
+      sleep 1
+    fi
+    EXCLUDE_GPUS="$RESTART_EXCLUDE" tmux new-session -d -s queue-dispatch "bash $QUEUE/dispatch.sh"
+    echo "dispatcher restarted (exclude_gpus=${RESTART_EXCLUDE:-none}; running jobs untouched)"
+    ;;
   stop)
     if [ -x "$QUEUE/stop.sh" ]; then
       bash "$QUEUE/stop.sh"
@@ -317,7 +343,7 @@ fi
 # ---------------------------------------------------------------------------
 # Run it
 # ---------------------------------------------------------------------------
-if ! "${SSH_CMD[@]}" "MODE=$MODE SHOW_JOBS=$SHOW_JOBS LOG_TAIL=$LOG_TAIL SHOW_DISPATCH=$SHOW_DISPATCH ADD_ID=$ADD_ID ADD_COMMAND_B64=$ADD_COMMAND_B64 REMOVE_ID=$REMOVE_ID bash -s" <<< "$REMOTE_SCRIPT"; then
+if ! "${SSH_CMD[@]}" "MODE=$MODE SHOW_JOBS=$SHOW_JOBS LOG_TAIL=$LOG_TAIL SHOW_DISPATCH=$SHOW_DISPATCH RESTART_EXCLUDE=$RESTART_EXCLUDE ADD_ID=$ADD_ID ADD_COMMAND_B64=$ADD_COMMAND_B64 REMOVE_ID=$REMOVE_ID bash -s" <<< "$REMOTE_SCRIPT"; then
   echo "error: remote command failed (SSH reachable? queue present?)" >&2
   exit 3
 fi

@@ -2,7 +2,7 @@
 # not the immutable D0 design contract.  The CLI still requires --execute and a
 # concrete --runtime-factory; this file alone never launches a simulator.
 schema_version: mjlab-x2-diffusion-d1-collection-v1
-contract: docs/plans/beyondmimic_diffusion_d0_contract.yaml
+contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml
 execution_authorized: false
 runtime_factory: null
 frequency_hz: 50

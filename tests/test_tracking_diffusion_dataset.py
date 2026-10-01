@@ -29,7 +29,7 @@ def test_grouping_is_deterministic_and_windows_are_lazy(tmp_path) -> None:
   assert index.coverage() == {"train": 1, "validation": 0, "test": 1}
   bundle = fit_training_statistics(index)
   sample = WindowDataset(index, "train", bundle)[0]
-  assert sample.tokens.shape == (41, 231)
+  assert sample.tokens.shape == (41, 167)
   assert sample.current_index == 8
 
 

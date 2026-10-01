@@ -211,3 +211,35 @@ def test_checkpoint_config_hash_tampering_is_rejected(tmp_path) -> None:
   torch.save(payload, path)
   with pytest.raises(CheckpointError, match="config hash"):
     load_checkpoint(path, model=nn.Linear(3, 2))
+
+
+def test_projected_checkpoint_rejected_before_restoring_model(tmp_path) -> None:
+  old_contract = DiffusionContract.from_yaml(
+    "docs/plans/beyondmimic_diffusion_d0_contract.yaml"
+  )
+  path = tmp_path / "legacy.pt"
+  save_checkpoint(
+    path,
+    model=nn.Linear(231, 231),
+    ema=None,
+    optimizer=None,
+    scaler=None,
+    config=TrainingConfig(),
+    contract=old_contract,
+    schedule=DiffusionSchedule.build(),
+    dataset_identity=_identity(),
+    global_step=1,
+    epoch=1,
+    best_validation_loss=None,
+    rng_state={"torch": torch.get_rng_state()},
+  )
+  restored_model = nn.Linear(167, 167)
+  before = {name: value.clone() for name, value in restored_model.state_dict().items()}
+  with pytest.raises(CheckpointError, match="explicit migration and retraining"):
+    load_checkpoint(
+      path,
+      model=restored_model,
+      expected_contract_identity=DiffusionContract().identity_hash(),
+    )
+  for name, value in restored_model.state_dict().items():
+    assert torch.equal(value, before[name])

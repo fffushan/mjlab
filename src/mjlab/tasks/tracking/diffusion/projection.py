@@ -1,4 +1,9 @@
-"""Train-only normalization and the persisted 199-D state projection."""
+"""Train-only normalization for the active no-mixture 135-D state schema.
+
+``ProjectionBundle`` remains as a compatibility name for persisted callers, but
+its active transform is only per-feature normalization.  The legacy D0 bundle
+with random/emphasis rows is intentionally not accepted by the active contract.
+"""
 
 from __future__ import annotations
 
@@ -135,6 +140,12 @@ class ProjectionBundle:
       self.pseudoinverse,
       (c.state_dimension, c.projected_state_dimension),
     )
+    if c.projection_rows == 0:
+      identity = np.eye(c.state_dimension, dtype=np.float64)
+      if not np.array_equal(self.matrix, identity) or not np.array_equal(
+        self.pseudoinverse, identity
+      ):
+        raise ProjectionError("no-mixture bundles require identity state transforms")
     if (
       self.state_stats.mean.size != c.state_dimension
       or self.latent_stats.mean.size != c.latent_dimension
@@ -175,16 +186,26 @@ class ProjectionBundle:
       or latent_stats.mean.size != contract.latent_dimension
     ):
       raise ProjectionError("statistics dimensions do not match contract")
-    rng = np.random.Generator(np.random.PCG64(contract.projection_seed))
-    a = rng.normal(
-      0.0, 1.0, size=(contract.projection_rows, contract.state_dimension)
-    ).astype(np.float64)
-    emphasis = np.ones(contract.state_dimension, dtype=np.float64)
-    emphasis[:15] = 6.0
-    matrix = np.vstack(
-      (a * emphasis[None, :], np.eye(contract.state_dimension, dtype=np.float64))
-    )
-    pseudoinverse = np.linalg.pinv(matrix, rcond=contract.projection_rcond)
+    if contract.schema_version == "mjlab-x2-state-latent-d0-v1":
+      rng = np.random.Generator(np.random.PCG64(contract.projection_seed))
+      a = rng.normal(
+        0.0, 1.0, size=(contract.projection_rows, contract.state_dimension)
+      ).astype(np.float64)
+      emphasis = np.ones(contract.state_dimension, dtype=np.float64)
+      emphasis[:15] = 6.0
+      matrix = np.vstack(
+        (a * emphasis[None, :], np.eye(contract.state_dimension, dtype=np.float64))
+      )
+      pseudoinverse = np.linalg.pinv(matrix, rcond=contract.projection_rcond)
+    else:
+      if contract.projection_rows != 0:
+        raise ProjectionError(
+          "active no-mixture bundles cannot contain added projection rows; "
+          "use the explicit migration command"
+        )
+      identity = np.eye(contract.state_dimension, dtype=np.float64)
+      matrix = identity.copy()
+      pseudoinverse = identity.copy()
     temporary = object.__new__(cls)
     object.__setattr__(temporary, "contract", contract)
     object.__setattr__(temporary, "state_stats", state_stats)
@@ -198,13 +219,19 @@ class ProjectionBundle:
 
   def project_state(self, state: np.ndarray) -> np.ndarray:
     normalized = self.state_stats.normalize(state)
+    if self.contract.projection_rows == 0:
+      return normalized
     return normalized @ self.matrix.T
 
   def inverse_state(self, projected: np.ndarray) -> np.ndarray:
     projected = _finite("projected state", projected)
     if projected.shape[-1] != self.contract.projected_state_dimension:
       raise ProjectionError("projected state width does not match contract")
-    normalized = projected @ self.pseudoinverse.T
+    normalized = (
+      projected
+      if self.contract.projection_rows == 0
+      else projected @ self.pseudoinverse.T
+    )
     return self.state_stats.denormalize(normalized)
 
   def normalize_latent(self, latent: np.ndarray) -> np.ndarray:
@@ -251,7 +278,13 @@ class ProjectionBundle:
     try:
       with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata"].item()))
-        if metadata["contract"]["schema_version"] != contract.schema_version:
+        bundle_schema = metadata["contract"]["schema_version"]
+        if bundle_schema != contract.schema_version:
+          if bundle_schema == "mjlab-x2-state-latent-d0-v1":
+            raise ProjectionError(
+              "legacy projected D0 bundle rejected by the active no-mixture contract; "
+              "run the explicit raw-store migration"
+            )
           raise ProjectionError("projection contract schema mismatch")
         state = FeatureStats(
           int(metadata["state_stats"]["count"]), data["state_mean"], data["state_std"]
@@ -262,6 +295,8 @@ class ProjectionBundle:
           data["latent_std"],
         )
         matrix, pinv = data["matrix"], data["pseudoinverse"]
+    except ProjectionError:
+      raise
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
       raise ProjectionError(f"invalid projection bundle {path}") from exc
     bundle = cls(

@@ -36,6 +36,9 @@ class TrainerError(RuntimeError):
   """The training state is invalid or became non-finite."""
 
 
+_STATE_DIMENSION = DiffusionContract().state_dimension
+
+
 @dataclass(frozen=True, slots=True)
 class TrainResult:
   """Summary and artifact paths from one bounded training invocation."""
@@ -151,9 +154,9 @@ def _as_tokens(batch: Any) -> Tensor:
     raise TrainerError("dataset must return tokens or (tokens, weight, index)")
   if not isinstance(tokens, Tensor):
     tokens = torch.as_tensor(tokens)
-  if tokens.ndim != 3 or tokens.shape[-2:] != (41, 231):
+  if tokens.ndim != 3 or tokens.shape[-2:] != (41, 167):
     raise TrainerError(
-      f"dataset tokens must have shape [B, 41, 231], got {tuple(tokens.shape)}"
+      f"dataset tokens must have shape [B, 41, 167], got {tuple(tokens.shape)}"
     )
   if not tokens.is_floating_point():
     tokens = tokens.float()
@@ -253,28 +256,25 @@ def _metrics(
   unknown: Tensor,
 ) -> dict[str, float]:
   squared = (prediction.float() - target.float()).square()
-  state = squared[..., :199]
-  latent = squared[..., 199:]
-  projected = state[..., :64]
-  identity = state[..., 64:]
+  state_width = _STATE_DIMENSION
+  state = squared[..., :state_width]
+  latent = squared[..., state_width:]
   unknown_batched = unknown.to(device=squared.device).expand(squared.shape[0], -1, -1)
   unknown_sq = squared[unknown_batched]
-  unknown_state_mask = unknown_batched[..., :199]
-  unknown_latent_mask = unknown_batched[..., 199:]
+  unknown_state_mask = unknown_batched[..., :state_width]
+  unknown_latent_mask = unknown_batched[..., state_width:]
   values: dict[str, float] = {
     "loss": _mean_or_zero(squared),
     "total_mse": _mean_or_zero(squared),
     "state_mse": _mean_or_zero(state),
     "latent_mse": _mean_or_zero(latent),
-    "projected_rows_mse": _mean_or_zero(projected),
-    "identity_rows_mse": _mean_or_zero(identity),
     "unknown_mse": _mean_or_zero(unknown_sq),
-    "unknown_state_mse": _mean_or_zero(squared[..., :199][unknown_state_mask]),
-    "unknown_latent_mse": _mean_or_zero(squared[..., 199:][unknown_latent_mask]),
+    "unknown_state_mse": _mean_or_zero(state[unknown_state_mask]),
+    "unknown_latent_mse": _mean_or_zero(latent[unknown_latent_mask]),
   }
   for prefix, levels, width_slice in (
-    ("state", k_state, (..., slice(0, 199))),
-    ("latent", k_latent, (..., slice(199, 231))),
+    ("state", k_state, (..., slice(0, state_width))),
+    ("latent", k_latent, (..., slice(state_width, None))),
   ):
     selected_values = squared[width_slice]
     for bucket, mask in _level_bucket(levels):
@@ -344,7 +344,7 @@ class DiffusionTrainer:
     self._alpha_bars = self.schedule.alpha_bars_torch(
       device=self.device, dtype=torch.float32
     )
-    self._unknown_mask = clean_mask(
+    self._unknown_mask = ~clean_mask(
       current_index=self.contract.current_index,
       state_dimension=self.contract.projected_state_dimension,
       token_dimension=self.contract.token_dimension,
@@ -368,6 +368,7 @@ class DiffusionTrainer:
           optimizer=self.optimizer,
           scaler=self.scaler,
           map_location=self.device,
+          expected_contract_identity=self.contract.identity_hash(),
         )
       except CheckpointError as exc:
         raise TrainerError(f"resume checkpoint is invalid: {exc}") from exc

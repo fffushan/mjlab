@@ -27,7 +27,7 @@ CONTRACT_PATH = (
   Path(__file__).resolve().parents[1]
   / "docs"
   / "plans"
-  / "beyondmimic_diffusion_d0_contract.yaml"
+  / "beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
 )
 CONTRACT = DiffusionContract.from_yaml(CONTRACT_PATH)
 SCHEDULE = DiffusionSchedule.from_contract(CONTRACT)

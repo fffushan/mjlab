@@ -46,6 +46,52 @@ if [ -n "${TASK_ALIASES[$TASK]:-}" ]; then
 fi
 EXTRA=("$@")
 
+if [ "$TASK" = "diffusion-no-mixtures" ]; then
+  case "$ITERS" in
+    ''|*[!0-9]*) echo "[error] diffusion max-updates must be a positive integer: $ITERS" >&2; exit 2 ;;
+  esac
+  if [ "$ITERS" -le 0 ]; then
+    echo "[error] diffusion max-updates must be positive: $ITERS" >&2
+    exit 2
+  fi
+  if [ "${#EXTRA[@]}" -ne 0 ]; then
+    echo "[error] diffusion-no-mixtures takes no extra positional arguments" >&2
+    exit 2
+  fi
+  DIFFUSION_CONTRACT="${DIFFUSION_CONTRACT:-$REPO/docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml}"
+  DIFFUSION_CONFIG="${DIFFUSION_CONFIG:-$REPO/configs/diffusion/x2_50hz_train.yaml}"
+  DIFFUSION_SOURCE="${DIFFUSION_SOURCE_DIR:-$REPO/logs/diffusion/d1-bulk-par}"
+  DIFFUSION_DATASET="${DIFFUSION_DATASET_DIR:-$REPO/logs/diffusion/d1-bulk-no-mixtures}"
+  DIFFUSION_OUT="${DIFFUSION_OUTPUT_DIR:-$REPO/logs/diffusion/d2-no-mixtures-bulk}"
+  if [ ! -f "$DIFFUSION_DATASET/offline/dataset.json" ]; then
+    if [ -e "$DIFFUSION_DATASET" ] && [ -n "$(find "$DIFFUSION_DATASET" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+      echo "[error] no-mixture dataset destination exists but is incomplete: $DIFFUSION_DATASET" >&2
+      exit 2
+    fi
+    echo "[diffusion] migrating raw store to $DIFFUSION_DATASET"
+    cd "$REPO"
+    "$REPO/.venv/bin/python" -m mjlab.scripts.diffusion migrate-no-mixtures \
+      --source-directory "$DIFFUSION_SOURCE" \
+      --destination-directory "$DIFFUSION_DATASET" \
+      --source-contract "$REPO/docs/plans/beyondmimic_diffusion_d0_contract.yaml" \
+      --contract "$DIFFUSION_CONTRACT" \
+      --json "$DIFFUSION_DATASET/migration.json"
+  fi
+  mkdir -p "$DIFFUSION_OUT"
+  echo "[diffusion] training $ITERS updates on visible GPU $GPU_ID"
+  cd "$REPO"
+  export CUDA_VISIBLE_DEVICES="$GPU_ID"
+  exec "$REPO/.venv/bin/python" -m mjlab.scripts.diffusion train \
+    --dataset-dir "$DIFFUSION_DATASET" \
+    --config "$DIFFUSION_CONFIG" \
+    --out "$DIFFUSION_OUT" \
+    --contract "$DIFFUSION_CONTRACT" \
+    --device cuda:0 \
+    --max-updates "$ITERS" \
+    --allow-long-run \
+    --json "$DIFFUSION_OUT/train.json"
+fi
+
 NUM_ENVS="${NUM_ENVS:-8192}"
 GPU_ID="${GPU_ID:-0}"
 

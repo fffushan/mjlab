@@ -1,7 +1,7 @@
 # Non-authorizing D2 training input.  The CLI still requires an explicit
 # --max-updates or --epochs budget before it can start.
 schema_version: mjlab-x2-state-latent-train-v1
-contract: docs/plans/beyondmimic_diffusion_d0_contract.yaml
+contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml
 model: {layers: 6, width: 512, attention_heads: 8, ffn_width: 2048, dropout: 0.0}
 noise: {training_k: 1000, cosine_offset: 0.008, beta_min: 1.0e-5, beta_max: 0.999, updates: 20}
 training:

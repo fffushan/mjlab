@@ -5,6 +5,13 @@ Changelog
 Added
 ^^^^^
 
+- Added the versioned X2 diffusion no-mixture representation contract
+  ``mjlab-x2-state-latent-d1-no-mixtures-v1``: train-only normalization of 135
+  physical hybrid-state values plus the frozen 32-D VAE latent (167-wide tokens,
+  41 steps at 50 Hz). The explicit ``migrate-no-mixtures`` CLI rebuilds a
+  derived dataset from legacy raw rows while preserving split assignments and
+  source provenance; legacy projected bundles remain rejected.
+
 - Added the X2 PPO tracking task ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations``. It preserves the standing-start X2 task while using the Unitree G1 magnitudes for initial pose/velocity/joint-position randomization and external pushes.
 
  and evaluator at

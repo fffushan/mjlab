@@ -76,7 +76,7 @@ def test_evaluate_offline_empty_split_requires_nonzero_unless_zero_bound(
   from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule
 
   contract = DiffusionContract.from_yaml(
-    Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml")
+    Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml")
   )
   schedule = DiffusionSchedule.from_contract(contract)
   dataset_dir = tmp_path / "dataset"
@@ -184,7 +184,7 @@ def test_evaluate_offline_empty_split_requires_nonzero_unless_zero_bound(
     "projection_hashes": {"matrix": "c" * 64},
   }
   dataset = diffusion._attach_dataset_identity(
-    torch.utils.data.TensorDataset(torch.zeros((1, 41, 231))),
+    torch.utils.data.TensorDataset(torch.zeros((1, 41, 167))),
     base_identity=base,
     split="train",
     motion_ids=("tennis_001",),

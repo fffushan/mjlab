@@ -93,7 +93,7 @@ class DatasetSource:
     try:
       projection = ProjectionBundle.load(offline / "projection.npz", contract=contract)
     except (OSError, ProjectionError, ValueError) as exc:
-      raise DatasetError("invalid offline projection bundle") from exc
+      raise DatasetError(f"invalid offline projection bundle: {exc}") from exc
 
     store = AppendOnlyShardStore(store_path, contract=contract)
     if store.contract.identity_hash() != contract.identity_hash():
@@ -185,8 +185,16 @@ class WindowRecord:
 
   def __post_init__(self) -> None:
     tokens = np.asarray(self.tokens, dtype=np.float32)
-    if tokens.shape != (41, 231) or not np.isfinite(tokens).all():
-      raise DatasetError("window tokens must be finite with shape (41, 231)")
+    if (
+      tokens.ndim != 2
+      or tokens.shape[0] != 41
+      or tokens.shape[1] not in {167, 231}
+      or not np.isfinite(tokens).all()
+    ):
+      raise DatasetError(
+        "window tokens must be finite with shape (41, 167) for active data "
+        "or (41, 231) for explicit legacy data"
+      )
     _validate_provenance_fields(
       self.split, self.phase, self.ou_noise_norm, self.start_tick
     )
@@ -248,8 +256,13 @@ def _normalise_motion_ids(motion_ids: Sequence[str] | None) -> tuple[str, ...] |
 def _record_from_sample(sample: Any, ref: WindowRef, split: str) -> WindowRecord:
   tokens = np.asarray(sample.tokens, dtype=np.float32)
   rows = sample.rows
-  if tokens.shape != (41, 231) or not np.isfinite(tokens).all():
-    raise DatasetError("window materialization produced invalid tokens")
+  if (
+    tokens.ndim != 2
+    or tokens.shape[0] != 41
+    or tokens.shape[1] not in {167, 231}
+    or not np.isfinite(tokens).all()
+  ):
+    raise DatasetError("window materialization produced an invalid token shape")
   if not rows:
     raise DatasetError("window materialization produced no source rows")
   first = rows[0]
@@ -509,7 +522,11 @@ def build_token_cache(
   if source_obj is None:
     source_obj = DatasetSource(
       Path(loaded.store.root).parent,
-      Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml"),
+      Path(
+        "docs/plans/beyondmimic_diffusion_d0_contract.yaml"
+        if loaded.contract.projection_rows
+        else "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
+      ),
     )
   selected_count = sum(
     1
@@ -520,7 +537,11 @@ def build_token_cache(
       limit=None,
     )
   )
-  shape = (selected_count, 41, 231)
+  shape = (
+    selected_count,
+    loaded.contract.window_steps,
+    loaded.contract.token_dimension,
+  )
   projected_bytes = math.prod(shape) * cache_dtype.itemsize
   projected_gib = projected_bytes / (1024**3)
   print(
@@ -672,7 +693,11 @@ class TokenWindowDataset(torch.utils.data.Dataset):
       if source_obj is None:
         source_obj = DatasetSource(
           Path(loaded.store.root).parent,
-          Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml"),
+          Path(
+            "docs/plans/beyondmimic_diffusion_d0_contract.yaml"
+            if loaded.contract.projection_rows
+            else "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
+          ),
         )
       raw_shape = metadata.get("shape")
       if not isinstance(raw_shape, list) or len(raw_shape) != 3:

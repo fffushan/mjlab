@@ -8,14 +8,14 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-_FROZEN_PARAMETER_COUNT = 20_197_607
+_FROZEN_PARAMETER_COUNT = 20_132_007
 
 
 @dataclass(frozen=True, slots=True)
 class DenoiserSettings:
-  """Transformer dimensions and embedding settings from the D0 contract."""
+  """Transformer dimensions for the active no-mixture token contract."""
 
-  token_dimension: int = 231
+  token_dimension: int = 167
   sequence_length: int = 41
   embedding_count: int = 1001
   width: int = 512
@@ -50,9 +50,9 @@ class DenoiserSettings:
     k = 1000 if training_k is None else int(training_k)
     if k < 0:
       raise ValueError("training_k must be non-negative")
-    token_dimension = int(getattr(contract, "token_dimension", 231))
+    token_dimension = int(getattr(contract, "token_dimension", 167))
     sequence_length = int(getattr(contract, "window_steps", 41))
-    if token_dimension != 231 or sequence_length != 41:
+    if token_dimension != 167 or sequence_length != 41:
       raise ValueError("contract dimensions disagree with the frozen D0 model")
     return cls(
       token_dimension=token_dimension,

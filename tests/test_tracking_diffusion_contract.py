@@ -16,6 +16,16 @@ def test_frozen_yaml_contract_identity_and_dimensions() -> None:
   )
 
 
+def test_no_mixture_yaml_is_versioned_and_has_physical_width() -> None:
+  contract = DiffusionContract.from_yaml(
+    "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
+  )
+  assert contract.schema_version == "mjlab-x2-state-latent-d1-no-mixtures-v1"
+  assert contract.projected_state_dimension == 135
+  assert contract.token_dimension == 167
+  assert contract.projection_rows == 0
+
+
 def test_artifact_identity_is_fail_closed() -> None:
   contract = DiffusionContract()
   with pytest.raises(ContractError):

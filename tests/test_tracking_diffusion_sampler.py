@@ -35,11 +35,11 @@ class _InputDependentDenoiser:
 
 
 def _conditions() -> SamplerConditions:
-  clean = torch.randn((1, 41, 231), dtype=torch.float64)
+  clean = torch.randn((1, 41, 167), dtype=torch.float64)
   mask = clean_mask(
     current_index=8,
-    state_dimension=199,
-    token_dimension=231,
+    state_dimension=135,
+    token_dimension=167,
     device=clean.device,
   )
   return SamplerConditions(clean, mask)
@@ -151,6 +151,8 @@ def test_ddim_can_start_at_level_950_and_skip_terminal_call() -> None:
     result[0][conditions.clean_mask], conditions.clean_tokens[0][conditions.clean_mask]
   )
 
+
+def test_ddpm_uses_each_adjacent_reverse_level_and_reapplies_mask() -> None:
   schedule = DiffusionSchedule.build()
   conditions = _conditions()
   denoiser = _OracleDenoiser(conditions.clean_tokens)

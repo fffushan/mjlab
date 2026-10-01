@@ -230,6 +230,7 @@ def load_checkpoint(
   optimizer: Any | None = None,
   scaler: Any | None = None,
   map_location: str | torch.device = "cpu",
+  expected_contract_identity: str | None = None,
 ) -> CheckpointState:
   """Load a checkpoint and optionally restore supplied mutable components."""
   source = Path(path)
@@ -258,6 +259,14 @@ def load_checkpoint(
   }
   if not required.issubset(payload):
     raise CheckpointError("checkpoint is missing required identity/state fields")
+  if (
+    expected_contract_identity is not None
+    and payload["contract_identity"] != expected_contract_identity
+  ):
+    raise CheckpointError(
+      "checkpoint contract identity differs from the active no-mixture "
+      "representation; legacy projected checkpoints require explicit migration and retraining"
+    )
   model_state = _require_mapping(payload, "model")
   config = _require_mapping(payload, "config")
   projection_hashes_raw = _require_mapping(payload, "projection_hashes")

@@ -267,9 +267,10 @@ def _infer_state_dimension(mask: Tensor) -> int:
     state_dimension = int(first[int(partial[0].item())].sum().item())
     if 0 < state_dimension < first.shape[-1]:
       return state_dimension
-  # A fully unknown synthetic mask has no boundary signal.  Keep the frozen
-  # projected-state width for real tokens and a useful fallback for small tests.
-  return 199 if first.shape[-1] >= 231 else max(1, first.shape[-1] - 1)
+  # Synthetic masks may be entirely unknown and therefore carry no boundary
+  # signal.  The latent width is fixed by the frozen VAE; derive the state
+  # boundary from the token width rather than reintroducing a projected width.
+  return max(1, first.shape[-1] - 32)
 
 
 def _initial_norms(noise: Tensor, state_dimension: int) -> dict[str, float]:
@@ -280,6 +281,31 @@ def _initial_norms(noise: Tensor, state_dimension: int) -> dict[str, float]:
     "latent": float(torch.linalg.vector_norm(latent).item()),
     "tokens": float(torch.linalg.vector_norm(noise).item()),
   }
+
+
+def ddim_jump(
+  sample: Tensor,
+  x0_hat: Tensor,
+  *,
+  schedule: DiffusionSchedule,
+  source: int,
+  destination: int,
+) -> Tensor:
+  """Apply one deterministic DDIM jump without changing conditioning."""
+  if not 0 <= destination < source <= schedule.training_k:
+    raise ValueError("DDIM jump must have 0 <= destination < source")
+  alpha_bars = schedule.alpha_bars_torch(device=sample.device, dtype=sample.dtype)
+  if destination == schedule.clean_index:
+    return x0_hat.clone()
+  alpha_source = alpha_bars[source]
+  epsilon_hat = (sample - torch.sqrt(alpha_source) * x0_hat) / torch.sqrt(
+    1.0 - alpha_source
+  )
+  alpha_destination = alpha_bars[destination]
+  return (
+    torch.sqrt(alpha_destination) * x0_hat
+    + torch.sqrt(1.0 - alpha_destination) * epsilon_hat
+  )
 
 
 def sample_trajectory(
@@ -326,7 +352,6 @@ def sample_trajectory(
 
   fixed_state = mask_batched[..., :state_dimension].all(dim=-1)
   fixed_latent = mask_batched[..., state_dimension:].all(dim=-1)
-  alpha_bars = schedule.alpha_bars_torch(device=sample.device, dtype=sample.dtype)
   seen: list[int] = []
   returned: list[int] = []
 
@@ -354,15 +379,13 @@ def sample_trajectory(
     seen.append(int(source))
     returned.append(int(source))
 
-    a_source = alpha_bars[source]
-    if destination == schedule.clean_index:
-      jumped = x0_hat.clone()
-    else:
-      a_destination = alpha_bars[destination]
-      eps_hat = (sample - torch.sqrt(a_source) * x0_hat) / torch.sqrt(1.0 - a_source)
-      jumped = (
-        torch.sqrt(a_destination) * x0_hat + torch.sqrt(1.0 - a_destination) * eps_hat
-      )
+    jumped = ddim_jump(
+      sample,
+      x0_hat,
+      schedule=schedule,
+      source=source,
+      destination=destination,
+    )
     sample = apply_clean_mask(jumped, clean_batched, mask_batched)
 
   diagnostics = SamplerDiagnostics(

@@ -19,8 +19,12 @@ class ContractError(ValueError):
   """A contract or artifact manifest is incomplete or incompatible."""
 
 
-_SCHEMA = "mjlab-x2-state-latent-d0-v1"
+_SCHEMA = "mjlab-x2-state-latent-d1-no-mixtures-v1"
+_LEGACY_SCHEMA = "mjlab-x2-state-latent-d0-v1"
 _D0_CONTRACT_SHA = "42694cdd3acd72afd2d234a85ca29e9c7a646d64df831021c8dd43e55f3f73e7"
+_D1_NO_MIXTURES_CONTRACT_SHA = (
+  "f5237d4327fd7cfd4c065604806555a43f8afa97c0ea17a9e59a3482a6d0caed"
+)
 _VAE_SHA = "69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117"
 _RECOVERY_SHA = "caf17c38f23ad180829a230a9a3259f14eedd3860dd90a046b8be92d3d047681"
 _XML_SHA = "ae0dcbceda3ef74e029e3bf4a9ea24ea8cc58ab44f1518e635653fc79f928125"
@@ -64,13 +68,13 @@ class DiffusionContract:
   current_index: int = 8
   future_steps: int = 32
   window_steps: int = 41
-  projected_state_dimension: int = 199
-  token_dimension: int = 231
+  projected_state_dimension: int = 135
+  token_dimension: int = 167
   split_seed: int = 42
   split_fractions: tuple[float, float, float] = (0.8, 0.1, 0.1)
   std_floor: float = 1.0e-6
   projection_seed: int = 42
-  projection_rows: int = 64
+  projection_rows: int = 0
   projection_rcond: float = 1.0e-12
   vae_checkpoint: str = "logs/distillation/mixed-10k/checkpoint-final.pt"
   vae_sha256: str = _VAE_SHA
@@ -109,7 +113,7 @@ class DiffusionContract:
   )
 
   def __post_init__(self) -> None:
-    if self.schema_version != _SCHEMA:
+    if self.schema_version not in {_SCHEMA, _LEGACY_SCHEMA}:
       raise ContractError(f"unsupported schema_version {self.schema_version!r}")
     if self.current_index != self.past_steps:
       raise ContractError("current_index must equal past_steps")
@@ -120,8 +124,13 @@ class DiffusionContract:
       or self.state_dimension != 15 + 6 * self.body_count
     ):
       raise ContractError("ordered body names and state dimension are inconsistent")
-    if self.projected_state_dimension != self.state_dimension + self.projection_rows:
-      raise ContractError("projection dimension is inconsistent")
+    if self.schema_version == _SCHEMA:
+      if self.projected_state_dimension != self.state_dimension:
+        raise ContractError("no-mixture state width must equal physical state width")
+      if self.projection_rows != 0:
+        raise ContractError("no-mixture contract forbids added projection rows")
+    elif self.projected_state_dimension != self.state_dimension + self.projection_rows:
+      raise ContractError("legacy projection dimension is inconsistent")
     if self.token_dimension != self.projected_state_dimension + self.latent_dimension:
       raise ContractError("token dimension is inconsistent")
     if self.control_hz <= 0 or self.period_seconds <= 0 or self.std_floor <= 0:
@@ -153,8 +162,11 @@ class DiffusionContract:
     The YAML contains many D2 fields.  They are deliberately ignored here,
     while all D1 identity values are checked against the frozen defaults.
     """
-    if not isinstance(payload, Mapping) or payload.get("schema_version") != _SCHEMA:
-      raise ContractError("payload is not the frozen D0 schema")
+    if not isinstance(payload, Mapping) or payload.get("schema_version") not in {
+      _SCHEMA,
+      _LEGACY_SCHEMA,
+    }:
+      raise ContractError("payload is not a supported diffusion schema")
     state = payload.get("state", {})
     window = payload.get("window", {})
     prep = payload.get("preprocessing", {})
@@ -223,11 +235,21 @@ class DiffusionContract:
       raise ContractError("PyYAML is required to read the frozen D0 manifest") from exc
     source = Path(path).read_bytes()
     digest = hashlib.sha256(source).hexdigest()
-    if digest != _D0_CONTRACT_SHA:
-      raise ContractError(
-        f"frozen D0 contract hash mismatch: expected {_D0_CONTRACT_SHA}, got {digest}"
-      )
     payload = yaml.safe_load(source)
+    if digest == _D0_CONTRACT_SHA:
+      expected = _D0_CONTRACT_SHA
+    elif digest == _D1_NO_MIXTURES_CONTRACT_SHA:
+      expected = _D1_NO_MIXTURES_CONTRACT_SHA
+    else:
+      schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
+      expected = (
+        _D0_CONTRACT_SHA if schema == _LEGACY_SCHEMA else _D1_NO_MIXTURES_CONTRACT_SHA
+      )
+    if digest != expected:
+      schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
+      raise ContractError(
+        f"diffusion contract hash mismatch for {schema}: expected {expected}, got {digest}"
+      )
     contract = cls.from_mapping(payload)
     return replace(contract, contract_sha256=digest)
 

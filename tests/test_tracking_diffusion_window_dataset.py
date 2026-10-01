@@ -38,7 +38,7 @@ def test_yaml_and_default_contract_identity_hashes_are_pinned() -> None:
     "fc0bc53d0efb1a58f700f78716e5cf36dca24d527c2a7d9b46bffe49cc9a23de"
   )
   assert DEFAULT_CONTRACT.identity_hash() == (
-    "330f7fe0394f1c8b2e32b0383a54d2de8abaa51ed4f1de3f7675f3ba2c263f14"
+    "eae0d2fff601f85742306310cfac1f7332dfdeddba4fc59009595a9ad632fc76"
   )
   assert yaml_contract.identity_hash() != DEFAULT_CONTRACT.identity_hash()
 
@@ -142,7 +142,7 @@ def test_token_cache_v1_requires_actionable_rebuild(tmp_path) -> None:
 
 
 def _synthetic_record(index: int, phase: str) -> WindowRecord:
-  tokens = np.full((41, 231), index + 0.25, dtype=np.float32)
+  tokens = np.full((41, 167), index + 0.25, dtype=np.float32)
   return WindowRecord(
     tokens=tokens,
     split="train",
@@ -188,7 +188,7 @@ def test_window_provenance_stream_is_token_free_and_weight_equivalent(
     dtype=np.dtype(np.float32),
     motion_ids=None,
     limit=None,
-    shape=(2, 41, 231),
+    shape=(2, 41, 167),
     created_at="now",
     content_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
   )
@@ -217,8 +217,7 @@ def test_pilot_token_slice_statistics_are_nonuniform_and_finite() -> None:
   projected_std = float(tokens[..., :64].std())
   identity_std = float(tokens[..., 64:199].std())
   latent_std = float(tokens[..., 199:].std())
-  # Broad bounds preserve the measured pilot ranges while guarding against a
-  # forbidden post-projection re-standardization.
+  # Historical D0 diagnostics remain byte/semantics compatible.
   assert 12.0 < projected_std < 22.0
   assert 0.3 < identity_std < 1.2
   assert 0.5 < latent_std < 1.5
