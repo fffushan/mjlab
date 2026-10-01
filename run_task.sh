@@ -46,6 +46,9 @@ if [ -n "${TASK_ALIASES[$TASK]:-}" ]; then
 fi
 EXTRA=("$@")
 
+NUM_ENVS="${NUM_ENVS:-8192}"
+GPU_ID="${GPU_ID:-0}"
+
 if [ "$TASK" = "diffusion-no-mixtures" ]; then
   case "$ITERS" in
     ''|*[!0-9]*) echo "[error] diffusion max-updates must be a positive integer: $ITERS" >&2; exit 2 ;;
@@ -91,9 +94,6 @@ if [ "$TASK" = "diffusion-no-mixtures" ]; then
     --allow-long-run \
     --json "$DIFFUSION_OUT/train.json"
 fi
-
-NUM_ENVS="${NUM_ENVS:-8192}"
-GPU_ID="${GPU_ID:-0}"
 
 # ---------------------------------------------------------------- motion file
 MOTION="${MOTION_FILE:-}"
