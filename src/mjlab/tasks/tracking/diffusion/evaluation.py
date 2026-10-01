@@ -309,6 +309,7 @@ def evaluate_generation(
   diagnostics_path: str | Path | None = None,
   split: str | None = None,
   sampler_kind: str = "ddim",
+  start_level: int = 1000,
   reverse_diagnostics_path: str | Path | None = None,
 ) -> GenerationReport:
   """Score conditioned DDIM generation against the specified baselines.
@@ -323,8 +324,12 @@ def evaluate_generation(
     raise ValueError("max_windows must be non-negative")
   if sampler_kind not in {"ddim", "ddpm"}:
     raise ValueError("sampler_kind must be 'ddim' or 'ddpm'")
-  if reverse_diagnostics_path is not None and sampler_kind != "ddim":
-    raise ValueError("reverse diagnostics require sampler_kind='ddim'")
+  if reverse_diagnostics_path is not None and (
+    sampler_kind != "ddim" or start_level != 1000
+  ):
+    raise ValueError("reverse diagnostics require the default 1000-level DDIM path")
+  if sampler_kind == "ddpm" and start_level != 1000:
+    raise ValueError("start_level is only supported for DDIM")
   projection_contract = getattr(projection, "contract", None)
   if projection_contract is not None and hasattr(projection_contract, "identity_hash"):
     if projection_contract.identity_hash() != contract.identity_hash():
@@ -375,7 +380,7 @@ def evaluate_generation(
   sampler_generator = _cpu_generator(seed)
   prior_generator = _cpu_generator(seed)
   accumulator = _MetricAccumulator()
-  sampler_config = SamplerConfig(grid=grid)
+  sampler_config = SamplerConfig(grid=grid, start_level=start_level)
   ddpm_generator = _cpu_generator(seed)
   reverse_noise_generator = _cpu_generator(seed + 1)
   reverse_accumulator = (

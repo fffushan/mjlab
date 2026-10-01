@@ -968,7 +968,12 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     # Keep the CLI explicit about device placement; ``evaluate_generation``
     # also enforces it at the API boundary.
     model.to(device)
-    diagnostics_path = run_dir / f"generation-{args.sampler}-{args.split}.json"
+    diagnostics_path = (
+      run_dir / f"generation-{args.sampler}-{args.split}.json"
+      if args.start_level == 1000
+      else run_dir
+      / f"generation-{args.sampler}-start-{args.start_level}-{args.split}.json"
+    )
     reverse_diagnostics_path = (
       run_dir / f"reverse-diagnostic-{args.split}.json"
       if args.reverse_diagnostic
@@ -987,10 +992,12 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       diagnostics_path=diagnostics_path,
       split=args.split,
       sampler_kind=args.sampler,
+      start_level=args.start_level,
       reverse_diagnostics_path=reverse_diagnostics_path,
     )
     payload = report.as_dict()
     payload["sampler"] = args.sampler
+    payload["start_level"] = args.start_level
     payload["selection_split"] = state.selection_split
     payload["best_metric_split"] = getattr(state, "best_metric_split", None)
     payload["test_selection_provenance"] = recorded_split == "test"
@@ -1128,6 +1135,13 @@ def build_parser() -> argparse.ArgumentParser:
     choices=("ddim", "ddpm"),
     default="ddim",
     help="reverse sampler; ddpm runs all 1000 adjacent training levels",
+  )
+  evaluate.add_argument(
+    "--start-level",
+    type=int,
+    choices=tuple(range(50, 1001, 50)),
+    default=1000,
+    help="DDIM initialization level; 950 skips the 1000-level call",
   )
   evaluate.add_argument(
     "--reverse-diagnostic",

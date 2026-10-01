@@ -129,7 +129,28 @@ def test_ddim_seed_reproducibility_and_clean_reapplication() -> None:
   )
 
 
-def test_ddpm_runs_all_adjacent_levels_and_reapplies_conditions() -> None:
+def test_ddim_can_start_at_level_950_and_skip_terminal_call() -> None:
+  schedule = DiffusionSchedule.build()
+  grid = InferenceGrid.uniform(schedule)
+  conditions = _conditions()
+  denoiser = _OracleDenoiser(conditions.clean_tokens)
+  result, diagnostics = sample_trajectory(
+    denoiser,
+    schedule=schedule,
+    conditions=conditions,
+    config=SamplerConfig(grid, start_level=950),
+    generator=torch.Generator().manual_seed(31),
+  )
+  assert result.shape == conditions.clean_tokens.shape
+  assert diagnostics.denoiser_calls == 19
+  assert diagnostics.jumps == 19
+  assert diagnostics.source_ids_returned == tuple(range(950, 0, -50))
+  assert diagnostics.step_ids_seen == tuple(range(950, 0, -50))
+  assert diagnostics.final_index == 0
+  assert torch.equal(
+    result[0][conditions.clean_mask], conditions.clean_tokens[0][conditions.clean_mask]
+  )
+
   schedule = DiffusionSchedule.build()
   conditions = _conditions()
   denoiser = _OracleDenoiser(conditions.clean_tokens)

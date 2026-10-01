@@ -28,6 +28,7 @@ class SamplerConfig:
   eta: float = 0.0
   guidance_strength: float = 0.0
   initial_noise_scale: float = 1.0
+  start_level: int = 1000
 
   def __post_init__(self) -> None:
     if self.eta != 0.0:
@@ -38,6 +39,8 @@ class SamplerConfig:
       raise ValueError("initial_noise_scale must be finite")
     if self.initial_noise_scale < 0.0:
       raise ValueError("initial_noise_scale must be non-negative")
+    if self.start_level not in self.grid.source_ids:
+      raise ValueError("start_level must be one of the inference-grid source levels")
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,7 +294,9 @@ def sample_trajectory(
 
   The denoiser sees the original training timestep at each jump.  Fixed entries
   use clean step id zero and are restored from ``clean_tokens`` after every
-  update, including the final destination at index zero.
+  update, including the final destination at index zero.  The default starts at
+  level 1000 and runs all 20 frozen jumps.  An opt-in lower ``start_level``
+  skips preceding high-noise calls while preserving the same DDIM update grid.
   """
   if config.eta != 0.0:
     raise ValueError("D2 supports only eta=0.0")
@@ -325,9 +330,10 @@ def sample_trajectory(
   seen: list[int] = []
   returned: list[int] = []
 
-  for source, destination in zip(
-    config.grid.source_ids, config.grid.destination_ids, strict=True
-  ):
+  start_index = config.grid.source_ids.index(config.start_level)
+  active_sources = config.grid.source_ids[start_index:]
+  active_destinations = config.grid.destination_ids[start_index:]
+  for source, destination in zip(active_sources, active_destinations, strict=True):
     if source == schedule.clean_index:
       raise ValueError("the denoiser must never be called at clean index 0")
     step_ids = torch.full(
@@ -361,7 +367,7 @@ def sample_trajectory(
 
   diagnostics = SamplerDiagnostics(
     denoiser_calls=len(returned),
-    jumps=len(config.grid.source_ids),
+    jumps=len(active_sources),
     source_ids_returned=tuple(returned),
     step_ids_seen=tuple(seen),
     final_index=config.grid.destination_ids[-1],
