@@ -795,7 +795,15 @@ class ReplayPolicy:
 
 @dataclass(frozen=True, slots=True)
 class CohortResources:
-  """Runtime resource and seed settings a strict resume must reproduce."""
+  """Runtime resource and seed settings a strict resume must reproduce.
+
+  ``device`` is recorded for audit but is **not** one of the settings a resume
+  reproduces: it names the card a shard collects on, and a shard's environment
+  and generator seeds derive from the shard's *index* (``worker_env_seed``,
+  ``worker_generator_seed``), never from the device name.  Moving a run to a
+  free card therefore cannot change which rows are sampled, so it sits with the
+  transport name on the audit-only side of the resume contract.
+  """
 
   device: str
   requested_seed: int
@@ -1216,7 +1224,9 @@ def require_same_cohort(stored: CohortIdentity, expected: CohortIdentity) -> Non
 
   Strict resume reproduces the ordered members, every artifact path and digest,
   the clip extents and audited body mapping, the common contract, the slot and
-  phase policy, the replay partition policy, and the resource/seed settings.
+  phase policy, the replay partition policy, and the recorded seed settings.
+  The device name is recorded but not compared, so a run may resume on
+  different cards; see :data:`_RESUME_COMPARED_RESOURCE_FIELDS`.
   Members that are missing, extra, or reordered, and every changed value, are
   reported by name so the caller can explain the refusal.
   """
@@ -1342,10 +1352,23 @@ def require_same_replay_policy(policy: ReplayPolicy, reference: ReplayPolicy) ->
       raise _differ(f"replay weight[{position}]", left, right)
 
 
+_RESUME_COMPARED_RESOURCE_FIELDS = ("requested_seed", "effective_seed")
+"""Resource settings a strict resume reproduces.
+
+``device`` is deliberately absent: it names the card a shard collects on, and
+which rows get sampled is decided by the shard's *index*, not by the device
+name.  Replacing a busy card must therefore not refuse a resume -- the same
+distinction the transport name and ``checkpoint_every`` already have.  The
+device stays recorded in :meth:`CohortResources.as_dict` and in the run's
+resolved configuration, so a substitution is visible in the report instead of
+being silent.
+"""
+
+
 def _require_same_resources(
   resources: CohortResources, reference: CohortResources
 ) -> None:
-  for name in resources.as_dict():
+  for name in _RESUME_COMPARED_RESOURCE_FIELDS:
     if getattr(resources, name) != getattr(reference, name):
       raise _differ(
         f"resource setting {name}", getattr(resources, name), getattr(reference, name)

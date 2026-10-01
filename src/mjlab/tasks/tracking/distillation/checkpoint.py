@@ -1020,13 +1020,38 @@ def _require_fifo_replay(replay: ReplayBufferProtocol, caller: str) -> ReplayPol
   return policy
 
 
+def _retarget_replay_device(payload: Any, map_location: str | torch.device) -> Any:
+  """Point a loaded replay state at the device its tensors were mapped onto.
+
+  ``torch.load(map_location=...)`` moves a saved ring's tensors but cannot
+  rewrite the storage name recorded beside them, so a resume on a different
+  device -- or any CUDA run read through a CPU ``map_location`` -- would look
+  like a corrupted snapshot and be refused, even though the tensors are
+  consistent with one another.  That recorded name says where the ring lives,
+  not which run produced it: the original device stays recorded in the run's
+  resolved configuration, and the live buffer adopts the mapped device.
+
+  A state without a ``device`` field (a different replay implementation) passes
+  through unchanged, as does a payload that is not a mapping at all.
+  """
+  if not isinstance(payload, Mapping):
+    return payload
+  state = payload.get("replay")
+  if not isinstance(state, Mapping) or "device" not in state:
+    return payload
+  retargeted = dict(payload)
+  retargeted["replay"] = {**state, "device": str(torch.device(map_location))}
+  return retargeted
+
+
 def _load_payload(
   path: str | os.PathLike[str], map_location: str | torch.device
 ) -> Any:
   try:
-    return torch.load(path, map_location=map_location, weights_only=True)
+    payload = torch.load(path, map_location=map_location, weights_only=True)
   except Exception as exc:
     raise CheckpointValidationError(f"could not load checkpoint: {exc}") from exc
+  return _retarget_replay_device(payload, map_location)
 
 
 def _build_inference_model(

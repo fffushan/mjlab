@@ -2533,7 +2533,7 @@ def test_cohort_resume_legacy_runtime_without_worker_keys_is_compatible(
   assert report["resolved_config"]["runtime"]["workers"]["mode"] == "single"
 
 
-def test_cohort_resume_refuses_a_changed_worker_devices(
+def test_cohort_resume_refuses_a_changed_worker_layout(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   capsys: pytest.CaptureFixture[str],
@@ -2541,9 +2541,10 @@ def test_cohort_resume_refuses_a_changed_worker_devices(
 ) -> None:
   """A checkpoint trained with sharded workers is not resumable unsharded.
 
-  Worker devices, per-worker environment counts and the seed scheme are all
-  recorded in the compared runtime entry, so a single-process invocation
-  cannot silently continue a run whose rows came from two environments.
+  The worker mode, worker count, per-worker environment count and seed scheme
+  are all compared, so a single-process invocation cannot silently continue a
+  run whose rows came from two environments.  The device *names* are not part
+  of that comparison; the substitution test below covers that half.
   """
   calls: list[dict] = []
   _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
@@ -2585,6 +2586,60 @@ def test_cohort_resume_refuses_a_changed_worker_devices(
   assert out == ""
   assert "runtime" in err
   assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_runtime_card_names_are_audited_rather_than_compared() -> None:
+  """The compared runtime keeps the layout and the seed provenance only.
+
+  Changing the card names is what the audit records; changing the worker mode,
+  the worker count, the environments per worker, the seed scheme, ``num_envs``
+  or the resolved seed remains a refusal.
+  """
+  stored = {
+    "device": "cuda:4",
+    "num_envs": 8,
+    "seed": 7,
+    "resolved_seed": 7,
+    "seed_provenance": {"available": True, "requested_seed": 7},
+    "workers": {
+      "mode": "sharded",
+      "devices": ["cuda:4"],
+      "count": 1,
+      "envs_per_worker": 8,
+      "seed_scheme": 1,
+    },
+  }
+  moved = {
+    **stored,
+    "device": "cuda:7",
+    "workers": {**stored["workers"], "devices": ["cuda:7"]},
+  }
+  assert distill._resume_comparable_runtime(
+    stored
+  ) == distill._resume_comparable_runtime(moved)
+  assert distill._device_substitution(stored, moved) == {
+    "device": {"stored": "cuda:4", "requested": "cuda:7"},
+    "worker_devices": {"stored": ["cuda:4"], "requested": ["cuda:7"]},
+  }
+  assert distill._device_substitution(stored, stored) is None
+  for changed in (
+    {**stored, "workers": {**stored["workers"], "mode": "single", "devices": []}},
+    {
+      **stored,
+      "workers": {
+        **stored["workers"],
+        "count": 2,
+        "envs_per_worker": 4,
+        "devices": ["cuda:4", "cuda:5"],
+      },
+    },
+    {**stored, "workers": {**stored["workers"], "seed_scheme": 2}},
+    {**stored, "num_envs": 16},
+    {**stored, "resolved_seed": 8},
+  ):
+    assert distill._resume_comparable_runtime(
+      stored
+    ) != distill._resume_comparable_runtime(changed)
 
 
 def test_cohort_transport_is_recorded_but_not_a_resume_invariant(

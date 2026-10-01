@@ -128,9 +128,11 @@ updates, no replay insertion, no report emission.
 - Repeated `cpu` entries are allowed deliberately: a CPU shard contends for no
   physical device, and repeating `'cpu'` is how the N-worker merge path is
   exercised without GPUs. Repeated GPU entries stay refused.
-- Resolved configuration records one compared `runtime.workers` object
+- Resolved configuration records one `runtime.workers` object
   (`mode` `single`/`sharded`, `devices`, `count`, `envs_per_worker`,
-  `seed_scheme`) plus an audit-only `execution.transport`.
+  `seed_scheme`) plus an audit-only `execution.transport`. Compared are the mode,
+  the count, the environments per worker and the seed scheme; 9.11 moved the
+  device names (`devices`, and the trainer device) to audit-only.
 - Absent `--worker-devices` ⇒ today's single-process path, byte-identical apart
   from that one new compared entry and the audit key.
 
@@ -274,11 +276,14 @@ Mechanism unchanged: the parent writes the versioned cohort checkpoint with
 model, optimizer, normalizers, replay, RNG and counters. Resume restarts
 simulators by design, so workers are recreated rather than restored. A
 multi-worker checkpoint cannot be resumed by a single-worker configuration (or
-vice versa): the trainer device and the whole `runtime.workers` object — mode,
-devices, count, envs per worker, seed scheme — are strict-compared. Keeping the
-identity in one object is what makes the legacy default safe: it is applied
-whole, so a partially populated worker record can never be read as the
-single-process case. `execution.transport` is deliberately not compared.
+vice versa): the layout — worker mode, worker count, environments per worker and
+seed scheme — is strict-compared. Keeping the identity in one object is what
+makes the legacy default safe: it is applied whole, so a partially populated
+worker record can never be read as the single-process case. `execution.transport`
+is deliberately not compared, and since 9.11 neither are the card *names*: the
+trainer device and `runtime.workers.devices` are recorded and reported in
+`resume.device_changed` but need not be reproduced, because a shard's environment
+and generator seeds derive from its index rather than from the device it runs on.
 
 ### 3.10 Parent-side artifacts without a local environment
 
@@ -1016,3 +1021,71 @@ it is cheap; it has not been run.
 Sources: `runs/distill_x2_tennis_mixed/v3-8192-1gpu-200-20260929T095810Z/run.log`
 and `.../v3-8192-1gpu-10000-20260929T133249Z/run.log` on the NAS, read
 2026-09-29.
+
+### 9.11 The resume invariant pinned the card name, not the layout (fixed 2026-09-30)
+
+**What happened.** Continuing the 15-teacher v3 run from iteration 10000 needed
+`--device cuda:4 --worker-devices "('cuda:4',)"` on a host where `cuda:4` was
+occupied by another run, so the continuation was launched by keeping the stored
+labels and remapping them onto a free card with
+`CUDA_VISIBLE_DEVICES=0,1,2,3,7` (visible index 4 to physical card 7). That
+worked, but it made the recorded `runtime.device` a label rather than a hardware
+claim, which is the wrong contract: the *layout* is what a resume must
+reproduce.
+
+**Why the name was pinned.** Three layers carried it along inside objects that
+had independent reasons to be compared:
+
+1. `CohortResources.device` — the identity also carries the seed settings, so
+   its record is compared field by field by `require_same_cohort`, and its digest
+   covers `resources`.
+2. `resolved_config.runtime.device` with `runtime.workers.devices` — the whole
+   `runtime` entry is a resume invariant.
+3. The replay ring's recorded storage device: `torch.load(map_location=...)` maps
+   a saved ring's tensors but cannot rewrite the storage name beside them, so
+   `BalancedReplayBuffer._validated_state` saw tensors and metadata that
+   disagreed and refused the load.
+
+None of the three needed the name. A shard's environment and generator seeds are
+pure functions of the shard *index* (`worker_env_seed`,
+`worker_generator_seed` in `cohort_setup.py`), so which card a shard runs on
+cannot change which rows are sampled — the same distinction
+`execution.transport` and `checkpoint_every` already have.
+
+**What changed.** `_require_same_resources` compares only
+`_RESUME_COMPARED_RESOURCE_FIELDS` (`requested_seed`, `effective_seed`) while
+`CohortResources.device` stays recorded. `_check_resume_compatibility` compares
+the runtime entry with the card names removed (`_resume_comparable_runtime`) and
+reports the substitution as `resume.device_changed`; the layout, `num_envs` and
+the seed provenance stay strict. `_load_payload` retargets a loaded ring's
+recorded device to the device its tensors were mapped onto, which also fixes a
+latent defect: any CUDA run read through a CPU `map_location` was refused for the
+same reason. `cohort_digest` left `_COHORT_RESUME_INVARIANT_KEYS`: it is the
+digest of the stored cohort record, so requiring it demanded a byte-identical
+identity with the card names included, and it cannot be recomputed device-free
+without changing the digest of every existing checkpoint (the loader checks the
+recorded digest against the recomputed one, so `digest()` must not change).
+Every input to that digest except the device name is still compared field by
+field by `require_same_cohort`, which runs first and names the differing field,
+so the entry was already redundant with it.
+
+**Evidence.** `test_tracking_distillation_cohort_checkpoint.py` adds a
+contract-level case (a moved device passes `require_same_cohort` while the
+identity digest still differs and a changed seed still refuses), a load-level
+case (a ring recorded as `cuda:9` loads on `cpu`), and an invariant-level case
+that drives `_check_resume_compatibility` through a **genuinely loaded** cohort
+state: moved card names produce `device_changed` with no mismatch, while a
+changed worker count in the same entry still refuses naming `runtime`.
+`test_tracking_distillation_cohort_cli.py` renames the layout refusal test and
+unit-tests the comparator, including `num_envs` and `resolved_seed`. 495
+distillation tests pass; `ruff check`, `ruff format` and `ty` are clean on the
+touched files. Sharded collection needs real devices, so the substitution is
+covered at the contract and state level rather than by an end-to-end sharded CLI
+run.
+
+**Not done.** The fix is in the working tree on the workstation, not on the
+shared server checkout (still `376a94943`), because deploying there swaps files
+under running jobs. Until then a resume on different cards still needs the
+`CUDA_VISIBLE_DEVICES` relabel: Run 3 continues to record `device: cuda:4` while
+running physically on card 7, as its directory's `PROVENANCE-IRREGULAR.md`
+states.

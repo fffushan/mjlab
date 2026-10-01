@@ -176,7 +176,6 @@ _RESUME_INVARIANT_KEYS = (
 _COHORT_RESUME_INVARIANT_KEYS = (
   "manifest",
   "teacher_ids",
-  "cohort_digest",
   "mapping_digest",
   "phase_policy",
   "task",
@@ -189,10 +188,17 @@ _COHORT_RESUME_INVARIANT_KEYS = (
 """Cohort entries a version-2 resume must reproduce; only the budget grows.
 
 The member identities, artifact digests, clip extents, slot/phase policy,
-replay partition policy, and seed/device resources live in the checkpoint's
+replay partition policy, and recorded seed settings live in the checkpoint's
 stored cohort record and are compared strictly by ``resume_cohort`` before this
 list is consulted, so this list only pins the remaining runner/trainer/model
 settings that are not part of the cohort contract.
+
+``cohort_digest`` is deliberately absent for that reason: it is the digest of
+the record above, so requiring it here demanded a byte-identical identity --
+card names included, even though they do not change which rows are sampled.
+Every input to the digest except the device name is still compared field by
+field by ``require_same_cohort``, which runs first and names the differing
+field.
 """
 
 
@@ -743,6 +749,59 @@ def _resume_compatible_value(key: str, stored: Any, requested: Any) -> Any:
   return stored
 
 
+def _resume_comparable_runtime(runtime: Mapping[str, Any]) -> dict[str, Any]:
+  """The runtime entry a resume compares: everything but the card names.
+
+  ``runtime.device`` and ``runtime.workers.devices`` record which cards a shard
+  collects on.  Neither changes which rows are sampled -- a shard's environment
+  and generator seeds derive from its index, not from the device name -- so a
+  resume may move to different cards, exactly like the transport name and
+  ``checkpoint_every``.  The layout (worker mode, worker count, environments per
+  worker, seed scheme), ``num_envs`` and the seed provenance stay compared, so a
+  resume still cannot change how many shards collect or how much each collects.
+  """
+  comparable = dict(runtime)
+  comparable.pop("device", None)
+  workers = comparable.get("workers")
+  if isinstance(workers, Mapping):
+    comparable["workers"] = {
+      key: value for key, value in workers.items() if key != "devices"
+    }
+  return comparable
+
+
+def _device_substitution(
+  stored: Mapping[str, Any], requested: Mapping[str, Any]
+) -> dict[str, Any] | None:
+  """Audit the cards a resume moved to, or ``None`` when nothing moved.
+
+  The card names are excluded from the compared runtime entry, so the report
+  states the substitution explicitly instead of letting it happen silently.
+  """
+  changes: dict[str, Any] = {}
+  if stored.get("device") != requested.get("device"):
+    changes["device"] = {
+      "stored": stored.get("device"),
+      "requested": requested.get("device"),
+    }
+  stored_workers = stored.get("workers")
+  requested_workers = requested.get("workers")
+  stored_devices = (
+    stored_workers.get("devices") if isinstance(stored_workers, Mapping) else None
+  )
+  requested_devices = (
+    requested_workers.get("devices")
+    if isinstance(requested_workers, Mapping)
+    else None
+  )
+  if stored_devices != requested_devices:
+    changes["worker_devices"] = {
+      "stored": stored_devices,
+      "requested": requested_devices,
+    }
+  return changes or None
+
+
 def _check_resume_compatibility(
   state: LifecycleState | CohortLifecycleState,
   requested: Mapping[str, Any],
@@ -752,7 +811,10 @@ def _check_resume_compatibility(
   """Refuse a resume that would silently change stored settings/schedules.
 
   Every stored semantic entry listed in ``invariant_keys`` must be reproduced;
-  only the total lifetime iteration budget may grow.  A checkpoint that
+  only the total lifetime iteration budget may grow.  The card names inside the
+  ``runtime`` entry are the one exception: they are recorded and reported
+  instead of compared, because they do not change which rows are sampled.
+  A checkpoint that
   predates this provenance record is reported as unverified rather than being
   failed against fields it never stored, and any entry the checkpoint *did*
   record is still compared.
@@ -764,6 +826,7 @@ def _check_resume_compatibility(
     "provenance_verified": verified,
     "checked": [],
     "mismatches": [],
+    "device_changed": None,
     "budget": None,
     "unverified": [],
   }
@@ -774,7 +837,18 @@ def _check_resume_compatibility(
       audit["unverified"].append(key)
       continue
     audit["checked"].append(key)
-    if _resume_compatible_value(key, stored[key], requested[key]) != requested[key]:
+    stored_value = _resume_compatible_value(key, stored[key], requested[key])
+    if key == "runtime":
+      # Card names are audited rather than compared; the layout and the seed
+      # provenance inside the same entry stay compared.
+      if _resume_comparable_runtime(stored_value) != _resume_comparable_runtime(
+        requested[key]
+      ):
+        audit["mismatches"].append(key)
+      else:
+        audit["device_changed"] = _device_substitution(stored_value, requested[key])
+      continue
+    if stored_value != requested[key]:
       audit["mismatches"].append(key)
   stored_schedule = state.schedule or stored.get("schedule") or {}
   if not stored_schedule:

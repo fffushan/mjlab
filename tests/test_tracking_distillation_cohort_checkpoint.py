@@ -21,6 +21,7 @@ import pytest
 import torch
 from tracking_distillation_fixtures import make_actor
 
+from mjlab.scripts import distill
 from mjlab.tasks.tracking.distillation.adapter import (
   DistillationSnapshot,
   DistillationStep,
@@ -910,13 +911,6 @@ def drop_member(identity: CohortIdentity) -> CohortIdentity:
     ),
     pytest.param(
       lambda identity: replace(
-        identity, resources=replace(identity.resources, device="cuda:0")
-      ),
-      "resource setting device",
-      id="device",
-    ),
-    pytest.param(
-      lambda identity: replace(
         identity,
         resources=replace(identity.resources, requested_seed=SEED + 1),
       ),
@@ -936,6 +930,35 @@ def test_require_same_cohort_reports_each_changed_field(
   identity = make_identity(real_cohort, plan, make_replay(schema, plan), body_selection)
   with pytest.raises(CohortContractError, match=message):
     require_same_cohort(identity, mutate(identity))
+
+
+def test_require_same_cohort_accepts_a_resumed_run_on_a_different_device(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+) -> None:
+  """The card a shard collects on is recorded but is not part of the contract.
+
+  A shard's environment and generator seeds derive from its index, not from the
+  device name, so moving a run to a free card cannot change which rows are
+  sampled.  The device stays in the record -- so the substitution is visible and
+  still distinguishes the two launches -- while the seed settings a resume does
+  reproduce remain strict.
+  """
+  identity = make_identity(real_cohort, plan, make_replay(schema, plan), body_selection)
+  moved = replace(identity, resources=replace(identity.resources, device="cuda:7"))
+  require_same_cohort(identity, moved)
+  assert moved.resources.device == "cuda:7"
+  assert moved.as_dict()["resources"]["device"] == "cuda:7"
+  # The record still tells the two launches apart, which is why the identity
+  # digest cannot be a resume invariant while the device is audit-only.
+  assert moved.digest() != identity.digest()
+  with pytest.raises(CohortContractError, match="resource setting requested_seed"):
+    require_same_cohort(
+      identity,
+      replace(identity, resources=replace(identity.resources, requested_seed=SEED + 1)),
+    )
 
 
 def test_require_same_cohort_reports_reordered_and_missing_members(
@@ -1186,13 +1209,6 @@ def test_version_one_and_version_two_loaders_refuse_each_other(
       "replay quotas",
       id="changed-quotas",
     ),
-    pytest.param(
-      lambda identity: replace(
-        identity, resources=replace(identity.resources, device="cuda:0")
-      ),
-      "resource setting device",
-      id="changed-device",
-    ),
   ],
 )
 def test_strict_cohort_resume_rejects_an_incompatible_live_cohort(
@@ -1214,6 +1230,149 @@ def test_strict_cohort_resume_rejects_an_incompatible_live_cohort(
   with pytest.raises(CheckpointValidationError, match=message):
     load_cohort_checkpoint(path, trainer, trainer.replay, expected_cohort=live)
   assert_state_unchanged(trainer, trainer.replay, None, before)
+
+
+def test_strict_cohort_resume_loads_a_ring_recorded_on_another_device(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """A checkpoint recorded on one device resumes onto another one.
+
+  ``map_location`` moves the saved ring tensors, so the storage name recorded
+  beside them is retargeted to the device they actually landed on instead of
+  being refused as an inconsistent snapshot.
+  """
+  trainer, identity = make_cohort_trainer(
+    schema, plan, body_selection, real_cohort, updates=1
+  )
+  path = tmp_path / "cohort.pt"
+  save_cohort_checkpoint(path, trainer, trainer.replay, cohort=identity)
+
+  # A checkpoint whose ring was recorded on another card, loaded on cpu.
+  payload = torch.load(path, map_location="cpu", weights_only=True)
+  payload["replay"]["device"] = "cuda:9"
+  torch.save(payload, path)
+
+  restored, _ = make_cohort_trainer(
+    schema, plan, body_selection, real_cohort, updates=0
+  )
+  state = load_cohort_checkpoint(
+    path,
+    restored,
+    restored.replay,
+    expected_cohort=identity,
+    map_location="cpu",
+  )
+  assert state.cohort == identity
+  assert restored.replay.state_dict()["device"] == "cpu"
+
+
+def test_cohort_resume_invariant_audits_card_names_rather_than_comparing_them(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """A loaded cohort state resumes on other cards and reports the move.
+
+  The runtime entry keeps its layout (worker mode, worker count, environments
+  per worker, seed scheme) and the seed provenance compared, while the card
+  names are recorded in the audit.  Sharded collection needs real devices, so
+  this drives the invariant check through a genuinely loaded cohort state.
+  """
+  trainer, identity = make_cohort_trainer(
+    schema, plan, body_selection, real_cohort, updates=1
+  )
+  runtime = {
+    "device": "cuda:4",
+    "num_envs": 8,
+    "seed": 7,
+    "resolved_seed": 7,
+    "seed_provenance": {"available": True, "requested_seed": 7},
+    "workers": {
+      "mode": "sharded",
+      "devices": ["cuda:4"],
+      "count": 1,
+      "envs_per_worker": 8,
+      "seed_scheme": 1,
+    },
+  }
+  schedule = {"max_iterations": 4}
+  stored_config = {
+    "provenance_version": distill.PROVENANCE_VERSION,
+    "manifest": "configs/distillation/x2_tennis_mixed.yaml",
+    "teacher_ids": list(TEACHER_IDS),
+    "mapping_digest": identity.mapping_digest,
+    "phase_policy": identity.slots.phase_policy,
+    "task": "tracking",
+    "task_id": None,
+    "runtime": runtime,
+    "trainer": {"learning_rate": 5e-4},
+    "replay": {"capacity": 24},
+    "model": {"settings": {}, "schema": {}},
+    "schedule": schedule,
+  }
+  path = tmp_path / "cohort.pt"
+  save_cohort_checkpoint(
+    path,
+    trainer,
+    trainer.replay,
+    cohort=identity,
+    counters={"iteration": 1, "segment_namespace": 1},
+    schedule=schedule,
+    resolved_config=stored_config,
+  )
+  restored, _ = make_cohort_trainer(
+    schema, plan, body_selection, real_cohort, updates=0
+  )
+  state = load_cohort_checkpoint(
+    path, restored, restored.replay, expected_cohort=identity
+  )
+
+  moved = {
+    **stored_config,
+    "runtime": {
+      **runtime,
+      "device": "cuda:7",
+      "workers": {**runtime["workers"], "devices": ["cuda:7"]},
+    },
+  }
+  audit = distill._check_resume_compatibility(
+    state, moved, invariant_keys=distill._COHORT_RESUME_INVARIANT_KEYS
+  )
+  assert audit["mismatches"] == []
+  assert audit["device_changed"] == {
+    "device": {"stored": "cuda:4", "requested": "cuda:7"},
+    "worker_devices": {"stored": ["cuda:4"], "requested": ["cuda:7"]},
+  }
+
+  # A different layout inside the same entry still refuses, and names it.
+  changed_layout = {
+    **stored_config,
+    "runtime": {
+      **runtime,
+      "workers": {
+        **runtime["workers"],
+        "count": 2,
+        "envs_per_worker": 4,
+        "devices": ["cuda:7", "cuda:8"],
+      },
+    },
+  }
+  with pytest.raises(distill.DistillationError, match="runtime"):
+    distill._check_resume_compatibility(
+      state, changed_layout, invariant_keys=distill._COHORT_RESUME_INVARIANT_KEYS
+    )
+
+  # The identity digest covers the stored record including the device, so it
+  # cannot itself be an invariant while the device is audit-only.  Every other
+  # input to that digest is compared field by field by ``require_same_cohort``,
+  # which runs first and names the differing field.
+  assert "cohort_digest" not in distill._COHORT_RESUME_INVARIANT_KEYS
 
 
 def test_strict_cohort_resume_rejects_a_tampered_cohort_record(
