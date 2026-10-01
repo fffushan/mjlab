@@ -5,6 +5,17 @@ Changelog
 Added
 ^^^^^
 
+- Added the X2 PPO tracking task ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations``. It preserves the standing-start X2 task while using the Unitree G1 magnitudes for initial pose/velocity/joint-position randomization and external pushes.
+
+ and evaluator at
+  ``scripts/experiments/vae_teacher_student_replay/``. It replays a frozen
+  teacher and VAE student on the same recorded 164-D teacher/68-D reference
+  and 99-D conditioning states, reports raw-action/target disagreement by
+  fixed reference-time windows, validates embedded reference and student
+  ONNX parity, and deliberately makes no closed-loop stability claim. The
+  compact 1,103-state failure/success fixture and source/model hashes are in
+  ``tests/fixtures/vae_teacher_student/``.
+
 - Added an offline X2 tennis reference generator that copies clips 000–020
   (012 is absent) into ``data/tennis/guard040_linear05/`` with 0.5-second
   linear root-position/joint transitions to motion 040's initial guard pose,

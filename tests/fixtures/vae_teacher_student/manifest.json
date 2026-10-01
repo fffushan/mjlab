@@ -1,0 +1,44 @@
+{
+  "format": "x2-vae-teacher-student-recorded-states-v1",
+  "created_from_capture": "20260930T152353Z_teacher_vae_trace_pc2",
+  "rows": 1103,
+  "state_arrays": {
+    "vae_reference": "float32 [N,68] = q31,dq31,anchor_error6",
+    "vae_conditioning": "float32 [N,99] = gravity3,gyro3,relative_q31,dq31,previous_action31",
+    "student_raw_action": "float32 [N,31]",
+    "student_latent": "float32 [N,32]",
+    "reference_frame": "int32",
+    "engagement_generation": "int32",
+    "assembly_wall_ns": "int64",
+    "run_kind": "unicode"
+  },
+  "runs": {
+    "failure": {
+      "rows": 110,
+      "generations": [
+        2
+      ],
+      "trace_file": "inference_trace_1790782012732600_3002216_1.jsonl",
+      "trace_sha256": "c451bef02618579ae38646bb7d6294dad9a00ee669ef35e0e793de9dd7f0ee7f"
+    },
+    "successful_r4": {
+      "rows": 993,
+      "generations": [
+        2,
+        4,
+        6
+      ],
+      "trace_file": "inference_trace_1790782158526244_3005511_1.jsonl",
+      "trace_sha256": "33c106e75b6d959a8bd5d88136c3eb9167f8e76c5a3d9abee56da99bc30a826c"
+    }
+  },
+  "source_bag_sha256": "2d23a28998cdc5c5b26ca10f822408a5090dfd01d86433758d28f7d31a189079",
+  "model_sha256": {
+    "baseline-tennis-001.onnx": "552ded7bbc08a110e1a90c70a532b4aad267aa2b47c3632f0036b3dd4381782a",
+    "encoder.onnx": "e35f98b32bdf8b45dfa027c1250cd55e743652308b62d3e9e6e2790b378b533f",
+    "decoder.onnx": "19289616d1065093a69cd021594bcf11a68ed0351a7d595ec62d884fb3318216",
+    "contract.json": "fa310f7edd3b68f624d5fcd55b04852714c276975ee6352ad0b9c89eb1793ec7"
+  },
+  "selection": "policy_family=vae_tracking, assembly_wall_ns>0, outcome=inference_succeeded, vae_reference length=68; failure generation=2; successful generations=2,4,6",
+  "limitations": "Compact policy-state snapshots, not complete ROS bags or actuator/contact telemetry. The successful generation=2 and failure generation=2 belong to different controller processes."
+}

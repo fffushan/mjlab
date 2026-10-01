@@ -30,6 +30,30 @@ make test       # Run the full test suite
 make docs       # Build documentation
 ```
 
+## Offline X2 VAE teacher-fidelity replay
+
+The repository includes a compact recorded-state evaluation for the X2 VAE in
+``scripts/experiments/vae_teacher_student_replay/``. It feeds the frozen teacher
+and VAE student the same recorded reference, proprioception, anchor, gyro and
+previous-action state, then reports teacher/student raw-action and target
+position disagreement. This is a one-step **teacher-fidelity** evaluation: it
+measures whether the VAE reproduces teacher actions, and does not claim that a
+teacher would remain stable in closed loop or on hardware.
+
+The policy-state fixture is tracked in
+``tests/fixtures/vae_teacher_student/``. Frozen model files are supplied
+explicitly rather than loaded from mutable training/deployment paths:
+
+```sh
+uv run python scripts/experiments/vae_teacher_student_replay/evaluate.py \
+  --states tests/fixtures/vae_teacher_student/recorded_states.npz \
+  --model-dir /path/to/frozen/models \
+  --output-dir logs/diagnostics/vae_teacher_student_replay
+```
+
+See the evaluator README for the required model files, state layout and
+provenance limits.
+
 Always run `make check` before committing. This runs formatting, linting,
 and type checking. Do not commit code that fails type checking.
 
