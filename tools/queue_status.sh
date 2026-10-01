@@ -110,7 +110,6 @@ while [ $# -gt 0 ]; do
         echo "error: --exclude-gpus is only valid after --restart" >&2; exit 2
       fi
       RESTART_EXCLUDE="$2"
-      [ "$RESTART_EXCLUDE" = "none" ] && RESTART_EXCLUDE=""
       shift 2 ;;
     --jobs) SHOW_JOBS=1; shift ;;
     --tail)
