@@ -1,4 +1,11 @@
-"""Offline D1 state-latent collection and dataset core."""
+"""State-latent diffusion for X2 tracking: offline collection and datasets (D1),
+training and evaluation (D2), and the bounded reference-free D3 handover seam
+(``handover``) with its offline real-model replay check (``replay_integration``).
+
+This package is deliberately simulator-free at the D2/D3 offline core; the D3
+seam claims no closed-loop, simulator, export or hardware evidence, and history
+provenance (origin/contiguity, no reference fallback) is a caller obligation.
+"""
 
 from .adapter import (
   ActionContract,
@@ -34,6 +41,17 @@ from .dataset import (
   build_dataset,
   fit_training_statistics,
   grouped_split,
+)
+from .handover import (
+  ContinuationPlan,
+  ContinuationStep,
+  DecodeFn,
+  ExecutedPair,
+  HandoverError,
+  HandoverHistory,
+  PlanAgeError,
+  ReferenceFreeContinuation,
+  build_reference_free_plan,
 )
 from .migration import rebuild_no_mixture_dataset
 from .noising import (
@@ -171,6 +189,15 @@ __all__ = [
   "ProjectionBundle",
   "ProjectionError",
   "rebuild_no_mixture_dataset",
+  "ContinuationPlan",
+  "ContinuationStep",
+  "DecodeFn",
+  "ExecutedPair",
+  "HandoverError",
+  "HandoverHistory",
+  "PlanAgeError",
+  "ReferenceFreeContinuation",
+  "build_reference_free_plan",
   "ShardStore",
   "ShardWriter",
   "SplitAssignments",

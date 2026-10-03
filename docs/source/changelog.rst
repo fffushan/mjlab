@@ -1,9 +1,8 @@
 =========
-Changelog
-=========
-
 Added
 ^^^^^
+
+- Added the bounded D3 reference-free X2 diffusion handover seam: owned eight-step state/latent history snapshots, active 167-channel no-mixture conditioning, strict 20-step DDIM/current-latent decoding, contract/hash guards, and an offline frozen D2/VAE replay diagnostic with explicit synthetic-conditioning and no-closed-loop claims. See ``docs/plans/beyondmimic_diffusion_d3_seam.md`` and the replay evaluator under ``scripts/experiments/diffusion_d3_replay/``.
 
 - Added the versioned X2 diffusion no-mixture representation contract
   ``mjlab-x2-state-latent-d1-no-mixtures-v1``: train-only normalization of 135
