@@ -448,6 +448,9 @@ class VaeDistillationTrainer:
         kl += float(result.kl.detach().item())
         samples += batch.batch_size
       gradient_norm = self._check_gradients()
+      if self.config.numerical_controls:
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self._check_gradients()
       optimizer_called = True
       self.optimizer.step()
       for parameter in self.model.parameters():

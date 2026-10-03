@@ -1,0 +1,57 @@
+# Increased-perturbation tennis teacher cohort.
+#
+# These six teachers track motions 013-018 and use the `incXXX` identity to
+# distinguish them from the original `tennis_XXX` teacher family. They were
+# trained from the increased-perturbation PPO runs under
+# logs/rsl_rl/agibot_x2_tracking_increated_perturbations/.
+#
+# This manifest intentionally contains only the six new teachers. Combining
+# them with the existing 15-member cohort would exceed the VAE exporter's
+# 16-member ceiling and would confound this teacher-family comparison.
+version: 1
+name: x2-tennis-teachers-increased-perturbation-v1
+robot: agibot_x2
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations
+teachers:
+- id: inc013
+  checkpoint: logs/distillation/teachers/inc013/model_29999.pt
+  motion: data/tennis/single_013_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/inc013/params/env.yaml
+  agent_config: logs/distillation/teachers/inc013/params/agent.yaml
+  onnx: logs/distillation/teachers/inc013/model_29999.onnx
+  sampling_weight: 1.0
+- id: inc014
+  checkpoint: logs/distillation/teachers/inc014/model_29999.pt
+  motion: data/tennis/single_014_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/inc014/params/env.yaml
+  agent_config: logs/distillation/teachers/inc014/params/agent.yaml
+  onnx: logs/distillation/teachers/inc014/model_29999.onnx
+  sampling_weight: 1.0
+- id: inc015
+  checkpoint: logs/distillation/teachers/inc015/model_29999.pt
+  motion: data/tennis/single_015_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/inc015/params/env.yaml
+  agent_config: logs/distillation/teachers/inc015/params/agent.yaml
+  onnx: logs/distillation/teachers/inc015/model_29999.onnx
+  sampling_weight: 1.0
+- id: inc016
+  checkpoint: logs/distillation/teachers/inc016/model_29999.pt
+  motion: data/tennis/single_016_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/inc016/params/env.yaml
+  agent_config: logs/distillation/teachers/inc016/params/agent.yaml
+  onnx: logs/distillation/teachers/inc016/model_29999.onnx
+  sampling_weight: 1.0
+- id: inc017
+  checkpoint: logs/distillation/teachers/inc017/model_29999.pt
+  motion: data/tennis/single_017_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/inc017/params/env.yaml
+  agent_config: logs/distillation/teachers/inc017/params/agent.yaml
+  onnx: logs/distillation/teachers/inc017/model_29999.onnx
+  sampling_weight: 1.0
+- id: inc018
+  checkpoint: logs/distillation/teachers/inc018/model_29999.pt
+  motion: data/tennis/single_018_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/inc018/params/env.yaml
+  agent_config: logs/distillation/teachers/inc018/params/agent.yaml
+  onnx: logs/distillation/teachers/inc018/model_29999.onnx
+  sampling_weight: 1.0

@@ -71,22 +71,63 @@ def make_snapshot(batch: int = 2) -> ObservationSnapshot:
       ),
       105,
     ),
+    (
+      DecoderMode.GRAVITY_TWIST,
+      (
+        "projected_gravity",
+        "root_linear_velocity",
+        "gyro",
+        "relative_joint_q",
+        "joint_dq",
+        "previous_action",
+      ),
+      102,
+    ),
   ],
 )
 def test_all_modes_have_exact_named_order_and_width(
   mode: DecoderMode, names: tuple[str, ...], width: int
 ) -> None:
   schema = schema_for_mode(mode)
-  packed = pack_observations(make_snapshot(), schema)
+  if mode is DecoderMode.GRAVITY_TWIST:
+    base = make_snapshot()
+    base = ObservationSnapshot(
+      reference_q=base.reference_q,
+      reference_dq=base.reference_dq,
+      anchor_position_error=torch.full((2, 3), 7.0),
+      anchor_orientation_error=base.anchor_orientation_error,
+      projected_gravity=base.projected_gravity,
+      root_linear_velocity=torch.full((2, 3), 8.0),
+      gyro=base.gyro,
+      relative_joint_q=base.relative_joint_q,
+      joint_dq=base.joint_dq,
+      previous_action=base.previous_action,
+    )
+  else:
+    base = make_snapshot()
+  packed = pack_observations(base, schema)
 
-  assert schema.reference_names == (
-    "reference_q",
-    "reference_dq",
-    "anchor_orientation_error",
-  )
+  if mode is DecoderMode.GRAVITY_TWIST:
+    assert schema.reference_names == (
+      "reference_q",
+      "reference_dq",
+      "anchor_position_error",
+      "anchor_orientation_error",
+    )
+    assert packed.reference.shape == (2, 71)
+    assert packed.reference[0, 62:65].tolist() == [7.0, 7.0, 7.0]
+    assert packed.conditioning[0, 3:6].tolist() == [8.0, 8.0, 8.0]
+  else:
+    assert schema.reference_names == (
+      "reference_q",
+      "reference_dq",
+      "anchor_orientation_error",
+    )
   assert schema.conditioning_names == names
-  assert (packed.reference.shape, packed.conditioning.shape) == ((2, 68), (2, width))
-  assert schema.decoder_reference_conditioned is (mode is not DecoderMode.GRAVITY)
+  assert packed.conditioning.shape == (2, width)
+  assert schema.decoder_reference_conditioned is (
+    mode in (DecoderMode.ANCHOR, DecoderMode.GRAVITY_ANCHOR)
+  )
 
 
 def test_rot6d_uses_existing_first_two_column_reshape() -> None:

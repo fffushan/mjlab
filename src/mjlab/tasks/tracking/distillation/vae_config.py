@@ -19,7 +19,14 @@ JOINT_DIM = 31
 REFERENCE_DIM = 68
 ACTION_DIM = 31
 LATENT_DIM = 32
-CONDITIONING_DIMS = {"gravity": 99, "anchor": 102, "gravity_anchor": 105}
+CONDITIONING_DIMS = {
+  "gravity": 99,
+  "anchor": 102,
+  "gravity_anchor": 105,
+  # Paper-shaped X2 input-vector ablation: projected gravity + full root/IMU
+  # twist (linear velocity + angular velocity) + joint state + action.
+  "gravity_twist": 102,
+}
 
 DEFAULT_JOINT_ORDER = tuple(f"joint_{index:02d}" for index in range(JOINT_DIM))
 
@@ -30,6 +37,7 @@ class DecoderMode(str, Enum):
   GRAVITY = "gravity"
   ANCHOR = "anchor"
   GRAVITY_ANCHOR = "gravity_anchor"
+  GRAVITY_TWIST = "gravity_twist"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,21 +113,43 @@ class VaeSchema:
       raise ValueError("joint_order names must be unique")
     if self.latent_dim != LATENT_DIM or self.action_dim != ACTION_DIM:
       raise ValueError("M2 schemas require latent_dim=32 and action_dim=31")
-    if self.reference_dim != REFERENCE_DIM:
-      raise ValueError(f"reference layout must have width {REFERENCE_DIM}")
+    expected_reference_dim = 71 if self.mode is DecoderMode.GRAVITY_TWIST else REFERENCE_DIM
+    if self.reference_dim != expected_reference_dim:
+      raise ValueError(
+        f"reference layout must have width {expected_reference_dim}"
+      )
     expected = CONDITIONING_DIMS[self.mode.value]
     if self.conditioning_dim != expected:
       raise ValueError(
         f"{self.mode.value} conditioning layout must have width {expected}, "
         f"got {self.conditioning_dim}"
       )
-    if self.reference_names != (
+    if self.reference_names == (
+      "reference_q",
+      "reference_dq",
+      "anchor_position_error",
+      "anchor_orientation_error",
+    ):
+      if self.mode is not DecoderMode.GRAVITY_TWIST:
+        raise ValueError(
+          "anchor-position reference layout is only valid for gravity_twist"
+        )
+    elif self.reference_names != (
       "reference_q",
       "reference_dq",
       "anchor_orientation_error",
     ):
       raise ValueError("reference fields are not in the required q, dq, anchor order")
-    if self.mode is DecoderMode.GRAVITY:
+    if self.mode is DecoderMode.GRAVITY_TWIST:
+      expected_names = (
+        "projected_gravity",
+        "root_linear_velocity",
+        "gyro",
+        "relative_joint_q",
+        "joint_dq",
+        "previous_action",
+      )
+    elif self.mode is DecoderMode.GRAVITY:
       expected_names = (
         "projected_gravity",
         "gyro",
@@ -169,7 +199,7 @@ class VaeSchema:
 
   @property
   def decoder_reference_conditioned(self) -> bool:
-    return self.mode is not DecoderMode.GRAVITY
+    return self.mode in (DecoderMode.ANCHOR, DecoderMode.GRAVITY_ANCHOR)
 
   def compatibility_metadata(self) -> dict[str, Any]:
     """Return JSON-compatible metadata sufficient to reject schema collisions."""
@@ -290,27 +320,43 @@ def make_schema(
 ) -> VaeSchema:
   """Build one immutable layout, with gravity as the default mode."""
   selected = DecoderMode(mode)
-  reference_fields = (
-    _field("reference_q", JOINT_DIM, "reference"),
-    _field("reference_dq", JOINT_DIM, "reference"),
-    _field("anchor_orientation_error", 6, "anchor"),
-  )
-  common = (
-    _field("gyro", 3, "imu"),
-    _field("relative_joint_q", JOINT_DIM, "joint"),
-    _field("joint_dq", JOINT_DIM, "joint"),
-    _field("previous_action", ACTION_DIM, "action"),
-  )
-  if selected is DecoderMode.GRAVITY:
-    conditioning_fields = (_field("projected_gravity", 3, "root"), *common)
-  elif selected is DecoderMode.ANCHOR:
-    conditioning_fields = (reference_fields[2], *common)
-  else:
+  if selected is DecoderMode.GRAVITY_TWIST:
+    reference_fields = (
+      _field("reference_q", JOINT_DIM, "reference"),
+      _field("reference_dq", JOINT_DIM, "reference"),
+      _field("anchor_position_error", 3, "anchor"),
+      _field("anchor_orientation_error", 6, "anchor"),
+    )
     conditioning_fields = (
       _field("projected_gravity", 3, "root"),
-      reference_fields[2],
-      *common,
+      _field("root_linear_velocity", 3, "imu"),
+      _field("gyro", 3, "imu"),
+      _field("relative_joint_q", JOINT_DIM, "joint"),
+      _field("joint_dq", JOINT_DIM, "joint"),
+      _field("previous_action", ACTION_DIM, "action"),
     )
+  else:
+    reference_fields = (
+      _field("reference_q", JOINT_DIM, "reference"),
+      _field("reference_dq", JOINT_DIM, "reference"),
+      _field("anchor_orientation_error", 6, "anchor"),
+    )
+    common = (
+      _field("gyro", 3, "imu"),
+      _field("relative_joint_q", JOINT_DIM, "joint"),
+      _field("joint_dq", JOINT_DIM, "joint"),
+      _field("previous_action", ACTION_DIM, "action"),
+    )
+    if selected is DecoderMode.GRAVITY:
+      conditioning_fields = (_field("projected_gravity", 3, "root"), *common)
+    elif selected is DecoderMode.ANCHOR:
+      conditioning_fields = (reference_fields[2], *common)
+    else:
+      conditioning_fields = (
+        _field("projected_gravity", 3, "root"),
+        reference_fields[2],
+        *common,
+      )
   return VaeSchema(
     mode=selected,
     joint_order=tuple(joint_order),

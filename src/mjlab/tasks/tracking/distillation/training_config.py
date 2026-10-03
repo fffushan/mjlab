@@ -31,6 +31,7 @@ class TrainingConfig:
   accumulation_steps: int = 15
   minibatch_size: int = 256
   latent_mode: TrainingLatentMode = "sampled"
+  numerical_controls: bool = False
 
   def __post_init__(self) -> None:
     for name, value in (
@@ -49,6 +50,8 @@ class TrainingConfig:
         raise ValueError(f"{name} must be a positive integer")
     if self.latent_mode != "sampled":
       raise ValueError("latent_mode must be 'sampled'")
+    if not isinstance(self.numerical_controls, bool):
+      raise ValueError("numerical_controls must be a boolean")
 
 
 # The descriptive alias makes the lifecycle API readable without breaking the

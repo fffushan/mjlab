@@ -37,6 +37,7 @@ from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.distillation.vae_config import (
   DEFAULT_MODEL_SETTINGS,
   VaeSchema,
+  make_schema,
 )
 
 ENV_SEED_STRIDE = 1_000_003
@@ -109,6 +110,8 @@ class CohortSetup:
   phase_policy: PhasePolicy
   reset_policy: ResetPolicy
   base_seed: int
+  schema_mode: str = "gravity"
+  numerical_controls: bool = False
 
   def resolve(self) -> CohortContract:
     """Load and validate the cohort manifest this setup names."""
@@ -122,8 +125,10 @@ class CohortSetup:
     ``worker_index`` 0 with a base seed reproduces the single-process path's
     environment exactly, because the derivation adds zero for the first worker.
     """
+    cohort = self.resolve()
+    schema = make_schema(self.schema_mode, joint_order=cohort.actions.joint_names)
     return make_multi_teacher_distillation_adapter(
-      self.resolve(),
+      cohort,
       self.teacher_ids,
       phase_policy=self.phase_policy,
       task_id=self.task_id,
@@ -131,6 +136,7 @@ class CohortSetup:
       device=device,
       seed=worker_env_seed(self.base_seed, worker_index),
       reset_policy=self.reset_policy,
+      schema=schema,
     )
 
   def build_student(
@@ -144,4 +150,8 @@ class CohortSetup:
     parent's model, not that it is the parent's initialization.
     """
     torch.manual_seed(worker_env_seed(self.base_seed, worker_index))
-    return ConditionalVAE(schema, DEFAULT_MODEL_SETTINGS).to(device)
+    return ConditionalVAE(
+      schema,
+      DEFAULT_MODEL_SETTINGS,
+      numerical_controls=self.numerical_controls,
+    ).to(device)

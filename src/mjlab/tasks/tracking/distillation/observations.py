@@ -80,6 +80,11 @@ class ObservationSnapshot:
   relative_joint_q: torch.Tensor
   joint_dq: torch.Tensor
   previous_action: torch.Tensor
+  # Optional until the paper-shaped gravity_twist schema is selected.  Keeping
+  # these fields optional preserves construction compatibility for the default
+  # 68/99 schema and makes the ablation's required features explicit at pack time.
+  anchor_position_error: torch.Tensor | None = None
+  root_linear_velocity: torch.Tensor | None = None
 
   def __post_init__(self) -> None:
     vector_fields = (
@@ -114,6 +119,18 @@ class ObservationSnapshot:
       raise ObservationValidationError(
         "all snapshot fields must share device and dtype"
       )
+    optional_vectors = (
+      ("anchor_position_error", self.anchor_position_error, 3),
+      ("root_linear_velocity", self.root_linear_velocity, 3),
+    )
+    for name, value, width in optional_vectors:
+      if value is None:
+        continue
+      _validate_vector(name, value, width, batch)
+      if value.device != device or value.dtype != dtype:
+        raise ObservationValidationError(
+          "all snapshot fields must share device and dtype"
+        )
 
   @property
   def batch_size(self) -> int:
@@ -129,7 +146,7 @@ class ObservationSnapshot:
 
   def named_features(self) -> dict[str, torch.Tensor]:
     """Return named raw features without creating or caching transformed data."""
-    return {
+    values = {
       "reference_q": self.reference_q,
       "reference_dq": self.reference_dq,
       "anchor_orientation_error": self.anchor_orientation_error,
@@ -139,6 +156,11 @@ class ObservationSnapshot:
       "joint_dq": self.joint_dq,
       "previous_action": self.previous_action,
     }
+    if self.anchor_position_error is not None:
+      values["anchor_position_error"] = self.anchor_position_error
+    if self.root_linear_velocity is not None:
+      values["root_linear_velocity"] = self.root_linear_velocity
+    return values
 
 
 # A descriptive alias for callers that use the architecture document's name.

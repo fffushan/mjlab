@@ -237,14 +237,19 @@ class ConditionalVAE(nn.Module):
     settings: ModelSettings = DEFAULT_MODEL_SETTINGS,
     *,
     normalizer_eps: float = 1e-5,
+    numerical_controls: bool = False,
   ) -> None:
     super().__init__()
     if not isinstance(schema, VaeSchema):
       raise ModelValidationError("schema must be a VaeSchema")
     if not isinstance(settings, ModelSettings):
       raise ModelValidationError("settings must be ModelSettings")
+    if not isinstance(numerical_controls, bool):
+      raise ModelValidationError("numerical_controls must be a boolean")
     self.schema = schema
     self.settings = settings
+    self.numerical_controls = numerical_controls
+    self._logvar_bounds = (-10.0, 10.0) if numerical_controls else None
     hidden_dims = _activation_settings(settings)
     self.reference_normalizer = StudentNormalizer(
       schema.reference_dim, eps=normalizer_eps
@@ -300,6 +305,8 @@ class ConditionalVAE(nn.Module):
     normalized = self.reference_normalizer(reference)
     encoded = self.encoder(normalized)
     mu, logvar = self.mu_head(encoded), self.logvar_head(encoded)
+    if self._logvar_bounds is not None:
+      logvar = logvar.clamp(*self._logvar_bounds)
     _require_finite_result("encoder mean", mu)
     _require_finite_result("encoder log variance", logvar)
     return mu, logvar

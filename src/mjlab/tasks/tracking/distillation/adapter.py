@@ -54,10 +54,11 @@ from mjlab.tasks.tracking.distillation.teachers import (
   load_frozen_teacher,
 )
 from mjlab.tasks.tracking.distillation.vae_config import (
+  DecoderMode,
   VaeSchema,
   make_schema,
 )
-from mjlab.utils.lab_api.math import euler_xyz_from_quat
+from mjlab.utils.lab_api.math import euler_xyz_from_quat, subtract_frame_transforms
 
 
 class InitializationKind(IntEnum):
@@ -1173,11 +1174,29 @@ def _capture_snapshot(
     gravity = robot.data.projected_gravity_b.detach().clone()
   except AttributeError as exc:
     raise DistillationError("robot asset has no root projected-gravity data") from exc
+  anchor_position_error = None
+  root_linear_velocity = None
+  if schema.mode is DecoderMode.GRAVITY_TWIST:
+    try:
+      root_linear_velocity = robot.data.root_link_lin_vel_b.detach().clone()
+    except AttributeError as exc:
+      raise DistillationError(
+        "robot asset has no root linear velocity in the IMU frame"
+      ) from exc
+    anchor_position_error, _ = subtract_frame_transforms(
+      command.robot_anchor_pos_w,
+      command.robot_anchor_quat_w,
+      command.anchor_pos_w,
+      command.anchor_quat_w,
+    )
+    anchor_position_error = anchor_position_error.detach().clone()
   features = ObservationSnapshot(
     reference_q=values["command"][:, :31],
     reference_dq=values["command"][:, 31:62],
+    anchor_position_error=anchor_position_error,
     anchor_orientation_error=values["motion_anchor_ori_b"],
     projected_gravity=gravity,
+    root_linear_velocity=root_linear_velocity,
     gyro=values["base_ang_vel"],
     relative_joint_q=values["joint_pos"],
     joint_dq=values["joint_vel"],

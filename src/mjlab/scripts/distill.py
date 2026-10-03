@@ -1003,6 +1003,7 @@ def _build_cohort_runner(
   accumulation_steps: int,
   learning_rate: float,
   beta: float,
+  numerical_controls: bool,
   seed: int,
   max_iterations: int,
   bootstrap_steps: int,
@@ -1040,6 +1041,7 @@ def _build_cohort_runner(
     beta=beta,
     accumulation_steps=accumulation_steps,
     minibatch_size=minibatch_size,
+    numerical_controls=numerical_controls,
   )
   runner_config = RunnerConfig(
     max_iterations=max_iterations,
@@ -1117,6 +1119,7 @@ def _build_sharded_cohort_runner(
   accumulation_steps: int,
   learning_rate: float,
   beta: float,
+  numerical_controls: bool,
   seed: int,
   max_iterations: int,
   bootstrap_steps: int,
@@ -1146,6 +1149,7 @@ def _build_sharded_cohort_runner(
     beta=beta,
     accumulation_steps=accumulation_steps,
     minibatch_size=minibatch_size,
+    numerical_controls=numerical_controls,
   )
   runner_config = RunnerConfig(
     max_iterations=max_iterations,
@@ -1167,7 +1171,9 @@ def _build_sharded_cohort_runner(
     descriptions = pool.describe()
     primary = _require_one_shard_contract(descriptions, setup)
     torch.manual_seed(seed)
-    model = ConditionalVAE(primary.schema, DEFAULT_MODEL_SETTINGS).to(device)
+    model = ConditionalVAE(
+      primary.schema, DEFAULT_MODEL_SETTINGS, numerical_controls=numerical_controls
+    ).to(device)
     weights = {
       clip.motion_id: float(cohort.teacher(clip.teacher_id).entry.sampling_weight)
       for clip in primary.library.clips
@@ -1300,6 +1306,11 @@ def _cohort_resolved_config(
       "accumulation_steps": trainer.config.accumulation_steps,
       "minibatch_size": trainer.config.minibatch_size,
       "latent_mode": trainer.config.latent_mode,
+      **(
+        {"numerical_controls": True}
+        if trainer.config.numerical_controls
+        else {}
+      ),
     },
     "replay": {
       "kind": "balanced-motion-replay",
@@ -1976,6 +1987,8 @@ def _train_cohort(
   worker_devices: tuple[str, ...] = (),
   learning_rate: float,
   beta: float,
+  schema_mode: str = "gravity",
+  numerical_controls: bool = False,
   seed: int,
   rollout_latent: RolloutLatent,
   checkpoint_every: int,
@@ -2025,6 +2038,8 @@ def _train_cohort(
       phase_policy=_COHORT_PHASE_POLICY,
       reset_policy=reset_policy,
       base_seed=seed,
+      schema_mode=schema_mode,
+      numerical_controls=numerical_controls,
     )
     if worker_devices:
       primary_build = _build_sharded_cohort_runner(
@@ -2040,6 +2055,7 @@ def _train_cohort(
         accumulation_steps=accumulation_steps,
         learning_rate=learning_rate,
         beta=beta,
+        numerical_controls=numerical_controls,
         seed=seed,
         max_iterations=max_iterations,
         bootstrap_steps=bootstrap_steps,
@@ -2068,6 +2084,7 @@ def _train_cohort(
         accumulation_steps=accumulation_steps,
         learning_rate=learning_rate,
         beta=beta,
+        numerical_controls=numerical_controls,
         seed=seed,
         max_iterations=max_iterations,
         bootstrap_steps=bootstrap_steps,
@@ -2227,6 +2244,8 @@ def _train(
   worker_devices: tuple[str, ...] | None = None,
   learning_rate: float = 5e-4,
   beta: float = 0.01,
+  schema_mode: str = "gravity",
+  numerical_controls: bool = False,
   seed: int = 0,
   rollout_latent: RolloutLatent = "mean",
   checkpoint_every: int = 500,
@@ -2373,6 +2392,8 @@ def _train(
       phase_bins=resolved_phase_bins,
       learning_rate=learning_rate,
       beta=beta,
+      schema_mode=schema_mode,
+      numerical_controls=numerical_controls,
       seed=seed,
       rollout_latent=rollout_latent,
       checkpoint_every=checkpoint_every,
