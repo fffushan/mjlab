@@ -111,6 +111,30 @@ if [ "$TASK" = "vae" ]; then
     "${EXTRA[@]}"
 fi
 
+if [ "$TASK" = "diffusion-no-mixtures-evaluate" ]; then
+  if [ "$ITERS" != "full" ]; then
+    echo "[error] diffusion-no-mixtures-evaluate requires the literal second argument 'full'" >&2
+    exit 2
+  fi
+  if [ "${#EXTRA[@]}" -ne 0 ]; then
+    echo "[error] diffusion-no-mixtures-evaluate takes no extra positional arguments" >&2
+    exit 2
+  fi
+  DIFFUSION_CONTRACT="${DIFFUSION_CONTRACT:-$REPO/docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml}"
+  DIFFUSION_RUN="${DIFFUSION_RUN_DIR:-$REPO/logs/diffusion/d2-no-mixtures-bulk}"
+  DIFFUSION_JSON="${DIFFUSION_EVAL_JSON:-$DIFFUSION_RUN/generation-ddim-validation-no-mixtures.json}"
+  cd "$REPO"
+  export CUDA_VISIBLE_DEVICES="$GPU_ID"
+  echo "[diffusion] evaluating full validation split on visible GPU $GPU_ID"
+  exec "$REPO/.venv/bin/python" -m mjlab.scripts.diffusion evaluate-offline \
+    --run "$DIFFUSION_RUN" \
+    --checkpoint "$DIFFUSION_RUN/checkpoint-best.pt" \
+    --contract "$DIFFUSION_CONTRACT" \
+    --split validation \
+    --device cuda:0 \
+    --json "$DIFFUSION_JSON"
+fi
+
 # ---------------------------------------------------------------- motion file
 MOTION="${MOTION_FILE:-}"
 if [ -z "$MOTION" ] && [ ${#EXTRA[@]} -gt 0 ]; then
