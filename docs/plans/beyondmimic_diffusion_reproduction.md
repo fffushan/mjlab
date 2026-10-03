@@ -1,15 +1,6 @@
 # BeyondMimic state–latent diffusion: DDPM training, DDIM inference at 50 Hz
 
-Status: **D0 specification/audit complete, with explicit runtime-risk acceptance
-(2026-09-29).** The user approved the recommended defaults, endpoint qualification
-and progression toward a small prototype before 50 Hz replanning is demonstrated.
-The authoritative design is the [frozen D0 contract](beyondmimic_diffusion_d0_contract.yaml);
-see [closeout, evidence and deferred gates](beyondmimic_diffusion_d0_validation.md#11-d0-closeout--2026-09-29).
-This is not implementation or runtime acceptance. **D1 has not started**;
-collection, training, remote jobs and hardware execution still require separate
-authorization. Preserve DDPM-style training, 20-update DDIM inference and the
-**50 Hz X2 control contract**; flow matching is deferred. No simulator or GPU job
-was launched for this closeout.
+Status: **D2 offline closure complete for the active no-mixture representation (2026-10-04).** D0 specification/audit is complete and D1 is complete. The original projected 231-channel design remains preserved as a historical baseline; current D2 uses the user-approved `mjlab-x2-state-latent-d1-no-mixtures-v1` contract with 167 channels. Full evidence is recorded in [`logs/diagnostics/diffusion-d2-closure-20261003/REPORT.md`](../../logs/diagnostics/diffusion-d2-closure-20261003/REPORT.md) and the D2 implementation record. The exact bounded local pilot was explicitly waived by the user. No simulator, controller, export, hardware or deployment operation was performed. Preserve DDPM-style training, 20-update DDIM inference and the **50 Hz X2 control contract**; flow matching is deferred.
 
 Related: [VAE architecture](beyondmimic_vae_distillation.md),
 [VAE milestones](beyondmimic_vae_implementation.md),
@@ -511,18 +502,13 @@ by larger runs. D0 freezes collection qualification and numerical tolerances.
 Later task-specific closed-loop tolerances must be preregistered against matched
 VAE baselines before D3/D4 comparisons; they are not invented paper targets.
 
-**Current milestone status (2026-09-29): D0 specification/audit complete, with
-runtime risk explicitly accepted.** Artifact selection, numerical contract,
-qualification thresholds and a bounded pilot design are frozen. **D1 is not
-started:** no sequence collector, qualification pilot or diffusion dataset has
-been produced by this work. D2 and later phases are likewise not started. Design
-approval is not test evidence or authority to launch runs.
+**Current milestone status (2026-10-04): D0 and D1 are closed; D2 offline closure is complete for the active no-mixture contract.** D1 produced the qualified dataset. D2 software gates, full 104000-update training, decoder parity, exact interruption/resume equivalence and three-seed held-out generation all passed. The exact bounded local pilot was waived by explicit user decision and is recorded as waived, not complete. D3 and later phases remain unstarted.
 
 | Phase | Work and artifact | Done condition / next handoff |
 | --- | --- | --- |
 | **D0 — freeze specification and feasibility (closed)** | Pin VAE/cohort and prior accepted evidence; freeze root/body schema, preprocessing, noise/DDIM grids, guidance convention, qualification/numerical tolerances and bounded pilot manifest; audit tensor timing | Complete as specification/audit with explicit 50 Hz runtime-risk acceptance. New adapter/parity/qualification tests are D1/D2 gates; sustained runtime is D5. No new simulator baseline claimed; see report section 11 for gate reconciliation |
 | **D1 — sequence collector and dataset** | Clean pilot, OU pilot, acceptance/endpoint audit, indexed shards, grouped split, train-only statistics and projection | Replay reproduces stored clean actions; no reset/teleport/time leakage; acceptance and phase coverage auditable; bounded disk/RAM estimate. Only then approve approximately 100-fold accepted coverage |
-| **D2 — diffusion tensor/training core** | Pure CPU tests, forward schedule/DDIM jumps/masks, Transformer, trainer/checkpoint/EMA; tiny fixed-batch overfit then bounded single-motion pilot | Analytic noising/sampling tests and resume pass; true inference conditioning works; normalized-latent inverse and decoder parity pass; fixed-seed held-out generation beats trivial copy/zero diagnostics. Hand candidate to D3, not directly to hardware |
+| **D2 — diffusion tensor/training core (closed for active no-mixture contract)** | Pure CPU tests, forward schedule/DDIM jumps/masks, Transformer, trainer/checkpoint/EMA, full bulk training and offline generation | Software/analytic tests, exact resume equivalence, frozen decoder parity and three fixed-seed held-out generation pass. The exact bounded local pilot is user-waived. Hand candidate to D3, not directly to hardware |
 | **D3 — unguided closed-loop continuation** | VAE-history handover, reference-free generation, current-proprio decoder, one-motion then qualified multi-motion runs | Per-motion survival/physical errors/actions assessed against frozen VAE baselines on matched initializations; predicted versus realized state consequences measured; no hidden encoder/reference fallback; history/reset/plan-age tests pass |
 | **D4 — inpainting and cost guidance** | Sparse in-distribution keyframes first; physical cost gradients; conditional transitions; locomotion/navigation only with a qualified relevant cohort | Same-noise comparison changes executed latents and improves realized task metrics without unacceptable stability regression; fixed context remains fixed; transition failures/strong-guidance failures reported separately |
 | **D5 — 50 Hz runtime, export and sim2sim** | Async scheduler, stale-plan handling, numerical export parity, guided backend, RTX 5080 sustained timing, independent vendor-simulator execution with injected delay/dropouts | End-to-end 20 ms cadence and declared p99 budget demonstrated in specified workload; no tensor-only timing claim; sim2sim policy/safety checks pass. Deliver versioned runtime bundle and residual-risk report |

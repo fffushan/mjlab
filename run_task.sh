@@ -131,7 +131,13 @@ if [ "$TASK" = "diffusion-no-mixtures-evaluate" ]; then
   fi
   DIFFUSION_CONTRACT="${DIFFUSION_CONTRACT:-$REPO/docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml}"
   DIFFUSION_RUN="${DIFFUSION_RUN_DIR:-$REPO/logs/diffusion/d2-no-mixtures-bulk}"
-  DIFFUSION_JSON="${DIFFUSION_EVAL_JSON:-$DIFFUSION_RUN/generation-ddim-validation-no-mixtures.json}"
+  if [ -n "${DIFFUSION_EVAL_JSON:-}" ]; then
+    DIFFUSION_JSON="$DIFFUSION_EVAL_JSON"
+  elif [ -n "${DIFFUSION_EVAL_SEED:-}" ]; then
+    DIFFUSION_JSON="$DIFFUSION_RUN/generation-ddim-validation-no-mixtures-seed${DIFFUSION_EVAL_SEED}.json"
+  else
+    DIFFUSION_JSON="$DIFFUSION_RUN/generation-ddim-validation-no-mixtures.json"
+  fi
   cd "$REPO"
   export CUDA_VISIBLE_DEVICES="$GPU_ID"
   echo "[diffusion] evaluating full validation split on visible GPU $GPU_ID"

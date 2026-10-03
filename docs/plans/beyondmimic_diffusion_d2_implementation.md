@@ -1,14 +1,20 @@
 # BeyondMimic diffusion D2 — implementation plan: the DDPM trainer
 
-Status: **plan written 2026-09-30, implementation not started.** D0 is closed as a
+Status: **D2 closure complete for the active no-mixture representation (2026-10-04).** D0 is closed as a
 specification and D1 is complete (a qualified 248420-row clean+OU dataset exists).
+The original projected 231-channel implementation remains historical; the active D2
+artifact uses the user-approved `mjlab-x2-state-latent-d1-no-mixtures-v1` contract
+with 167 channels. Full closure evidence is in
+[`logs/diagnostics/diffusion-d2-closure-20261003/REPORT.md`](../../logs/diagnostics/diffusion-d2-closure-20261003/REPORT.md).
+The exact bounded local pilot was explicitly waived by the user; no simulator,
+controller, export, hardware or deployment operation was performed.
 D2 is the supervised **training core**: the frozen schedule, per-token noising, the
 Transformer denoiser, the 20-update DDIM sampler, the trainer with EMA/checkpoint/
 resume, an offline generation diagnostic, and the CLI that drives them.
 
-This document is a plan and an acceptance checklist, not evidence. Nothing here
-authorizes a long training run, a bulk-dataset run, hardware work or a deployment
-artifact. The D2 done condition is inherited from the reproduction plan §6:
+This document remains the implementation plan and acceptance checklist; the closure
+report is the evidence record. The D2 done condition is inherited from the
+reproduction plan §6:
 
 > Pure CPU tests, forward schedule/DDIM jumps/masks, Transformer, trainer/
 > checkpoint/EMA; tiny fixed-batch overfit then bounded single-motion pilot.
@@ -37,6 +43,12 @@ Authoritative inputs, in precedence order:
    `stage3/diffusion/*` and `stage3/models/state_latent_transformer.py` informed
    this plan; the corrections the reproduction plan §3 already demanded are
    restated as requirements in §5. Do not import it from mjlab.
+
+The original D0 constants in §2 and the detailed sections below describe the
+historical projected 231-channel contract. They remain preserved for reproducibility
+of that historical run. For current D2 acceptance, the active no-mixture contract
+and its exact 167-channel identity are authoritative; old projected checkpoints and
+caches must not be reinterpreted.
 
 Out of D2 scope, deferred by phase: guidance and physical costs (`guidance.py`,
 D4), the closed-loop reference-free environment, handover policy and planning
@@ -755,7 +767,11 @@ NAS access:
 dataset: logs/diffusion/d1-pilot-20260930b   (store 13500 rows/54 shards; train 2640, test 1020)
 ```
 
-Budget, all three enforced by the invocation and recorded:
+The exact bounded local pilot requirement was **waived by the user on 2026-10-04**.
+It is not marked complete: the full 104000-update no-mixture bulk run and three-seed
+held-out validation are accepted as the stronger active-contract quality evidence.
+
+Budget, as originally specified for the non-waived pilot evidence:
 
 1. **Tiny fixed-batch overfit** — 8 windows, <= 2000 updates, target train loss
    < 1e-3 on a fixed noise draw, CPU or `cuda:0`, <= 5 min.
@@ -767,9 +783,9 @@ Budget, all three enforced by the invocation and recorded:
 3. **Offline generation diagnostic** — on the 1020 held-out test windows and on
    the non-training windows of the chosen motion, reporting the §7.8 margins.
 
-These are bounded engineering gates, not model-quality claims. No bulk-dataset
-run, no 1000-epoch run, no export and no hardware are part of D2. A bulk-dataset
-run is D2b and needs explicit authorization and a monitored managed-container job.
+These were bounded engineering gates, not model-quality claims. The exact local
+pilot is waived as recorded above. The active bulk run and validation evidence are
+in the D2 closure report; no export or hardware operation is part of D2.
 
 ## 9. Non-goals in D2
 
@@ -1225,3 +1241,33 @@ round's own evidence: default resolution of `all-motions-300` now refuses the
 test-selected best and names the explicit `last` path, while the explicit `last`
 checkpoint remains evaluable and reports
 `test_selection_provenance: true`. Suite after F6: **135 passed, 1 skipped**.
+
+### 13.10 Active no-mixture D2 closure — 2026-10-04
+
+The active representation is the user-approved
+`mjlab-x2-state-latent-d1-no-mixtures-v1` contract: 135 normalized physical-state
+channels plus 32 normalized VAE-latent channels, 167 token channels, and no added
+projection rows. The historical projected 231-channel implementation and its
+failed quality gate remain preserved as a separate baseline.
+
+- Remote `d2-no-mixtures-bulk` completed exit 0 at **104000 updates / 1000 epochs**.
+- `d2-no-mixtures-eval`, `d2-no-mixtures-eval-seed1`, and
+  `d2-no-mixtures-eval-seed2` each evaluated all **6764 validation windows** with
+  default 20-step DDIM and passed copy-current, prior-only and zero-latent gates.
+  The three-seed phase means are normalized latent **0.9915069 ± 0.0007458**,
+  normalized physical state **0.0839142 ± 0.0006864**, and normalized token
+  **0.4873707 ± 0.0017798**.
+- Frozen-VAE decoder replay passed on 16 samples using
+  `load_cohort_member_inference`: latent inverse max error `1.1484e-7`, decoder
+  max absolute and relative difference `0.0`, tolerance `1e-5`.
+- Exact CPU interruption/resume comparison passed: four uninterrupted updates
+  versus two updates, checkpoint, and two resumed updates; model, EMA and
+  optimizer max deltas were `0.0`, and the saved RNG states were equal.
+- The exact bounded local pilot is **waived by explicit user decision**. It is not
+  represented as completed. The full closure report is
+  [`logs/diagnostics/diffusion-d2-closure-20261003/REPORT.md`](../../logs/diagnostics/diffusion-d2-closure-20261003/REPORT.md).
+
+D2 is closed for the offline tensor/training core. D3 remains responsible for
+VAE-history handover and reference-free closed-loop continuation; D4 for guidance,
+D5 for export and sustained timing, and D6 for hardware qualification. No
+simulator, controller, export, deployment or hardware evidence is implied here.
