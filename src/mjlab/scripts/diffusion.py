@@ -999,7 +999,7 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       records=records,
       projection=loaded.projection,
       contract=contract,
-      seed=config.eval_seed,
+      seed=config.eval_seed if args.seed is None else args.seed,
       device=device,
       max_windows=args.max_windows,
       diagnostics_path=diagnostics_path,
@@ -1195,6 +1195,7 @@ def build_parser() -> argparse.ArgumentParser:
     type=Path,
     help="output path for the opt-in pathwise transition report",
   )
+  evaluate.add_argument("--seed", type=int)
   evaluate.add_argument("--json", type=Path)
   evaluate.set_defaults(handler=_command_evaluate_offline)
 

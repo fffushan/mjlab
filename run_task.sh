@@ -126,12 +126,17 @@ if [ "$TASK" = "diffusion-no-mixtures-evaluate" ]; then
   cd "$REPO"
   export CUDA_VISIBLE_DEVICES="$GPU_ID"
   echo "[diffusion] evaluating full validation split on visible GPU $GPU_ID"
+  EVAL_SEED_ARGS=()
+  if [ -n "${DIFFUSION_EVAL_SEED:-}" ]; then
+    EVAL_SEED_ARGS=(--seed "$DIFFUSION_EVAL_SEED")
+  fi
   exec "$REPO/.venv/bin/python" -m mjlab.scripts.diffusion evaluate-offline \
     --run "$DIFFUSION_RUN" \
     --checkpoint "$DIFFUSION_RUN/checkpoint-best.pt" \
     --contract "$DIFFUSION_CONTRACT" \
     --split validation \
     --device cuda:0 \
+    "${EVAL_SEED_ARGS[@]}" \
     --json "$DIFFUSION_JSON"
 fi
 
