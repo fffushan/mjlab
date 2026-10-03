@@ -116,9 +116,18 @@ if [ "$TASK" = "diffusion-no-mixtures-evaluate" ]; then
     echo "[error] diffusion-no-mixtures-evaluate requires the literal second argument 'full'" >&2
     exit 2
   fi
-  if [ "${#EXTRA[@]}" -ne 0 ]; then
-    echo "[error] diffusion-no-mixtures-evaluate takes no extra positional arguments" >&2
+  if [ "${#EXTRA[@]}" -gt 1 ]; then
+    echo "[error] diffusion-no-mixtures-evaluate accepts at most one seed argument" >&2
     exit 2
+  fi
+  if [ "${#EXTRA[@]}" -eq 1 ]; then
+    case "${EXTRA[0]}" in
+      ''|*[!0-9-]*)
+        echo "[error] diffusion-no-mixtures-evaluate seed must be an integer" >&2
+        exit 2
+        ;;
+      *) export DIFFUSION_EVAL_SEED="${EXTRA[0]}" ;;
+    esac
   fi
   DIFFUSION_CONTRACT="${DIFFUSION_CONTRACT:-$REPO/docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml}"
   DIFFUSION_RUN="${DIFFUSION_RUN_DIR:-$REPO/logs/diffusion/d2-no-mixtures-bulk}"
