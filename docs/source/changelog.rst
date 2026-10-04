@@ -2,7 +2,47 @@
 Added
 ^^^^^
 
+- Added the opt-in D4 sparse task surface on the D3 closed-loop seam. A new
+  ``conditioned_continuation`` module wires the finished hard-keyframe
+  inpainting and pose-cost guidance components into the frozen reference-free
+  continuation through two narrow optional handover hooks; ``evaluate.py``
+  gains ``--task-config PATH``, a strict bounded JSON loader under
+  ``scripts/experiments/diffusion_d3_closed_loop/`` and a preparation tool that
+  extracts verified sparse targets from an existing qualified recording. The
+  default run, the eight bootstrap pairs, the measured current conditioning and
+  the existing GUI/headless guards are unchanged.
+
 - Added the bounded D3 reference-free X2 diffusion handover seam: owned eight-step state/latent history snapshots, active 167-channel no-mixture conditioning, strict 20-step DDIM/current-latent decoding, contract/hash guards, and an offline frozen D2/VAE replay diagnostic with explicit synthetic-conditioning and no-closed-loop claims. See ``docs/plans/beyondmimic_diffusion_d3_seam.md`` and the replay evaluator under ``scripts/experiments/diffusion_d3_replay/``.
+
+- Added the bounded integration-only X2 closed-loop harness under
+  ``scripts/experiments/diffusion_d3_closed_loop/``. Its explicit-path
+  preflight loads the frozen contract, no-mixture projection, EMA-selected D2
+  checkpoint, gravity VAE cohort member and manifest without constructing an
+  environment; only ``--execute`` enters one matched 8-bootstrap/25-tick
+  smoke budget. The report uses one bounded full/compact/marker persistence path,
+  records actual imported-source versus artifact-root provenance and
+  model/normalizer/file integrity, and makes no fake-test or simulator quality
+  claim.
+
+- Added the preregistered serial D3 pilot driver
+  ``scripts/experiments/diffusion_d3_closed_loop/run_pilot.py``. It fixes the
+  ``tennis_000`` seed x start-fraction matrix, the eight-bootstrap/tick budget
+  and the deterministic baseline-boundary-safe horizon before any physics,
+  runs one serial GPU environment at a time under a whole-batch wall/output
+  cap, retains every attempted/partial/fall outcome, stops on software,
+  integrity, output or untrusted-runtime failure, and records a manifest plus
+  bounded JSONL progress. Its CPU fake tests cover the matrix, the horizon, the
+  subprocess capture and the batch stop/continue policy.
+
+- Added an opt-in single-branch Viser browser diagnostic for the D3
+  frozen-policy path under
+  ``scripts/experiments/diffusion_d3_closed_loop/view.py``. It reuses the
+  evaluator's explicit-path frozen loaders and the existing Viser viewer, runs
+  one operator-selected ``baseline`` or ``diffusion`` branch (eight real VAE
+  bootstrap pairs then reference-free continuation), starts paused with
+  pause/resume/single-step/slower playback, renders an explicit diagnostic-only
+  status, and disables the stock reference-scrubbing controls. It is a separate
+  authority from the unchanged matched-pair gate and makes no acceptance claim.
 
 - Added the versioned X2 diffusion no-mixture representation contract
   ``mjlab-x2-state-latent-d1-no-mixtures-v1``: train-only normalization of 135
@@ -371,6 +411,52 @@ Added
 
 Changed
 ^^^^^^^
+
+- The D4 task loader now re-verifies recording-bound sources instead of trusting
+  the declared label: it re-reads the recording and summary bytes, re-checks their
+  digests, rows, recorded contract identity and member/seed/start-frame scenario,
+  and re-extracts every target state at its tick before accepting the task. A
+  hand-written ``preparation_tool:`` prefix can no longer upgrade a source, an
+  unverified or merely declared source is refused under ``--execute``, and the
+  task file plus its bound recording files join the run's before/after integrity
+  expectations. The preparation tool gained ``--recording-dir`` for actual D3
+  closed-loop runs (the archived ``diffusion-d3-recorded-comparison-*`` layout),
+  keeps raw NPZ shards as an honestly ``declared`` weaker layout, and validates
+  its payload with the strict loader before an atomic write. Task configs and
+  recording files are read through a bounded regular-file reader.
+
+- The opt-in D4 sparse task surface now enforces pure modes (hard keyframes only
+  in ``keyframe``, soft pose goals only in ``poseguided``, both in ``combined``)
+  and refuses a hard keyframe and a soft goal scheduled on the same tick, since
+  the hard row makes the soft cost a constant with zero gradient.
+
+- D4 task runs now score hard keyframes and soft pose goals separately from
+  trusted measured observations, including the final budget post and a
+  trustworthy fall post, which are reported through a new optional
+  post-observation seam. Planning ticks and measured observations are counted
+  separately, a next-row metric on a hard-fixed row is labelled
+  ``hard_keyframe_row`` instead of ``denoiser_forecast``, and
+  ``TaskConditioning.reset()`` plus the new optional reset hook clear the whole
+  task ledger before the mandatory fresh bootstrap. Runs without
+  ``--task-config`` keep the original D3 provenance: no task block is emitted in
+  the preflight report, the run provenance or the bounded marker.
+
+- The D3 reference-free continuation seam accepts two optional D4 task hooks
+  (``plan_transform`` and ``sampler_factory``) plus an optional bounded per-step
+  task record on ``ContinuationStep``. Both default to ``None``, so every
+  existing caller keeps the original plan, sampler, RNG and decode path.
+
+- The D3 reference-free continuation seam also accepts two optional reporting
+  lifecycle hooks (``on_reset`` and ``measured_post``). The reset hook runs after
+  the seam clears its own history, and the measured-post seam only forwards an
+  already-validated trusted successor tick; neither can sample, decode, change
+  history or advance the planning count. Both default to ``None``.
+
+- The D3 closed-loop matched-pair runner now defaults its initial/bootstrap
+  array matching tolerance to ``1e-3``, the teacher-tracking error scale
+  selected by the user, instead of ``1e-6``. This is a raw matched-array
+  tolerance, not a universal length unit and not an unguided reference-tracking
+  failure criterion; historical ``1e-6`` results remain unchanged.
 
 - ``distill train`` now exposes standing-start options without changing the
   legacy reference-only default. Standing options require the cohort path,

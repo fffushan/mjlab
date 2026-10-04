@@ -1,5 +1,15 @@
 # Diffusion policy — controller integration handoff
 
+> **Historical 231-channel projected-contract handoff, not current readiness.**
+> Keep the historical algorithm notes below; active no-mixture tokens are167
+> channels (135state+32latent), and D2 offline gates have passed. D3 seam/evaluator/
+> GUI usability is operator-accepted and D4a sparse keyframe/pose guidance is
+> implemented in the opt-in headless mjlab surface; neither is a controller,
+> real-time or hardware qualification. Use the [active contract](beyondmimic_diffusion_d1_no_mixtures_contract.yaml)
+> and [D4a plan](beyondmimic_diffusion_d4_keyframes_pose_guidance.md) rather
+> than this document's old model-quality/width claims. Export, sustained timing
+> and controller/vendor integration remain D5; hardware qualification is D6.
+
 Audience: a fresh session that will build a **controller** (sim and later real robot)
 that runs the D2 state–latent diffusion generator for the AgiBot X2.
 
@@ -22,11 +32,13 @@ source* feeding an already-deployed VAE decoder.
 | **No exported artifact** | No ONNX/TorchScript for the denoiser exists yet. Export is a separate task (was scoped as D5). |
 | **No real-time timing evidence** | The D0 contract requires **50 Hz / 20 ms**. The only measurement on record is the *whole* VAE+controller loop at **~31–41 ms/step unplugged** (`NOW.md`), already over budget. 20 DDIM jumps per control step is a hard latency problem, not a detail. |
 | **Model quality gate NOT met** | §7.8 of the D2 plan fails on pilot-scale data; bulk training is in progress. Do **not** judge this model's tracking quality from any existing number. |
-| **Guidance not implemented** | `guidance_strength != 0` raises. Any cost/obstacle-guided behaviour is D4, unavailable. |
+| **D4 guidance implementation available** | The opt-in headless task surface implements sparse keyframe inpainting and pose-cost input-VJP guidance. No physical guided trial, stability, real-time, export or hardware claim exists. |
 | **Hardware state estimate unvalidated** | D0 uses simulator ground truth. The hardware state estimator is a separate gate (D6). |
 | **Fall detection caveat** | Physical-fall criterion is tilt-only (>70° root tilt). A pelvis-"sinking" level collapse can pass it. |
 
-So: build and unit-test the *interface* now; do not trust it on hardware.
+So: the D3/D4 interfaces are software-validated and remain opt-in; do not
+use them as controller or hardware qualification. Export/runtime timing is D5
+and hardware state estimation/operation is D6.
 
 ---
 

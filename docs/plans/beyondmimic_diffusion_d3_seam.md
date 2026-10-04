@@ -1,11 +1,13 @@
 # BeyondMimic diffusion D3 — bounded handover seam (implemented slice)
 
-Status: **bounded D3 seam implemented (2026-10-05); no closed-loop, simulator,
-controller, export or hardware evidence exists.** This record documents only the
-implemented offline/runtime seam and its tests. D3's measured acceptance gates
+Status: **bounded D3 handover seam implemented.** This record covers the committed
+offline/runtime seam and its tests, not a statement that later mjlab simulation
+never occurred. The [closed-loop evaluator](beyondmimic_diffusion_d3_closed_loop_evaluation.md)
+and [operator-accepted GUI](../../logs/diagnostics/diffusion-d3-gui-implementation-20261004/REPORT.md)
+are now implemented in isolated candidates. D3's measured acceptance gates
 (survival, physical errors, and matched VAE-baseline comparisons from the
 [reproduction plan §6](beyondmimic_diffusion_reproduction.md)) remain open and
-require a controller/evaluation harness plus explicit authorization.
+require recorded validation using that harness plus explicit experiment authority.
 
 ## Implemented seam
 
@@ -47,6 +49,22 @@ Token/window semantics are unchanged from the active no-mixture contract
 channels (135 normalized physical-state + 32 normalized VAE latent). The frozen
 VAE decoder semantics are untouched: the seam only supplies the latent that the
 decoder already accepts.
+
+## Closed-loop integration harness
+
+The integration-only entry point is
+`scripts/experiments/diffusion_d3_closed_loop/evaluate.py`. It validates explicit
+hashes and the live ``tennis_000``-style cohort member through the existing
+replay loaders before the private X2 runtime factory can construct an
+environment. Without ``--execute`` it is simulator-free; execution is one
+matched pair with eight VAE bootstrap transitions and a bounded continuation
+budget. The runtime owns measured 99-D conditioning and freezes reference
+updates after handover. Reports use the shared bounded
+``persist_evaluation_report`` API for both initial and after-run writes, retain
+actual imported-source fingerprints separately from the artifact root, and
+record model/normalizer/non-Tensor extra-state and frozen-file before/after
+integrity. Fake-runtime tests and software passes are not physical closed-loop
+evidence; no simulator smoke was run by the integration worker.
 
 ## Tests
 

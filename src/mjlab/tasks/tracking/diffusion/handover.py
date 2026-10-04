@@ -29,13 +29,31 @@ normalized VAE latent).  Legacy 231-channel contracts are rejected here.
 This module is deliberately simulator-free and claims no closed-loop, simulator,
 export or hardware evidence; a controller or evaluation harness supplies
 measured states and the frozen decoder callable.
+
+Two optional D4 hooks let a task lane steer the frozen continuation without
+duplicating this seam's history, tick-age guard, decoding or prediction logic:
+``plan_transform`` rewrites the freshly built plan (for example hard-keyframe
+inpainting) and ``sampler_factory`` supplies a per-tick replacement for
+:func:`~.sampler.sample_trajectory` (for example pose-cost guidance).  Both
+default to ``None``, which reproduces the D3 call sequence and sample exactly.
+A sampler may return diagnostics carrying a bounded ``task`` mapping; it is
+attached to :class:`ContinuationStep` for the evaluation report.
+
+Two more optional lifecycle hooks stay reporting-only: ``on_reset`` runs right
+after :meth:`ReferenceFreeContinuation.reset` clears history, so a task lane can
+drop its own ledger before the mandatory fresh bootstrap, and ``measured_post``
+receives one trusted measured post-step observation through
+:meth:`ReferenceFreeContinuation.observe_measured_post` without sampling,
+decoding, recording history or advancing the planning count.
 """
 
 from __future__ import annotations
 
+import json
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -55,6 +73,10 @@ from .state import WorldState, world_to_hybrid
 # Frozen gravity-mode decoder conditioning width
 # (tasks/tracking/distillation/vae_config.py CONDITIONING_DIMS["gravity"]).
 _CONDITIONING_DIM = 99
+
+# A task lane must not smuggle unbounded state or gradient tensors into the
+# evaluation report through the per-step task record.
+_MAX_TASK_RECORD_BYTES = 8192
 
 
 class HandoverError(ValueError):
@@ -236,17 +258,53 @@ def build_reference_free_plan(
 
 
 DecodeFn = Callable[[Tensor, Tensor], Tensor]
+# A task lane rewrites the built plan with the measured current state, for
+# example to fix sparse hard keyframes.
+PlanTransform = Callable[["ContinuationPlan", WorldState], "ContinuationPlan"]
+# A task lane supplies the per-tick sampler callable; it is invoked exactly like
+# ``sample_trajectory`` and must return ``(sample, diagnostics)``.
+SamplerCallable = Callable[..., tuple[Tensor, Any]]
+SamplerFactory = Callable[["ContinuationPlan", WorldState], SamplerCallable]
+# Called after ``reset`` clears history, before the mandatory fresh bootstrap.
+ResetHook = Callable[[], None]
+# Called with one trusted measured post-step (tick, state) observation.
+MeasuredPostHook = Callable[[int, WorldState], None]
+
+
+def _bounded_task_record(value: object) -> Mapping[str, Any] | None:
+  """Return a bounded, JSON-serializable per-step task record or ``None``."""
+  if value is None:
+    return None
+  if not isinstance(value, Mapping):
+    raise HandoverError("a sampler task record must be a mapping")
+  record = dict(value)
+  try:
+    encoded = json.dumps(record, sort_keys=True, default=str, separators=(",", ":"))
+  except (TypeError, ValueError) as exc:
+    raise HandoverError(f"sampler task record is not serializable: {exc}") from exc
+  if len(encoded.encode()) > _MAX_TASK_RECORD_BYTES:
+    raise HandoverError(
+      f"sampler task record exceeds the {_MAX_TASK_RECORD_BYTES}-byte bound"
+    )
+  return record
 
 
 @dataclass(frozen=True, slots=True)
 class ContinuationStep:
-  """One decoded diffusion control step and its recorded provenance."""
+  """One decoded diffusion control step and its recorded provenance.
+
+  ``task`` is the optional bounded task-lane record for this tick (active goal
+  and keyframe identifiers, denoiser/VJP/cost counts and bounded cost/norm
+  scalars).  It is ``None`` for the default unguided path.
+  """
 
   tick: int
   action: np.ndarray
   executed_latent: np.ndarray
   denoiser_calls: int
   final_index: int
+  predicted_next_hybrid_state: np.ndarray | None = None
+  task: Mapping[str, Any] | None = None
 
 
 class ReferenceFreeContinuation:
@@ -287,6 +345,10 @@ class ReferenceFreeContinuation:
     device: str | torch.device = "cpu",
     generator: torch.Generator,
     sampler_config: SamplerConfig | None = None,
+    plan_transform: PlanTransform | None = None,
+    sampler_factory: SamplerFactory | None = None,
+    on_reset: ResetHook | None = None,
+    measured_post: MeasuredPostHook | None = None,
   ) -> None:
     _require_no_mixture(contract)
     _require_matching_projection(projection, contract)
@@ -303,6 +365,17 @@ class ReferenceFreeContinuation:
     self._decode = decode
     self._generator = generator
     self._sampler_config = sampler_config or SamplerConfig(grid)
+    if plan_transform is not None and not callable(plan_transform):
+      raise HandoverError("plan_transform must be callable or None")
+    if sampler_factory is not None and not callable(sampler_factory):
+      raise HandoverError("sampler_factory must be callable or None")
+    self._plan_transform = plan_transform
+    self._sampler_factory = sampler_factory
+    for name, hook in (("on_reset", on_reset), ("measured_post", measured_post)):
+      if hook is not None and not callable(hook):
+        raise HandoverError(f"{name} hook must be callable or None")
+    self._on_reset = on_reset
+    self._measured_post = measured_post
     self._last_tick: int | None = None
 
   def record_executed(
@@ -316,9 +389,29 @@ class ReferenceFreeContinuation:
     self.history.push(state, latent)
 
   def reset(self) -> None:
-    """Drop history and tick age; a fresh VAE bootstrap is now required."""
+    """Drop history and tick age; a fresh VAE bootstrap is now required.
+
+    An installed ``on_reset`` hook runs after the seam has cleared its own
+    state, so a task lane drops its ledger before the next measured pair is
+    recorded.  Without a hook this is exactly the D3 reset.
+    """
     self.history.reset()
     self._last_tick = None
+    if self._on_reset is not None:
+      self._on_reset()
+
+  def observe_measured_post(self, tick: int, state: WorldState) -> bool:
+    """Report a trusted post, returning whether an observer actually ran.
+
+    The evaluation runner calls this only for a post-step observation that is
+    finite and reset/teleport/segment/tick/period/reference-safe.  It is a
+    reporting-only seam: it never samples, decodes, changes history or advances
+    the planning count.  Without a hook it returns False and adds no task count.
+    """
+    if self._measured_post is None:
+      return False
+    self._measured_post(int(tick), state)
+    return True
 
   def plan(
     self,
@@ -327,8 +420,13 @@ class ReferenceFreeContinuation:
     tick: int,
     device: str | torch.device | None = None,
   ) -> ContinuationPlan:
-    """Build the conditioning window without sampling (evaluation seam)."""
-    return build_reference_free_plan(
+    """Build the conditioning window without sampling (evaluation seam).
+
+    When a ``plan_transform`` is installed it is applied to the built plan with
+    the same measured current state, so a task lane can fix sparse targets in
+    the window without rebuilding history or conditioning.
+    """
+    plan = build_reference_free_plan(
       self.history,
       current_state,
       projection=self.projection,
@@ -336,6 +434,9 @@ class ReferenceFreeContinuation:
       contract=self.contract,
       device=device or self._device,
     )
+    if self._plan_transform is None:
+      return plan
+    return self._plan_transform(plan, current_state)
 
   def step(
     self,
@@ -358,13 +459,25 @@ class ReferenceFreeContinuation:
         "call reset() after any reset or plan discontinuity"
       )
     plan = self.plan(current_state, tick=tick)
-    sample, diagnostics = sample_trajectory(
-      self._denoiser,
-      schedule=self.schedule,
-      conditions=SamplerConditions(plan.clean_tokens, plan.clean_mask),
-      config=self._sampler_config,
-      generator=self._generator,
-    )
+    conditions = SamplerConditions(plan.clean_tokens, plan.clean_mask)
+    if self._sampler_factory is None:
+      sample, diagnostics = sample_trajectory(
+        self._denoiser,
+        schedule=self.schedule,
+        conditions=conditions,
+        config=self._sampler_config,
+        generator=self._generator,
+      )
+    else:
+      sampler = self._sampler_factory(plan, current_state)
+      sample, diagnostics = sampler(
+        self._denoiser,
+        schedule=self.schedule,
+        conditions=conditions,
+        config=self._sampler_config,
+        generator=self._generator,
+      )
+    task_record = _bounded_task_record(getattr(diagnostics, "task", None))
     latent_slice = slice(
       self.contract.projected_state_dimension, self.contract.token_dimension
     )
@@ -377,6 +490,24 @@ class ReferenceFreeContinuation:
     )
     executed_latent = self.projection.denormalize_latent(normalized)
     action = self._decode_action(executed_latent, conditioning)
+    predicted_next_hybrid_state: np.ndarray | None = None
+    next_index = self.contract.current_index + 1
+    if next_index < sample.shape[0]:
+      predicted = self.projection.inverse_state(
+        sample[next_index, : self.contract.projected_state_dimension]
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .numpy()
+        .astype(np.float64)[None, :]
+      )
+      if (
+        predicted.shape != (1, self.contract.state_dimension)
+        or not np.isfinite(predicted).all()
+      ):
+        raise HandoverError(
+          "sampler predicted next hybrid state must be finite with shape [135]"
+        )
+      predicted_next_hybrid_state = np.array(predicted[0], copy=True)
     self._last_tick = int(tick)
     return ContinuationStep(
       tick=int(tick),
@@ -384,6 +515,8 @@ class ReferenceFreeContinuation:
       executed_latent=executed_latent,
       denoiser_calls=diagnostics.denoiser_calls,
       final_index=diagnostics.final_index,
+      predicted_next_hybrid_state=predicted_next_hybrid_state,
+      task=task_record,
     )
 
   def _decode_action(
@@ -418,7 +551,12 @@ __all__ = [
   "ExecutedPair",
   "HandoverError",
   "HandoverHistory",
+  "MeasuredPostHook",
   "PlanAgeError",
+  "PlanTransform",
   "ReferenceFreeContinuation",
+  "ResetHook",
+  "SamplerCallable",
+  "SamplerFactory",
   "build_reference_free_plan",
 ]
