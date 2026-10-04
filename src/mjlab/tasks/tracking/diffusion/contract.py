@@ -25,7 +25,33 @@ _D0_CONTRACT_SHA = "42694cdd3acd72afd2d234a85ca29e9c7a646d64df831021c8dd43e55f3f
 _D1_NO_MIXTURES_CONTRACT_SHA = (
   "f5237d4327fd7cfd4c065604806555a43f8afa97c0ea17a9e59a3482a6d0caed"
 )
+# Revision 2 repins only the frozen VAE: the 12-teacher increased-perturbation
+# student (`inc000`-`inc011`) instead of the three-clip `mixed-10k` student.
+# Representation, window, split, normalization and qualification semantics are
+# unchanged, so the previous revision stays loadable and comparable.
+_D0_INC12_CONTRACT_SHA = (
+  "39f1e85370efebdf83716d3e60ee505c1b38057c88bce3527439ad949ad23d9b"
+)
+_D1_INC12_CONTRACT_SHA = (
+  "645fef76f672408850832ab9bb06e0436cca517473b4a1d74004182138954d05"
+)
 _VAE_SHA = "69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117"
+_INC12_VAE_SHA = "22a650bcba7375bca4578c229554ea3c93c357244919ea83d7ba1b6878282a4d"
+_INC12_VAE_PATH = "logs/distillation/vae-inc-a-12t-nc/checkpoint-final.pt"
+# Every approved (path, sha256) VAE pair.  Membership is checked when a contract
+# is decoded from YAML, so an unregistered VAE still fails closed.
+_APPROVED_VAE_IDENTITIES: frozenset[tuple[str, str]] = frozenset(
+  {
+    ("logs/distillation/mixed-10k/checkpoint-final.pt", _VAE_SHA),
+    (_INC12_VAE_PATH, _INC12_VAE_SHA),
+  }
+)
+# Approved contract *file* digests per schema.  A new revision must be
+# registered here before any command will read it.
+_CONTRACT_SHAS_BY_SCHEMA: dict[str, frozenset[str]] = {
+  _LEGACY_SCHEMA: frozenset({_D0_CONTRACT_SHA, _D0_INC12_CONTRACT_SHA}),
+  _SCHEMA: frozenset({_D1_NO_MIXTURES_CONTRACT_SHA, _D1_INC12_CONTRACT_SHA}),
+}
 _RECOVERY_SHA = "caf17c38f23ad180829a230a9a3259f14eedd3860dd90a046b8be92d3d047681"
 _XML_SHA = "ae0dcbceda3ef74e029e3bf4a9ea24ea8cc58ab44f1518e635653fc79f928125"
 _PHYSICAL_FALL_SHA = "3c0d64bdc9aa69d8fd372f343e47ab6f9da59a77d2efd8e3d860eff2c1ebf68a"
@@ -216,9 +242,13 @@ class DiffusionContract:
       )
     except (KeyError, TypeError, ValueError) as exc:
       raise ContractError(f"malformed D0 payload: {exc}") from exc
+    if (contract.vae_checkpoint, contract.vae_sha256) not in _APPROVED_VAE_IDENTITIES:
+      raise ContractError(
+        "vae artifact identity is not an approved revision: "
+        f"{contract.vae_checkpoint} ({contract.vae_sha256})"
+      )
     if (
-      contract.vae_sha256 != _VAE_SHA
-      or contract.recovery_sha256 != _RECOVERY_SHA
+      contract.recovery_sha256 != _RECOVERY_SHA
       or contract.state_xml_sha256 != _XML_SHA
       or contract.physical_fall_source_sha256 != _PHYSICAL_FALL_SHA
       or contract.vae_tracking_rejection_source_sha256 != _VAE_TRACKING_REJECTION_SHA
@@ -236,19 +266,12 @@ class DiffusionContract:
     source = Path(path).read_bytes()
     digest = hashlib.sha256(source).hexdigest()
     payload = yaml.safe_load(source)
-    if digest == _D0_CONTRACT_SHA:
-      expected = _D0_CONTRACT_SHA
-    elif digest == _D1_NO_MIXTURES_CONTRACT_SHA:
-      expected = _D1_NO_MIXTURES_CONTRACT_SHA
-    else:
-      schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
-      expected = (
-        _D0_CONTRACT_SHA if schema == _LEGACY_SCHEMA else _D1_NO_MIXTURES_CONTRACT_SHA
-      )
-    if digest != expected:
-      schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
+    schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
+    allowed = _CONTRACT_SHAS_BY_SCHEMA.get(str(schema), frozenset())
+    if digest not in allowed:
       raise ContractError(
-        f"diffusion contract hash mismatch for {schema}: expected {expected}, got {digest}"
+        f"diffusion contract hash mismatch for {schema}: expected one of "
+        f"{sorted(allowed)}, got {digest}"
       )
     contract = cls.from_mapping(payload)
     return replace(contract, contract_sha256=digest)

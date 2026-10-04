@@ -385,13 +385,21 @@ class FrozenVaePolicy:
     teacher_id: str = "tennis_000",
     expected_teacher_hashes: dict[str, str] | None = None,
     artifact_metadata: Any | None = None,
+    cohort_manifest: str | Path | None = None,
+    cohort_manifest_sha256: str | None = None,
+    contract: Any | None = None,
   ) -> "FrozenVaePolicy":
-    """Load the pinned M4 cohort member through its checked inference loader.
+    """Load a pinned cohort member through its checked inference loader.
 
     The D0 VAE is a version-3 cohort checkpoint, not a version-1 single-teacher
     envelope.  The cohort manifest and selected teacher are therefore resolved
     before calling ``load_cohort_member_inference``; the selected teacher's real
     ONNX export supplies the action metadata shared by the frozen student.
+
+    The cohort manifest, its expected digest and the pinned artifact identity
+    default to the frozen three-clip revision.  A caller selecting another
+    registered contract revision passes all three explicitly; the loaded
+    checkpoint bytes are always compared against the selected contract.
     """
     from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
     from mjlab.tasks.tracking.distillation.checkpoint import (
@@ -400,12 +408,24 @@ class FrozenVaePolicy:
     )
     from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 
+    selected_contract = contract if contract is not None else DEFAULT_CONTRACT
     repo_root = _repo_root()
-    manifest_path = repo_root / _MIXED_COHORT_MANIFEST
+    if cohort_manifest is None:
+      manifest_path = repo_root / _MIXED_COHORT_MANIFEST
+      expected_manifest_digest = _MIXED_COHORT_MANIFEST_SHA256
+    else:
+      manifest_path = Path(cohort_manifest)
+      if not manifest_path.is_absolute():
+        manifest_path = repo_root / manifest_path
+      expected_manifest_digest = cohort_manifest_sha256
     if not manifest_path.is_file():
       raise AdapterError(f"frozen VAE cohort manifest is missing: {manifest_path}")
     manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    if manifest_digest != _MIXED_COHORT_MANIFEST_SHA256:
+    if expected_manifest_digest is None:
+      raise AdapterError(
+        f"frozen VAE cohort manifest digest was not supplied: {manifest_path}"
+      )
+    if manifest_digest != expected_manifest_digest:
       raise AdapterError(f"frozen VAE cohort manifest hash mismatch: {manifest_path}")
     try:
       cohort = resolve_cohort(load_manifest(manifest_path, repo_root=repo_root))
@@ -459,8 +479,10 @@ class FrozenVaePolicy:
     policy.artifact_sha256 = hashlib.sha256(
       policy.artifact_path.read_bytes()
     ).hexdigest()
-    if policy.artifact_sha256 != DEFAULT_CONTRACT.vae_sha256:
-      raise AdapterError("frozen VAE checkpoint hash does not match the D0 artifact")
+    if policy.artifact_sha256 != selected_contract.vae_sha256:
+      raise AdapterError(
+        "frozen VAE checkpoint hash does not match the selected contract artifact"
+      )
     return policy
 
   def latent_and_action(

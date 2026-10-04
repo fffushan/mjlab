@@ -57,6 +57,9 @@ PILOT_SEEDS: tuple[int, ...] = (0, 1, 2)
 D1_RUN_ID = "d1-pilot-x2-tennis-mixed-v1"
 D1_BULK_RUN_ID = "d1-bulk-x2-tennis-mixed-v1"
 
+# Frozen three-clip cohort used by both frozen revisions' pilot schedule.
+_DEFAULT_COHORT_MANIFEST = "configs/distillation/x2_tennis_mixed.yaml"
+
 # The plan sizes the bulk collection as ``L * 50 * 100`` retained rows
 # (~111300 for the three clips).  At the pilot yield of ~108 accepted rows per
 # trial that is ~1030 trials, i.e. 57 seeds x 3 phases x 3 clips pairs.
@@ -167,6 +170,28 @@ def build_trials(
   return tuple(clean) + tuple(ou)
 
 
+def resolve_rollout_ids(cohort_ids: Sequence[str], selection: str) -> tuple[str, ...]:
+  """Resolve the rollout teacher selection against a cohort manifest.
+
+  An empty ``selection`` means "every member".  A non-empty selection must name
+  each member at most once and every name must be a cohort member, so a typo can
+  never silently roll out a different clip or a member the checkpoint cannot
+  serve.  This is what keeps the checkpoint's cohort identity (which it
+  validates) separate from the clips actually rolled out.
+  """
+  ids = tuple(str(member) for member in cohort_ids)
+  if not ids:
+    raise RuntimeX2Error("cohort manifest contains no members")
+  chosen = tuple(part.strip() for part in selection.split(",") if part.strip())
+  rollout = chosen if chosen else ids
+  if len(set(rollout)) != len(rollout):
+    raise RuntimeX2Error(f"rollout selection repeats a member: {rollout}")
+  unknown = [member for member in rollout if member not in ids]
+  if unknown:
+    raise RuntimeX2Error(f"rollout teachers {unknown} are not members of {ids}")
+  return rollout
+
+
 def build_pilot_trials(
   motion_frames: Sequence[tuple[str, int]],
   *,
@@ -184,6 +209,7 @@ def build_bulk_trials(
   motion_frames: Sequence[tuple[str, int]],
   *,
   seed_count: int = BULK_SEED_COUNT,
+  run_id: str = D1_BULK_RUN_ID,
   worker: int = 0,
   workers: int = 1,
 ) -> tuple[TrialSpec, ...]:
@@ -193,7 +219,7 @@ def build_bulk_trials(
   return build_trials(
     motion_frames,
     seeds=tuple(range(seed_count)),
-    run_id=D1_BULK_RUN_ID,
+    run_id=run_id,
     worker=worker,
     workers=workers,
   )
@@ -681,6 +707,12 @@ def build_x2_runtime(request: Any) -> Any:
 
   repo_root = Path(__file__).resolve().parents[5]
   device = os.environ.get("MJLAB_D1_DEVICE", "cuda:0")
+  # The selected contract owns the pinned artifacts.  The CLI resolves it from
+  # ``--contract`` and passes it in the request; the module default is only a
+  # fallback for direct library callers.
+  selected_contract = getattr(request, "contract", None)
+  if selected_contract is None:
+    selected_contract = DEFAULT_CONTRACT
 
   # Schedule selection is an explicit operational input, never inferred: the
   # frozen contract's pilot schedule must stay the default.
@@ -690,43 +722,59 @@ def build_x2_runtime(request: Any) -> Any:
   worker = int(os.environ.get("MJLAB_D1_WORKER", "0"))
   workers = int(os.environ.get("MJLAB_D1_WORKERS", "1"))
   if schedule == "pilot":
-    base_schedule = build_pilot_trials
     seed_count = len(PILOT_SEEDS)
+    default_run_id = D1_RUN_ID
   elif schedule == "bulk":
     seed_count = int(os.environ.get("MJLAB_D1_BULK_SEEDS", str(BULK_SEED_COUNT)))
-    base_schedule = partial(build_bulk_trials, seed_count=seed_count)
+    default_run_id = D1_BULK_RUN_ID
   else:
     raise RuntimeX2Error(
       f"MJLAB_D1_SCHEDULE must be 'pilot' or 'bulk', got {schedule!r}"
     )
+  run_id = os.environ.get("MJLAB_D1_RUN_ID", "").strip() or default_run_id
+  base_schedule = (
+    partial(build_pilot_trials, run_id=run_id)
+    if schedule == "pilot"
+    else partial(build_bulk_trials, seed_count=seed_count, run_id=run_id)
+  )
   schedule_trials = partial(base_schedule, worker=worker, workers=workers)
-  manifest_path = repo_root / "configs/distillation/x2_tennis_mixed.yaml"
+
+  # The checkpoint's own cohort manifest resolves VAE members; the rollout
+  # selection may be any non-empty subset of those members.  Keeping the two
+  # separate is what lets a 12-teacher student be rolled out on three clips
+  # without redefining its cohort identity, which the checkpoint validates.
+  manifest_path = Path(
+    os.environ.get("MJLAB_D1_COHORT_MANIFEST", _DEFAULT_COHORT_MANIFEST)
+  )
+  if not manifest_path.is_absolute():
+    manifest_path = repo_root / manifest_path
   if not manifest_path.is_file():
     raise RuntimeX2Error(f"frozen cohort manifest is missing: {manifest_path}")
   manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
   cohort = resolve_cohort(load_manifest(manifest_path, repo_root=repo_root))
-  teacher_ids = tuple(cohort.teacher_ids)
-  if len(teacher_ids) != 3:
-    raise RuntimeX2Error(
-      f"D1 pilot expects the frozen 3-member cohort, found {teacher_ids}"
-    )
-
-  action_contract = _action_contract_for(cohort, teacher_ids[0])
+  cohort_ids = tuple(cohort.teacher_ids)
+  rollout_ids = resolve_rollout_ids(
+    cohort_ids, os.environ.get("MJLAB_D1_ROLLOUT_TEACHERS", "")
+  )
+  action_contract = _action_contract_for(cohort, rollout_ids[0])
   if tuple(action_contract.joint_order) != tuple(cohort.actions.joint_names):
     raise RuntimeX2Error("artifact joint order disagrees with the cohort contract")
 
   qualification = QualificationConfig()
   vae = FrozenVaePolicy.from_checkpoint(
-    repo_root / DEFAULT_CONTRACT.vae_checkpoint,
+    repo_root / selected_contract.vae_checkpoint,
     action_contract,
-    teacher_id=teacher_ids[0],
+    teacher_id=rollout_ids[0],
+    cohort_manifest=manifest_path,
+    cohort_manifest_sha256=manifest_sha256,
+    contract=selected_contract,
   )
   ppo = FrozenPpoRecoveryPolicy.from_onnx(
-    repo_root / DEFAULT_CONTRACT.recovery_onnx, action_contract
+    repo_root / selected_contract.recovery_onnx, action_contract
   )
 
-  runtime = X2DiffusionRuntime(cohort, teacher_ids, device=device)
-  for teacher_id in teacher_ids:
+  runtime = X2DiffusionRuntime(cohort, rollout_ids, device=device)
+  for teacher_id in rollout_ids:
     env = runtime.environment(teacher_id)
     if env.joint_names != tuple(action_contract.joint_order):
       raise RuntimeX2Error(
@@ -745,7 +793,7 @@ def build_x2_runtime(request: Any) -> Any:
   trials = schedule_trials(
     [
       (teacher_id, cohort.teacher(teacher_id).reference.frames)
-      for teacher_id in teacher_ids
+      for teacher_id in rollout_ids
     ]
   )
   if len(trials) > request.max_trials:
@@ -763,8 +811,13 @@ def build_x2_runtime(request: Any) -> Any:
       "max_gpus": request.max_gpus,
       "device": device,
       "control_hz": int(round(1.0 / qualification.period_seconds)),
-      "cohort_manifest": "configs/distillation/x2_tennis_mixed.yaml",
+      "cohort_manifest": str(manifest_path),
       "cohort_manifest_sha256": manifest_sha256,
+      "cohort_ids": list(cohort_ids),
+      "rollout_teachers": list(rollout_ids),
+      "vae_checkpoint": selected_contract.vae_checkpoint,
+      "vae_sha256": selected_contract.vae_sha256,
+      "run_id": run_id,
       "schedule": schedule,
       "seeds": seed_count,
       "trials": len(trials),
@@ -778,6 +831,7 @@ __all__ = [
   "BULK_SEED_COUNT",
   "D1_BULK_RUN_ID",
   "D1_RUN_ID",
+  "resolve_rollout_ids",
   "PHASE_FRACTIONS",
   "PILOT_SEEDS",
   "InitialStateSnapshot",

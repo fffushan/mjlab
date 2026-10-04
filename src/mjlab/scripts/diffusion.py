@@ -199,7 +199,11 @@ def _validate_trial_pairs(trials: tuple[Any, ...]) -> str | None:
 
 
 def _validate_runtime_bundle(
-  bundle: RuntimeBundle, *, max_envs: int | None = None, max_gpus: int | None = None
+  bundle: RuntimeBundle,
+  *,
+  max_envs: int | None = None,
+  max_gpus: int | None = None,
+  contract: Any | None = None,
 ) -> str | None:
   if not bundle.runtime_verified:
     return "runtime factory is not a verified concrete X2 runtime"
@@ -233,16 +237,17 @@ def _validate_runtime_bundle(
     return "runtime PPO binding has no frozen artifact identity"
   from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
 
+  selected_contract = contract if contract is not None else DEFAULT_CONTRACT
   for name, policy, expected_hash in (
-    ("VAE", collector.vae, DEFAULT_CONTRACT.vae_sha256),
-    ("PPO", collector.ppo, DEFAULT_CONTRACT.recovery_sha256),
+    ("VAE", collector.vae, selected_contract.vae_sha256),
+    ("PPO", collector.ppo, selected_contract.recovery_sha256),
   ):
     path = policy.artifact_path
     if not isinstance(path, Path) or not path.is_file():
       return f"runtime {name} binding artifact path is not a file"
     actual_hash = _sha256(path)
     if actual_hash != policy.artifact_sha256 or actual_hash != expected_hash:
-      return f"runtime {name} binding artifact bytes are not the pinned D0 asset"
+      return f"runtime {name} binding artifact bytes are not the pinned contract asset"
     metadata = policy.artifact_metadata
     try:
       policy.action_contract.verify_metadata(metadata, require_actuator_metadata=True)
@@ -486,7 +491,7 @@ def _command_collect(args: argparse.Namespace) -> int:
   if not isinstance(bundle, RuntimeBundle):
     raise TypeError("runtime factory must return RuntimeBundle")
   runtime_error = _validate_runtime_bundle(
-    bundle, max_envs=args.max_envs, max_gpus=args.max_gpus
+    bundle, max_envs=args.max_envs, max_gpus=args.max_gpus, contract=contract
   )
   if runtime_error is not None:
     print(runtime_error, file=sys.stderr)
