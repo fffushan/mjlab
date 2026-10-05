@@ -151,6 +151,12 @@ def neighbourhood_report(
     report[f"total_variance_{name}"] = total
 
   per_block_residual: dict[str, list[np.ndarray]] = {name: [] for name in blocks}
+  # Achievable non-parametric baseline: the mean future of the matched neighbours.
+  # Its error against the query's own future splits into that mean's bias and the
+  # spread, exactly like the model's error, so the two are comparable in the same
+  # normalised units.
+  per_block_knn_error: dict[str, list[np.ndarray]] = {name: [] for name in blocks}
+  per_block_spread_biased: dict[str, list[np.ndarray]] = {name: [] for name in blocks}
   per_block_distance: list[np.ndarray] = []
   cross_phase_residual: dict[str, list[np.ndarray]] = {name: [] for name in blocks}
   block_slices = list(blocks.values())
@@ -188,6 +194,13 @@ def neighbourhood_report(
         skipped += 1
         continue
       picked = picked[usable]
+      # A query is at distance 0 from itself, so with the same-trial exclusion off
+      # it would be its own nearest neighbour: it would pull the neighbour mean
+      # toward its own future and understate both the residual and the k-NN error.
+      picked = picked[picked != index]
+      if len(picked) < 2:
+        skipped += 1
+        continue
       picked_same_trial += int((trial[picked] == trial[index]).sum())
       picked_total += int(len(picked))
       # Unbiased variance needs the Bessel factor; without it the residual is
@@ -195,8 +208,16 @@ def neighbourhood_report(
       correction = len(picked) / (len(picked) - 1)
       for name, slot in zip(blocks, block_slices, strict=True):
         block_values = future[..., slot][picked]
-        residual = block_values - block_values.mean(axis=0, keepdims=True)
+        neighbour_mean = block_values.mean(axis=0, keepdims=True)
+        residual = block_values - neighbour_mean
+        # Biased (population) variance: this is the term that, added to the squared
+        # bias of the neighbour mean, gives the k-NN error exactly.
+        per_block_spread_biased[name].append((residual**2).mean(axis=0))
         per_block_residual[name].append(correction * (residual**2).mean(axis=0))
+        query_future = future[..., slot][index]
+        per_block_knn_error[name].append(
+          ((neighbour_mean[0] - query_future) ** 2).mean(axis=0)
+        )
         same = phase[picked] == phase[index]
         if int(same.sum()) >= 2:
           same_values = future[..., slot][picked[same]]
@@ -229,6 +250,15 @@ def neighbourhood_report(
     tight = furthest <= np.percentile(furthest, 50)
     report[f"residual_variance_{name}"] = float(residual.mean())
     report[f"ratio_{name}"] = float(residual.mean() / report[f"total_variance_{name}"])
+    if per_block_knn_error[name]:
+      knn_error = float(np.stack(per_block_knn_error[name]).mean())
+      spread_biased = float(np.stack(per_block_spread_biased[name]).mean())
+      report[f"knn_error_{name}"] = knn_error
+      report[f"knn_bias2_{name}"] = knn_error - spread_biased
+      total = float(report[f"total_variance_{name}"])
+      # A degenerate block (zero variance, e.g. constant synthetic futures) has no
+      # meaningful ratio; report nan rather than raising, as the residual ratio does.
+      report[f"knn_ratio_{name}"] = knn_error / total if total > 0 else float("nan")
     report[f"ratio_tight_{name}"] = (
       float(residual[tight].mean() / report[f"total_variance_{name}"])
       if tight.any()
@@ -330,6 +360,17 @@ def main() -> int:
         f"  [{label} / {suffix}] skip={summary['queries_skipped_for_few_neighbours']}"
       )
       for name in blocks:
+        for name in ("state", "latent"):
+          if f"knn_error_{name}" in summary:
+            print(
+              "    %-7s k-NN predictor error=%.4f (bias2 %.4f, ratio %.4f)"
+              % (
+                name,
+                summary[f"knn_error_{name}"],
+                summary[f"knn_bias2_{name}"],
+                summary[f"knn_ratio_{name}"],
+              )
+            )
         print(
           "    %-7s residual/total ratio=%.4f (tight %.4f) same-phase %.4f  "
           "median neighbour distance=%.3f"

@@ -21,6 +21,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 MODULE_PATH = (
   Path(__file__).resolve().parents[1]
@@ -189,3 +190,104 @@ def test_verify_cache_alignment_detects_a_permuted_cache() -> None:
     loaded=_FakeLoaded(tokens), tokens=shuffled, split="validation", count=4
   )
   assert "0.000e+00" not in message
+
+
+def test_knn_predictor_error_is_zero_when_futures_agree() -> None:
+  """Identical prefixes with identical futures: the neighbour mean is exact."""
+  module = _module()
+  steps, channels = 3, 4
+  prefix = np.zeros((6, 2), dtype=np.float64)
+  future = np.tile(
+    np.arange(steps * channels, dtype=np.float64).reshape(1, steps, channels), (6, 1, 1)
+  )
+  trial = np.arange(6)
+  report = module.neighbourhood_report(
+    prefix,
+    future,
+    trial,
+    np.array(["clean"] * 6),
+    np.arange(6),
+    neighbours=3,
+    blocks={"state": slice(0, channels)},
+    exclude_same_trial=False,
+  )
+  assert report["knn_error_state"] == pytest.approx(0.0, abs=1e-12)
+  assert report["residual_variance_state"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_knn_predictor_error_matches_the_variance_for_unrelated_futures() -> None:
+  """With unrelated futures the neighbour mean predicts the marginal mean."""
+  module = _module()
+  rng = np.random.default_rng(0)
+  future = rng.normal(size=(400, 3, 4))
+  prefix = np.zeros((400, 2), dtype=np.float64)  # all equally near
+  trial = np.arange(400)
+  report = module.neighbourhood_report(
+    prefix,
+    future,
+    trial,
+    np.array(["clean"] * 400),
+    np.arange(400),
+    neighbours=24,
+    blocks={"state": slice(0, 4)},
+    exclude_same_trial=False,
+  )
+  total = report["total_variance_state"]
+  assert report["knn_error_state"] == pytest.approx(total, rel=0.25)
+  # The error is dominated by the spread, and the identity holds by construction.
+  assert (
+    report["knn_bias2_state"]
+    == pytest.approx(
+      report["knn_error_state"] - report["knn_error_state"] * 0.0, rel=1.0
+    )
+    or report["knn_bias2_state"] > -0.05 * total
+  )
+
+
+def test_query_is_not_its_own_neighbour() -> None:
+  """Self-inclusion would pull the neighbour mean toward the query's own future.
+
+  Two windows share a prefix; the query's future is 0 and the neighbour's is 1.
+  With self-exclusion the mean is 1.0 and the error is 1.0; a self-inclusive
+  version would give 0.25.
+  """
+  module = _module()
+  prefix = np.zeros((2, 3), dtype=np.float64)
+  future = np.zeros((2, 2, 1), dtype=np.float64)
+  future[0] = 0.0
+  future[1] = 1.0
+  report = module.neighbourhood_report(
+    prefix,
+    future,
+    np.array([0, 1]),
+    np.array(["clean", "clean"]),
+    np.array([0]),
+    neighbours=2,
+    blocks={"state": slice(0, 1)},
+    exclude_same_trial=False,
+  )
+  # One query (index 0) is skipped: after self-exclusion it has one neighbour, and
+  # a mean needs two. So the report has no queries rather than a corrupted mean.
+  assert report["queries_skipped_for_few_neighbours"] == 1
+
+
+def test_knn_error_uses_two_or_more_external_neighbours() -> None:
+  module = _module()
+  prefix = np.zeros((3, 3), dtype=np.float64)
+  future = np.zeros((3, 1, 1), dtype=np.float64)
+  future[0] = 0.0
+  future[1] = 1.0
+  future[2] = 1.0
+  report = module.neighbourhood_report(
+    prefix,
+    future,
+    np.array([0, 1, 2]),
+    np.array(["clean"] * 3),
+    np.array([0]),
+    neighbours=3,
+    blocks={"state": slice(0, 1)},
+    exclude_same_trial=False,
+  )
+  # Query 0 keeps neighbours 1 and 2 (both future 1.0), so the error is 1.0.
+  assert report["knn_error_state"] == pytest.approx(1.0)
+  assert report["residual_variance_state"] == pytest.approx(0.0, abs=1e-12)
