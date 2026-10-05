@@ -124,6 +124,7 @@ def neighbourhood_report(
   neighbours: int,
   blocks: dict[str, slice],
   exclude_same_trial: bool = True,
+  pool_mask: np.ndarray | None = None,
 ) -> dict[str, object]:
   """Residual future spread among near-identical prefixes from other trials."""
   # Coerce once: integer-array indexing needs real arrays, not lists.
@@ -184,6 +185,14 @@ def neighbourhood_report(
       # to 40 of 41 timesteps and would make the future look trivially predictable.
       same_trial = trial[selection, None] == trial[None, :]
       distances[same_trial] = np.inf
+    if pool_mask is not None:
+      # Restrict the neighbour pool (e.g. to training windows) so the baseline
+      # cannot be helped by a neighbour from the query's own split.  This is what
+      # makes the number a train-only reference rather than an information bound.
+      allowed = np.asarray(pool_mask, dtype=bool)
+      if allowed.shape[0] != normalised.shape[0]:
+        raise ValueError("pool_mask length does not match the window rows")
+      distances = np.where(allowed[None, :], distances, np.inf)
     order = np.argsort(distances, axis=1)[:, :neighbours]
     rows = np.arange(len(selection))[:, None]
     chosen_distance = distances[rows, order]
@@ -279,6 +288,11 @@ def main() -> int:
   parser.add_argument("--cache-dir", type=Path, required=True)
   parser.add_argument("--out", type=Path, required=True)
   parser.add_argument("--neighbours", type=int, default=16)
+  parser.add_argument(
+    "--pool-split",
+    default=None,
+    help="restrict the neighbour pool to one split (e.g. train)",
+  )
   parser.add_argument("--max-queries", type=int, default=1500)
   args = parser.parse_args()
 
@@ -332,6 +346,7 @@ def main() -> int:
     "current_index": current_index,
     "state_dimension": state_dimension,
     "neighbours": args.neighbours,
+    "pool_split": args.pool_split,
     "alignment_check": alignment,
   }
   for label, mask in (
@@ -352,6 +367,9 @@ def main() -> int:
         phase,
         selected,
         neighbours=args.neighbours,
+        pool_mask=(
+          (split_of == args.pool_split) if args.pool_split is not None else None
+        ),
         blocks=blocks,
         exclude_same_trial=excluded,
       )

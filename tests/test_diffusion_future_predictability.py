@@ -291,3 +291,48 @@ def test_knn_error_uses_two_or_more_external_neighbours() -> None:
   # Query 0 keeps neighbours 1 and 2 (both future 1.0), so the error is 1.0.
   assert report["knn_error_state"] == pytest.approx(1.0)
   assert report["residual_variance_state"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_pool_mask_excludes_a_nearer_neighbour_from_another_split() -> None:
+  """A train-only pool must ignore the query's own split even when it is nearer.
+
+  W0 (query) and W1 share a prefix and are validation; W2/W3 share a different
+  prefix and are train. Unmasked the query keeps W1 (future 1) plus both train
+  windows (future 3), so the neighbour mean is 7/3; with a train-only pool W1 is
+  removed and the mean is 3.0, so the error goes 49/9 -> 9.0.
+  """
+  module = _module()
+  prefix = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [1.0, 1.0]])
+  future = np.array([[[0.0]], [[1.0]], [[3.0]], [[3.0]]])
+  trial = np.arange(4)
+  phase = np.array(["clean"] * 4)
+  args = dict(neighbours=4, blocks={"state": slice(0, 1)}, exclude_same_trial=False)
+  unmasked = module.neighbourhood_report(
+    prefix, future, trial, phase, np.array([0]), **args
+  )
+  assert unmasked["knn_error_state"] == pytest.approx(49.0 / 9.0)
+  masked = module.neighbourhood_report(
+    prefix,
+    future,
+    trial,
+    phase,
+    np.array([0]),
+    pool_mask=np.array([False, False, True, True]),
+    **args,
+  )
+  assert masked["knn_error_state"] == pytest.approx(9.0)
+
+
+def test_pool_mask_length_is_validated() -> None:
+  module = _module()
+  with pytest.raises(ValueError, match="pool_mask length"):
+    module.neighbourhood_report(
+      np.zeros((3, 2)),
+      np.zeros((3, 1, 1)),
+      np.arange(3),
+      np.array(["clean"] * 3),
+      np.array([0]),
+      neighbours=3,
+      blocks={"state": slice(0, 1)},
+      pool_mask=np.array([True, False]),
+    )
