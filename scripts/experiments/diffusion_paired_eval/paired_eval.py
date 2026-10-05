@@ -110,6 +110,26 @@ def _unique_identities(records: list[Any], name: str) -> tuple[dict, list]:
   return unique, ambiguous
 
 
+def estimated_reference_frame(record: Any) -> int:
+  """Estimate the motion frame a window covers: pair-family start + tick.
+
+  `pair_id` encodes `motion:seed:start_frame` (see `build_bulk_trials`), so the
+  rollout's start frame is its last integer group; a window at `start_tick` then
+  covers approximately `start_frame + start_tick` of the reference clip.  This is
+  an estimate used only to bucket windows by region, never an identity.
+  """
+  numbers = re.findall(r"(\d+)", str(record.pair_id))
+  start_frame = int(numbers[-1]) if numbers else -1
+  return start_frame + int(record.start_tick)
+
+
+def in_frame_range(record: Any, frame_range: str) -> bool:
+  """True when the estimated reference frame falls inside `LO:HI` (inclusive)."""
+  low, high = (int(part) for part in frame_range.split(":"))
+  frame = estimated_reference_frame(record)
+  return low <= frame <= high
+
+
 def load_arm(
   name: str,
   run_dir: Path,
@@ -219,6 +239,23 @@ def main() -> int:
     help="print per-arm window identity inventories and exit",
   )
   parser.add_argument("--max-windows", type=int, default=None)
+  parser.add_argument(
+    "--only-motion",
+    default=None,
+    help="keep only this canonical motion group (e.g. 001)",
+  )
+  parser.add_argument(
+    "--frame-range",
+    default=None,
+    metavar="LO:HI",
+    help="keep only windows whose estimated reference frame is in LO..HI",
+  )
+  parser.add_argument(
+    "--exclude-frame-range",
+    default=None,
+    metavar="LO:HI",
+    help="drop windows whose estimated reference frame is in LO..HI",
+  )
   args = parser.parse_args()
 
   device = torch.device(args.device)
@@ -320,6 +357,23 @@ def main() -> int:
   matched = [key for key in shared if perturbation_matches(key)]
   all_count, matched_count = len(shared), len(matched)
   shared = matched
+  filter_counts: dict[str, int] = {}
+  if args.only_motion is not None:
+    before = len(shared)
+    shared = [key for key in shared if key[0] == args.only_motion]
+    filter_counts["only_motion_removed"] = before - len(shared)
+  if args.frame_range is not None:
+    before = len(shared)
+    shared = [key for key in shared if in_frame_range(maps[0][key], args.frame_range)]
+    filter_counts["frame_range_removed"] = before - len(shared)
+  if args.exclude_frame_range is not None:
+    before = len(shared)
+    shared = [
+      key
+      for key in shared
+      if not in_frame_range(maps[0][key], args.exclude_frame_range)
+    ]
+    filter_counts["exclude_frame_range_removed"] = before - len(shared)
   if args.max_windows is not None:
     # Sample across every motion rather than truncating the sorted prefix.
     per_bucket: dict[str, list] = {}
@@ -355,6 +409,12 @@ def main() -> int:
       "shared_identity_only": all_count,
       "shared_with_matching_perturbation": matched_count,
       "excluded_perturbation_mismatch": all_count - matched_count,
+      "filters": {
+        "only_motion": args.only_motion,
+        "frame_range": args.frame_range,
+        "exclude_frame_range": args.exclude_frame_range,
+      },
+      "filter_counts": filter_counts,
       "groups": {f"{mn}|{p}": len(v) for (mn, p), v in sorted(groups.items())},
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
