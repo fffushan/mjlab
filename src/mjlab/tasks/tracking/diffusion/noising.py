@@ -32,21 +32,64 @@ def sample_levels(
   *,
   training_k: int,
   generator: torch.Generator,
+  mode: str = "uniform",
+  shift_gamma: float = 3.0,
+  logit_std: float = 1.0,
 ) -> Tensor:
-  """Sample inclusive integer diffusion levels independently per token."""
+  """Sample inclusive integer diffusion levels independently per token.
+
+  ``mode`` selects the level distribution.  ``uniform`` reproduces the frozen D2
+  behaviour exactly (including its single ``randint`` draw); the alternatives are
+  ablation arms that reallocate gradient between noise regimes:
+
+  ``logit_normal``
+    ``sigmoid(N(0, logit_std))``, which concentrates samples on mid noise.
+  ``low_noise``
+    ``u ** shift_gamma``, which concentrates samples on low noise (detail).
+  ``high_noise``
+    ``1 - u ** shift_gamma``, which concentrates samples on high noise
+    (structure).
+  """
   if training_k < 0:
     raise ValueError("training_k must be non-negative")
   normalized_shape = tuple(int(value) for value in shape)
   if any(value < 0 for value in normalized_shape):
     raise ValueError("level shape dimensions must be non-negative")
-  return torch.randint(
-    0,
-    training_k + 1,
-    normalized_shape,
-    generator=generator,
-    device=_generator_device(generator),
-    dtype=torch.long,
-  )
+  if mode == "uniform":
+    return torch.randint(
+      0,
+      training_k + 1,
+      normalized_shape,
+      generator=generator,
+      device=_generator_device(generator),
+      dtype=torch.long,
+    )
+  device = _generator_device(generator)
+  if mode == "logit_normal":
+    if logit_std <= 0.0:
+      raise ValueError("logit_std must be positive")
+    normal = torch.randn(
+      normalized_shape,
+      generator=generator,
+      device=device,
+      dtype=torch.float32,
+    )
+    fraction = torch.sigmoid(normal * float(logit_std))
+  elif mode in {"low_noise", "high_noise"}:
+    if shift_gamma <= 0.0:
+      raise ValueError("shift_gamma must be positive")
+    uniform = torch.rand(
+      normalized_shape,
+      generator=generator,
+      device=device,
+      dtype=torch.float32,
+    )
+    shifted = uniform ** float(shift_gamma)
+    fraction = shifted if mode == "low_noise" else 1.0 - shifted
+  else:
+    raise ValueError(f"unsupported level sampling mode {mode!r}")
+  levels = torch.round(fraction * float(training_k))
+  return levels.to(dtype=torch.long).clamp_(0, training_k)
 
 
 def _alpha_coefficients(

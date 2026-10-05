@@ -58,6 +58,14 @@ class TrainingConfig:
   eval_seed: int = 0
   ema_power: float = 0.75
   ema_max_decay: float = 0.9999
+  # Ablation surface.  Every default reproduces the frozen D2 behaviour, so an
+  # unmodified config trains exactly the artifact the D2 contract describes.
+  level_sampling: str = "uniform"
+  level_shift_gamma: float = 3.0
+  level_logit_std: float = 1.0
+  state_loss_weight: float = 1.0
+  latent_loss_weight: float = 1.0
+  checkpoint_every: int | None = None
 
   def validate(
     self, *, explicit_budget: bool = False, allow_long_run: bool = False
@@ -150,6 +158,33 @@ class TrainingConfig:
         "the test split is reserved for the final report and must never drive "
         "model selection"
       )
+    if self.level_sampling not in {
+      "uniform",
+      "logit_normal",
+      "low_noise",
+      "high_noise",
+    }:
+      raise TrainingConfigError(
+        "level_sampling must be uniform, logit_normal, low_noise or high_noise"
+      )
+    if float(self.level_shift_gamma) <= 0.0:
+      raise TrainingConfigError("level_shift_gamma must be positive")
+    if float(self.level_logit_std) <= 0.0:
+      raise TrainingConfigError("level_logit_std must be positive")
+    for name in ("state_loss_weight", "latent_loss_weight"):
+      value = getattr(self, name)
+      if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise TrainingConfigError(f"{name} must be finite")
+      if float(value) < 0.0:
+        raise TrainingConfigError(f"{name} must be non-negative")
+    if float(self.state_loss_weight) == 0.0 and float(self.latent_loss_weight) == 0.0:
+      raise TrainingConfigError("at least one loss weight must be positive")
+    if self.checkpoint_every is not None and (
+      isinstance(self.checkpoint_every, bool)
+      or not isinstance(self.checkpoint_every, int)
+      or self.checkpoint_every <= 0
+    ):
+      raise TrainingConfigError("checkpoint_every must be a positive integer")
 
   def as_dict(self) -> dict[str, object]:
     """Return the resolved scalar fields in stable serialization order."""
@@ -219,6 +254,9 @@ class TrainingConfig:
     evaluation = payload.get("eval", {})
     if not isinstance(evaluation, Mapping):
       raise TrainingConfigError("eval section must be a mapping")
+    ablation = payload.get("ablation", {})
+    if not isinstance(ablation, Mapping):
+      raise TrainingConfigError("ablation section must be a mapping")
 
     values: dict[str, Any] = {}
     field_names = set(cls.__dataclass_fields__)
@@ -237,6 +275,17 @@ class TrainingConfig:
       values["ema_power"] = ema["power"]
     if "max_decay" in ema:
       values["ema_max_decay"] = ema["max_decay"]
+    ablation_fields = {
+      "level_sampling",
+      "level_shift_gamma",
+      "level_logit_std",
+      "state_loss_weight",
+      "latent_loss_weight",
+      "checkpoint_every",
+    }
+    for name in sorted(ablation_fields):
+      if name in ablation:
+        values[name] = ablation[name]
     try:
       config = cls(**values)
     except (TypeError, ValueError) as exc:

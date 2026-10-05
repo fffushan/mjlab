@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -53,14 +54,60 @@ BASELINES = (
 )
 
 
-def _window_identity(record: Any) -> tuple[str, str, str, str, int]:
+def motion_key(motion_id: str) -> str:
+  """Canonical motion identity, independent of the collection's naming scheme.
+
+  The same physical clip appears as `tennis_000` in the published collection and
+  as `inc000` in the revision-2 collections (the `incXXX` suffix is defined to be
+  the tennis motion id), and one clip carries a `_ss` suffix, so the *first*
+  digit group is the stable identity rather than a trailing one.
+  """
+  match = re.search(r"(\d+)", str(motion_id))
+  return match.group(1) if match else str(motion_id)
+
+
+def trial_key(record: Any) -> str:
+  """Canonical trial id: `<motion>:<seed>:<start_frame>` with the motion renamed.
+
+  `pair_id`/`group_key` already encode the protocol coordinates, so replacing the
+  collection-local motion name keeps them comparable across collections.
+  """
+  raw = str(getattr(record, "pair_id", "") or getattr(record, "group_key", ""))
+  parts = raw.split(":")
+  if len(parts) == 3:
+    return ":".join([motion_key(parts[0]), parts[1], parts[2]])
+  return raw
+
+
+def _window_identity(record: Any) -> tuple[str, str, str, int]:
+  """Semantic identity of the underlying motion sample.
+
+  A window is only identified by its protocol coordinates: the motion, the
+  perturbation phase, the trial (seed and start frame), and the tick.  Without
+  the trial the key is many-to-one (85 ticks per trial and many trials per
+  motion/phase), and the raw motion name and pair id are dataset-local strings.
+  """
   return (
-    str(record.motion_id),
-    str(record.group_key),
+    motion_key(record.motion_id),
     str(record.phase),
-    str(record.pair_id),
+    trial_key(record),
     int(record.start_tick),
   )
+
+
+def _unique_identities(records: list[Any], name: str) -> tuple[dict, list]:
+  """Map identity -> record, excluding identities that are not one-to-one."""
+  buckets: dict[tuple[str, str, str, int], list[Any]] = {}
+  for record in records:
+    buckets.setdefault(_window_identity(record), []).append(record)
+  unique = {key: rows[0] for key, rows in buckets.items() if len(rows) == 1}
+  ambiguous = sorted(key for key, rows in buckets.items() if len(rows) > 1)
+  if ambiguous:
+    print(
+      f"  note: {name} has {len(ambiguous)} ambiguous identities (excluded), "
+      f"e.g. {ambiguous[0]}"
+    )
+  return unique, ambiguous
 
 
 def load_arm(
@@ -161,6 +208,16 @@ def main() -> int:
   parser.add_argument("--device", default="cuda:0")
   parser.add_argument("--checkpoint", default="checkpoint-best.pt")
   parser.add_argument("--out", type=Path, required=True)
+  parser.add_argument(
+    "--dry-run-identities",
+    action="store_true",
+    help="check the shared window set and exit before scoring anything",
+  )
+  parser.add_argument(
+    "--diagnose-identities",
+    action="store_true",
+    help="print per-arm window identity inventories and exit",
+  )
   parser.add_argument("--max-windows", type=int, default=None)
   args = parser.parse_args()
 
@@ -179,18 +236,136 @@ def main() -> int:
     for name, run_dir, contract, ckpt in specs
   ]
 
-  # Identical window set for every arm: intersect on stable provenance.
-  maps = [{_window_identity(r): r for r in arm["records"]} for arm in arms]
+  # Identical window set for every arm: intersect on semantic identity.
+  maps = []
+  for arm in arms:
+    unique, ambiguous = _unique_identities(arm["records"], arm["name"])
+    maps.append(unique)
+    arm["ambiguous_identities"] = len(ambiguous)
   shared = sorted(set.intersection(*(set(m) for m in maps)))
+
+  if args.diagnose_identities:
+    for arm in arms:
+      rows = arm["records"]
+      pairs: dict[tuple[str, str], list[int]] = {}
+      for record in rows:
+        pairs.setdefault((str(record.motion_id), str(record.phase)), []).append(
+          int(record.start_tick)
+        )
+      print(f"--- {arm['name']}: {len(rows)} windows, datasets={arm['dataset']}")
+      print(f"    distinct motion_ids: {sorted({str(r.motion_id) for r in rows})}")
+      print(f"    distinct phases: {sorted({str(r.phase) for r in rows})}")
+      for key, ticks in sorted(pairs.items()):
+        print(
+          "    %-24s n=%-5d ticks min=%d max=%d distinct=%d first=%s"
+          % (
+            ":".join(key),
+            len(ticks),
+            min(ticks),
+            max(ticks),
+            len(set(ticks)),
+            sorted(set(ticks))[:6],
+          )
+        )
+    print("--- candidate key overlaps (first arm vs last arm)")
+    first, last = arms[0]["records"], arms[-1]["records"]
+
+    def keyset(rows, fields):
+      out = set()
+      for record in rows:
+        values = {
+          "motion": str(record.motion_id),
+          "canon": motion_key(record.motion_id),
+          "phase": str(record.phase),
+          "tick": int(record.start_tick),
+          "pair": str(record.pair_id),
+          "trial": trial_key(record),
+          "group": str(record.group_key),
+        }
+        out.add(tuple(values[f] for f in fields))
+      return out
+
+    for fields in (
+      ("motion",),
+      ("canon",),
+      ("phase",),
+      ("tick",),
+      ("canon", "phase"),
+      ("canon", "tick"),
+      ("phase", "tick"),
+      ("canon", "phase", "tick"),
+      ("canon", "phase", "trial"),
+      ("canon", "phase", "trial", "tick"),
+    ):
+      a, b = keyset(first, fields), keyset(last, fields)
+      print(
+        "    %-28s first=%-6d last=%-6d shared=%d"
+        % ("+".join(fields), len(a), len(b), len(a & b))
+      )
+    for arm in arms:
+      sample = sorted({str(r.pair_id) for r in arm["records"]})[:3]
+      group = sorted({str(r.group_key) for r in arm["records"]})[:3]
+      print(f"    {arm['name']} pair_id sample={sample} group_key sample={group}")
+    return 0
+
+  # A window is only the same physical sample if its perturbation matches too.
+  def perturbation_matches(key) -> bool:
+    reference = float(maps[0][key].ou_noise_norm)
+    for other in maps[1:]:
+      value = float(other[key].ou_noise_norm)
+      if abs(value - reference) > 1e-9 * max(1.0, abs(reference)):
+        return False
+    return True
+
+  matched = [key for key in shared if perturbation_matches(key)]
+  all_count, matched_count = len(shared), len(matched)
+  shared = matched
   if args.max_windows is not None:
-    shared = shared[: args.max_windows]
+    # Sample across every motion rather than truncating the sorted prefix.
+    per_bucket: dict[str, list] = {}
+    for key in shared:
+      per_bucket.setdefault(key[0], []).append(key)
+    quota = max(1, args.max_windows // max(1, len(per_bucket)))
+    sampled: list = []
+    for keys in per_bucket.values():
+      sampled.extend(keys[:quota])
+    shared = sorted(sampled)
   if not shared:
     raise SystemExit("no window identities are shared by the arms")
 
   per_arm_records = [[m[key] for key in shared] for m in maps]
   groups: dict[tuple[str, str], list[int]] = {}
   for index, key in enumerate(shared):
-    groups.setdefault((key[0], key[2]), []).append(index)
+    groups.setdefault((key[0], key[1]), []).append(index)
+
+  if args.dry_run_identities:
+    payload = {
+      "dry_run": True,
+      "split": args.split,
+      "arms": {
+        arm["name"]: {
+          "checkpoint": arm["checkpoint"],
+          "dataset": arm["dataset"],
+          "records": len(arm["records"]),
+          "unique_identities": len(m),
+          "ambiguous_identities": arm["ambiguous_identities"],
+        }
+        for arm, m in zip(arms, maps, strict=True)
+      },
+      "shared_identity_only": all_count,
+      "shared_with_matching_perturbation": matched_count,
+      "excluded_perturbation_mismatch": all_count - matched_count,
+      "groups": {f"{mn}|{p}": len(v) for (mn, p), v in sorted(groups.items())},
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(payload["groups"], indent=2, sort_keys=True))
+    print(
+      f"  shared identities: {all_count}; matching perturbation: {matched_count}; "
+      f"excluded: {all_count - matched_count}"
+    )
+    print(f"report: {args.out}")
+    return 0
 
   overall: dict[str, Any] = {}
   by_group: dict[str, Any] = {}
@@ -209,7 +384,29 @@ def main() -> int:
     "checkpoint": args.checkpoint,
     "reference_arm": reference,
     "window_identities": {
+      "identity_fields": [
+        "motion_id_canonical(first digits)",
+        "phase",
+        "trial_canonical(motion:seed:start_frame)",
+        "start_tick",
+      ],
+      "motion_ids": {
+        arm["name"]: {
+          str(key): str(value)
+          for key, value in sorted(
+            {r.motion_id: motion_key(r.motion_id) for r in arm["records"]}.items()
+          )
+        }
+        for arm in arms
+      },
       "per_arm": {arm["name"]: len(arm["records"]) for arm in arms},
+      "per_arm_unique": {
+        arm["name"]: len(m) for arm, m in zip(arms, maps, strict=True)
+      },
+      "per_arm_ambiguous": {arm["name"]: arm["ambiguous_identities"] for arm in arms},
+      "shared_identity_only": all_count,
+      "shared_with_matching_perturbation": matched_count,
+      "excluded_perturbation_mismatch": all_count - matched_count,
       "shared": len(shared),
       "groups": {f"{m}|{p}": len(v) for (m, p), v in sorted(groups.items())},
     },
@@ -225,6 +422,7 @@ def main() -> int:
         "metrics": {
           label: overall[arm["name"]]["metrics"].get(key) for key, label in SCORED
         },
+        "all_metrics": overall[arm["name"]]["metrics"],
         "baselines": {
           key: overall[arm["name"]]["metrics"].get(key) for key in BASELINES
         },
@@ -233,6 +431,10 @@ def main() -> int:
     },
     "paired": {},
     "per_group": {},
+    "per_group_all_metrics": {
+      group: {name: per_arm[name].get("metrics", {}) for name in per_arm}
+      for group, per_arm in by_group.items()
+    },
   }
 
   for name in [arm["name"] for arm in arms[1:]]:

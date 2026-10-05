@@ -357,6 +357,10 @@ class DiffusionTrainer:
     self.best_metric_split: str | None = None
     self._last_train_loss: float | None = None
     self._resume_state: CheckpointState | None = None
+    # First global step at which a periodic checkpoint is due.  Unlike best/last
+    # these exist so the validation curve and its optimum stay inspectable.
+    every = self.config.checkpoint_every
+    self._next_periodic = every if every is not None else 0
 
     _set_seed(self.config.seed)
     if resume is not None:
@@ -380,6 +384,9 @@ class DiffusionTrainer:
       self.best_metric_split = state.best_metric_split
       self._fp32_checked = state.fp32_checked
       self._resume_state = state
+      every = self.config.checkpoint_every
+      if every is not None:
+        self._next_periodic = (self.global_step // every + 1) * every
 
     self._updates_per_epoch = self._updates_for_samples(self._epoch_sample_count())
     self._resolved_updates = self.config.resolved_updates(self._updates_per_epoch)
@@ -515,11 +522,17 @@ class DiffusionTrainer:
       (batch, self.contract.window_steps),
       training_k=self.schedule.training_k,
       generator=self.noise_generator,
+      mode=self.config.level_sampling,
+      shift_gamma=self.config.level_shift_gamma,
+      logit_std=self.config.level_logit_std,
     ).to(self.device)
     k_latent = sample_levels(
       (batch, self.contract.window_steps),
       training_k=self.schedule.training_k,
       generator=self.noise_generator,
+      mode=self.config.level_sampling,
+      shift_gamma=self.config.level_shift_gamma,
+      logit_std=self.config.level_logit_std,
     ).to(self.device)
     noised = add_independent_noise(
       clean[..., : self.contract.projected_state_dimension],
@@ -539,7 +552,27 @@ class DiffusionTrainer:
         prediction = self.model(noised.tokens, step_ids)
       _finite_tensor(prediction, "denoiser output")
     target = x0_target(clean)
-    loss = F.mse_loss(prediction.float(), target, reduction="mean")
+    state_weight = float(self.config.state_loss_weight)
+    latent_weight = float(self.config.latent_loss_weight)
+    if state_weight == 1.0 and latent_weight == 1.0:
+      # Unmodified path: keep the frozen D2 objective byte-identical.
+      loss = F.mse_loss(prediction.float(), target, reduction="mean")
+    else:
+      # Block-weighted replacement for the plain mean.  The denominator keeps
+      # the objective on the same per-channel scale as the unmodified loss so
+      # learning rates stay comparable across arms.
+      difference = (prediction.float() - target).square()
+      split = self.contract.projected_state_dimension
+      state_squared = difference[..., :split]
+      latent_squared = difference[..., split:]
+      denominator = state_weight * state_squared.numel() + latent_weight * (
+        latent_squared.numel()
+      )
+      if denominator <= 0.0:
+        raise TrainerError("at least one loss weight must be positive")
+      loss = (
+        state_weight * state_squared.sum() + latent_weight * latent_squared.sum()
+      ) / denominator
     _finite_tensor(loss, "loss")
     return loss, prediction.float(), target, k_state, k_latent
 
@@ -641,6 +674,14 @@ class DiffusionTrainer:
             )
             metrics_file.flush()
             pending = []
+            every = self.config.checkpoint_every
+            if every is not None and self.global_step >= self._next_periodic:
+              checkpoint_paths["periodic"] = self._save(
+                f"checkpoint-iter-{self.global_step:06d}.pt",
+                epoch=epoch,
+                best_validation_loss=self.best_validation_loss,
+              )
+              self._next_periodic = (self.global_step // every + 1) * every
         if pending:
           # This is defensive: the normal last-batch flush above handles a
           # partial final group, but never discard gradients if a custom loader
