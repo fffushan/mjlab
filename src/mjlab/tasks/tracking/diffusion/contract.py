@@ -38,19 +38,37 @@ _D1_INC12_CONTRACT_SHA = (
 _VAE_SHA = "69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117"
 _INC12_VAE_SHA = "22a650bcba7375bca4578c229554ea3c93c357244919ea83d7ba1b6878282a4d"
 _INC12_VAE_PATH = "logs/distillation/vae-inc-a-12t-nc/checkpoint-final.pt"
+# Revision 3 repins only the frozen VAE again: the 30-teacher
+# increased-perturbation student (`inc000`-`inc011`, `inc013`-`inc030`) instead of
+# the 12-teacher one.  Representation, window, split, normalization and
+# qualification semantics are unchanged, so both earlier revisions stay loadable
+# and comparable.
+_INC30_VAE_SHA = "4a90bbdf76028d3cbe56cfcfbce9604ef96ce7b5ab5e0a7c241235be6f2dee0e"
+_INC30_VAE_PATH = "logs/distillation/vae-inc-all-30t-nc/checkpoint-final.pt"
+_D0_INC30_CONTRACT_SHA = (
+  "14319f177b9022205365c472544dd57850c00f04cf16214341f0c013cfc1911a"
+)
+_D1_INC30_CONTRACT_SHA = (
+  "95a72864773087b8ee711da14d324ca2c26b6654fea92122026987038d126202"
+)
 # Every approved (path, sha256) VAE pair.  Membership is checked when a contract
 # is decoded from YAML, so an unregistered VAE still fails closed.
 _APPROVED_VAE_IDENTITIES: frozenset[tuple[str, str]] = frozenset(
   {
     ("logs/distillation/mixed-10k/checkpoint-final.pt", _VAE_SHA),
     (_INC12_VAE_PATH, _INC12_VAE_SHA),
+    (_INC30_VAE_PATH, _INC30_VAE_SHA),
   }
 )
 # Approved contract *file* digests per schema.  A new revision must be
 # registered here before any command will read it.
 _CONTRACT_SHAS_BY_SCHEMA: dict[str, frozenset[str]] = {
-  _LEGACY_SCHEMA: frozenset({_D0_CONTRACT_SHA, _D0_INC12_CONTRACT_SHA}),
-  _SCHEMA: frozenset({_D1_NO_MIXTURES_CONTRACT_SHA, _D1_INC12_CONTRACT_SHA}),
+  _LEGACY_SCHEMA: frozenset(
+    {_D0_CONTRACT_SHA, _D0_INC12_CONTRACT_SHA, _D0_INC30_CONTRACT_SHA}
+  ),
+  _SCHEMA: frozenset(
+    {_D1_NO_MIXTURES_CONTRACT_SHA, _D1_INC12_CONTRACT_SHA, _D1_INC30_CONTRACT_SHA}
+  ),
 }
 _RECOVERY_SHA = "caf17c38f23ad180829a230a9a3259f14eedd3860dd90a046b8be92d3d047681"
 _XML_SHA = "ae0dcbceda3ef74e029e3bf4a9ea24ea8cc58ab44f1518e635653fc79f928125"
