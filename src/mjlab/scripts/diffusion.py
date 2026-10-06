@@ -32,6 +32,11 @@ DEFAULT_CONFIG_PATH = Path("configs/diffusion/x2_50hz_collection.yaml")
 # configs/diffusion/x2_50hz_collection.yaml; these are the outer limits, raised
 # for the post-pilot bulk collection after the pilot's budgets were reviewed.
 MAX_COLLECTION_TRIALS = 5_000
+# Per-trial no-progress tolerance.  The CLI default stays at 120 s, but a longer
+# explicit value is allowed: a shared-storage stall of about ten minutes stopped a
+# 2565-trial collection at 47.8% (2026-10-06), and --max-wall-minutes already
+# bounds a genuine hang.
+MAX_MONITOR_INACTIVITY_SECONDS = 1_800
 
 
 @dataclass(frozen=True)
@@ -320,7 +325,12 @@ def _validate_resource_budgets(args: argparse.Namespace) -> str | None:
     ("max_envs", args.max_envs, 1, 8),
     ("max_gpus", args.max_gpus, 1, 1),
     ("max_wall_minutes", args.max_wall_minutes, 1, 720),
-    ("monitor_inactivity_seconds", args.monitor_inactivity_seconds, 1, 120),
+    (
+      "monitor_inactivity_seconds",
+      args.monitor_inactivity_seconds,
+      1,
+      MAX_MONITOR_INACTIVITY_SECONDS,
+    ),
     ("max_output_mib", args.max_output_mib, 1, 4096),
   )
   for name, value, lower, upper in limits:

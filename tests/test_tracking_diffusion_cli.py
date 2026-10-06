@@ -109,6 +109,46 @@ def test_cli_rejects_multi_environment_budget_until_identity_is_carried() -> Non
   assert "max_envs" in budget_result
 
 
+def test_cli_allows_a_longer_monitor_tolerance_but_bounds_it() -> None:
+  """A stall longer than the default tolerance stopped a real collection.
+
+  The default stays at 120 s.  A longer explicit value must validate, because a
+  shared-storage stall of about ten minutes stopped a 2565-trial collection
+  (2026-10-06), and the ceiling must still refuse an effectively unbounded value.
+  """
+  parser = diffusion.build_parser()
+  longer = parser.parse_args(
+    [
+      "collect",
+      "--output",
+      "store",
+      "--report",
+      "report.json",
+      "--monitor-inactivity-seconds",
+      "900",
+    ]
+  )
+  assert diffusion._validate_resource_budgets(longer) is None
+  too_long = parser.parse_args(
+    [
+      "collect",
+      "--output",
+      "store",
+      "--report",
+      "report.json",
+      "--monitor-inactivity-seconds",
+      "1801",
+    ]
+  )
+  result = diffusion._validate_resource_budgets(too_long)
+  assert result is not None
+  assert "monitor_inactivity_seconds" in result
+  default = parser.parse_args(
+    ["collect", "--output", "store", "--report", "report.json"]
+  )
+  assert default.monitor_inactivity_seconds == 120
+
+
 def test_cli_collect_rejects_a_standalone_transition_budget() -> None:
   """The transition count comes from the schedule, not a separate cap.
 
