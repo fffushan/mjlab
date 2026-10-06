@@ -109,6 +109,36 @@ def test_cli_rejects_multi_environment_budget_until_identity_is_carried() -> Non
   assert "max_envs" in budget_result
 
 
+def test_cli_collect_rejects_a_standalone_transition_budget() -> None:
+  """The transition count comes from the schedule, not a separate cap.
+
+  A hand-set cap smaller than a worker's shard silently truncated a real
+  collection (2026-10-06), so the CLI must not accept one and the collection
+  path must not expose a constant for it.
+  """
+  parser = diffusion.build_parser()
+  try:
+    parser.parse_args(
+      [
+        "collect",
+        "--output",
+        "store",
+        "--report",
+        "report.json",
+        "--max-control-transitions",
+        "600000",
+      ]
+    )
+  except SystemExit:
+    pass
+  else:  # pragma: no cover
+    raise AssertionError("a standalone transition budget was accepted")
+  args = parser.parse_args(["collect", "--output", "store", "--report", "report.json"])
+  assert not hasattr(args, "max_control_transitions")
+  assert not hasattr(diffusion, "MAX_COLLECTION_TRANSITIONS")
+  assert diffusion._validate_resource_budgets(args) is None
+
+
 def test_collection_config_rejects_multi_environment_budget(tmp_path: Path) -> None:
   config = tmp_path / "collection.yaml"
   config.write_text(

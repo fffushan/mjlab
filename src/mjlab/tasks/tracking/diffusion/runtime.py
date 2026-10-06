@@ -24,7 +24,7 @@ class CollectionRequest:
   output: Path
   trials: tuple[Any, ...]
   max_trials: int
-  max_control_transitions: int
+  max_control_transitions: int | None
   max_envs: int
   max_gpus: int
   max_wall_minutes: int

@@ -32,7 +32,6 @@ DEFAULT_CONFIG_PATH = Path("configs/diffusion/x2_50hz_collection.yaml")
 # configs/diffusion/x2_50hz_collection.yaml; these are the outer limits, raised
 # for the post-pilot bulk collection after the pilot's budgets were reviewed.
 MAX_COLLECTION_TRIALS = 5_000
-MAX_COLLECTION_TRANSITIONS = 600_000
 
 
 @dataclass(frozen=True)
@@ -318,12 +317,6 @@ def _load_collection_config(path: Path) -> dict[str, Any]:
 def _validate_resource_budgets(args: argparse.Namespace) -> str | None:
   limits = (
     ("max_trials", args.max_trials, 1, MAX_COLLECTION_TRIALS),
-    (
-      "max_control_transitions",
-      args.max_control_transitions,
-      1,
-      MAX_COLLECTION_TRANSITIONS,
-    ),
     ("max_envs", args.max_envs, 1, 8),
     ("max_gpus", args.max_gpus, 1, 1),
     ("max_wall_minutes", args.max_wall_minutes, 1, 720),
@@ -469,9 +462,7 @@ def _command_collect(args: argparse.Namespace) -> int:
   from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
 
   contract = _load_contract(args.contract)
-  store = AppendOnlyShardStore(
-    args.output, contract=contract, max_total_rows=args.max_control_transitions
-  )
+  store = AppendOnlyShardStore(args.output, contract=contract, max_total_rows=None)
   trial_specs: tuple[Any, ...] = ()
   request = CollectionRequest(
     contract,
@@ -479,7 +470,9 @@ def _command_collect(args: argparse.Namespace) -> int:
     args.output,
     trial_specs,
     args.max_trials,
-    args.max_control_transitions,
+    # No separate transition cap: the schedule and qualification.control_steps
+    # determine how many transitions a collection produces.
+    None,
     args.max_envs,
     args.max_gpus,
     args.max_wall_minutes,
@@ -542,9 +535,8 @@ def _command_collect(args: argparse.Namespace) -> int:
         )
         continue
       ou_attempted += 1
-    remaining = args.max_control_transitions - transitions
     trial_started = time.monotonic()
-    result = bundle.collector.collect(spec, remaining_transitions=remaining)
+    result = bundle.collector.collect(spec)
     trial_elapsed = time.monotonic() - trial_started
     transitions += result.qualification.steps
     if spec.phase == "clean":
@@ -556,8 +548,6 @@ def _command_collect(args: argparse.Namespace) -> int:
       partial_reason = "inactivity_limit"
       results.append({"phase": "monitor", "reason": partial_reason})
       break
-    if transitions > args.max_control_transitions:
-      raise RuntimeError("control-transition budget exceeded by runtime factory")
     results.append(
       {
         "run_id": spec.run_id,
@@ -1133,7 +1123,6 @@ def build_parser() -> argparse.ArgumentParser:
   collect.add_argument("--output", type=Path, required=True)
   collect.add_argument("--report", type=Path, required=True)
   collect.add_argument("--max-trials", type=int, default=1)
-  collect.add_argument("--max-control-transitions", type=int, default=250)
   collect.add_argument("--max-envs", type=int, default=1)
   collect.add_argument("--max-gpus", type=int, default=1)
   collect.add_argument("--max-wall-minutes", type=int, default=1)
