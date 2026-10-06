@@ -13,6 +13,7 @@ import torch
 
 from mjlab.tasks.tracking.diffusion import (
   DEFAULT_CONTRACT,
+  DatasetError,
   DatasetSource,
   DiffusionContract,
   LoadedDataset,
@@ -20,12 +21,105 @@ from mjlab.tasks.tracking.diffusion import (
   WindowCacheError,
   WindowRecord,
   build_token_cache,
+  dataset_token_cache_path,
   iter_window_provenance,
   load_window_records,
+  token_cache_identity_key,
 )
 
 PILOT = Path("logs/diffusion/d1-pilot-20260930b")
 CONTRACT_YAML = Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml")
+
+
+def _dataset_owned_copy(tmp_path: Path, source: DatasetSource) -> DatasetSource:
+  """A dataset directory that shares the store but owns its offline directory."""
+  dataset = tmp_path / "owned-dataset"
+  (dataset / "offline").mkdir(parents=True, exist_ok=True)
+  (dataset / "store").symlink_to((source.directory / "store").resolve())
+  for name in ("assignments.json", "dataset.json", "projection.npz"):
+    origin = source.directory / "offline" / name
+    (dataset / "offline" / name).write_bytes(origin.read_bytes())
+  return DatasetSource(dataset, source.contract_path)
+
+
+def test_token_cache_identity_key_is_stable_and_identity_sensitive() -> None:
+  base = {
+    "source_hash": "a" * 64,
+    "split": "train",
+    "contract_hash": "c" * 64,
+    "projection_hash": "e" * 64,
+  }
+  key = token_cache_identity_key(**base)
+  assert key == token_cache_identity_key(**base)
+  assert len(key) == 16
+  assert all(character in "0123456789abcdef" for character in key)
+  for field, value in (
+    ("source_hash", "b" * 64),
+    ("split", "test"),
+    ("contract_hash", "d" * 64),
+    ("projection_hash", "f" * 64),
+  ):
+    changed = dict(base)
+    changed[field] = value
+    assert token_cache_identity_key(**changed) != key, field
+  assert token_cache_identity_key(**base, dtype=np.float64) != key
+  assert token_cache_identity_key(**base, motion_ids=["tennis_000"]) != key
+  assert token_cache_identity_key(**base, limit=10) != key
+  # A motion filter is a set, so its order must not change the key.
+  assert token_cache_identity_key(**base, motion_ids=["b", "a"]) == (
+    token_cache_identity_key(**base, motion_ids=["a", "b"])
+  )
+  with pytest.raises(DatasetError, match="unknown split"):
+    token_cache_identity_key(**{**base, "split": "unknown"})
+
+
+def test_dataset_token_cache_path_is_owned_by_the_dataset_and_keyed() -> None:
+  source = _source()
+  loaded = source.load()
+  path = dataset_token_cache_path(source, loaded, "train")
+  # The cache belongs to the dataset offline directory, not to a training run.
+  assert path.parent == source.directory / "offline"
+  assert path.suffix == ".npy"
+  # The audit in evaluation.py globs offline/tokens-*.npy, so the name must match.
+  assert path.match("tokens-*.npy")
+  prefix, key = path.stem.rsplit("-", 1)
+  assert prefix == "tokens-train"
+  assert len(key) == 16
+  # The key alone names the identity, and the resolver is deterministic.
+  assert path == source.token_cache_path("train", key)
+  assert dataset_token_cache_path(source, loaded, "train") == path
+  # A different split or motion filter must not collide with this path.
+  assert dataset_token_cache_path(source, loaded, "test") != path
+  filtered = dataset_token_cache_path(
+    source, loaded, "train", motion_ids=["tennis_000"]
+  )
+  assert filtered != path
+  assert filtered.parent == path.parent
+
+
+def test_dataset_scoped_cache_builds_once_and_is_reused(tmp_path) -> None:
+  owned = _dataset_owned_copy(tmp_path, _source())
+  loaded = owned.load()
+  path = dataset_token_cache_path(owned, loaded, "train", motion_ids=["tennis_000"])
+  assert not path.exists()
+  first_path, first_count = build_token_cache(
+    owned, "train", path, motion_ids=["tennis_000"]
+  )
+  assert first_path == path
+  assert path.with_suffix(".json").is_file()
+  before = path.stat()
+  second_path, second_count = build_token_cache(
+    owned, "train", path, motion_ids=["tennis_000"]
+  )
+  after = second_path.stat()
+  assert second_path == path
+  assert second_count == first_count
+  # Reuse must not rewrite the file.
+  assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+  # Every cache in the dataset offline directory matches the audit glob.
+  assert [cache.name for cache in sorted(path.parent.glob("tokens-*.npy"))] == [
+    path.name
+  ]
 
 
 def _source() -> DatasetSource:

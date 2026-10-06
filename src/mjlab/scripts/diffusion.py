@@ -458,6 +458,59 @@ def _command_stats(args: argparse.Namespace) -> int:
   return 0
 
 
+def _command_build_token_cache(args: argparse.Namespace) -> int:
+  """Build or validate the dataset-owned token cache for the requested splits.
+
+  The cache is derived metadata, so the dataset owns it.  A run that finds a
+  valid cache validates it and reuses it, so only the first build is expensive.
+  """
+  import time
+
+  from mjlab.tasks.tracking.diffusion.window_dataset import (
+    _DEFAULT_MAX_CACHE_GIB,
+    DatasetSource,
+    build_token_cache,
+    dataset_token_cache_path,
+  )
+
+  source = DatasetSource(Path(args.dataset_dir), Path(args.contract))
+  loaded = source.load()
+  requested = [value.strip() for value in str(args.splits).split(",") if value.strip()]
+  ceiling = _DEFAULT_MAX_CACHE_GIB if args.max_cache_gib is None else args.max_cache_gib
+  payload: dict[str, object] = {"dataset": str(source.directory), "splits": {}}
+  entries: dict[str, object] = payload["splits"]  # type: ignore[assignment]
+  for split in requested:
+    path = dataset_token_cache_path(source, loaded, split, motion_ids=args.motion)
+    metadata_path = path.with_suffix(".json")
+    existed = path.is_file() and metadata_path.is_file()
+    started = time.perf_counter()
+    cache_path, count = build_token_cache(
+      source,
+      split,
+      path,
+      motion_ids=args.motion,
+      max_cache_gib=ceiling,
+    )
+    seconds = round(time.perf_counter() - started, 1)
+    print(
+      f"token cache {split}: {cache_path} windows={count} "
+      f"{'reused' if existed else 'built'} in {seconds}s",
+      flush=True,
+    )
+    entries[split] = {
+      "path": str(cache_path),
+      "windows": count,
+      "reused": existed,
+      "seconds": seconds,
+      "bytes": cache_path.stat().st_size if cache_path.is_file() else None,
+    }
+  if args.json is not None:
+    Path(args.json).write_text(
+      json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+  return 0
+
+
 def _command_build_index(args: argparse.Namespace) -> int:
   """Build and persist the window index that belongs to a dataset.
 
@@ -486,6 +539,26 @@ def _command_build_index(args: argparse.Namespace) -> int:
     store, assignments, jobs=args.jobs, contract=contract
   )
   built_seconds = time.perf_counter() - started
+
+  # Refuse to persist an index whose coverage disagrees with the dataset
+  # manifest: this is the check that caught a partition that silently dropped
+  # windows, and it must run before anything is written.
+  manifest_path = dataset / "offline" / "dataset.json"
+  if manifest_path.is_file():
+    recorded = {
+      str(key): int(value)
+      for key, value in json.loads(manifest_path.read_text(encoding="utf-8"))[
+        "windows"
+      ].items()
+    }
+    actual = index.coverage()
+    if recorded != actual:
+      print(
+        "refusing to persist a window index whose coverage differs from "
+        f"dataset.json: expected {recorded}, got {actual}",
+        file=sys.stderr,
+      )
+      return 1
 
   path = window_index_path(dataset)
   record = save_window_index(
@@ -737,6 +810,7 @@ def _command_train(args: argparse.Namespace) -> int:
       _projection_identity,
       _source_dataset_hash,
       build_token_cache,
+      dataset_token_cache_path,
       iter_window_provenance,
       load_window_records,
     )
@@ -797,22 +871,22 @@ def _command_train(args: argparse.Namespace) -> int:
 
     def make_dataset(split: str) -> tuple[Any, list[Any], Path | None]:
       if args.cache_tokens:
-        if selected_motions:
-          suffix = hashlib.sha256(
-            "\\0".join(sorted(selected_motions)).encode("utf-8")
-          ).hexdigest()[:12]
-        else:
-          suffix = "all"
-        path = output_dir / f"tokens-{split}-{suffix}.npy"
+        # The cache belongs to the dataset: it is a function of the stored rows,
+        # the contract and the projection only, so every run over this dataset
+        # shares one file instead of rebuilding a private copy per run.
+        path = dataset_token_cache_path(
+          source,
+          loaded,
+          split,
+          motion_ids=selected_motions,
+        )
         cache_path, cache_count = build_token_cache(
           source,
           split,
           path,
           motion_ids=selected_motions,
           max_cache_gib=(
-            _DEFAULT_MAX_CACHE_GIB
-            if args.max_cache_gib is None
-            else args.max_cache_gib
+            _DEFAULT_MAX_CACHE_GIB if args.max_cache_gib is None else args.max_cache_gib
           ),
         )
         provenance = list(
@@ -1253,6 +1327,32 @@ def build_parser() -> argparse.ArgumentParser:
   )
   index.add_argument("--json", type=Path)
   index.set_defaults(handler=_command_build_index)
+
+  token_cache = commands.add_parser(
+    "build-token-cache",
+    help="build or validate the dataset-owned token cache",
+  )
+  token_cache.add_argument("--dataset-dir", type=Path, required=True)
+  token_cache.add_argument("--contract", type=Path, required=True)
+  token_cache.add_argument(
+    "--splits",
+    default="train,validation,test",
+    help="comma-separated split names",
+  )
+  token_cache.add_argument(
+    "--motion",
+    action="append",
+    default=None,
+    help="limit the cache to these motion ids; repeatable",
+  )
+  token_cache.add_argument(
+    "--max-cache-gib",
+    type=float,
+    default=None,
+    help="ceiling for a single cache; the module constant applies by default",
+  )
+  token_cache.add_argument("--json", type=Path)
+  token_cache.set_defaults(handler=_command_build_token_cache)
 
   evaluate = commands.add_parser(
     "evaluate-offline", help="score a checkpoint without constructing a simulator"

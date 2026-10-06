@@ -130,9 +130,11 @@ from .window_dataset import (
   WindowProvenance,
   WindowRecord,
   build_token_cache,
+  dataset_token_cache_path,
   iter_window_provenance,
   load_window_records,
   sampling_weights,
+  token_cache_identity_key,
 )
 
 __all__ = [
@@ -238,8 +240,10 @@ __all__ = [
   "WindowProvenance",
   "WindowRecord",
   "build_token_cache",
+  "dataset_token_cache_path",
   "iter_window_provenance",
   "load_window_records",
   "sampling_weights",
+  "token_cache_identity_key",
   "x0_target",
 ]

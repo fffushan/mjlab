@@ -157,10 +157,15 @@ class DatasetSource:
         f"window coverage differs from dataset.json: expected {expected}, got {actual}"
       )
 
-  def token_cache_path(self, split: str) -> Path:
-    """Return the conventional sibling ``.npy`` path for a split cache."""
+  def token_cache_path(self, split: str, key: str | None = None) -> Path:
+    """Return the dataset-scoped ``.npy`` path for a split cache.
+
+    A key names one cache identity, so a different dataset, contract or
+    projection can never resolve to the same file.
+    """
     _validate_split(split)
-    return self.directory / "offline" / f"tokens-{split}.npy"
+    name = f"tokens-{split}.npy" if key is None else f"tokens-{split}-{key}.npy"
+    return self.directory / "offline" / name
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +427,64 @@ def _source_dataset_hash(source: DatasetSource, loaded: LoadedDataset) -> str:
   return _sha256_bytes(
     json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
   )
+
+
+def token_cache_identity_key(
+  *,
+  source_hash: str,
+  split: str,
+  contract_hash: str,
+  projection_hash: str,
+  dtype: Any = np.float32,
+  motion_ids: Sequence[str] | None = None,
+  limit: int | None = None,
+) -> str:
+  """Return a short key that names one token-cache identity.
+
+  The key becomes part of the file name.  Two identities therefore cannot
+  share a path, and a stale cache cannot be mistaken for the wanted one.
+  """
+  _validate_split(split)
+  selected = _normalise_motion_ids(motion_ids)
+  payload = {
+    "format": _CACHE_VERSION,
+    "source_dataset_hash": source_hash,
+    "split": split,
+    "contract_hash": contract_hash,
+    "projection_hash": projection_hash,
+    "dtype": np.dtype(dtype).str,
+    "motion_ids": None if selected is None else list(selected),
+    "limit": limit,
+  }
+  encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+  return _sha256_bytes(encoded)[:16]
+
+
+def dataset_token_cache_path(
+  source: DatasetSource,
+  loaded: LoadedDataset,
+  split: str,
+  *,
+  dtype: Any = np.float32,
+  motion_ids: Sequence[str] | None = None,
+  limit: int | None = None,
+) -> Path:
+  """Resolve the dataset-scoped token-cache path for this source identity.
+
+  The cache belongs to the dataset, not to one training run.  It is a function
+  of the stored rows, the contract and the projection, so every run over the
+  same dataset shares it.
+  """
+  key = token_cache_identity_key(
+    source_hash=_source_dataset_hash(source, loaded),
+    split=split,
+    contract_hash=loaded.contract.identity_hash(),
+    projection_hash=_projection_identity(loaded.projection),
+    dtype=dtype,
+    motion_ids=motion_ids,
+    limit=limit,
+  )
+  return source.token_cache_path(split, key)
 
 
 def _cache_metadata(
@@ -869,7 +932,9 @@ __all__ = [
   "WindowProvenance",
   "WindowRecord",
   "build_token_cache",
+  "dataset_token_cache_path",
   "iter_window_provenance",
   "load_window_records",
   "sampling_weights",
+  "token_cache_identity_key",
 ]
