@@ -1,0 +1,29 @@
+8 files already formatted
+All checks passed!
+warning[possibly-missing-attribute]: Attribute `append` may be missing on object of type `Unknown | str | list[Unknown | int] | ndarray[_AnyShape, dtype[Any]]`
+   --> tests/test_tracking_diffusion_scheduler.py:810:3
+    |
+808 |   )
+809 |   source["task_revision"] = "changed"
+810 |   source["targets"].append(99)
+    |   ^^^^^^^^^^^^^^^^^^^^^^^^
+811 |   source["mask"][0] = 0
+812 |   assert request.context is not None
+    |
+info: rule `possibly-missing-attribute` is enabled by default
+
+error[invalid-assignment]: Cannot assign to a subscript on an object of type `str`
+   --> tests/test_tracking_diffusion_scheduler.py:811:3
+    |
+809 |   source["task_revision"] = "changed"
+810 |   source["targets"].append(99)
+811 |   source["mask"][0] = 0
+    |   ^^^^^^^^^^^^^^^^^
+812 |   assert request.context is not None
+813 |   context = cast(Mapping[str, object], request.context)
+    |
+info: The full type of the subscripted object is `Unknown | str | list[Unknown | int] | ndarray[_AnyShape, dtype[Any]]`
+info: `str` does not have a `__setitem__` method.
+info: rule `invalid-assignment` is enabled by default
+
+Found 2 diagnostics

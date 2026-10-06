@@ -1,3 +1,18 @@
+Upcoming version (not yet released)
+===================================
+
+Added
+^^^^^
+
+- Added the CPU-only D5 asynchronous latent runtime facade. It preserves the
+  eight measured VAE bootstrap pairs, submits bounded raw 32-D latent planning,
+  selects the execution-tick row, decodes it with current finite 99-D
+  conditioning, and records state/latent history only after execution
+  acknowledgement. The runtime checks originating request provenance and exact
+  executor cleanup evidence. Stale, future, incompatible, exhausted and
+  non-finite plans fail closed with no action. This integration evidence does
+  not claim D5 timing, simulator, export, deployment or hardware readiness.
+
 =========
 Added
 ^^^^^

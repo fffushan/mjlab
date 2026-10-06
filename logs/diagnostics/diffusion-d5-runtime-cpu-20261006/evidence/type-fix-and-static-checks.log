@@ -1,0 +1,100 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-9.0.3, pluggy-1.6.0 -- /home/agiuser/projects/worktrees/mjlab/d5-scheduler-20261006/.venv/bin/python
+rootdir: /home/agiuser/projects/worktrees/mjlab/d5-runtime-20261006/integration
+configfile: pyproject.toml
+plugins: typeguard-4.4.4, anyio-4.11.0
+collecting ... collected 71 items
+
+tests/test_tracking_diffusion_scheduler.py::test_accepted_request_provenance_tracks_origin_and_clears_with_plan PASSED [  1%]
+tests/test_tracking_diffusion_scheduler.py::test_accepted_request_provenance_clears_on_release PASSED [  2%]
+tests/test_tracking_diffusion_scheduler.py::test_accepted_request_provenance_clears_on_shutdown PASSED [  4%]
+tests/test_tracking_diffusion_scheduler.py::test_latest_request_replaces_bounded_pending_request PASSED [  5%]
+tests/test_tracking_diffusion_scheduler.py::test_newer_requests_wait_for_the_single_in_flight_request PASSED [  7%]
+tests/test_tracking_diffusion_scheduler.py::test_old_result_cannot_overwrite_newer_accepted_plan PASSED [  8%]
+tests/test_tracking_diffusion_scheduler.py::test_plan_actions_are_selected_at_consecutive_ticks PASSED [  9%]
+tests/test_tracking_diffusion_scheduler.py::test_late_result_uses_only_bounded_previous_plan_suffix PASSED [ 11%]
+tests/test_tracking_diffusion_scheduler.py::test_plan_exhaustion_fails_closed_even_with_long_trajectory PASSED [ 12%]
+tests/test_tracking_diffusion_scheduler.py::test_reset_invalidates_accepted_plan_and_drains_old_in_flight_request PASSED [ 14%]
+tests/test_tracking_diffusion_scheduler.py::test_policy_switch_drains_old_in_flight_request_before_new_submission PASSED [ 15%]
+tests/test_tracking_diffusion_scheduler.py::test_release_prevents_every_later_action_and_shuts_down_once PASSED [ 16%]
+tests/test_tracking_diffusion_scheduler.py::test_policy_switch_ignores_late_old_result PASSED [ 18%]
+tests/test_tracking_diffusion_scheduler.py::test_duplicate_plan_sequence_fails_closed PASSED [ 19%]
+tests/test_tracking_diffusion_scheduler.py::test_planner_exception_fails_closed_until_reset PASSED [ 21%]
+tests/test_tracking_diffusion_scheduler.py::test_non_finite_planner_output_fails_closed_with_event PASSED [ 22%]
+tests/test_tracking_diffusion_scheduler.py::test_snapshots_and_returned_actions_are_owned_copies PASSED [ 23%]
+tests/test_tracking_diffusion_scheduler.py::test_shutdown_invalidates_pending_and_accepted_work PASSED [ 25%]
+tests/test_tracking_diffusion_scheduler.py::test_executor_shutdown_and_lifecycle_are_deterministic PASSED [ 26%]
+tests/test_tracking_diffusion_scheduler.py::test_wrong_action_width_fails_closed_at_scheduler_boundary PASSED [ 28%]
+tests/test_tracking_diffusion_scheduler.py::test_wrong_contract_identity_fails_closed_at_scheduler_boundary PASSED [ 29%]
+tests/test_tracking_diffusion_scheduler.py::test_max_fallback_ticks_requires_nonnegative_integer[nan] PASSED [ 30%]
+tests/test_tracking_diffusion_scheduler.py::test_max_fallback_ticks_requires_nonnegative_integer[inf] PASSED [ 32%]
+tests/test_tracking_diffusion_scheduler.py::test_max_fallback_ticks_requires_nonnegative_integer[-1] PASSED [ 33%]
+tests/test_tracking_diffusion_scheduler.py::test_max_fallback_ticks_requires_nonnegative_integer[1.5] PASSED [ 35%]
+tests/test_tracking_diffusion_scheduler.py::test_max_fallback_ticks_requires_nonnegative_integer[True] PASSED [ 36%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_planner_plan_fails_closed_and_does_not_stick PASSED [ 38%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_request_and_plan_arrays_raise_scheduler_error PASSED [ 39%]
+tests/test_tracking_diffusion_scheduler.py::test_stale_and_current_results_do_not_reorder_pending_submission PASSED [ 40%]
+tests/test_tracking_diffusion_scheduler.py::test_default_period_exposes_consistent_fifty_hz_metadata PASSED [ 42%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_completion_preserves_active_work_across_reset[False] PASSED [ 43%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_completion_preserves_active_work_across_reset[True] PASSED [ 45%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[nan] PASSED [ 46%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[inf] PASSED [ 47%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[1.0] PASSED [ 49%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[1.5] PASSED [ 50%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[True] PASSED [ 52%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[False] PASSED [ 53%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[value6] PASSED [ 54%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[-1] PASSED [ 56%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[1] PASSED [ 57%]
+tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[value9] PASSED [ 59%]
+tests/test_tracking_diffusion_scheduler.py::test_zero_sequence_ids_are_rejected_but_zero_generation_is_valid PASSED [ 60%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_completion_ids_do_not_release_active_slot[request_sequence_id] PASSED [ 61%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_completion_ids_do_not_release_active_slot[policy_generation] PASSED [ 63%]
+tests/test_tracking_diffusion_scheduler.py::test_plan_sequence_is_revalidated_at_executor_boundary[nan] PASSED [ 64%]
+tests/test_tracking_diffusion_scheduler.py::test_plan_sequence_is_revalidated_at_executor_boundary[inf] PASSED [ 66%]
+tests/test_tracking_diffusion_scheduler.py::test_plan_sequence_is_revalidated_at_executor_boundary[True] PASSED [ 67%]
+tests/test_tracking_diffusion_scheduler.py::test_plan_sequence_is_revalidated_at_executor_boundary[1.0] PASSED [ 69%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[value0] PASSED [ 70%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[value1] PASSED [ 71%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[True] PASSED [ 73%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[0.02] PASSED [ 74%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[value4] PASSED [ 76%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[nan] PASSED [ 77%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[inf] PASSED [ 78%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[0.0] PASSED [ 80%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[-0.02] PASSED [ 81%]
+tests/test_tracking_diffusion_scheduler.py::test_period_requires_a_finite_positive_real_scalar[0.02j] PASSED [ 83%]
+tests/test_tracking_diffusion_scheduler.py::test_fallback_expires_on_elapsed_ticks_not_consume_calls PASSED [ 84%]
+tests/test_tracking_diffusion_scheduler.py::test_tick_jump_within_fallback_bound_selects_execution_tick_row PASSED [ 85%]
+tests/test_tracking_diffusion_scheduler.py::test_future_plan_replacement_fails_closed_until_valid PASSED [ 87%]
+tests/test_tracking_diffusion_scheduler.py::test_expired_replacement_does_not_resurrect_old_plan PASSED [ 88%]
+tests/test_tracking_diffusion_scheduler.py::test_wrong_generation_cannot_clear_current_active_slot PASSED [ 90%]
+tests/test_tracking_diffusion_scheduler.py::test_executor_exception_preserves_active_ownership_during_reset[submit] PASSED [ 91%]
+tests/test_tracking_diffusion_scheduler.py::test_executor_exception_preserves_active_ownership_during_reset[poll] PASSED [ 92%]
+tests/test_tracking_diffusion_scheduler.py::test_malformed_active_envelope_fails_closed_without_assertion PASSED [ 94%]
+tests/test_tracking_diffusion_scheduler.py::test_wrong_plan_shape_is_revalidated_at_executor_boundary PASSED [ 95%]
+tests/test_tracking_diffusion_scheduler.py::test_optional_request_context_is_owned_frozen_and_pickleable PASSED [ 97%]
+tests/test_tracking_diffusion_scheduler.py::test_request_context_defaults_to_none_for_legacy_callers PASSED [ 98%]
+tests/test_tracking_diffusion_scheduler.py::test_request_context_rejects_non_serializable_or_nonfinite_values PASSED [100%]
+
+============================= slowest 5 durations ==============================
+0.00s call     tests/test_tracking_diffusion_scheduler.py::test_optional_request_context_is_owned_frozen_and_pickleable
+0.00s call     tests/test_tracking_diffusion_scheduler.py::test_default_period_exposes_consistent_fifty_hz_metadata
+0.00s call     tests/test_tracking_diffusion_scheduler.py::test_sequence_and_generation_constructors_reject_invalid_ids[nan]
+0.00s call     tests/test_tracking_diffusion_scheduler.py::test_request_context_rejects_non_serializable_or_nonfinite_values
+0.00s call     tests/test_tracking_diffusion_scheduler.py::test_plan_actions_are_selected_at_consecutive_ticks
+============================== 71 passed in 1.33s ==============================
+All checks passed!
+All checks passed!
+0 errors, 0 warnings, 0 informations
+WARNING: there is a new pyright version available (v1.1.408 -> v1.1.414).
+Please install the new version or set PYRIGHT_PYTHON_FORCE_VERSION to `latest`
+
+src/mjlab/tasks/tracking/diffusion/scheduler.py: OK
+src/mjlab/tasks/tracking/diffusion/latent_planning.py: OK
+src/mjlab/tasks/tracking/diffusion/planner_executor.py: OK
+src/mjlab/tasks/tracking/diffusion/async_latent_runtime.py: OK
+tests/test_tracking_diffusion_scheduler.py: OK
+tests/test_tracking_diffusion_latent_planning.py: OK
+tests/test_tracking_diffusion_planner_executor.py: OK
+tests/test_tracking_diffusion_async_latent_runtime.py: OK
