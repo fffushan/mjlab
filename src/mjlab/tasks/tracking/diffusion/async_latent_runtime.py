@@ -128,6 +128,10 @@ def _copy_vector(value: object, name: str, width: int) -> np.ndarray:
   return np.array(array, dtype=np.float64, copy=True)
 
 
+def _released_decode(_latent: Tensor, _conditioning: Tensor) -> Tensor:
+  raise AsyncLatentRuntimeError("decoder is released")
+
+
 def _metadata_int(metadata: Mapping[str, object], name: str) -> int:
   value = metadata.get(name)
   return _nonnegative_int(value, f"plan metadata {name}")
@@ -273,6 +277,7 @@ class AsyncLatentRuntime:
     max_future_skew_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
     device: str | torch.device = "cpu",
+    planner_device: str | torch.device = "cpu",
     vae_identity: str = "unspecified-vae",
     model_identity: str = "unspecified-model",
     projection_identity: str | None = None,
@@ -292,13 +297,19 @@ class AsyncLatentRuntime:
       raise AsyncLatentRuntimeError("clock must be callable")
     if not isinstance(generator, torch.Generator):
       raise AsyncLatentRuntimeError("generator must be a torch.Generator")
-    if str(generator.device) != "cpu":
-      raise AsyncLatentRuntimeError("D5 CPU runtime requires a CPU torch.Generator")
     try:
       resolved_device = torch.device(device)
       torch.empty(0, device=resolved_device)
+      resolved_planner_device = torch.device(planner_device)
+      torch.empty(0, device=resolved_planner_device)
     except (RuntimeError, ValueError) as exc:
-      raise AsyncLatentRuntimeError(f"invalid decoder device {device!r}") from exc
+      raise AsyncLatentRuntimeError(
+        f"invalid decoder or planner device {device!r}/{planner_device!r}"
+      ) from exc
+    if torch.device(generator.device) != resolved_planner_device:
+      raise AsyncLatentRuntimeError(
+        "request generator device must match planner_device"
+      )
     period = _finite(period_seconds, "period_seconds")
     if abs(period - contract.period_seconds) > 1.0e-12:
       raise AsyncLatentRuntimeError("period_seconds differs from the active contract")
@@ -322,6 +333,7 @@ class AsyncLatentRuntime:
     self.contract = contract
     self.decode = decode
     self.device = resolved_device
+    self.planner_device = resolved_planner_device
     self.period_seconds = period
     self.max_source_age_seconds = max_age
     self.max_future_skew_seconds = max_skew
@@ -340,7 +352,7 @@ class AsyncLatentRuntime:
       expected_action_dim=contract.latent_dimension,
       expected_contract_identity=contract.identity_hash(),
     )
-    self._generator = torch.Generator(device="cpu")
+    self._generator = torch.Generator(device=resolved_planner_device)
     self._generator.set_state(generator.get_state().detach().clone())
     self._task_snapshot: TaskSnapshot | None = None
     self._pending_execution: _PendingExecution | None = None
@@ -507,7 +519,7 @@ class AsyncLatentRuntime:
       self._projection_identity = packet.projection_identity
       self._advance_generator()
       self.scheduler.request(
-        packet.input_snapshot,
+        np.asarray((packet.source_tick, packet.source_timestamp), dtype=np.float64),
         source_timestamp=packet.source_timestamp,
         source_tick=packet.source_tick,
         context=packet.as_context(),
@@ -640,6 +652,7 @@ class AsyncLatentRuntime:
     self.history.reset()
     self._released = True
     self.scheduler.release()
+    self.decode = _released_decode
     return RuntimeStatus.RELEASED
 
   def shutdown(self) -> RuntimeStatus:
@@ -653,6 +666,7 @@ class AsyncLatentRuntime:
     self.history.reset()
     self._shutdown = True
     self.scheduler.shutdown()
+    self.decode = _released_decode
     return RuntimeStatus.SHUTDOWN
 
   def _require_open(self) -> None:
@@ -669,9 +683,11 @@ class AsyncLatentRuntime:
 
   def _advance_generator(self) -> None:
     try:
-      torch.rand(1, generator=self._generator)
+      torch.rand(1, generator=self._generator, device=self.planner_device)
     except (RuntimeError, TypeError) as exc:
-      raise AsyncLatentRuntimeError("could not advance request-local CPU RNG") from exc
+      raise AsyncLatentRuntimeError(
+        "could not advance request-local planner-device RNG"
+      ) from exc
 
   def _invalidate_task_work(self) -> None:
     self._pending_execution = None

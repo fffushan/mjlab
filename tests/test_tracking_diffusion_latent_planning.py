@@ -217,6 +217,16 @@ def test_packet_wire_round_trip_has_no_live_objects_or_mutable_arrays() -> None:
     packet.input_snapshot[0, 0] = 1.0
 
 
+def test_compact_context_round_trip_avoids_python_scalar_expansion() -> None:
+  packet = _packet(task={"mode": "unguided", "revision": "task-r1"})
+  readable = pickle.dumps(packet.as_wire(), protocol=pickle.HIGHEST_PROTOCOL)
+  compact = packet.as_context()
+  assert compact["encoding"] == "pickle-numpy-v1"
+  assert isinstance(compact["payload"], bytes)
+  assert len(pickle.dumps(compact, protocol=pickle.HIGHEST_PROTOCOL)) < len(readable)
+  assert LatentPlanningPacket.from_wire(compact) == packet
+
+
 def test_fixed_noise_output_matches_existing_synchronous_sampler_and_denormalizes() -> (
   None
 ):

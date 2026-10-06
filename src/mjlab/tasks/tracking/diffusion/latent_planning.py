@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import pickle
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, cast
@@ -48,6 +49,7 @@ from .state import WorldState
 
 LATENT_PLANNING_SCHEMA = "mjlab-d5-latent-planning-v1"
 RAW_LATENT_REPRESENTATION = "latent/raw/32"
+_COMPACT_CONTEXT_ENCODING = "pickle-numpy-v1"
 ROOT_FRAME = "world"
 
 _STATE_FIELDS = (
@@ -844,11 +846,49 @@ class LatentPlanningPacket:
     }
 
   def as_context(self) -> dict[str, object]:
-    """Return the plain mapping intended for ``PlannerRequest.context``."""
-    return self.as_wire()
+    """Return a compact binary snapshot for ``PlannerRequest.context``.
+
+    ``as_wire`` remains the readable compatibility form.  The hot executor
+    path uses NumPy arrays inside one pickle payload so it does not allocate
+    thousands of Python float/bool objects or duplicate the 41x167 window as
+    nested lists on every control tick.
+    """
+    states = tuple(pair.state for pair in self.pairs) + (self.current_state,)
+    compact = {
+      "states": {
+        name: np.asarray([getattr(state, name) for state in states], dtype=np.float64)
+        for name in _STATE_FIELDS
+      },
+      "latents": np.asarray([pair.latent for pair in self.pairs], dtype=np.float64),
+      "clean_tokens": np.asarray(self.clean_tokens, dtype=np.float32),
+      "clean_mask": np.asarray(self.clean_mask, dtype=bool),
+      "source_timestamp": self.source_timestamp,
+      "source_tick": self.source_tick,
+      "source_frame": self.source_frame,
+      "period_seconds": self.period_seconds,
+      "root_frame": self.root_frame,
+      "contract_identity": self.contract_identity,
+      "vae_identity": self.vae_identity,
+      "projection_identity": self.projection_identity,
+      "model_identity": self.model_identity,
+      "task": None if self.task is None else self.task.as_wire(),
+      "rng_state": self.rng_state,
+      "rng_device": self.rng_device,
+    }
+    try:
+      payload = pickle.dumps(compact, protocol=pickle.HIGHEST_PROTOCOL)
+    except (pickle.PickleError, TypeError, ValueError) as exc:
+      raise LatentPlanningError(
+        "compact planning context could not be serialized"
+      ) from exc
+    return {
+      "schema": LATENT_PLANNING_SCHEMA,
+      "encoding": _COMPACT_CONTEXT_ENCODING,
+      "payload": payload,
+    }
 
   def to_wire(self) -> dict[str, object]:
-    """Alias for the request-context wire mapping."""
+    """Return the readable compatibility wire mapping."""
     return self.as_wire()
 
   @classmethod
@@ -856,6 +896,17 @@ class LatentPlanningPacket:
     fields = _mapping(payload, "latent planning packet")
     if fields.get("schema") != LATENT_PLANNING_SCHEMA:
       raise LatentPlanningError("latent planning packet schema is incompatible")
+    if fields.get("encoding") is not None:
+      if fields.get("encoding") != _COMPACT_CONTEXT_ENCODING:
+        raise LatentPlanningError("latent planning packet encoding is incompatible")
+      raw = fields.get("payload")
+      if not isinstance(raw, bytes):
+        raise LatentPlanningError("compact planning packet payload must be bytes")
+      try:
+        compact = pickle.loads(raw)
+      except (EOFError, pickle.PickleError, TypeError, ValueError) as exc:
+        raise LatentPlanningError("compact planning packet payload is invalid") from exc
+      return cls._from_compact_payload(compact)
     pairs = tuple(
       PlanningPair.from_wire(_mapping(item, "planning packet pair"))
       for item in _sequence(fields.get("pairs"))
@@ -887,6 +938,78 @@ class LatentPlanningPacket:
       clean_mask=tuple(
         tuple(row) for row in cast(Sequence[Sequence[bool]], fields["clean_mask"])
       ),
+      rng_state=tuple(cast(Sequence[int], fields["rng_state"])),
+      rng_device=cast(str, fields["rng_device"]),
+    )
+
+  @classmethod
+  def _from_compact_payload(cls, payload: object) -> "LatentPlanningPacket":
+    fields = _mapping(payload, "compact planning packet")
+    states_value = _mapping(fields.get("states"), "compact planning states")
+    expected_state_shapes = {
+      "root_position": (9, 3),
+      "root_quaternion_wxyz": (9, 4),
+      "root_linear_velocity": (9, 3),
+      "root_angular_velocity": (9, 3),
+      "body_positions": (9, DEFAULT_CONTRACT.body_count, 3),
+      "body_linear_velocities": (9, DEFAULT_CONTRACT.body_count, 3),
+    }
+    state_arrays: dict[str, np.ndarray] = {}
+    for name, shape in expected_state_shapes.items():
+      try:
+        array = np.asarray(states_value[name], dtype=np.float64)
+      except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise LatentPlanningError(f"compact state field {name!r} is invalid") from exc
+      if array.shape != shape or not np.isfinite(array).all():
+        raise LatentPlanningError(f"compact state field {name!r} has an invalid shape")
+      state_arrays[name] = array
+    try:
+      latents = np.asarray(fields["latents"], dtype=np.float64)
+      clean_tokens = np.asarray(fields["clean_tokens"], dtype=np.float32)
+      clean_mask = np.asarray(fields["clean_mask"], dtype=bool)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+      raise LatentPlanningError("compact planning arrays are invalid") from exc
+    if latents.shape != (8, 32) or not np.isfinite(latents).all():
+      raise LatentPlanningError("compact latents must have shape [8, 32]")
+    if clean_tokens.shape != (41, 167) or not np.isfinite(clean_tokens).all():
+      raise LatentPlanningError("compact tokens must have shape [41, 167]")
+    if clean_mask.shape != (41, 167):
+      raise LatentPlanningError("compact mask must have shape [41, 167]")
+
+    states = tuple(
+      StateSnapshot(
+        tuple(state_arrays["root_position"][index]),
+        tuple(state_arrays["root_quaternion_wxyz"][index]),
+        tuple(state_arrays["root_linear_velocity"][index]),
+        tuple(state_arrays["root_angular_velocity"][index]),
+        tuple(tuple(row) for row in state_arrays["body_positions"][index]),
+        tuple(tuple(row) for row in state_arrays["body_linear_velocities"][index]),
+      )
+      for index in range(9)
+    )
+    task_value = fields.get("task")
+    task = (
+      None
+      if task_value is None
+      else TaskSnapshot.from_wire(_mapping(task_value, "compact planning task"))
+    )
+    return cls(
+      pairs=tuple(
+        PlanningPair(states[index], tuple(latents[index])) for index in range(8)
+      ),
+      current_state=states[8],
+      source_timestamp=cast(float, fields["source_timestamp"]),
+      source_tick=cast(int, fields["source_tick"]),
+      source_frame=cast(int, fields["source_frame"]),
+      period_seconds=cast(float, fields["period_seconds"]),
+      root_frame=cast(str, fields["root_frame"]),
+      contract_identity=cast(str, fields["contract_identity"]),
+      vae_identity=cast(str, fields["vae_identity"]),
+      projection_identity=cast(str, fields["projection_identity"]),
+      model_identity=cast(str, fields["model_identity"]),
+      task=task,
+      clean_tokens=tuple(tuple(row) for row in clean_tokens),
+      clean_mask=tuple(tuple(row) for row in clean_mask),
       rng_state=tuple(cast(Sequence[int], fields["rng_state"])),
       rng_device=cast(str, fields["rng_device"]),
     )

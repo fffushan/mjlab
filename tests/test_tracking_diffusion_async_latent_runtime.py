@@ -243,6 +243,7 @@ def _runtime(
   max_source_age_seconds: float = 0.5,
   max_future_skew_seconds: float = 0.0,
   expected_source_frame: int | None = None,
+  planner_device: str | torch.device = "cpu",
 ) -> AsyncLatentRuntime:
   random = generator or torch.Generator(device="cpu").manual_seed(9)
   return AsyncLatentRuntime(
@@ -256,6 +257,7 @@ def _runtime(
     max_source_age_seconds=max_source_age_seconds,
     max_future_skew_seconds=max_future_skew_seconds,
     expected_source_frame=expected_source_frame,
+    planner_device=planner_device,
   )
 
 
@@ -616,7 +618,20 @@ def test_cleanup_confirmed_requires_both_exact_inspection_properties() -> None:
     assert runtime.cleanup_confirmed is False
 
 
-def test_acknowledgement_token_is_required_for_history_pairing() -> None:
+def test_planner_generator_must_match_planner_device() -> None:
+  with pytest.raises(ValueError, match="generator device"):
+    _runtime(_NoInspectionExecutor(), _Clock(), planner_device="meta")
+
+
+def test_release_clears_owner_decoder_reference() -> None:
+  decoder = _Decoder()
+  runtime = _runtime(_NoInspectionExecutor(), _Clock(), decoder=decoder)
+  assert runtime.decode is decoder
+  runtime.release()
+  assert runtime.decode is not decoder
+  with pytest.raises(ValueError, match="decoder is released"):
+    runtime.decode(torch.zeros((1, 32)), torch.zeros((1, 99)))
+
   runtime = _runtime(_ImmediateExecutor(_plan_for_request), _Clock())
   _bootstrap(runtime)
   step = runtime.step(make_state(20), np.full(99, 0.4), tick=0)

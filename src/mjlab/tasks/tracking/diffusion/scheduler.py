@@ -17,7 +17,6 @@ not a latent planner or current-proprioception decoder integration.
 
 from __future__ import annotations
 
-import pickle
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -127,12 +126,7 @@ class PlannerRequest:
     snapshot.setflags(write=False)
     object.__setattr__(self, "input_snapshot", snapshot)
     if self.context is not None:
-      frozen = _freeze_context(self.context)
-      try:
-        pickle.dumps(frozen)
-      except (pickle.PickleError, TypeError, ValueError) as exc:
-        raise SchedulerError("planner context must be pickleable") from exc
-      object.__setattr__(self, "context", frozen)
+      object.__setattr__(self, "context", _freeze_context(self.context))
 
 
 @dataclass(frozen=True, slots=True)

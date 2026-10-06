@@ -252,6 +252,7 @@ def build_model_backed_runtime(
       max_future_skew_seconds=max_future_skew_seconds,
       clock=clock,
       device=spec.decoder_device,
+      planner_device=spec.planner_device,
       vae_identity=backend.vae_identity,
       model_identity=backend.model_identity,
       expected_source_frame=expected_source_frame,
