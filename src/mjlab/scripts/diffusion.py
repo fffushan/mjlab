@@ -458,6 +458,62 @@ def _command_stats(args: argparse.Namespace) -> int:
   return 0
 
 
+def _command_build_index(args: argparse.Namespace) -> int:
+  """Build and persist the window index that belongs to a dataset.
+
+  The index is derived metadata, so the dataset owns it.  This command writes
+  the artifact, reads it back, and refuses a success exit unless the reloaded
+  index reproduces the built one.
+  """
+  import time
+
+  from mjlab.tasks.tracking.diffusion.dataset import (
+    build_window_index,
+    load_window_index,
+    save_window_index,
+    store_manifest_sha256,
+    window_index_path,
+  )
+  from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
+
+  contract = _load_contract(args.contract)
+  dataset = Path(args.dataset_dir)
+  store = AppendOnlyShardStore(dataset / "store", contract=contract)
+  assignments = _load_assignments(dataset / "offline" / "assignments.json")
+
+  started = time.perf_counter()
+  index, method = build_window_index(
+    store, assignments, jobs=args.jobs, contract=contract
+  )
+  built_seconds = time.perf_counter() - started
+
+  path = window_index_path(dataset)
+  record = save_window_index(
+    path,
+    index,
+    store_manifest_sha256=store_manifest_sha256(store),
+    assignments_sha256=assignments.sha256(),
+  )
+  reloaded = load_window_index(
+    path, store=store, assignments=assignments, contract=contract
+  )
+  payload = {
+    "contract_sha256": contract.contract_sha256,
+    "dataset": str(dataset),
+    "jobs": args.jobs,
+    "method": method,
+    "refs": len(index),
+    "coverage": index.coverage(),
+    "seconds": round(built_seconds, 3),
+    "reload_matches": reloaded.refs == index.refs,
+    **record,
+  }
+  if args.json is not None:
+    _json_write(args.json, payload)
+  print(json.dumps(payload, indent=2, sort_keys=True))
+  return 0 if payload["reload_matches"] else 1
+
+
 def _command_collect(args: argparse.Namespace) -> int:
   if not args.execute:
     print("collect requires --execute; no runtime was launched", file=sys.stderr)
@@ -1186,6 +1242,17 @@ def build_parser() -> argparse.ArgumentParser:
   train.add_argument("--allow-long-run", action="store_true")
   train.add_argument("--json", type=Path)
   train.set_defaults(handler=_command_train)
+
+  index = commands.add_parser(
+    "build-index", help="build and persist the dataset window index"
+  )
+  index.add_argument("--dataset-dir", type=Path, required=True)
+  index.add_argument("--contract", type=Path, required=True)
+  index.add_argument(
+    "--jobs", type=int, default=1, help="worker processes; 1 is sequential"
+  )
+  index.add_argument("--json", type=Path)
+  index.set_defaults(handler=_command_build_index)
 
   evaluate = commands.add_parser(
     "evaluate-offline", help="score a checkpoint without constructing a simulator"

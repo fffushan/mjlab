@@ -103,9 +103,42 @@ class DatasetSource:
         "projection contract identity differs from loaded YAML contract"
       )
 
-    index = WindowIndex.build(store, assignments, contract=contract)
+    index, index_source = self._resolve_index(store, assignments, contract)
     self._validate_dataset_manifest(index.coverage(), offline / "dataset.json")
-    return LoadedDataset(contract, projection, assignments, store, index)
+    return LoadedDataset(
+      contract, projection, assignments, store, index, index_source=index_source
+    )
+
+  def _resolve_index(
+    self,
+    store: AppendOnlyShardStore,
+    assignments: SplitAssignments,
+    contract: DiffusionContract,
+  ) -> tuple[WindowIndex, str]:
+    """Prefer the persisted index; rebuild only when it cannot be trusted.
+
+    The index is derived metadata and belongs to the dataset.  A stale index
+    means the store or the assignments changed, so rebuilding is the correct
+    recovery and is exactly what ran before this artifact existed; a malformed
+    or inconsistent index is refused rather than accepted.
+    """
+    import sys
+
+    from .dataset import load_window_index, window_index_path
+
+    persisted = window_index_path(self.directory)
+    if persisted.is_file():
+      try:
+        loaded = load_window_index(
+          persisted, store=store, assignments=assignments, contract=contract
+        )
+        return loaded, "persisted"
+      except (DatasetError, OSError, ValueError, KeyError) as exc:
+        print(
+          f"window index {persisted} is unusable ({exc}); rebuilding it",
+          file=sys.stderr,
+        )
+    return WindowIndex.build(store, assignments, contract=contract), "rebuilt"
 
   @staticmethod
   def _validate_dataset_manifest(coverage: Mapping[str, int], path: Path) -> None:
@@ -139,6 +172,7 @@ class LoadedDataset:
   assignments: SplitAssignments
   store: AppendOnlyShardStore
   index: WindowIndex
+  index_source: str = "rebuilt"
 
   def dataset(self, split: str) -> WindowDataset:
     """Return a lazy projected window view, including an empty split."""

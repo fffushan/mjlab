@@ -285,6 +285,22 @@ class AppendOnlyShardStore:
   def shard_count(self) -> int:
     return len(self._manifest()["shards"])
 
+  def shard_items(self) -> tuple[Mapping[str, Any], ...]:
+    """Return the manifest's shard entries, in store order."""
+    return tuple(self._manifest()["shards"])
+
+  def iter_rows_range(self, start: int, stop: int) -> Iterator[TrajectoryRow]:
+    """Yield rows from shard indices ``[start, stop)`` only.
+
+    A partitioned reader must open only its own shards, otherwise every worker
+    pays the full store read and the partition buys nothing.
+    """
+    items = self._manifest()["shards"]
+    if start < 0 or stop > len(items) or start > stop:
+      raise StorageError("shard range is out of bounds")
+    for item in items[start:stop]:
+      yield from self._read_shard(item)
+
   def _known_identities(self) -> set[tuple[str, int, str, str, int]]:
     """Identities already written, seeded once from the existing shards.
 

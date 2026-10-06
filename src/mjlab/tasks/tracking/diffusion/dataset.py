@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence, cast
 
 import numpy as np
@@ -258,39 +259,9 @@ class WindowIndex:
         (row.run_id, row.env_id, row.episode_id, row.segment_id), []
       ).append(row)
     refs: list[WindowRef] = []
-    width = contract.window_steps
     for segment_rows in by_segment.values():
-      segment_rows.sort(key=lambda row: row.tick)
-      for start in range(0, max(0, len(segment_rows) - width + 1)):
-        chunk = segment_rows[start : start + width]
-        first = chunk[0]
-        if not cls._eligible(chunk, contract):
-          continue
-        group = _row_group(first)
-        split = assignments.split_for(group)
-        refs.append(
-          WindowRef(
-            first.run_id,
-            first.env_id,
-            first.episode_id,
-            first.segment_id,
-            first.tick,
-            split,
-            group,
-            width,
-          )
-        )
-    refs.sort(
-      key=lambda ref: (
-        ref.split,
-        ref.group_key,
-        ref.run_id,
-        ref.env_id,
-        ref.episode_id,
-        ref.segment_id,
-        ref.start_tick,
-      )
-    )
+      refs.extend(_segment_refs(segment_rows, assignments, contract))
+    refs.sort(key=_ref_sort_key)
     return cls(store, assignments, refs, contract=contract)
 
   @staticmethod
@@ -439,6 +410,332 @@ def build_dataset(
   return index, assignments
 
 
+_INDEX_SCHEMA = "mjlab-x2-diffusion-window-index-v1"
+_INDEX_FILENAME = "window_index.npz"
+
+
+def window_index_path(directory: str | Path) -> Path:
+  """Return the conventional persisted-index path inside a dataset directory."""
+  return Path(directory) / "offline" / _INDEX_FILENAME
+
+
+def store_manifest_sha256(store: AppendOnlyShardStore) -> str:
+  """Digest the store manifest, so a stale index cannot be trusted."""
+  return hashlib.sha256((Path(store.root) / "manifest.json").read_bytes()).hexdigest()
+
+
+def _split_names() -> tuple[str, ...]:
+  """Split names in a deterministic order.
+
+  ``_SPLITS`` must not be relied on for order: a set would serialise one order
+  and compare against another, which would look like a corrupt index.
+  """
+  return tuple(sorted(_SPLITS))
+
+
+def _intern(values: Sequence[str]) -> tuple[np.ndarray, dict[str, int]]:
+  """Intern repeated identity strings; the per-ref arrays then stay numeric."""
+  unique = sorted(set(values))
+  return np.asarray(unique, dtype="<U160"), {value: i for i, value in enumerate(unique)}
+
+
+def save_window_index(
+  path: str | Path,
+  index: WindowIndex,
+  *,
+  store_manifest_sha256: str,
+  assignments_sha256: str,
+) -> dict[str, object]:
+  """Persist a window index beside its dataset, atomically.
+
+  The index is derived metadata: references only, no tokens.  Interning the
+  repeated identity strings keeps the artifact near 20 MB for 609k windows,
+  against the 12-25 minutes that rebuilding it costs.
+  """
+  refs = index.refs
+  run_ids, run_of = _intern([ref.run_id for ref in refs])
+  episode_ids, episode_of = _intern([ref.episode_id for ref in refs])
+  segment_ids, segment_of = _intern([ref.segment_id for ref in refs])
+  group_keys, group_of = _intern([ref.group_key for ref in refs])
+  names = _split_names()
+  split_of = {name: position for position, name in enumerate(names)}
+  coverage = index.coverage()
+  arrays: dict[str, np.ndarray] = {
+    "schema": np.asarray(_INDEX_SCHEMA),
+    "contract_hash": np.asarray(index.contract.identity_hash()),
+    "store_manifest_sha256": np.asarray(store_manifest_sha256),
+    "assignments_sha256": np.asarray(assignments_sha256),
+    "ref_count": np.asarray(len(refs), dtype=np.int64),
+    "coverage": np.asarray([coverage[name] for name in names], dtype=np.int64),
+    "split_names": np.asarray(names, dtype="<U16"),
+    "run_ids": run_ids,
+    "episode_ids": episode_ids,
+    "segment_ids": segment_ids,
+    "group_keys": group_keys,
+    "ref_run": np.asarray([run_of[ref.run_id] for ref in refs], dtype=np.int32),
+    "ref_episode": np.asarray(
+      [episode_of[ref.episode_id] for ref in refs], dtype=np.int32
+    ),
+    "ref_segment": np.asarray(
+      [segment_of[ref.segment_id] for ref in refs], dtype=np.int32
+    ),
+    "ref_group": np.asarray([group_of[ref.group_key] for ref in refs], dtype=np.int32),
+    "ref_env": np.asarray([ref.env_id for ref in refs], dtype=np.int64),
+    "ref_start": np.asarray([ref.start_tick for ref in refs], dtype=np.int64),
+    "ref_length": np.asarray([ref.length for ref in refs], dtype=np.int32),
+    "ref_split": np.asarray([split_of[ref.split] for ref in refs], dtype=np.int8),
+  }
+  target = Path(path)
+  target.parent.mkdir(parents=True, exist_ok=True)
+  # Write beside the target, then rename: a reader never sees a partial index.
+  temporary = target.with_name(target.name + ".partial")
+  with temporary.open("wb") as handle:
+    np.savez(handle, **arrays)
+  digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+  temporary.replace(target)
+  return {
+    "path": str(target),
+    "sha256": digest,
+    "refs": len(refs),
+    "coverage": coverage,
+    "bytes": target.stat().st_size,
+  }
+
+
+def load_window_index(
+  path: str | Path,
+  *,
+  store: AppendOnlyShardStore,
+  assignments: SplitAssignments,
+  contract: DiffusionContract = DEFAULT_CONTRACT,
+) -> WindowIndex:
+  """Load a persisted index, refusing one that cannot describe this store."""
+  target = Path(path)
+  with np.load(target, allow_pickle=False) as payload:
+    schema = str(payload["schema"])
+    if schema != _INDEX_SCHEMA:
+      raise DatasetError(f"unsupported window index schema {schema!r}")
+    if str(payload["contract_hash"]) != contract.identity_hash():
+      raise DatasetError("window index contract identity differs")
+    if str(payload["store_manifest_sha256"]) != store_manifest_sha256(store):
+      raise DatasetError("window index does not describe this store")
+    if str(payload["assignments_sha256"]) != assignments.sha256():
+      raise DatasetError("window index does not describe these split assignments")
+    names = [str(value) for value in payload["split_names"]]
+    if tuple(names) != _split_names():
+      raise DatasetError("window index split names differ")
+    run_ids = [str(value) for value in payload["run_ids"]]
+    episode_ids = [str(value) for value in payload["episode_ids"]]
+    segment_ids = [str(value) for value in payload["segment_ids"]]
+    group_keys = [str(value) for value in payload["group_keys"]]
+    count = int(payload["ref_count"])
+    refs = tuple(
+      WindowRef(
+        run_ids[int(payload["ref_run"][position])],
+        int(payload["ref_env"][position]),
+        episode_ids[int(payload["ref_episode"][position])],
+        segment_ids[int(payload["ref_segment"][position])],
+        int(payload["ref_start"][position]),
+        cast(SplitName, names[int(payload["ref_split"][position])]),
+        group_keys[int(payload["ref_group"][position])],
+        int(payload["ref_length"][position]),
+      )
+      for position in range(count)
+    )
+    recorded = [int(value) for value in payload["coverage"]]
+  index = WindowIndex(store, assignments, refs, contract=contract)
+  actual = index.coverage()
+  expected = {name: recorded[position] for position, name in enumerate(_split_names())}
+  if actual != expected:
+    raise DatasetError(
+      f"window index coverage disagrees with itself: recorded {expected}, got {actual}"
+    )
+  return index
+
+
+def _segment_refs(
+  segment_rows: Sequence[TrajectoryRow],
+  assignments: SplitAssignments,
+  contract: DiffusionContract,
+) -> list[WindowRef]:
+  """Emit every eligible window of one segment.
+
+  Shared by the sequential and the parallel builders, so the two cannot drift.
+  """
+  width = contract.window_steps
+  ordered = sorted(segment_rows, key=lambda row: row.tick)
+  refs: list[WindowRef] = []
+  for start in range(0, max(0, len(ordered) - width + 1)):
+    chunk = ordered[start : start + width]
+    if not WindowIndex._eligible(chunk, contract):
+      continue
+    first = chunk[0]
+    group = _row_group(first)
+    refs.append(
+      WindowRef(
+        first.run_id,
+        first.env_id,
+        first.episode_id,
+        first.segment_id,
+        first.tick,
+        assignments.split_for(group),
+        group,
+        width,
+      )
+    )
+  return refs
+
+
+def _ref_sort_key(ref: WindowRef) -> tuple[object, ...]:
+  """Total order over references, shared by both builders.
+
+  This sort is what makes the index independent of the order in which segments
+  are visited, and therefore what makes a parallel build comparable to the
+  sequential one.
+  """
+  return (
+    ref.split,
+    ref.group_key,
+    ref.run_id,
+    ref.env_id,
+    ref.episode_id,
+    ref.segment_id,
+    ref.start_tick,
+  )
+
+
+def _segment_key(segment: tuple[str, int, str, str]) -> str:
+  return "|".join(str(part) for part in segment)
+
+
+def _identity_segment_key(value: object) -> str | None:
+  """Read a shard manifest's first/last identity as a segment key."""
+  if not isinstance(value, (list, tuple)) or len(value) < 4:
+    return None
+  return "|".join(str(part) for part in value[:4])
+
+
+def segment_shard_plan(store: AppendOnlyShardStore) -> list[tuple[str, int, int]] | None:
+  """Derive each segment's shard extent from manifest metadata only.
+
+  A shard records the identity of its first and last row, so a segment's extent
+  follows without reading any row.  Returns ``None`` when the store does not look
+  segment-contiguous, and the caller must then not partition the work.
+  """
+  items = store.shard_items()
+  starts: dict[str, int] = {}
+  ends: dict[str, int] = {}
+  order: list[str] = []
+  for index, item in enumerate(items):
+    first = _identity_segment_key(item.get("first"))
+    last = _identity_segment_key(item.get("last"))
+    if first is None or last is None:
+      return None
+    for key in (first, last):
+      if key not in starts:
+        starts[key] = index
+        order.append(key)
+      ends[key] = index
+  for position in range(1, len(order)):
+    # Shard extents must advance with the segment order and never overlap.
+    if starts[order[position]] < ends[order[position - 1]]:
+      return None
+  return [(key, starts[key], ends[key] + 1) for key in order]
+
+
+def _partition_plan(
+  plan: Sequence[tuple[str, int, int]], jobs: int
+) -> list[tuple[int, int, tuple[str, ...]]]:
+  """Split the plan into contiguous groups of roughly equal shard extent."""
+  total = sum(stop - start for _, start, stop in plan)
+  target = max(1, -(-total // jobs))
+  groups: list[list[tuple[str, int, int]]] = []
+  current: list[tuple[str, int, int]] = []
+  weight = 0
+  for entry in plan:
+    current.append(entry)
+    weight += entry[2] - entry[1]
+    if weight >= target and len(groups) < jobs - 1:
+      groups.append(current)
+      current = []
+      weight = 0
+  if current:
+    groups.append(current)
+  return [
+    (
+      min(entry[1] for entry in group),
+      max(entry[2] for entry in group),
+      tuple(entry[0] for entry in group),
+    )
+    for group in groups
+  ]
+
+
+def _build_refs_worker(
+  payload: tuple[str, DiffusionContract, dict[str, str], int, int, tuple[str, ...]],
+) -> tuple[WindowRef, ...]:
+  """Worker entry point: read only the assigned shards, emit assigned segments.
+
+  Rows of neighbouring segments are visible in the boundary shards and are
+  deliberately ignored, so a segment is always handled whole.
+  """
+  store_root, contract, group_to_split, start, stop, keys = payload
+  store = AppendOnlyShardStore(store_root, contract=contract)
+  assignments = SplitAssignments(group_to_split, contract.split_seed)
+  wanted = set(keys)
+  by_segment: dict[tuple[str, int, str, str], list[TrajectoryRow]] = {}
+  for row in store.iter_rows_range(start, stop):
+    segment = (row.run_id, row.env_id, row.episode_id, row.segment_id)
+    if _segment_key(segment) in wanted:
+      by_segment.setdefault(segment, []).append(row)
+  refs: list[WindowRef] = []
+  for segment_rows in by_segment.values():
+    refs.extend(_segment_refs(segment_rows, assignments, contract))
+  return tuple(refs)
+
+
+def build_window_index(
+  store: AppendOnlyShardStore,
+  assignments: SplitAssignments,
+  *,
+  jobs: int = 1,
+  contract: DiffusionContract = DEFAULT_CONTRACT,
+) -> tuple[WindowIndex, str]:
+  """Build the index, partitioned across processes when the store allows it.
+
+  Returns the index and how it was produced.  A store that does not look
+  segment-contiguous falls back to the sequential builder rather than risking a
+  partition that splits a segment.
+  """
+  if jobs <= 1:
+    return WindowIndex.build(store, assignments, contract=contract), "sequential"
+  plan = segment_shard_plan(store)
+  if not plan:
+    return (
+      WindowIndex.build(store, assignments, contract=contract),
+      "sequential-not-segment-contiguous",
+    )
+  groups = _partition_plan(plan, jobs)
+  if len(groups) <= 1:
+    return WindowIndex.build(store, assignments, contract=contract), "sequential-single-part"
+  group_to_split = dict(assignments.group_to_split)
+  payloads = [
+    (str(store.root), contract, group_to_split, start, stop, keys)
+    for start, stop, keys in groups
+  ]
+  import multiprocessing
+
+  context = multiprocessing.get_context("fork")
+  with context.Pool(processes=len(payloads)) as pool:
+    parts = pool.map(_build_refs_worker, payloads)
+  refs = [ref for part in parts for ref in part]
+  refs.sort(key=_ref_sort_key)
+  return (
+    WindowIndex(store, assignments, refs, contract=contract),
+    f"parallel-{len(groups)}",
+  )
+
+
 __all__ = [
   "DatasetError",
   "SplitAssignments",
@@ -449,4 +746,10 @@ __all__ = [
   "build_dataset",
   "fit_training_statistics",
   "grouped_split",
+  "load_window_index",
+  "save_window_index",
+  "store_manifest_sha256",
+  "window_index_path",
+  "build_window_index",
+  "segment_shard_plan",
 ]
