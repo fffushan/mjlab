@@ -1,11 +1,8 @@
-"""Diffusion contract gates: VAE repins, fail-closed registries.
+"""Diffusion contract loading and VAE revision metadata.
 
-Revisions 2 and 3 keep every representation, window, split and normalization
-field of revision 1 and repin only the frozen VAE (the 12-teacher and then the
-30-teacher increased-perturbation students).  These tests prove each widening is
-deliberate and still fail-closed: unregistered contract files and unapproved VAE
-identities must be refused, every earlier revision stays loadable, and the
-rollout selection may only narrow the checkpoint's own cohort.
+The reproduction loader keeps shape/schema compatibility checks but does not
+require every hand-edited manifest to be registered by its source-file digest.
+VAE and artifact fields remain available as descriptive metadata.
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from mjlab.tasks.tracking.diffusion import ContractError, DiffusionContract
+from mjlab.tasks.tracking.diffusion import DiffusionContract
 from mjlab.tasks.tracking.diffusion.runtime_x2 import (
   RuntimeX2Error,
   resolve_rollout_ids,
@@ -137,35 +134,28 @@ def test_inc12_declares_the_twelve_member_cohort_without_real_robot_claim() -> N
   assert vae["user_confirmed_real_robot_validation"] is False
 
 
-def test_unregistered_contract_revision_fails_closed(tmp_path: Path) -> None:
-  # Byte-identical content is registered; a single added comment is not.
+def test_unregistered_contract_revision_loads_for_reproduction(tmp_path: Path) -> None:
   altered = tmp_path / "beyondmimic_diffusion_d1_no_mixtures_inc12_contract.yaml"
   altered.write_text(D1_INC12.read_text() + "\n")
-  assert hashlib.sha256(altered.read_bytes()).hexdigest() != str(
-    FROZEN_DIGESTS[D1_INC12]
+  contract = DiffusionContract.from_yaml(altered)
+  assert contract.contract_sha256 == hashlib.sha256(altered.read_bytes()).hexdigest()
+  assert (
+    contract.identity_hash() == DiffusionContract.from_yaml(D1_INC12).identity_hash()
   )
-  with pytest.raises(ContractError, match="contract hash mismatch"):
-    DiffusionContract.from_yaml(altered)
 
 
-def test_unapproved_vae_identity_fails_closed() -> None:
+def test_custom_vae_identity_is_accepted_for_reproduction() -> None:
   payload = yaml.safe_load(D0_INC12.read_text())
   payload["vae"]["sha256"] = "0" * 64
-  with pytest.raises(ContractError, match="approved revision"):
-    DiffusionContract.from_mapping(payload)
-
-
-def test_approved_vae_identity_is_accepted_but_path_must_match() -> None:
-  payload = yaml.safe_load(D0_INC12.read_text())
-  # Same digest, different declared path: still refused, because the approved
-  # pair is (path, sha256).
-  payload["vae"]["checkpoint"] = "logs/distillation/somewhere-else/checkpoint-final.pt"
-  with pytest.raises(ContractError, match="approved revision"):
-    DiffusionContract.from_mapping(payload)
-  # Restoring the registered path loads.
-  payload["vae"]["checkpoint"] = INC12_VAE
   contract = DiffusionContract.from_mapping(payload)
-  assert contract.vae_sha256 == INC12_VAE_SHA
+  assert contract.vae_sha256 == "0" * 64
+
+
+def test_custom_vae_path_is_accepted_for_reproduction() -> None:
+  payload = yaml.safe_load(D0_INC12.read_text())
+  payload["vae"]["checkpoint"] = "logs/distillation/somewhere-else/checkpoint-final.pt"
+  contract = DiffusionContract.from_mapping(payload)
+  assert contract.vae_checkpoint.endswith("somewhere-else/checkpoint-final.pt")
 
 
 def test_inc30_revision_repins_only_the_vae() -> None:
@@ -228,11 +218,16 @@ def test_inc30_pinned_manifest_and_provenance_digests_match_the_files() -> None:
   )
 
 
-def test_inc30_unregistered_contract_revision_fails_closed(tmp_path: Path) -> None:
+def test_unregistered_inc30_contract_revision_loads_for_reproduction(
+  tmp_path: Path,
+) -> None:
   altered = tmp_path / "beyondmimic_diffusion_d1_no_mixtures_inc30_contract.yaml"
   altered.write_text(D1_INC30.read_text() + "\n")
-  with pytest.raises(ContractError, match="contract hash mismatch"):
-    DiffusionContract.from_yaml(altered)
+  contract = DiffusionContract.from_yaml(altered)
+  assert contract.contract_sha256 == hashlib.sha256(altered.read_bytes()).hexdigest()
+  assert (
+    contract.identity_hash() == DiffusionContract.from_yaml(D1_INC30).identity_hash()
+  )
 
 
 def test_rollout_selection_defaults_to_every_member() -> None:

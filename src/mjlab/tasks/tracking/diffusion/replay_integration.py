@@ -88,7 +88,7 @@ def verify_file_digest(path: str | Path, expected: str, *, role: str) -> None:
 
 
 def load_active_contract(path: str | Path) -> DiffusionContract:
-  """Load the active no-mixture contract from its hash-checked YAML."""
+  """Load the active dimensional contract without a file-hash gate."""
   try:
     return DiffusionContract.from_yaml(path)
   except (ContractError, OSError) as exc:
@@ -159,21 +159,36 @@ def load_denoiser(
   checkpoint_path: str | Path,
   *,
   contract: DiffusionContract,
-  checkpoint_sha256: str,
   projection_bundle: ProjectionBundle,
+  checkpoint_sha256: str | None = None,
+  verify_projection_hashes: bool = True,
+  verify_contract_identity: bool = True,
 ) -> LoadedDenoiser:
-  """Load the frozen D2 denoiser with EMA selection and fail-closed gates."""
-  verify_file_digest(checkpoint_path, checkpoint_sha256, role="diffusion checkpoint")
+  """Load the D2 denoiser with optional reproduction hash checks.
+
+  The model, checkpoint schema and tensor dimensions are always validated.  A
+  caller may omit file/projection digests for fast paper reproduction when the
+  artifact files are supplied explicitly.
+  """
+  if checkpoint_sha256 is not None:
+    verify_file_digest(checkpoint_path, checkpoint_sha256, role="diffusion checkpoint")
+  if not isinstance(verify_projection_hashes, bool):
+    raise ReplayError("verify_projection_hashes must be a boolean")
+  if not isinstance(verify_contract_identity, bool):
+    raise ReplayError("verify_contract_identity must be a boolean")
   model = StateLatentTransformer(DenoiserSettings.from_contract(contract))
   try:
     state = load_checkpoint(
       checkpoint_path,
       model=model,
-      expected_contract_identity=contract.identity_hash(),
+      expected_contract_identity=(
+        contract.identity_hash() if verify_contract_identity else None
+      ),
     )
   except CheckpointError as exc:
     raise ReplayError(f"frozen denoiser checkpoint rejected: {exc}") from exc
-  verify_projection_consistency(state.projection_hashes, projection_bundle)
+  if verify_projection_hashes:
+    verify_projection_consistency(state.projection_hashes, projection_bundle)
   ema_selected, ema_updates = apply_ema_selection(model, state.ema_state)
   model.eval()
   for parameter in model.parameters():
@@ -228,7 +243,7 @@ class LoadedVae:
 
   model: VaeDecodeModule
   member_id: str
-  checkpoint_sha256: str
+  checkpoint_sha256: str | None
   manifest_sha256: str
   relocated_artifact_roles: tuple[str, ...]
   joint_order: tuple[str, ...]
@@ -245,20 +260,19 @@ def load_vae_decoder(
   repo_root: str | Path,
   member: str,
   contract: DiffusionContract,
-  vae_checkpoint_sha256: str,
+  vae_checkpoint_sha256: str | None = None,
+  device: str | torch.device = "cpu",
 ) -> LoadedVae:
-  """Load the frozen gravity-mode VAE member through its checked loader.
+  """Load a gravity-mode VAE member without requiring artifact digests.
 
-  The member is resolved against the live manifest exactly as
-  ``diffusion/adapter.py`` does, but with explicit caller-supplied paths: no
-  pinned repository layout is assumed here.  Any loader failure (missing
-  member, changed or missing teacher artifact, wrong checkpoint kind) fails
-  closed; there is no substitution.
+  The cohort loader still validates the saved model schema and the requested
+  member.  File digests are optional reproduction metadata rather than a gate.
   """
-  verify_file_digest(
-    vae_checkpoint, vae_checkpoint_sha256, role="frozen VAE checkpoint"
-  )
-  if vae_checkpoint_sha256 != contract.vae_sha256:
+  if vae_checkpoint_sha256 is not None:
+    verify_file_digest(
+      vae_checkpoint, vae_checkpoint_sha256, role="frozen VAE checkpoint"
+    )
+  if vae_checkpoint_sha256 is not None and vae_checkpoint_sha256 != contract.vae_sha256:
     raise ReplayError(
       "frozen VAE checkpoint digest does not match the active contract's "
       f"pinned VAE identity {contract.vae_sha256}"
@@ -276,7 +290,7 @@ def load_vae_decoder(
       vae_checkpoint,
       cohort,
       member,
-      device="cpu",
+      device=device,
     )
   except Exception as exc:
     raise ReplayError(

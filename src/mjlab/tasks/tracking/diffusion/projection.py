@@ -311,8 +311,9 @@ class ProjectionBundle:
     )
     if metadata.get("contract", {}).get("schema_version") != contract.schema_version:
       raise ProjectionError("projection contract schema mismatch")
-    if metadata.get("contract", {}).get("contract_sha256") != contract.contract_sha256:
-      raise ProjectionError("projection contract identity mismatch")
+    # The source YAML digest is optional reproduction provenance.  Projection
+    # compatibility is defined by the active schema and the numerical bundle,
+    # not by byte identity of the manifest file.
     return bundle
 
 

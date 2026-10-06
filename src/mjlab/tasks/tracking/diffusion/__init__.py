@@ -54,6 +54,14 @@ from .handover import (
   build_reference_free_plan,
 )
 from .migration import rebuild_no_mixture_dataset
+from .model_backend import (
+  ModelBackend,
+  ModelBackendError,
+  ModelBackendSpec,
+  ModelPlannerFactory,
+  build_model_backed_runtime,
+  load_model_backend,
+)
 from .noising import (
   NoisedPair,
   add_independent_noise,
@@ -191,6 +199,12 @@ __all__ = [
   "ProjectionBundle",
   "ProjectionError",
   "rebuild_no_mixture_dataset",
+  "ModelBackend",
+  "ModelBackendError",
+  "ModelBackendSpec",
+  "ModelPlannerFactory",
+  "build_model_backed_runtime",
+  "load_model_backend",
   "ContinuationPlan",
   "ContinuationStep",
   "DecodeFn",

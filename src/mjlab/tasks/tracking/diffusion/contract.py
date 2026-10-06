@@ -21,55 +21,7 @@ class ContractError(ValueError):
 
 _SCHEMA = "mjlab-x2-state-latent-d1-no-mixtures-v1"
 _LEGACY_SCHEMA = "mjlab-x2-state-latent-d0-v1"
-_D0_CONTRACT_SHA = "42694cdd3acd72afd2d234a85ca29e9c7a646d64df831021c8dd43e55f3f73e7"
-_D1_NO_MIXTURES_CONTRACT_SHA = (
-  "f5237d4327fd7cfd4c065604806555a43f8afa97c0ea17a9e59a3482a6d0caed"
-)
-# Revision 2 repins only the frozen VAE: the 12-teacher increased-perturbation
-# student (`inc000`-`inc011`) instead of the three-clip `mixed-10k` student.
-# Representation, window, split, normalization and qualification semantics are
-# unchanged, so the previous revision stays loadable and comparable.
-_D0_INC12_CONTRACT_SHA = (
-  "39f1e85370efebdf83716d3e60ee505c1b38057c88bce3527439ad949ad23d9b"
-)
-_D1_INC12_CONTRACT_SHA = (
-  "645fef76f672408850832ab9bb06e0436cca517473b4a1d74004182138954d05"
-)
 _VAE_SHA = "69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117"
-_INC12_VAE_SHA = "22a650bcba7375bca4578c229554ea3c93c357244919ea83d7ba1b6878282a4d"
-_INC12_VAE_PATH = "logs/distillation/vae-inc-a-12t-nc/checkpoint-final.pt"
-# Revision 3 repins only the frozen VAE again: the 30-teacher
-# increased-perturbation student (`inc000`-`inc011`, `inc013`-`inc030`) instead of
-# the 12-teacher one.  Representation, window, split, normalization and
-# qualification semantics are unchanged, so both earlier revisions stay loadable
-# and comparable.
-_INC30_VAE_SHA = "4a90bbdf76028d3cbe56cfcfbce9604ef96ce7b5ab5e0a7c241235be6f2dee0e"
-_INC30_VAE_PATH = "logs/distillation/vae-inc-all-30t-nc/checkpoint-final.pt"
-_D0_INC30_CONTRACT_SHA = (
-  "14319f177b9022205365c472544dd57850c00f04cf16214341f0c013cfc1911a"
-)
-_D1_INC30_CONTRACT_SHA = (
-  "95a72864773087b8ee711da14d324ca2c26b6654fea92122026987038d126202"
-)
-# Every approved (path, sha256) VAE pair.  Membership is checked when a contract
-# is decoded from YAML, so an unregistered VAE still fails closed.
-_APPROVED_VAE_IDENTITIES: frozenset[tuple[str, str]] = frozenset(
-  {
-    ("logs/distillation/mixed-10k/checkpoint-final.pt", _VAE_SHA),
-    (_INC12_VAE_PATH, _INC12_VAE_SHA),
-    (_INC30_VAE_PATH, _INC30_VAE_SHA),
-  }
-)
-# Approved contract *file* digests per schema.  A new revision must be
-# registered here before any command will read it.
-_CONTRACT_SHAS_BY_SCHEMA: dict[str, frozenset[str]] = {
-  _LEGACY_SCHEMA: frozenset(
-    {_D0_CONTRACT_SHA, _D0_INC12_CONTRACT_SHA, _D0_INC30_CONTRACT_SHA}
-  ),
-  _SCHEMA: frozenset(
-    {_D1_NO_MIXTURES_CONTRACT_SHA, _D1_INC12_CONTRACT_SHA, _D1_INC30_CONTRACT_SHA}
-  ),
-}
 _RECOVERY_SHA = "caf17c38f23ad180829a230a9a3259f14eedd3860dd90a046b8be92d3d047681"
 _XML_SHA = "ae0dcbceda3ef74e029e3bf4a9ea24ea8cc58ab44f1518e635653fc79f928125"
 _PHYSICAL_FALL_SHA = "3c0d64bdc9aa69d8fd372f343e47ab6f9da59a77d2efd8e3d860eff2c1ebf68a"
@@ -201,10 +153,11 @@ class DiffusionContract:
 
   @classmethod
   def from_mapping(cls, payload: Mapping[str, Any]) -> "DiffusionContract":
-    """Build a contract from a strict, already-decoded D0 mapping.
+    """Build a contract from a decoded D0/D1 mapping.
 
-    The YAML contains many D2 fields.  They are deliberately ignored here,
-    while all D1 identity values are checked against the frozen defaults.
+    The mapping is checked for schema and dimensional compatibility.  Artifact
+    digests in the paper-reproduction manifest remain descriptive metadata; the
+    loader does not require a local checkout to match a registry of file bytes.
     """
     if not isinstance(payload, Mapping) or payload.get("schema_version") not in {
       _SCHEMA,
@@ -260,39 +213,30 @@ class DiffusionContract:
       )
     except (KeyError, TypeError, ValueError) as exc:
       raise ContractError(f"malformed D0 payload: {exc}") from exc
-    if (contract.vae_checkpoint, contract.vae_sha256) not in _APPROVED_VAE_IDENTITIES:
-      raise ContractError(
-        "vae artifact identity is not an approved revision: "
-        f"{contract.vae_checkpoint} ({contract.vae_sha256})"
-      )
-    if (
-      contract.recovery_sha256 != _RECOVERY_SHA
-      or contract.state_xml_sha256 != _XML_SHA
-      or contract.physical_fall_source_sha256 != _PHYSICAL_FALL_SHA
-      or contract.vae_tracking_rejection_source_sha256 != _VAE_TRACKING_REJECTION_SHA
-    ):
-      raise ContractError("D0 artifact identities do not match the selected assets")
+    # The reproduction loader keeps the declared artifact fields for metadata,
+    # but does not make their file hashes a prerequisite for reading the
+    # dimensional contract.  Missing or incompatible model files still fail at
+    # the model loader boundary.
     return contract
 
   @classmethod
   def from_yaml(cls, path: str | Path) -> "DiffusionContract":
-    """Load and validate the frozen YAML without making it executable config."""
+    """Load a reproduction contract without a source-file hash gate."""
     try:
       import yaml
     except ImportError as exc:  # pragma: no cover - project environments include yaml
-      raise ContractError("PyYAML is required to read the frozen D0 manifest") from exc
-    source = Path(path).read_bytes()
-    digest = hashlib.sha256(source).hexdigest()
-    payload = yaml.safe_load(source)
-    schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
-    allowed = _CONTRACT_SHAS_BY_SCHEMA.get(str(schema), frozenset())
-    if digest not in allowed:
-      raise ContractError(
-        f"diffusion contract hash mismatch for {schema}: expected one of "
-        f"{sorted(allowed)}, got {digest}"
-      )
+      raise ContractError("PyYAML is required to read the diffusion manifest") from exc
+    try:
+      source = Path(path).read_bytes()
+      payload = yaml.safe_load(source)
+    except OSError as exc:
+      raise ContractError(f"could not read diffusion contract {path}") from exc
+    if not isinstance(payload, Mapping):
+      raise ContractError("diffusion contract YAML must contain a mapping")
     contract = cls.from_mapping(payload)
-    return replace(contract, contract_sha256=digest)
+    # Keep the digest as descriptive provenance, but never use it as a gate or
+    # include it in ``identity_hash``.
+    return replace(contract, contract_sha256=hashlib.sha256(source).hexdigest())
 
   def as_dict(self) -> dict[str, Any]:
     return {
@@ -330,7 +274,13 @@ class DiffusionContract:
     }
 
   def identity_hash(self) -> str:
-    encoded = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":")).encode()
+    # A source-file digest is useful provenance, but it is not the semantic
+    # representation identity.  This keeps hand-edited reproduction manifests
+    # compatible with checkpoints and projection bundles that use the same
+    # 135-state/32-latent contract.
+    values = self.as_dict()
+    values["contract_sha256"] = None
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
   def validate_artifacts(

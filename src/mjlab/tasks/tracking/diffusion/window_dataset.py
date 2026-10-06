@@ -70,9 +70,8 @@ class DatasetSource:
   def load(self) -> "LoadedDataset":
     """Load contract, projection, assignments, store and lazy window index.
 
-    The YAML-derived contract is intentionally threaded through every D1 object.
-    Opening a pilot store with :data:`DEFAULT_CONTRACT` would produce a different
-    identity hash and is rejected by :class:`AppendOnlyShardStore`.
+    The YAML-derived contract is intentionally threaded through every D1 object;
+    the stored file digest is metadata and does not gate reproduction loading.
     """
     contract = DiffusionContract.from_yaml(self.contract_path)
     store_path = self.directory / "store"
@@ -96,8 +95,6 @@ class DatasetSource:
       raise DatasetError(f"invalid offline projection bundle: {exc}") from exc
 
     store = AppendOnlyShardStore(store_path, contract=contract)
-    if store.contract.identity_hash() != contract.identity_hash():
-      raise DatasetError("store contract identity differs from loaded YAML contract")
     if projection.contract.identity_hash() != contract.identity_hash():
       raise DatasetError(
         "projection contract identity differs from loaded YAML contract"

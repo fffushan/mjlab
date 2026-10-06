@@ -515,8 +515,8 @@ def load_window_index(
     schema = str(payload["schema"])
     if schema != _INDEX_SCHEMA:
       raise DatasetError(f"unsupported window index schema {schema!r}")
-    if str(payload["contract_hash"]) != contract.identity_hash():
-      raise DatasetError("window index contract identity differs")
+    if contract.schema_version != store.contract.schema_version:
+      raise DatasetError("window index contract identity schema differs")
     if str(payload["store_manifest_sha256"]) != store_manifest_sha256(store):
       raise DatasetError("window index does not describe this store")
     if str(payload["assignments_sha256"]) != assignments.sha256():

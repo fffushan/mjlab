@@ -13,6 +13,23 @@ Added
   non-finite plans fail closed with no action. This integration evidence does
   not claim D5 timing, simulator, export, deployment or hardware readiness.
 
+- Added the concrete D5 model-backed runtime assembly in
+  ``diffusion/model_backend.py``. It loads the existing denoiser, projection and
+  gravity-mode VAE interfaces, creates the denoiser inside the bounded spawned
+  planner worker, decodes only the execution-tick raw 32-D latent with current
+  99-D conditioning, and exposes a direct ``build_model_backed_runtime``
+  entrypoint. Paper-reproduction loading no longer requires contract-file or
+  artifact SHA values supplied by the caller; schema, dimensions, finite values
+  and model interfaces remain checked. This is CPU/software wiring only and
+  does not claim model timing, simulator, export, deployment or hardware
+  readiness.
+
+- Changed diffusion contract loading for reproduction speed. Source YAML and
+  artifact hashes remain descriptive metadata but are no longer registry or
+  semantic-identity gates. The active schema and 135-state/32-latent/167-token
+  dimensional checks remain enforced.
+
+
 =========
 Added
 ^^^^^

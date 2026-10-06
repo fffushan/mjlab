@@ -1,9 +1,16 @@
 # D5 asynchronous latent runtime
 
-This directory documents the CPU-only D5 runtime facade. The facade connects the
-bounded planner scheduler, the raw 32-dimensional latent plan, and the current
-99-dimensional X2 decoder input. It does not start a simulator, load a frozen
-asset, use a GPU, or activate a controller.
+For a model-backed reproduction, use `ModelBackendSpec` and
+`build_model_backed_runtime` from
+`mjlab.tasks.tracking.diffusion.model_backend`. Supply explicit contract,
+denoiser checkpoint, projection bundle, VAE checkpoint, cohort manifest,
+repository root and member paths. The denoiser is created inside the spawned
+planner worker; the VAE decoder is created in the owner process. Caller-supplied
+SHA values are optional in this research path. Schema, dimensions, tensor
+shapes, finite values and model interfaces are still checked, and missing or
+malformed files fail at load time. This entrypoint is not a timing or deployment
+gate.
+
 
 ## Runtime contract
 

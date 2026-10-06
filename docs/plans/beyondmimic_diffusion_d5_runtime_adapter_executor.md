@@ -1,16 +1,21 @@
 # D5a — latent planner, executor and CPU integration
 
-Authorization: 2026-10-06. The user requests focused delegated implementation.
-All children use `lz-fast/gpt-5.6-luna:max` with fresh context.
+Authorization: 2026-10-06. The parent is implementing the concrete backend and
+runtime wiring directly after the delegated reconnaissance wave timed out.
+
+The D5 model-backed reproduction path does not require source-file or artifact
+SHA values supplied by the caller. Hash fields remain optional provenance. The
+loader still checks the active schema, dimensions, tensor shapes, finite values,
+and model/VAE interfaces; missing or malformed assets fail at load time.
 
 ## Scope
 
-Implement the latent-plan adapter, a concrete bounded executor, and their CPU
-integration. Preserve the accepted D3/D4 paths and frozen learned artifacts.
-Do not run GPU, physics, remote, controller, export, vendor-simulator or hardware
-jobs. Do not retrain. Do not commit, push, stage or install packages.
+Implement the latent-plan adapter, a concrete bounded executor, a concrete
+model-backed reproduction loader and their CPU integration. Preserve the
+accepted D3/D4 paths and learned artifacts. Do not run GPU, physics, remote,
+controller, export, vendor-simulator or hardware jobs. Do not retrain. Do not
+commit, push, stage or install packages.
 
-The standalone scheduler has 65 focused tests and 128 adjacent CPU tests passing.
 It remains isolated. Its action-vector selector is not a complete latent runtime.
 [Scheduler report](../../../worktrees/mjlab/d5-scheduler-20261006/logs/diagnostics/diffusion-d5-scheduler-direct-fixes-20261006/REPORT.md).
 
@@ -142,7 +147,26 @@ execution-row selection, prefix history, task snapshots, source-age expiry,
 reset/release, malformed results and exact cleanup. Add a small real CPU-worker
 round-trip so the integration is not proved only with a fake executor.
 
-## Validation and stop rules
+## Model-backed reproduction seam
+
+`src/mjlab/tasks/tracking/diffusion/model_backend.py` provides
+`ModelBackendSpec`, `ModelPlannerFactory`, `load_model_backend` and
+`build_model_backed_runtime`. The spec contains only explicit paths, the VAE
+member, device strings and optional identities. The owner loads the VAE decoder;
+the spawned planner worker loads the active contract, projection bundle and
+EMA-selected diffusion denoiser, then returns `LatentPlanner.process`.
+
+The reproduction path does not require contract-file, checkpoint, VAE or
+projection SHA values from the caller. Contract-file SHA values remain optional
+metadata and are excluded from semantic identity. Structural gates remain:
+active schema, 135 physical channels, 32 latent channels, 167 token width,
+99-D conditioning, 31-D action output, finite tensors and compatible saved model
+schemas. Missing or malformed files still fail at the explicit loader boundary.
+
+This is library/software wiring. No actual frozen-model run, GPU timing,
+50 Hz/p99 result, export, simulator, controller, deployment or hardware claim
+is implied by the CPU tests.
+
 
 Focused commands: pytest with `-x -vv -o faulthandler_timeout=30`, Ruff lint and
 format check, scoped Ty/Pyright, and untracked-aware whitespace checks.

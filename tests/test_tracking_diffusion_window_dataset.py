@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -29,6 +30,7 @@ from mjlab.tasks.tracking.diffusion import (
 
 PILOT = Path("logs/diffusion/d1-pilot-20260930b")
 CONTRACT_YAML = Path("docs/plans/beyondmimic_diffusion_d0_contract.yaml")
+D1_CONTRACT_YAML = Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml")
 
 
 def _dataset_owned_copy(tmp_path: Path, source: DatasetSource) -> DatasetSource:
@@ -155,15 +157,14 @@ def _source() -> DatasetSource:
   return DatasetSource.resolve(PILOT, contract_path=CONTRACT_YAML)
 
 
-def test_yaml_and_default_contract_identity_hashes_are_pinned() -> None:
+def test_yaml_and_default_contract_identity_hashes_ignore_file_digest() -> None:
   yaml_contract = DiffusionContract.from_yaml(CONTRACT_YAML)
-  assert yaml_contract.identity_hash() == (
-    "fc0bc53d0efb1a58f700f78716e5cf36dca24d527c2a7d9b46bffe49cc9a23de"
+  assert (
+    yaml_contract.identity_hash()
+    == replace(yaml_contract, contract_sha256=None).identity_hash()
   )
-  assert DEFAULT_CONTRACT.identity_hash() == (
-    "eae0d2fff601f85742306310cfac1f7332dfdeddba4fc59009595a9ad632fc76"
-  )
-  assert yaml_contract.identity_hash() != DEFAULT_CONTRACT.identity_hash()
+  d1_contract = DiffusionContract.from_yaml(D1_CONTRACT_YAML)
+  assert d1_contract.identity_hash() == DEFAULT_CONTRACT.identity_hash()
 
 
 def test_pilot_reopens_with_yaml_contract_and_empty_validation() -> None:

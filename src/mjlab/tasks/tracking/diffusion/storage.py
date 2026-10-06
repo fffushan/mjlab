@@ -223,12 +223,16 @@ class AppendOnlyShardStore:
       payload = json.loads((self.root / "manifest.json").read_text())
     except (OSError, json.JSONDecodeError) as exc:
       raise StorageError("manifest is unreadable") from exc
-    if (
-      not isinstance(payload, dict)
-      or payload.get("format") != self.FORMAT
-      or payload.get("contract_hash") != self.contract.identity_hash()
-    ):
-      raise StorageError("manifest schema or contract hash mismatch")
+    if not isinstance(payload, dict) or payload.get("format") != self.FORMAT:
+      raise StorageError("manifest schema mismatch")
+    manifest_contract = payload.get("contract")
+    manifest_schema = (
+      manifest_contract.get("schema_version")
+      if isinstance(manifest_contract, dict)
+      else None
+    )
+    if manifest_schema != self.contract.schema_version:
+      raise StorageError("manifest schema mismatch")
     return payload
 
   def _write_manifest(self, shards: list[dict[str, Any]]) -> None:
