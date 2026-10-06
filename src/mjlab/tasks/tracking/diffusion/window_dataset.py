@@ -590,6 +590,84 @@ def _validate_cache(
   return metadata, array
 
 
+def _fill_token_cache_range(
+  payload: tuple[str, str, str, str, int, int, str],
+) -> tuple[int, int, int]:
+  """Materialise the tokens for one contiguous range of cache positions.
+
+  Each worker owns a disjoint slice of the destination, so two workers never
+  write the same row.  The split's reference order is stable, so position N is
+  always the same window whatever worker computed it.
+  """
+  directory, contract_path, split, destination, start, stop, dtype_str = payload
+  source = DatasetSource(Path(directory), Path(contract_path))
+  loaded = source.load()
+  view = loaded.dataset(split)
+  refs = loaded.refs(split)
+  cache_dtype = np.dtype(dtype_str)
+  memmap = np.load(destination, mmap_mode="r+")
+  written = 0
+  try:
+    for position in range(start, stop):
+      record = _record_from_sample(view[position], refs[position], split)
+      memmap[position] = record.tokens.astype(cache_dtype, copy=False)
+      written += 1
+    memmap.flush()
+  finally:
+    del memmap
+  return start, stop, written
+
+
+def _fill_token_cache_parallel(
+  temporary_array: Path,
+  source: DatasetSource,
+  split: str,
+  count: int,
+  dtype: Any,
+  jobs: int,
+) -> None:
+  """Fill one temporary cache array from several processes.
+
+  The work is one window at a time and every window is independent, so the only
+  thing that has to stay fixed is each window's position.  Spawn is used rather
+  than fork because this runs after a dataset load, where inheriting a threaded
+  parent risks a deadlock.
+  """
+  import multiprocessing
+
+  chunk = max(1, math.ceil(count / max(1, jobs)))
+  ranges = [(start, min(start + chunk, count)) for start in range(0, count, chunk)]
+  payloads = [
+    (
+      str(source.directory),
+      str(source.contract_path),
+      split,
+      str(temporary_array),
+      start,
+      stop,
+      np.dtype(dtype).str,
+    )
+    for start, stop in ranges
+  ]
+  context = multiprocessing.get_context("spawn")
+  with context.Pool(len(payloads)) as pool:
+    results = pool.map(_fill_token_cache_range, payloads)
+
+  # A range that nobody wrote, or one written twice, would corrupt the cache
+  # silently, so the coverage of the workers is checked before anything else.
+  covered = sorted((start, stop) for start, stop, _ in results)
+  expected = list(ranges)
+  if covered != expected:
+    raise WindowCacheError(
+      f"parallel token cache covered {covered} instead of {expected}"
+    )
+  for start, stop, written in results:
+    if written != stop - start:
+      raise WindowCacheError(
+        f"parallel token cache wrote {written} rows for positions {start}:{stop}"
+      )
+
+
 def build_token_cache(
   source: DatasetSource | LoadedDataset,
   split: str,
@@ -598,6 +676,7 @@ def build_token_cache(
   motion_ids: Sequence[str] | None = None,
   dtype: Any = np.float32,
   max_cache_gib: float = _DEFAULT_MAX_CACHE_GIB,
+  jobs: int = 1,
 ) -> tuple[Path, int]:
   """Build or validate a bounded float32 ``.npy`` token cache.
 
@@ -614,6 +693,14 @@ def build_token_cache(
     raise DatasetError("dtype must be a NumPy dtype") from exc
   if cache_dtype.kind != "f" or cache_dtype.itemsize not in {2, 4, 8}:
     raise DatasetError("token cache dtype must be a floating NumPy dtype")
+  # Validate before any temporary file exists: the write block below converts
+  # ValueError into a generic write error, which would hide these reasons.
+  if jobs < 1:
+    raise DatasetError("jobs must be one or more")
+  if jobs > 1 and selected_motions is not None:
+    raise DatasetError(
+      "a parallel token cache does not support a motion filter; use jobs=1"
+    )
 
   source_obj, loaded = _source_and_loaded(source)
   if source_obj is None:
@@ -692,15 +779,20 @@ def build_token_cache(
     memmap = np.lib.format.open_memmap(
       temporary_array, mode="w+", dtype=cache_dtype, shape=shape
     )
-    for index, record in enumerate(
-      _iter_window_records(
-        loaded,
-        split,
-        motion_ids=selected_motions,
-        limit=None,
+    if jobs > 1:
+      _fill_token_cache_parallel(
+        temporary_array, source_obj, split, selected_count, cache_dtype, jobs
       )
-    ):
-      memmap[index] = record.tokens.astype(cache_dtype, copy=False)
+    else:
+      for index, record in enumerate(
+        _iter_window_records(
+          loaded,
+          split,
+          motion_ids=selected_motions,
+          limit=None,
+        )
+      ):
+        memmap[index] = record.tokens.astype(cache_dtype, copy=False)
     memmap.flush()
     del memmap
     assert temporary_array is not None

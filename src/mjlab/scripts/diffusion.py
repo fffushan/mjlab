@@ -490,6 +490,7 @@ def _command_build_token_cache(args: argparse.Namespace) -> int:
       path,
       motion_ids=args.motion,
       max_cache_gib=ceiling,
+      jobs=args.jobs,
     )
     seconds = round(time.perf_counter() - started, 1)
     print(
@@ -1350,6 +1351,12 @@ def build_parser() -> argparse.ArgumentParser:
     type=float,
     default=None,
     help="ceiling for a single cache; the module constant applies by default",
+  )
+  token_cache.add_argument(
+    "--jobs",
+    type=int,
+    default=1,
+    help="worker processes; 1 builds the cache in this process",
   )
   token_cache.add_argument("--json", type=Path)
   token_cache.set_defaults(handler=_command_build_token_cache)

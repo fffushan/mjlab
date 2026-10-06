@@ -97,6 +97,35 @@ def test_dataset_token_cache_path_is_owned_by_the_dataset_and_keyed() -> None:
   assert filtered.parent == path.parent
 
 
+def test_parallel_token_cache_matches_the_sequential_cache(tmp_path) -> None:
+  owned = _dataset_owned_copy(tmp_path, _source())
+  sequential = tmp_path / "sequential.npy"
+  parallel = tmp_path / "parallel.npy"
+  build_token_cache(owned, "train", sequential, jobs=1)
+  build_token_cache(owned, "train", parallel, jobs=4)
+  left = np.load(sequential, mmap_mode="r")
+  right = np.load(parallel, mmap_mode="r")
+  assert left.shape == right.shape
+  assert left.dtype == right.dtype
+  assert np.array_equal(np.asarray(left), np.asarray(right))
+  # Identical bytes means the two caches are interchangeable, digest included.
+  assert sequential.stat().st_size == parallel.stat().st_size
+  assert (
+    json.loads(sequential.with_suffix(".json").read_text())["content_sha256"]
+    == json.loads(parallel.with_suffix(".json").read_text())["content_sha256"]
+  )
+
+
+def test_parallel_token_cache_refuses_a_motion_filter(tmp_path) -> None:
+  owned = _dataset_owned_copy(tmp_path, _source())
+  with pytest.raises(DatasetError, match="motion filter"):
+    build_token_cache(
+      owned, "train", tmp_path / "filtered.npy", motion_ids=["tennis_000"], jobs=2
+    )
+  with pytest.raises(DatasetError, match="jobs"):
+    build_token_cache(owned, "train", tmp_path / "zero.npy", jobs=0)
+
+
 def test_dataset_scoped_cache_builds_once_and_is_reused(tmp_path) -> None:
   owned = _dataset_owned_copy(tmp_path, _source())
   loaded = owned.load()
