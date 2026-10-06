@@ -225,6 +225,40 @@ def build_bulk_trials(
   )
 
 
+def resolve_worker_offset(value: str, worker: int, workers: int) -> int:
+  """Resolve ``MJLAB_D1_WORKER_OFFSET`` for one worker.
+
+  A resumed collection must skip the trials a previous run already stored, and
+  each worker can stop at a different trial.  An empty value keeps the frozen
+  behaviour (offset 0).  One integer applies to every worker; a comma-separated
+  list gives one offset per worker and must have exactly ``workers`` entries.
+  """
+  text = value.strip()
+  if not text:
+    return 0
+  parts = [part.strip() for part in text.split(",")]
+  if any(part == "" for part in parts):
+    raise RuntimeX2Error("MJLAB_D1_WORKER_OFFSET holds an empty entry")
+  if len(parts) == 1:
+    raw = parts[0]
+  elif len(parts) == workers:
+    raw = parts[worker]
+  else:
+    raise RuntimeX2Error(
+      f"MJLAB_D1_WORKER_OFFSET has {len(parts)} entries but MJLAB_D1_WORKERS "
+      f"is {workers}; give one value or one value per worker"
+    )
+  try:
+    offset = int(raw)
+  except ValueError as exc:
+    raise RuntimeX2Error(
+      f"MJLAB_D1_WORKER_OFFSET must hold integers, got {raw!r}"
+    ) from exc
+  if offset < 0:
+    raise RuntimeX2Error("MJLAB_D1_WORKER_OFFSET must be non-negative")
+  return offset
+
+
 def _as_numpy(value: Any, width: int | None = None) -> np.ndarray:
   array = value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else value
   array = np.asarray(array, dtype=np.float64).reshape(-1)
@@ -796,6 +830,19 @@ def build_x2_runtime(request: Any) -> Any:
       for teacher_id in rollout_ids
     ]
   )
+  # A resumed collection skips the trials a previous run already stored.  The
+  # schedule is deterministic, so a worker's shard is a stable prefix of the
+  # work it owes and the offset is the number of trials that worker finished.
+  worker_offset = resolve_worker_offset(
+    os.environ.get("MJLAB_D1_WORKER_OFFSET", ""), worker, workers
+  )
+  if worker_offset:
+    if worker_offset > len(trials):
+      raise RuntimeX2Error(
+        f"MJLAB_D1_WORKER_OFFSET {worker_offset} exceeds this worker's "
+        f"{len(trials)} scheduled trials"
+      )
+    trials = trials[worker_offset:]
   if len(trials) > request.max_trials:
     raise RuntimeX2Error(
       f"collection schedule has {len(trials)} trials, budget is {request.max_trials}"
@@ -809,6 +856,9 @@ def build_x2_runtime(request: Any) -> Any:
       "environment": "agibot_x2",
       "max_envs": request.max_envs,
       "max_gpus": request.max_gpus,
+      "worker_index": worker,
+      "worker_count": workers,
+      "worker_offset": worker_offset,
       "device": device,
       "control_hz": int(round(1.0 / qualification.period_seconds)),
       "cohort_manifest": str(manifest_path),
