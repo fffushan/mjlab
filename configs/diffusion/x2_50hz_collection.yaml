@@ -11,9 +11,10 @@ decimation: 4
 pilot:
   max_trials: 54
   max_control_transitions: 13500
-  # The collector carries one environment identity end-to-end, so the CLI fails
-  # closed unless this is 1 (the frozen D0 contract's 8 is the outer envelope,
-  # not the D1 pilot budget).
+  # The D1 collector used to fail closed unless this was 1, because exactly one
+  # environment identity was carried end-to-end.  That semantic constraint is
+  # removed (2026-10-06): one shared multi-motion environment can hold several
+  # reference clips and many parallel rows.  This pilot value stays 1.
   max_envs: 1
   max_gpus: 1
   max_wall_minutes: 15

@@ -92,8 +92,19 @@ def test_cli_rejects_verified_duck_typed_runtime_bundle() -> None:
   assert "concrete DiffusionCollector" in duck_result
 
 
-def test_cli_rejects_multi_environment_budget_until_identity_is_carried() -> None:
-  args = diffusion.build_parser().parse_args(
+def test_cli_allows_a_multi_environment_budget_and_bounds_it() -> None:
+  """The semantic max_envs == 1 rule was removed on 2026-10-06.
+
+  A shared multi-motion environment held 30 reference clips and 64 parallel rows
+  in 4.3 GiB, against 36.9 GiB for 30 single-motion environments, so a declared
+  budget above 1 must validate.  An absurd value must still meet the ceiling.
+  """
+  parser = diffusion.build_parser()
+  accepts = parser.parse_args(
+    ["collect", "--output", "store", "--report", "report.json", "--max-envs", "64"]
+  )
+  assert diffusion._validate_resource_budgets(accepts) is None
+  refuses = parser.parse_args(
     [
       "collect",
       "--output",
@@ -101,12 +112,12 @@ def test_cli_rejects_multi_environment_budget_until_identity_is_carried() -> Non
       "--report",
       "report.json",
       "--max-envs",
-      "2",
+      "100000",
     ]
   )
-  budget_result = diffusion._validate_resource_budgets(args)
-  assert budget_result is not None
-  assert "max_envs" in budget_result
+  result = diffusion._validate_resource_budgets(refuses)
+  assert result is not None
+  assert "max_envs" in result
 
 
 def test_cli_allows_a_longer_monitor_tolerance_but_bounds_it() -> None:
@@ -179,20 +190,29 @@ def test_cli_collect_rejects_a_standalone_transition_budget() -> None:
   assert diffusion._validate_resource_budgets(args) is None
 
 
-def test_collection_config_rejects_multi_environment_budget(tmp_path: Path) -> None:
+def test_collection_config_accepts_a_multi_environment_budget(tmp_path: Path) -> None:
   config = tmp_path / "collection.yaml"
   config.write_text(
     "schema_version: mjlab-x2-diffusion-d1-collection-v1\n"
     "execution_authorized: false\n"
     "pilot:\n"
-    "  max_envs: 8\n"
+    "  max_envs: 64\n"
+  )
+  payload = diffusion._load_collection_config(config)
+  assert payload["pilot"]["max_envs"] == 64
+  bad = tmp_path / "bad.yaml"
+  bad.write_text(
+    "schema_version: mjlab-x2-diffusion-d1-collection-v1\n"
+    "execution_authorized: false\n"
+    "pilot:\n"
+    "  max_envs: 0\n"
   )
   try:
-    diffusion._load_collection_config(config)
+    diffusion._load_collection_config(bad)
   except ValueError as exc:
     assert "max_envs" in str(exc)
   else:  # pragma: no cover
-    raise AssertionError("multi-environment config was accepted")
+    raise AssertionError("a non-positive environment budget was accepted")
 
 
 def test_runtime_factory_requires_module_function_syntax() -> None:

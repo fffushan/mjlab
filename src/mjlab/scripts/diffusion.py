@@ -32,6 +32,16 @@ DEFAULT_CONFIG_PATH = Path("configs/diffusion/x2_50hz_collection.yaml")
 # configs/diffusion/x2_50hz_collection.yaml; these are the outer limits, raised
 # for the post-pilot bulk collection after the pilot's budgets were reviewed.
 MAX_COLLECTION_TRIALS = 5_000
+# Sanity ceiling for the declared environment budget.  There is deliberately no
+# semantic constraint here any more.  The collector used to fail closed unless
+# max_envs was 1, because exactly one environment identity was carried
+# end-to-end.  A shared multi-motion environment removes that reason: a local
+# measurement on 2026-10-06 held 30 reference clips and 64 parallel rows in one
+# environment of 4.3 GiB, against 36.9 GiB for 30 single-motion environments.
+# The runtime still builds one environment per runtime identity and reports the
+# budget it was given, so a larger declared budget is not yet a promise that
+# that many environments are created.
+MAX_COLLECTION_ENVS = 4_096
 # Per-trial no-progress tolerance.  The CLI default stays at 120 s, but a longer
 # explicit value is allowed: a shared-storage stall of about ten minutes stopped a
 # 2565-trial collection at 47.8% (2026-10-06), and --max-wall-minutes already
@@ -312,17 +322,22 @@ def _load_collection_config(path: Path) -> dict[str, Any]:
   if payload.get("execution_authorized") is not False:
     raise ValueError("collection config must remain non-authorizing")
   pilot = payload.get("pilot")
-  if isinstance(pilot, dict) and pilot.get("max_envs") != 1:
-    raise ValueError(
-      "collection config pilot.max_envs must be 1 until environment identity is carried"
-    )
+  if isinstance(pilot, dict):
+    try:
+      declared_envs = int(pilot.get("max_envs"))
+    except (TypeError, ValueError) as exc:
+      raise ValueError(
+        "collection config pilot.max_envs must be a positive integer"
+      ) from exc
+    if declared_envs < 1:
+      raise ValueError("collection config pilot.max_envs must be a positive integer")
   return payload
 
 
 def _validate_resource_budgets(args: argparse.Namespace) -> str | None:
   limits = (
     ("max_trials", args.max_trials, 1, MAX_COLLECTION_TRIALS),
-    ("max_envs", args.max_envs, 1, 8),
+    ("max_envs", args.max_envs, 1, MAX_COLLECTION_ENVS),
     ("max_gpus", args.max_gpus, 1, 1),
     ("max_wall_minutes", args.max_wall_minutes, 1, 720),
     (
@@ -336,10 +351,6 @@ def _validate_resource_budgets(args: argparse.Namespace) -> str | None:
   for name, value, lower, upper in limits:
     if value < lower or value > upper:
       return f"{name} must be in [{lower}, {upper}]"
-  if args.max_envs != 1:
-    return (
-      "max_envs must be 1 until collector environment identity is carried end-to-end"
-    )
   return None
 
 

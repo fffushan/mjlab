@@ -176,7 +176,10 @@ open it at all. Recovery ONNX metadata is decoded from the real exporter schema
 reference metrics are required while VAE owns control; snapshots are keyed by
 `(pair_id, initial_state_id)` with full initialization fingerprints; the whole
 clean phase must precede OU and OU is blocked when its clean partner did not
-qualify/handoff; `max_envs != 1` fails closed; duck-typed/self-attested runtime
+qualify/handoff; a declared environment budget above 1 is accepted since
+2026-10-06, when the shared multi-motion environment removed the
+single-environment reason (4.3 GiB held 30 clips and 64 rows, against 36.9 GiB
+for 30 single-motion environments); duck-typed/self-attested runtime
 bundles are rejected; `TerminalEvidence` booleans are strict and malformed NPZ
 containers raise `StorageError`; provenance aliases link paired/duplicate
 families.
