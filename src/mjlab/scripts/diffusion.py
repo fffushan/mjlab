@@ -675,6 +675,7 @@ def _command_train(args: argparse.Namespace) -> int:
       TrainingConfigError,
     )
     from mjlab.tasks.tracking.diffusion.window_dataset import (
+      _DEFAULT_MAX_CACHE_GIB,
       DatasetSource,
       TokenWindowDataset,
       _projection_identity,
@@ -752,6 +753,11 @@ def _command_train(args: argparse.Namespace) -> int:
           split,
           path,
           motion_ids=selected_motions,
+          max_cache_gib=(
+            _DEFAULT_MAX_CACHE_GIB
+            if args.max_cache_gib is None
+            else args.max_cache_gib
+          ),
         )
         provenance = list(
           iter_window_provenance(
@@ -1166,6 +1172,16 @@ def build_parser() -> argparse.ArgumentParser:
     "--cache-tokens",
     action=argparse.BooleanOptionalAction,
     default=True,
+  )
+  train.add_argument(
+    "--max-cache-gib",
+    type=float,
+    default=None,
+    help=(
+      "ceiling for the float32 token cache, in GiB.  The default is the "
+      "module constant window_dataset._DEFAULT_MAX_CACHE_GIB.  A cache larger "
+      "than the ceiling is refused before it is built."
+    ),
   )
   train.add_argument("--allow-long-run", action="store_true")
   train.add_argument("--json", type=Path)

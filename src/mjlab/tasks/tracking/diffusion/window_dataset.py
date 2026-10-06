@@ -528,15 +528,21 @@ def build_token_cache(
         else "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
       ),
     )
-  selected_count = sum(
-    1
-    for _ in _iter_window_records(
-      loaded,
-      split,
-      motion_ids=selected_motions,
-      limit=None,
+  # The loaded index already knows this split's eligible windows, so the
+  # projected size is available before the token walk.  With a motion
+  # filter the count needs the records themselves.
+  if selected_motions is None:
+    selected_count = len(loaded.refs(split))
+  else:
+    selected_count = sum(
+      1
+      for _ in _iter_window_records(
+        loaded,
+        split,
+        motion_ids=selected_motions,
+        limit=None,
+      )
     )
-  )
   shape = (
     selected_count,
     loaded.contract.window_steps,
@@ -550,8 +556,9 @@ def build_token_cache(
   )
   if projected_gib > max_cache_gib:
     raise WindowCacheError(
-      f"token cache would require {projected_gib:.6f} GiB, above max_cache_gib="
-      f"{max_cache_gib:.6f}"
+      f"token cache for split {split!r} would require {projected_gib:.6f} GiB, "
+      f"above max_cache_gib={max_cache_gib:.6f}; raise the ceiling with "
+      f"--max-cache-gib (train) or the max_cache_gib argument"
     )
 
   source_hash = _source_dataset_hash(source_obj, loaded)
