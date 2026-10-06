@@ -263,17 +263,15 @@ def test_pair_snapshots_do_not_alias_duplicate_initial_state_ids() -> None:
   assert env.restored == ["snapshot-1", "snapshot-2"]
 
 
-def test_collector_rejects_clean_after_ou_phase_starts() -> None:
+def test_collector_allows_unrelated_clean_after_ou_starts() -> None:
   env = _Environment()
   collector = _collector(env)
   clean = TrialSpec("run", "motion", 4, 3, pair_id="a", initial_state_id="state")
   ou = TrialSpec("run", "motion", 4, 3, "ou", pair_id="a", initial_state_id="state")
+  next_clean = TrialSpec("run", "motion", 4, 3, pair_id="b", initial_state_id="state-b")
   collector.collect(clean)
   collector.collect(ou)
-  with pytest.raises(CollectorError, match="after the OU phase"):
-    collector.collect(
-      TrialSpec("run", "motion", 4, 3, pair_id="b", initial_state_id="state-b")
-    )
+  assert collector.collect(next_clean).qualification.qualified
 
 
 def test_failed_clean_partner_blocks_ou_trial() -> None:

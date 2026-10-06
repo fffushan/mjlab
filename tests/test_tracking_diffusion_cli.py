@@ -56,11 +56,12 @@ def test_cli_rejects_mismatched_partner_identity() -> None:
   assert diffusion._validate_trial_pairs((clean, mismatched)) is not None
 
 
-def test_cli_rejects_interleaved_clean_and_ou_phases() -> None:
+def test_cli_allows_interleaved_clean_and_ou_phases() -> None:
   clean_a = TrialSpec("run", "motion", 0, 0, pair_id="a", initial_state_id="s-a")
   clean_b = TrialSpec("run", "motion", 0, 1, pair_id="b", initial_state_id="s-b")
   ou_a = TrialSpec("run", "motion", 0, 0, "ou", pair_id="a", initial_state_id="s-a")
-  assert diffusion._validate_trial_pairs((clean_a, ou_a, clean_b)) is not None
+  ou_b = TrialSpec("run", "motion", 0, 1, "ou", pair_id="b", initial_state_id="s-b")
+  assert diffusion._validate_trial_pairs((clean_a, ou_a, clean_b, ou_b)) is None
 
 
 def test_cli_allows_duplicate_initial_state_ids_without_pair_aliasing() -> None:

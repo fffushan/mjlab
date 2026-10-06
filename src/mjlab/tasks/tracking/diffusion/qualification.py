@@ -134,6 +134,106 @@ def parse_step_evidence(value: Any) -> StepEvidence:
   raise QualificationError(f"unsupported post-step evidence type {type(value)!r}")
 
 
+def _batch_bool(name: str, value: Any, batch: int) -> np.ndarray:
+  result = np.asarray(value, dtype=bool).reshape(-1)
+  if result.shape != (batch,):
+    raise QualificationError(f"{name} must have shape [{batch}]")
+  return result.copy()
+
+  if result.shape != (batch,):
+    raise QualificationError(f"{name} must have shape [{batch}]")
+  return result.copy()
+
+
+@dataclass(frozen=True, slots=True)
+class StepEvidenceBatch:
+  """Post-step evidence stored as aligned ``[N]`` arrays."""
+
+  terminal_available: np.ndarray
+  terminated: np.ndarray
+  truncated: np.ndarray
+  reason: tuple[str | None, ...]
+  finite: np.ndarray
+  physical_fall: np.ndarray
+  tracking_rejection: np.ndarray
+  reset: np.ndarray
+  teleport: np.ndarray
+  reference_boundary: np.ndarray
+  clip_ended: np.ndarray
+
+  def __post_init__(self) -> None:
+    batch = np.asarray(self.terminal_available).reshape(-1).size
+    if batch == 0:
+      raise QualificationError("evidence batches must be non-empty")
+    for name in (
+      "terminal_available",
+      "terminated",
+      "truncated",
+      "finite",
+      "physical_fall",
+      "tracking_rejection",
+      "reset",
+      "teleport",
+      "reference_boundary",
+      "clip_ended",
+    ):
+      object.__setattr__(self, name, _batch_bool(name, getattr(self, name), batch))
+    if len(self.reason) != batch:
+      raise QualificationError("evidence reasons must match the batch size")
+    if any(value is not None and not isinstance(value, str) for value in self.reason):
+      raise QualificationError("evidence reasons must be strings or None")
+
+  @property
+  def batch_size(self) -> int:
+    return self.terminal_available.size
+
+  @classmethod
+  def from_values(cls, values: Any) -> "StepEvidenceBatch":
+    if isinstance(values, cls):
+      return values
+    if not isinstance(values, (tuple, list)):
+      raise QualificationError("a batch needs StepEvidence values")
+    parsed = tuple(parse_step_evidence(value) for value in values)
+    if not parsed:
+      raise QualificationError("evidence batches must be non-empty")
+    return cls(
+      np.asarray([value.terminal_available for value in parsed]),
+      np.asarray([value.terminated for value in parsed]),
+      np.asarray([value.truncated for value in parsed]),
+      tuple(value.reason for value in parsed),
+      np.asarray([value.finite for value in parsed]),
+      np.asarray([value.physical_fall for value in parsed]),
+      np.asarray([value.tracking_rejection for value in parsed]),
+      np.asarray([value.reset for value in parsed]),
+      np.asarray([value.teleport for value in parsed]),
+      np.asarray([value.reference_boundary for value in parsed]),
+      np.asarray([value.clip_ended for value in parsed]),
+    )
+
+  def select(self, indices: Any) -> "StepEvidenceBatch":
+    ids = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.batch_size):
+      raise QualificationError("evidence selection is outside the batch")
+    return type(self)(
+      self.terminal_available[ids],
+      self.terminated[ids],
+      self.truncated[ids],
+      tuple(self.reason[int(index)] for index in ids),
+      self.finite[ids],
+      self.physical_fall[ids],
+      self.tracking_rejection[ids],
+      self.reset[ids],
+      self.teleport[ids],
+      self.reference_boundary[ids],
+      self.clip_ended[ids],
+    )
+
+
+def parse_step_evidence_batch(value: Any) -> StepEvidenceBatch:
+  """Decode a vectorized evidence object without inferring survival."""
+  return StepEvidenceBatch.from_values(value)
+
+
 @dataclass(frozen=True, slots=True)
 class QualificationConfig:
   """Pinned D0 trial limits and physical/reference guard thresholds."""
@@ -332,11 +432,214 @@ class QualificationTracker:
       self._failure = reason
 
 
+class BatchedQualificationTracker:
+  """Vectorized qualification state for independent trial slots."""
+
+  _REASONS = (
+    "",
+    "missing_terminal_evidence",
+    "nonfinite_post_step",
+    "unexpected_reset",
+    "reference_teleport",
+    "physical_fall",
+    "vae_tracking_rejection",
+    "invalid_ppo_reference_boundary",
+  )
+  _REASON_CODES = {name: index for index, name in enumerate(_REASONS) if name}
+
+  def __init__(
+    self, batch_size: int, config: QualificationConfig | None = None
+  ) -> None:
+    if isinstance(batch_size, bool) or batch_size <= 0:
+      raise QualificationError("batched qualification needs a positive batch size")
+    self.config = config or QualificationConfig()
+    self.batch_size = int(batch_size)
+    self.steps = np.zeros(self.batch_size, dtype=np.int64)
+    self.vae_steps = np.zeros(self.batch_size, dtype=np.int64)
+    self.retained_vae_steps = np.zeros(self.batch_size, dtype=np.int64)
+    self.handoff_step = np.full(self.batch_size, -1, dtype=np.int64)
+    self.failure_codes = np.zeros(self.batch_size, dtype=np.int8)
+    self.interrupted = np.zeros(self.batch_size, dtype=bool)
+    self.saw_handoff = np.zeros(self.batch_size, dtype=bool)
+
+  @property
+  def failure(self) -> np.ndarray:
+    return self.failure_codes.copy()
+
+  @property
+  def done(self) -> np.ndarray:
+    return (
+      (self.failure_codes != 0)
+      | self.interrupted
+      | (self.steps >= self.config.control_steps)
+    )
+
+  def reset(self, env_ids: Any) -> None:
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.batch_size):
+      raise QualificationError("qualification reset indices are outside the batch")
+    self.steps[ids] = 0
+    self.vae_steps[ids] = 0
+    self.retained_vae_steps[ids] = 0
+    self.handoff_step[ids] = -1
+    self.failure_codes[ids] = 0
+    self.interrupted[ids] = False
+    self.saw_handoff[ids] = False
+
+  def _set_failure(self, ids: np.ndarray, reason: str) -> None:
+    code = self._REASON_CODES[reason]
+    unset = ids[self.failure_codes[ids] == 0]
+    self.failure_codes[unset] = code
+
+  @staticmethod
+  def _tilt_degrees(observation: Any) -> np.ndarray:
+    state = getattr(observation, "state", None)
+    quaternion = getattr(state, "root_quaternion_wxyz", None)
+    if quaternion is None:
+      return np.full(observation.batch_size, np.inf, dtype=np.float64)
+    value = np.asarray(quaternion, dtype=np.float64)
+    if value.ndim != 2 or value.shape[1] != 4:
+      return np.full(observation.batch_size, np.inf, dtype=np.float64)
+    norms = np.linalg.norm(value, axis=1)
+    safe = np.divide(
+      value, norms[:, None], out=np.zeros_like(value), where=norms[:, None] != 0
+    )
+    projected_gravity_z = 1.0 - 2.0 * (safe[:, 1] ** 2 + safe[:, 2] ** 2)
+    return np.degrees(np.arccos(np.clip(projected_gravity_z, -1.0, 1.0)))
+
+  def observe(
+    self,
+    env_ids: Any,
+    controller_ppo: Any,
+    evidence: Any,
+    observation: Any | None = None,
+  ) -> StepEvidenceBatch:
+    """Record one post-step event for the supplied independent rows."""
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.batch_size):
+      raise QualificationError(
+        "qualification observation indices are outside the batch"
+      )
+    ppo = _batch_bool("controller_ppo", controller_ppo, ids.size)
+    parsed = parse_step_evidence_batch(evidence)
+    if parsed.batch_size != ids.size:
+      raise QualificationError("evidence and qualification rows must align")
+    terminal_available = parsed.terminal_available.copy()
+    terminated = parsed.terminated.copy()
+    truncated = parsed.truncated.copy()
+    finite = parsed.finite.copy()
+    physical_fall = parsed.physical_fall.copy()
+    tracking_rejection = parsed.tracking_rejection.copy()
+    reset = parsed.reset.copy()
+    teleport = parsed.teleport.copy()
+    reference_boundary = parsed.reference_boundary.copy()
+    clip_ended = parsed.clip_ended.copy()
+    reasons = list(parsed.reason)
+
+    self.steps[ids] += 1
+    self.vae_steps[ids] += ~ppo
+    self.retained_vae_steps[ids] += (~ppo) & (
+      self.vae_steps[ids] <= self.config.retained_steps
+    )
+    if observation is not None:
+      tilt = self._tilt_degrees(observation)
+      explicit_tilt = getattr(observation, "physical_tilt_degrees", None)
+      if explicit_tilt is not None:
+        tilt = np.maximum(tilt, np.asarray(explicit_tilt, dtype=np.float64))
+      physical_fall |= tilt > self.config.physical_fall_degrees
+      for name, limit in (
+        ("anchor_z_error", self.config.anchor_z_error_m),
+        ("gravity_z_error", self.config.gravity_z_error),
+        ("end_effector_z_error", self.config.end_effector_z_error_m),
+      ):
+        values = getattr(observation, name, None)
+        if not np.any(ppo):
+          if values is None:
+            tracking_rejection |= ~ppo
+          else:
+            tracking_rejection |= (~ppo) & (
+              np.abs(np.asarray(values, dtype=np.float64)) > limit
+            )
+    else:
+      physical_fall |= ppo
+      tracking_rejection |= ~ppo
+
+    selected = ids
+    for mask, reason in (
+      (~terminal_available, "missing_terminal_evidence"),
+      (~finite, "nonfinite_post_step"),
+      (reset, "unexpected_reset"),
+      (teleport, "reference_teleport"),
+      (physical_fall, "physical_fall"),
+      ((~ppo) & tracking_rejection, "vae_tracking_rejection"),
+      (ppo & (reference_boundary | clip_ended), "invalid_ppo_reference_boundary"),
+    ):
+      self._set_failure(selected[mask], reason)
+    valid_boundary = (~ppo) & (reference_boundary | clip_ended)
+    boundary_ids = selected[valid_boundary & ~self.saw_handoff[selected]]
+    self.saw_handoff[boundary_ids] = True
+    self.handoff_step[boundary_ids] = self.steps[boundary_ids]
+    interrupted = (terminated | truncated) & ~valid_boundary
+    self.interrupted[
+      selected[interrupted] & (self.failure_codes[selected[interrupted]] == 0)
+    ] = True
+    return StepEvidenceBatch(
+      terminal_available,
+      terminated,
+      truncated,
+      tuple(reasons),
+      finite,
+      physical_fall,
+      tracking_rejection,
+      reset,
+      teleport,
+      reference_boundary,
+      clip_ended,
+    )
+
+  def finish(self, env_id: int) -> QualificationResult:
+    if env_id < 0 or env_id >= self.batch_size:
+      raise QualificationError("qualification result index is outside the batch")
+    code = int(self.failure_codes[env_id])
+    if code:
+      return QualificationResult(
+        False,
+        "failed",
+        self._REASONS[code],
+        int(self.steps[env_id]),
+        int(self.vae_steps[env_id]),
+        int(self.retained_vae_steps[env_id]),
+        None if self.handoff_step[env_id] < 0 else int(self.handoff_step[env_id]),
+      )
+    if self.interrupted[env_id] or self.steps[env_id] < self.config.control_steps:
+      return QualificationResult(
+        False,
+        "incomplete",
+        "early_termination" if self.interrupted[env_id] else "incomplete_timeout",
+        int(self.steps[env_id]),
+        int(self.vae_steps[env_id]),
+        int(self.retained_vae_steps[env_id]),
+        None if self.handoff_step[env_id] < 0 else int(self.handoff_step[env_id]),
+      )
+    return QualificationResult(
+      True,
+      "vae_then_standing" if self.saw_handoff[env_id] else "vae_only",
+      None,
+      int(self.steps[env_id]),
+      int(self.vae_steps[env_id]),
+      int(self.retained_vae_steps[env_id]),
+      None if self.handoff_step[env_id] < 0 else int(self.handoff_step[env_id]),
+    )
+
+
 __all__ = [
+  "BatchedQualificationTracker",
   "QualificationConfig",
   "QualificationError",
   "QualificationResult",
   "QualificationTracker",
   "StepEvidence",
+  "StepEvidenceBatch",
   "parse_step_evidence",
+  "parse_step_evidence_batch",
 ]

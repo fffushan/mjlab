@@ -84,6 +84,24 @@ def _vector(name: str, value: Sequence[float] | np.ndarray, width: int) -> np.nd
   return result.copy()
 
 
+def _matrix(name: str, value: Any, width: int) -> np.ndarray:
+  result = np.asarray(value, dtype=np.float64)
+  if result.ndim != 2 or result.shape[1] != width or not np.isfinite(result).all():
+    raise AdapterError(f"{name} must be finite with shape [N, {width}]")
+  if result.shape[0] == 0:
+    raise AdapterError(f"{name} must contain at least one row")
+  return result.copy()
+
+
+def _batch_indices(value: Any, size: int) -> np.ndarray:
+  indices = np.asarray(value, dtype=np.int64).reshape(-1)
+  if indices.size == 0 or np.any(indices < 0) or np.any(indices >= size):
+    raise AdapterError(f"batch indices must be non-empty and lie in [0, {size})")
+  if np.unique(indices).size != indices.size:
+    raise AdapterError("batch indices must not repeat rows")
+  return indices
+
+
 def _csv_values(name: str, value: Any, width: int) -> np.ndarray:
   """Decode an exporter list, whose ONNX representation is CSV text."""
   if isinstance(value, str):
@@ -267,6 +285,149 @@ class PostStepBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class VaeObservationBatch:
+  """Aligned VAE observations for selected simulator rows."""
+
+  state: WorldState
+  reference: np.ndarray
+  conditioning: np.ndarray
+  motion_id: tuple[str, ...]
+  reference_frame: np.ndarray
+  reference_phase: np.ndarray
+  physical_tilt_degrees: np.ndarray | None = None
+  anchor_z_error: np.ndarray | None = None
+  gravity_z_error: np.ndarray | None = None
+  end_effector_z_error: np.ndarray | None = None
+
+  def __post_init__(self) -> None:
+    batch = self.state.count
+    object.__setattr__(self, "reference", _matrix("reference", self.reference, 68))
+    object.__setattr__(
+      self, "conditioning", _matrix("conditioning", self.conditioning, 99)
+    )
+    if self.reference.shape[0] != batch or self.conditioning.shape[0] != batch:
+      raise AdapterError("VAE batch state and inputs must have the same row count")
+    if len(self.motion_id) != batch:
+      raise AdapterError("VAE batch motion ids must match the row count")
+    for name, value in (
+      ("reference_frame", self.reference_frame),
+      ("reference_phase", self.reference_phase),
+      ("physical_tilt_degrees", self.physical_tilt_degrees),
+      ("anchor_z_error", self.anchor_z_error),
+      ("gravity_z_error", self.gravity_z_error),
+      ("end_effector_z_error", self.end_effector_z_error),
+    ):
+      if value is None:
+        continue
+      array = np.asarray(value, dtype=np.float64).reshape(-1)
+      if array.shape != (batch,) or not np.isfinite(array).all():
+        raise AdapterError(f"{name} must be finite with shape [{batch}]")
+      object.__setattr__(self, name, array.copy())
+    frames = np.asarray(self.reference_frame, dtype=np.int64).reshape(-1)
+    if frames.shape != (batch,) or np.any(frames < 0):
+      raise AdapterError(f"reference_frame must be non-negative with shape [{batch}]")
+    object.__setattr__(self, "reference_frame", frames.copy())
+
+  @property
+  def batch_size(self) -> int:
+    return self.reference.shape[0]
+
+  def select(self, indices: Any) -> "VaeObservationBatch":
+    ids = _batch_indices(indices, self.batch_size)
+    return type(self)(
+      self.state.select(ids),
+      self.reference[ids],
+      self.conditioning[ids],
+      tuple(self.motion_id[int(index)] for index in ids),
+      self.reference_frame[ids],
+      self.reference_phase[ids],
+      None if self.physical_tilt_degrees is None else self.physical_tilt_degrees[ids],
+      None if self.anchor_z_error is None else self.anchor_z_error[ids],
+      None if self.gravity_z_error is None else self.gravity_z_error[ids],
+      None if self.end_effector_z_error is None else self.end_effector_z_error[ids],
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PpoObservationBatch:
+  """Aligned recovery-policy observations for selected simulator rows."""
+
+  state: WorldState
+  observation: np.ndarray
+  motion_id: tuple[str, ...]
+  reference_frame: np.ndarray
+  reference_phase: np.ndarray
+  anchor_z_error: np.ndarray | None = None
+  gravity_z_error: np.ndarray | None = None
+  end_effector_z_error: np.ndarray | None = None
+  physical_tilt_degrees: np.ndarray | None = None
+
+  def __post_init__(self) -> None:
+    batch = self.state.count
+    object.__setattr__(
+      self, "observation", _matrix("PPO observation", self.observation, 102)
+    )
+    if self.observation.shape[0] != batch or len(self.motion_id) != batch:
+      raise AdapterError("PPO batch fields must have the same row count")
+    frames = np.asarray(self.reference_frame, dtype=np.int64).reshape(-1)
+    if frames.shape != (batch,) or np.any(frames < 0):
+      raise AdapterError(f"reference_frame must be non-negative with shape [{batch}]")
+    object.__setattr__(self, "reference_frame", frames.copy())
+    for name, value in (
+      ("reference_phase", self.reference_phase),
+      ("anchor_z_error", self.anchor_z_error),
+      ("gravity_z_error", self.gravity_z_error),
+      ("end_effector_z_error", self.end_effector_z_error),
+      ("physical_tilt_degrees", self.physical_tilt_degrees),
+    ):
+      if value is None:
+        continue
+      array = np.asarray(value, dtype=np.float64).reshape(-1)
+      if array.shape != (batch,) or not np.isfinite(array).all():
+        raise AdapterError(f"{name} must be finite with shape [{batch}]")
+      object.__setattr__(self, name, array.copy())
+
+  @property
+  def batch_size(self) -> int:
+    return self.observation.shape[0]
+
+  def select(self, indices: Any) -> "PpoObservationBatch":
+    ids = _batch_indices(indices, self.batch_size)
+    return type(self)(
+      self.state.select(ids),
+      self.observation[ids],
+      tuple(self.motion_id[int(index)] for index in ids),
+      self.reference_frame[ids],
+      self.reference_phase[ids],
+      None if self.anchor_z_error is None else self.anchor_z_error[ids],
+      None if self.gravity_z_error is None else self.gravity_z_error[ids],
+      None if self.end_effector_z_error is None else self.end_effector_z_error[ids],
+      None if self.physical_tilt_degrees is None else self.physical_tilt_degrees[ids],
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PostStepBundleBatch:
+  """Evidence and physical timestamps aligned with a row batch."""
+
+  evidence: Any
+  timestamp: np.ndarray
+  observation: VaeObservationBatch | PpoObservationBatch | None = None
+
+  def __post_init__(self) -> None:
+    values = np.asarray(self.timestamp, dtype=np.float64).reshape(-1)
+    if values.size == 0 or not np.isfinite(values).all():
+      raise AdapterError("post-step batch timestamps must be finite and non-empty")
+    object.__setattr__(self, "timestamp", values.copy())
+    if self.observation is not None and self.observation.batch_size != values.size:
+      raise AdapterError("post-step observation and timestamp batches must align")
+
+  @property
+  def batch_size(self) -> int:
+    return self.timestamp.size
+
+
+@dataclass(frozen=True, slots=True)
 class VaeObservation:
   """Actual pre-action VAE inputs and simulator state."""
 
@@ -344,6 +505,24 @@ class DiffusionEnvironment(Protocol):
   def reset_after_trial(self) -> None: ...
   def capture_initial_state(self) -> Any: ...
   def restore_initial_state(self, snapshot: Any) -> None: ...
+
+
+class DiffusionBatchEnvironment(Protocol):
+  """Vectorized no-reset handoff boundary consumed by batched collection."""
+
+  num_envs: int
+
+  def reset_batch(self, specs: Sequence[Any]) -> None: ...
+  def observe_vae_batch(self, env_ids: np.ndarray) -> VaeObservationBatch: ...
+  def observe_ppo_batch(self, env_ids: np.ndarray) -> PpoObservationBatch: ...
+  def step_batch(self, action: np.ndarray) -> Any: ...
+  def post_step_evidence_batch(self, env_ids: np.ndarray) -> PostStepBundleBatch: ...
+  def switch_to_ppo_batch(self, env_ids: np.ndarray) -> None: ...
+  def capture_initial_state_batch(self, env_ids: np.ndarray) -> Any: ...
+  def restore_initial_state_batch(
+    self, env_ids: np.ndarray, snapshots: Any
+  ) -> None: ...
+  def reset_after_trial_batch(self, env_ids: np.ndarray) -> None: ...
 
 
 class FrozenVaePolicy:
@@ -513,6 +692,42 @@ class FrozenVaePolicy:
   def action(self, observation: VaeObservation) -> tuple[np.ndarray, np.ndarray]:
     return self.latent_and_action(observation.reference, observation.conditioning)
 
+  def to_device(self, device: str | torch.device) -> "FrozenVaePolicy":
+    """Move the frozen model for a batched rollout without changing scalar action."""
+    mover = getattr(self.model, "to", None)
+    if not callable(mover):
+      raise AdapterError("VAE model cannot be moved to a batched inference device")
+    mover(device)
+    return self
+
+  def batch_action(
+    self, observation: VaeObservationBatch
+  ) -> tuple[np.ndarray, np.ndarray]:
+    """Run one VAE encode/decode call for all supplied rows."""
+    reference = torch.as_tensor(observation.reference, dtype=torch.float32)
+    conditioning = torch.as_tensor(observation.conditioning, dtype=torch.float32)
+    parameters = getattr(self.model, "parameters", None)
+    if callable(parameters):
+      try:
+        device = next(parameters()).device
+        reference = reference.to(device)
+        conditioning = conditioning.to(device)
+      except StopIteration:
+        pass
+    with torch.no_grad():
+      mu, _ = self.model.encode(reference)
+      action = self.model.decode(mu, conditioning)
+    latent = mu.detach().cpu().numpy().astype(np.float64)
+    clean = action.detach().cpu().numpy().astype(np.float64)
+    if latent.shape != (observation.batch_size, 32) or clean.shape != (
+      observation.batch_size,
+      31,
+    ):
+      raise AdapterError("batched VAE produced an invalid latent or action")
+    if not np.isfinite(latent).all() or not np.isfinite(clean).all():
+      raise AdapterError("batched VAE produced non-finite values")
+    return latent, clean
+
 
 class RecoveryInference(Protocol):
   def __call__(self, observation: np.ndarray) -> np.ndarray: ...
@@ -614,6 +829,44 @@ class FrozenPpoRecoveryPolicy:
     # updated only after inference, matching last-frame controller semantics.
     self.previous_action = raw.copy()
     return raw
+
+  def batch_action(
+    self, observations: PpoObservationBatch, previous_actions: np.ndarray
+  ) -> np.ndarray:
+    """Run one recovery-policy inference call for all supplied rows."""
+    previous = _matrix("previous actions", previous_actions, 31)
+    if previous.shape[0] != observations.batch_size:
+      raise AdapterError("PPO previous-action rows must match observations")
+    if self.observation_builder is _default_ppo_observation_builder:
+      model_observation = observations.observation.copy()
+      model_observation[:, _PPO_ACTION_SLICE] = previous
+    else:
+      model_observation = np.stack(
+        [
+          self.observation_builder(
+            PpoObservation(
+              observations.state.select(np.asarray([index])),
+              observations.observation[index],
+              observations.motion_id[index],
+              int(observations.reference_frame[index]),
+              float(observations.reference_phase[index]),
+            ),
+            previous[index],
+          )
+          for index in range(observations.batch_size)
+        ]
+      )
+    raw = np.asarray(
+      self.inference(model_observation.astype(np.float32)), dtype=np.float64
+    )
+    if raw.shape != (observations.batch_size, 31) or not np.isfinite(raw).all():
+      raise AdapterError("batched PPO produced an invalid action")
+    return raw.copy()
+
+  def handoff_from_physical_batch(self, physical_action: np.ndarray) -> np.ndarray:
+    """Convert batched physical endpoint actions to PPO policy units."""
+    physical = _matrix("physical endpoint actions", physical_action, 31)
+    return np.stack([self.action_contract.from_physical(row) for row in physical])
 
   def previous_from_physical(
     self, physical_action: Sequence[float] | np.ndarray

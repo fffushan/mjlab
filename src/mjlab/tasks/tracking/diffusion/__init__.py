@@ -11,12 +11,16 @@ from .adapter import (
   ActionContract,
   AdapterError,
   CallbackEnvironmentAdapter,
+  DiffusionBatchEnvironment,
   DiffusionEnvironment,
   FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
+  PostStepBundleBatch,
   PpoObservation,
+  PpoObservationBatch,
   VaeObservation,
+  VaeObservationBatch,
 )
 from .checkpoint import (
   CheckpointError,
@@ -24,7 +28,15 @@ from .checkpoint import (
   load_checkpoint,
   save_checkpoint,
 )
-from .collector import CollectionResult, CollectorError, DiffusionCollector, TrialSpec
+from .collector import (
+  BatchedCollectionResult,
+  CollectionResult,
+  CollectorError,
+  DiffusionCollector,
+  SlotScheduler,
+  TrialSlotScheduler,
+  TrialSpec,
+)
 from .contract import (
   DEFAULT_CONTRACT,
   ArtifactIdentity,
@@ -62,7 +74,13 @@ from .noising import (
   sample_levels,
   x0_target,
 )
-from .policies import OUProcess, PolicyAction, PolicyError, make_policy_action
+from .policies import (
+  BatchedOUProcess,
+  OUProcess,
+  PolicyAction,
+  PolicyError,
+  make_policy_action,
+)
 from .projection import (
   FeatureStats,
   ProjectionBundle,
@@ -70,12 +88,15 @@ from .projection import (
   fit_feature_stats,
 )
 from .qualification import (
+  BatchedQualificationTracker,
   QualificationConfig,
   QualificationError,
   QualificationResult,
   QualificationTracker,
   StepEvidence,
+  StepEvidenceBatch,
   parse_step_evidence,
+  parse_step_evidence_batch,
 )
 from .sampler import (
   ReverseStepTrace,
@@ -140,16 +161,21 @@ __all__ = [
   "AdapterError",
   "CallbackEnvironmentAdapter",
   "CollectionResult",
+  "BatchedCollectionResult",
   "CheckpointError",
   "CheckpointState",
   "load_checkpoint",
   "save_checkpoint",
   "CollectorError",
   "DiffusionEnvironment",
+  "DiffusionBatchEnvironment",
   "DiffusionCollector",
+  "SlotScheduler",
+  "TrialSlotScheduler",
   "FrozenPpoRecoveryPolicy",
   "FrozenVaePolicy",
   "OUProcess",
+  "BatchedOUProcess",
   "DiffusionSchedule",
   "DenoiserSettings",
   "InferenceGrid",
@@ -169,16 +195,22 @@ __all__ = [
   "build_schedule",
   "clean_mask",
   "PpoObservation",
+  "PpoObservationBatch",
   "PostStepBundle",
+  "PostStepBundleBatch",
   "PolicyAction",
   "PolicyError",
   "QualificationConfig",
+  "BatchedQualificationTracker",
   "QualificationError",
   "QualificationResult",
   "QualificationTracker",
   "StepEvidence",
+  "StepEvidenceBatch",
+  "parse_step_evidence_batch",
   "TrialSpec",
   "VaeObservation",
+  "VaeObservationBatch",
   "AppendOnlyShardStore",
   "ArtifactIdentity",
   "ContractError",

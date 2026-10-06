@@ -39,7 +39,7 @@ class RuntimeBundle:
   collector: Any
   trials: tuple[Any, ...]
   runtime_verified: bool = False
-  runtime_provenance: dict[str, str | int] | None = None
+  runtime_provenance: dict[str, Any] | None = None
 
 
 __all__ = ["CollectionRequest", "RuntimeBundle"]

@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
 from .adapter import (
   ActionContract,
-  DiffusionEnvironment,
   FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
 )
-from .policies import OUProcess, make_policy_action
+from .policies import BatchedOUProcess, OUProcess, make_policy_action
 from .qualification import (
   QualificationConfig,
   QualificationResult,
   QualificationTracker,
   parse_step_evidence,
+  parse_step_evidence_batch,
 )
 from .storage import (
   AppendOnlyShardStore,
+  TerminalEvidence,
   TrajectoryRow,
   validate_monotonic_timestamps,
 )
@@ -96,6 +97,119 @@ class CollectionResult:
     return not self.qualification.qualified
 
 
+@dataclass(frozen=True, slots=True)
+class BatchedCollectionResult:
+  """Results from one slot-scheduled collection and one store append."""
+
+  results: tuple[CollectionResult, ...]
+  store_files: tuple[str, ...] = ()
+  skipped_ou_pairs: tuple[str, ...] = ()
+
+
+class TrialSlotScheduler:
+  """Replace completed rows while enforcing each pair's clean admission."""
+
+  def __init__(self, trials: Sequence[TrialSpec], slots: int) -> None:
+    if slots <= 0:
+      raise CollectorError("slot scheduler needs a positive slot count")
+    self._pending = list(trials)
+    self._slots = int(slots)
+    self._active: dict[int, TrialSpec] = {}
+    self._completed_clean: dict[str, CollectionResult] = {}
+    self._blocked_pairs: set[str] = set()
+    self._results: dict[str, CollectionResult] = {}
+    self._skipped_ou_pairs: list[str] = []
+
+  @property
+  def active(self) -> dict[int, TrialSpec]:
+    return dict(self._active)
+
+  @property
+  def pending(self) -> tuple[TrialSpec, ...]:
+    return tuple(self._pending)
+
+  @property
+  def skipped_ou_pairs(self) -> tuple[str, ...]:
+    return tuple(self._skipped_ou_pairs)
+
+  @property
+  def results(self) -> tuple[CollectionResult, ...]:
+    return tuple(self._results.values())
+
+  def _admissible(self, spec: TrialSpec) -> bool:
+    if spec.phase == "clean":
+      return not spec.pair_id or spec.pair_id not in self._completed_clean
+    if spec.phase != "ou" or not spec.pair_id:
+      return False
+    clean = self._completed_clean.get(spec.pair_id)
+    if clean is None:
+      return False
+    if not clean.qualification.qualified:
+      return False
+    return spec.pair_id not in self._blocked_pairs
+
+  def fill(self) -> dict[int, TrialSpec]:
+    """Fill empty slots and return only the newly admitted trials."""
+    started: dict[int, TrialSpec] = {}
+    for slot in range(self._slots):
+      if slot in self._active:
+        continue
+      while True:
+        candidate_index = next(
+          (index for index, spec in enumerate(self._pending) if self._admissible(spec)),
+          None,
+        )
+        if candidate_index is not None:
+          spec = self._pending.pop(candidate_index)
+          self._active[slot] = spec
+          started[slot] = spec
+          break
+        blocked_index = next(
+          (
+            index
+            for index, spec in enumerate(self._pending)
+            if spec.phase == "ou"
+            and spec.pair_id in self._completed_clean
+            and not self._completed_clean[spec.pair_id].qualification.qualified
+          ),
+          None,
+        )
+        if blocked_index is None:
+          break
+        blocked = self._pending.pop(blocked_index)
+        self._blocked_pairs.add(blocked.pair_id)
+        self._skipped_ou_pairs.append(blocked.pair_id)
+    return started
+
+  def complete(
+    self, slot: int, result: CollectionResult, *, fill: bool = True
+  ) -> dict[int, TrialSpec]:
+    spec = self._active.pop(slot, None)
+    if spec is None:
+      raise CollectorError(f"slot {slot} is not active")
+    if result.spec != spec:
+      raise CollectorError("slot result does not match its admitted trial")
+    self._results[spec.episode_id] = result
+    if spec.phase == "clean" and spec.pair_id:
+      self._completed_clean[spec.pair_id] = result
+      if not result.qualification.qualified:
+        self._blocked_pairs.add(spec.pair_id)
+    return self.fill() if fill else {}
+
+  def finish(self) -> tuple[CollectionResult, ...]:
+    if self._active:
+      raise CollectorError("slot scheduler cannot finish with active trials")
+    if self._pending:
+      raise CollectorError(
+        "slot scheduler has trials that never met the pair-local admission rule"
+      )
+    return self.results
+
+
+# Descriptive alias used by callers that name rows rather than slots.
+SlotScheduler = TrialSlotScheduler
+
+
 class DiffusionCollector:
   """Collect a bounded VAE interval and, at a clip boundary, PPO recovery.
 
@@ -106,7 +220,7 @@ class DiffusionCollector:
 
   def __init__(
     self,
-    env: DiffusionEnvironment,
+    env: Any,
     vae: FrozenVaePolicy,
     ppo: FrozenPpoRecoveryPolicy,
     *,
@@ -123,7 +237,6 @@ class DiffusionCollector:
     self.qualification = qualification or QualificationConfig()
     self.store = store
     self._initial_snapshots: dict[tuple[str, str], _InitialSnapshot] = {}
-    self._ou_phase_started = False
 
   def collect(
     self, spec: TrialSpec, *, remaining_transitions: int | None = None
@@ -148,20 +261,20 @@ class DiffusionCollector:
       # clean rollout that survived its window, which is exactly what a
       # ``vae_only`` outcome means (see docs/plans/beyondmimic_diffusion_reproduction.md
       # and the paper's supplementary "Diffusion Dataset Collection").
+      # Admission is pair-local.  The old global clean-before-OU rule protected
+      # this process-local snapshot map by making every clean snapshot available
+      # before any OU trial.  The snapshot and qualification checks above protect
+      # the actual dependency, so unrelated pairs can overlap safely.
       if not snapshot.qualification.qualified:
         raise CollectorError(
           "OU trial is blocked because its clean partner did not qualify"
         )
     elif spec.phase == "clean":
-      if self._ou_phase_started:
-        raise CollectorError("clean trial cannot start after the OU phase")
       if spec.pair_id:
         if not spec.initial_state_id:
           raise CollectorError("clean trial lacks an initial-state snapshot identity")
         if snapshot_key in self._initial_snapshots:
           raise CollectorError("clean trial would overwrite an existing pair snapshot")
-    if spec.phase == "ou":
-      self._ou_phase_started = True
     try:
       self.env.reset(
         seed=spec.seed, motion_id=spec.motion_id, start_frame=spec.start_frame
@@ -332,10 +445,374 @@ class DiffusionCollector:
     finally:
       self.env.reset_after_trial()
 
+  def collect_batched(
+    self,
+    specs: Sequence[TrialSpec],
+    *,
+    slots: int | None = None,
+    remaining_transitions: int | None = None,
+  ) -> BatchedCollectionResult:
+    """Collect independent trial slots with batched policy and evidence work.
+
+    The scalar :meth:`collect` path remains the reference implementation.  This
+    path only accepts an environment that exposes the explicit batch protocol.
+    Policy calls receive the VAE and PPO index subsets, so a row never evaluates
+    the policy that does not own its current phase.
+    """
+    if not specs:
+      return BatchedCollectionResult(())
+    if remaining_transitions is not None and remaining_transitions < 0:
+      raise CollectorError("remaining transition budget must be non-negative")
+    batch_size = int(slots or getattr(self.env, "num_envs", 0))
+    if batch_size <= 0:
+      raise CollectorError("batched collection needs a positive environment slot count")
+    required = (
+      "reset_batch",
+      "observe_vae_batch",
+      "observe_ppo_batch",
+      "step_batch",
+      "post_step_evidence_batch",
+      "switch_to_ppo_batch",
+      "capture_initial_state_batch",
+      "restore_initial_state_batch",
+      "reset_after_trial_batch",
+    )
+    missing = [name for name in required if not callable(getattr(self.env, name, None))]
+    if missing:
+      raise CollectorError(f"environment does not implement batch protocol: {missing}")
+
+    from .qualification import BatchedQualificationTracker
+
+    scheduler = TrialSlotScheduler(specs, batch_size)
+    tracker = BatchedQualificationTracker(batch_size, self.qualification)
+    ou = BatchedOUProcess([0] * batch_size)
+    controller_ppo = np.zeros(batch_size, dtype=bool)
+    previous = np.zeros((batch_size, 31), dtype=np.float64)
+    active_specs: list[TrialSpec | None] = [None] * batch_size
+    slot_rows: list[list[TrajectoryRow]] = [[] for _ in range(batch_size)]
+    slot_latents = np.zeros((batch_size, 32), dtype=np.float64)
+    snapshots: dict[tuple[str, str], Any] = {}
+    result_map: dict[str, CollectionResult] = {}
+    persisted: list[TrajectoryRow] = []
+    transitions = 0
+
+    def _ids(values: Sequence[int]) -> np.ndarray:
+      return np.asarray(tuple(values), dtype=np.int64)
+
+    def _state_row(state: Any, index: int) -> Any:
+      if state.root_position.ndim == 1:
+        return state
+      return type(state)(
+        *(
+          np.asarray(getattr(state, field))[index].copy()
+          for field in (
+            "root_position",
+            "root_quaternion_wxyz",
+            "root_linear_velocity",
+            "root_angular_velocity",
+            "body_positions",
+            "body_linear_velocities",
+          )
+        )
+      )
+
+    def _observation_row(observation: Any, local_index: int) -> Any:
+      from .adapter import PpoObservation, VaeObservation
+
+      state = _state_row(observation.state, local_index)
+      values = {
+        name: None
+        if getattr(observation, name, None) is None
+        else float(np.asarray(getattr(observation, name)).reshape(-1)[local_index])
+        for name in (
+          "physical_tilt_degrees",
+          "anchor_z_error",
+          "gravity_z_error",
+          "end_effector_z_error",
+        )
+      }
+      if hasattr(observation, "reference"):
+        return VaeObservation(
+          state,
+          observation.reference[local_index],
+          observation.conditioning[local_index],
+          observation.motion_id[local_index],
+          int(observation.reference_frame[local_index]),
+          float(observation.reference_phase[local_index]),
+          **values,
+        )
+      return PpoObservation(
+        state,
+        observation.observation[local_index],
+        observation.motion_id[local_index],
+        int(observation.reference_frame[local_index]),
+        float(observation.reference_phase[local_index]),
+        **{
+          key: 0.0 if value is None else value
+          for key, value in values.items()
+          if key != "physical_tilt_degrees"
+        },
+        physical_tilt_degrees=(
+          0.0
+          if values["physical_tilt_degrees"] is None
+          else values["physical_tilt_degrees"]
+        ),
+      )
+
+    def _finish_slot(slot: int, stopped_reason: str | None = None) -> CollectionResult:
+      spec = active_specs[slot]
+      if spec is None:
+        raise CollectorError(f"slot {slot} has no active trial")
+      validate_monotonic_timestamps(slot_rows[slot])
+      qualification = tracker.finish(slot)
+      if stopped_reason is not None and qualification.qualified:
+        qualification = QualificationResult(
+          False,
+          "incomplete",
+          stopped_reason,
+          qualification.steps,
+          qualification.vae_steps,
+          qualification.retained_vae_steps,
+          qualification.handoff_step,
+        )
+      rows = tuple(slot_rows[slot])
+      accepted = (
+        tuple(
+          replace(row, segment_qualified=True)
+          for index, row in enumerate(rows)
+          if row.controller == "vae"
+          and sum(existing.controller == "vae" for existing in rows[: index + 1])
+          <= self.qualification.retained_steps
+        )
+        if qualification.qualified
+        else ()
+      )
+      accepted_ids = {row.identity for row in accepted}
+      verification = tuple(row for row in rows if row.identity not in accepted_ids)
+      persisted_rows = tuple(
+        next(
+          (
+            accepted_row
+            for accepted_row in accepted
+            if accepted_row.identity == row.identity
+          ),
+          row,
+        )
+        for row in rows
+      )
+      persisted.extend(persisted_rows)
+      result = CollectionResult(
+        spec,
+        qualification,
+        rows,
+        accepted,
+        verification,
+        (),
+        stopped_reason,
+      )
+      result_map[spec.episode_id] = result
+      return result
+
+    def _admit(started: dict[int, TrialSpec]) -> None:
+      if not started:
+        return
+      slots_now = tuple(sorted(started))
+      ids = _ids(slots_now)
+      trial_specs = tuple(started[slot] for slot in slots_now)
+      self.env.reset_batch(trial_specs, env_ids=ids)
+      tracker.reset(ids)
+      previous[ids] = 0.0
+      controller_ppo[ids] = False
+      ou.reset(ids, [spec.seed for spec in trial_specs])
+      for slot, spec in started.items():
+        active_specs[slot] = spec
+        slot_rows[slot] = []
+        slot_latents[slot] = 0.0
+        key = (spec.pair_id, spec.initial_state_id)
+        if spec.phase == "clean":
+          captured = self.env.capture_initial_state_batch(np.asarray([slot]))
+          snapshots[key] = (
+            captured[0] if isinstance(captured, (tuple, list)) else captured
+          )
+        else:
+          if key not in snapshots:
+            raise CollectorError(
+              "OU trial was admitted without its clean partner snapshot"
+            )
+          self.env.restore_initial_state_batch(np.asarray([slot]), (snapshots[key],))
+
+    _admit(scheduler.fill())
+    while scheduler.active:
+      active_ids = _ids(tuple(sorted(scheduler.active)))
+      vae_ids = active_ids[~controller_ppo[active_ids]]
+      ppo_ids = active_ids[controller_ppo[active_ids]]
+      vae_observation = self.env.observe_vae_batch(vae_ids) if vae_ids.size else None
+      ppo_observation = self.env.observe_ppo_batch(ppo_ids) if ppo_ids.size else None
+      clean = np.zeros((batch_size, 31), dtype=np.float64)
+      latent = np.zeros((batch_size, 32), dtype=np.float64)
+      noise = np.zeros((batch_size, 31), dtype=np.float64)
+      if vae_ids.size:
+        assert vae_observation is not None
+        latent_values, clean_values = self.vae.batch_action(vae_observation)
+        clean[vae_ids] = clean_values
+        latent[vae_ids] = latent_values
+        retained = vae_ids[
+          tracker.vae_steps[vae_ids] < self.qualification.retained_steps
+        ]
+        if retained.size:
+          noise[retained] = ou.sample(retained)
+      if ppo_ids.size:
+        assert ppo_observation is not None
+        clean[ppo_ids] = self.ppo.batch_action(ppo_observation, previous[ppo_ids])
+      executed = clean + noise
+      if not np.isfinite(executed).all():
+        raise CollectorError("batched policy produced non-finite actions")
+      self.env.step_batch(executed)
+      bundle = self.env.post_step_evidence_batch(active_ids)
+      if bundle.observation is None:
+        raise CollectorError("batched post-step evidence lacks an observation")
+      evidence = parse_step_evidence_batch(bundle.evidence)
+      if evidence.batch_size != active_ids.size:
+        raise CollectorError("batched evidence rows do not match active slots")
+      parsed = tracker.observe(
+        active_ids,
+        controller_ppo[active_ids],
+        evidence,
+        bundle.observation,
+      )
+      position = {int(slot): index for index, slot in enumerate(active_ids.tolist())}
+      vae_position = {int(slot): index for index, slot in enumerate(vae_ids.tolist())}
+      ppo_position = {int(slot): index for index, slot in enumerate(ppo_ids.tolist())}
+      for slot in active_ids.tolist():
+        local = position[slot]
+        is_ppo = bool(controller_ppo[slot])
+        pre = ppo_observation if is_ppo else vae_observation
+        if pre is None:
+          raise CollectorError("missing pre-step observation for an active slot")
+        pre_local = (ppo_position if is_ppo else vae_position)[slot]
+        pre_row = _observation_row(pre, pre_local)
+        row_controller = "ppo" if is_ppo else "vae"
+        terminal = TerminalEvidence(
+          bool(parsed.terminal_available[local]),
+          bool(parsed.terminated[local]),
+          bool(parsed.truncated[local]),
+          parsed.reason[local],
+          bool(parsed.physical_fall[local]),
+          bool(parsed.tracking_rejection[local]),
+        )
+        spec = active_specs[slot]
+        assert spec is not None
+        row = TrajectoryRow(
+          run_id=spec.run_id,
+          env_id=slot,
+          episode_id=spec.episode_id,
+          segment_id=f"{spec.episode_id}:{row_controller}",
+          tick=int(tracker.steps[slot] - 1),
+          timestamp=float(bundle.timestamp[local]),
+          motion_id=pre_row.motion_id,
+          reference_frame=pre_row.reference_frame,
+          controller=row_controller,
+          state=pre_row.state,
+          previous_executed_action=previous[slot].copy(),
+          clean_action=clean[slot].copy(),
+          ou_noise=noise[slot].copy(),
+          executed_action=executed[slot].copy(),
+          latent=None if is_ppo else latent[slot].copy(),
+          terminal_evidence=terminal,
+          segment_qualified=False,
+          reset=bool(parsed.reset[local]),
+          teleport=bool(parsed.teleport[local]),
+          reference_boundary=bool(
+            parsed.reference_boundary[local] or parsed.clip_ended[local]
+          ),
+          fps=1.0 / self.qualification.period_seconds,
+          group_key=spec.group_key or f"{spec.motion_id}:{spec.start_frame}",
+          provenance={
+            "phase": spec.phase,
+            "reference_phase": f"{pre_row.reference_phase:.9g}",
+            "initial_seed": str(spec.seed),
+            "initial_start_frame": str(spec.start_frame),
+            "pair_id": spec.pair_id,
+            "initial_state_id": spec.initial_state_id,
+            "group_key_generated": "true" if not spec.group_key else "false",
+            "post_step_finite": str(bool(parsed.finite[local])),
+            "post_step_reason": parsed.reason[local] or "",
+          },
+        )
+        slot_rows[slot].append(row)
+        previous[slot] = executed[slot].copy()
+
+      boundary = parsed.reference_boundary | parsed.clip_ended
+      if vae_ids.size:
+        vae_boundary = np.asarray(
+          [boundary[position[slot]] for slot in vae_ids.tolist()], dtype=bool
+        )
+        vae_failed = tracker.failure_codes[vae_ids] != 0
+        handoff = vae_ids[vae_boundary & ~vae_failed]
+      else:
+        handoff = np.empty(0, dtype=np.int64)
+      if handoff.size:
+        self.env.switch_to_ppo_batch(handoff)
+        controller_ppo[handoff] = True
+        physical = self.vae_actions.offset + self.vae_actions.scale * executed[handoff]
+        previous[handoff] = self.ppo.handoff_from_physical_batch(physical)
+
+      done = active_ids[tracker.done[active_ids]]
+      transitions += int(active_ids.size)
+      if remaining_transitions is not None and transitions >= remaining_transitions:
+        done = active_ids
+      replacement_specs: dict[int, TrialSpec] = {}
+      for slot in done.tolist():
+        stopped = (
+          "control_transition_budget"
+          if remaining_transitions is not None
+          and transitions >= remaining_transitions
+          and tracker.steps[slot] < self.qualification.control_steps
+          else None
+        )
+        result = _finish_slot(slot, stopped)
+        started = scheduler.complete(
+          slot,
+          result,
+          fill=not (
+            remaining_transitions is not None and transitions >= remaining_transitions
+          ),
+        )
+        self.env.reset_after_trial_batch(np.asarray([slot], dtype=np.int64))
+        active_specs[slot] = None
+        controller_ppo[slot] = False
+        replacement_specs.update(started)
+      if remaining_transitions is not None and transitions >= remaining_transitions:
+        break
+      _admit(replacement_specs)
+
+    if scheduler.active:
+      # The optional transition cap ends every remaining slot without adding a
+      # post-cap simulator step.  This branch is used only by bounded tests.
+      for slot in tuple(sorted(scheduler.active)):
+        result = _finish_slot(slot, "control_transition_budget")
+        scheduler.complete(slot, result, fill=False)
+        self.env.reset_after_trial_batch(np.asarray([slot], dtype=np.int64))
+        active_specs[slot] = None
+    scheduler.finish()
+    ordered = tuple(
+      result_map[spec.episode_id] for spec in specs if spec.episode_id in result_map
+    )
+    store_files: tuple[str, ...] = ()
+    if self.store is not None and persisted:
+      store_files = self.store.append(persisted)
+    if store_files and ordered:
+      last = ordered[-1]
+      ordered = (*ordered[:-1], replace(last, store_files=store_files))
+    return BatchedCollectionResult(ordered, store_files, scheduler.skipped_ou_pairs)
+
 
 __all__ = [
+  "BatchedCollectionResult",
   "CollectionResult",
   "CollectorError",
   "DiffusionCollector",
+  "SlotScheduler",
+  "TrialSlotScheduler",
   "TrialSpec",
 ]

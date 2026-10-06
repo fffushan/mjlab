@@ -8,11 +8,8 @@ physical post-step evidence.
 Design constraints taken from the frozen D0 contract
 ---------------------------------------------------
 
-* ``max_envs == 1``.  The multi-motion builder cannot represent a three-clip
-  cohort in one row, so this factory builds **one single-motion environment per
-  clip** and reuses it across that clip's trials.
-* No mid-trial reset.  ``auto_reset`` is disabled and every trial start is a
-  controlled reset plus a deterministic ``reset_to_frame`` teleport.
+* A shared multi-motion environment may carry many rows.  Rows pin their own
+  reference clip and the collector owns every reset boundary.
 * The VAE phase ends at the clip's last reference frame, where control hands to
   the zero-command recovery policy in the *same* simulator state (continuation,
   never a state transplant).
@@ -105,12 +102,12 @@ def build_trials(
   worker: int = 0,
   workers: int = 1,
 ) -> tuple[TrialSpec, ...]:
-  """Build a clean-then-OU schedule for the given seeds.
+  """Build a pair-local clean/OU schedule for the given seeds.
 
-  The CLI requires the whole clean phase to precede every OU trial, exactly one
-  OU partner per clean pair, and an identical initialization fingerprint per
-  pair.  Trial order is therefore deterministic: every clean pair first, then
-  the matched OU partners in the same order.
+  Each OU item follows its own clean item.  Unrelated pairs may interleave.  The
+  old global clean-before-OU ordering protected the single-row snapshot map, but
+  the collector now checks the matching fingerprint and qualification at each
+  pair admission, so that global restriction is not required.
 
   ``worker``/``workers`` take a disjoint stride slice of whole pairs so several
   processes can collect in parallel.  Each worker still receives every one of
@@ -167,7 +164,7 @@ def build_trials(
         initial_state_id=initial_state_id,
       )
     )
-  return tuple(clean) + tuple(ou)
+  return tuple(item for pair in zip(clean, ou, strict=True) for item in pair)
 
 
 def resolve_rollout_ids(cohort_ids: Sequence[str], selection: str) -> tuple[str, ...]:
@@ -642,8 +639,356 @@ class X2MotionEnvironment:
     )
 
 
+class X2MultiMotionEnvironment:
+  """Shared X2 environment exposing the collector's vectorized row protocol."""
+
+  def __init__(
+    self,
+    cohort: Any,
+    teacher_ids: Sequence[str],
+    *,
+    num_envs: int,
+    device: str,
+    seed: int,
+  ) -> None:
+    from mjlab.tasks.tracking.distillation.environment import (
+      build_multi_motion_environment,
+    )
+
+    if num_envs < len(teacher_ids):
+      raise RuntimeX2Error("a shared environment needs at least one row per motion")
+    self.cohort = cohort
+    self.teacher_ids = tuple(teacher_ids)
+    self.env = build_multi_motion_environment(
+      cohort,
+      teacher_ids,
+      phase_policy="start",
+      num_envs=num_envs,
+      device=device,
+      seed=seed,
+    )
+    self.env.cfg.auto_reset = False
+    self.num_envs = int(self.env.num_envs)
+    self.device = self.env.device
+    self.period_seconds = float(self.env.step_dt)
+    self._row_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
+    self.command: Any = self.env.command_manager.get_term("motion")
+    self.robot = self.env.scene["robot"]
+    self._phase_ppo = np.zeros(self.num_envs, dtype=bool)
+    self._handoff_frame = np.zeros(self.num_envs, dtype=np.int64)
+    self._trial_clock = np.zeros(self.num_envs, dtype=np.float64)
+    self._pre_frames = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self._last_result: Any = None
+    self._body_indexes = torch.tensor(
+      [self.robot.body_names.index(name) for name in DEFAULT_CONTRACT.body_names],
+      dtype=torch.long,
+      device=self.device,
+    )
+    self.joint_names = tuple(self.robot.joint_names)
+    from mjlab.tasks.tracking.distillation.adapter import (
+      _capture_snapshot,
+      _term_slices,
+    )
+    from mjlab.tasks.tracking.distillation.vae_config import make_schema
+
+    self._capture_snapshot = _capture_snapshot
+    self._slices = _term_slices(cohort)
+    self._schema = make_schema(joint_order=cohort.actions.joint_names)
+    self._reference_terms: list[tuple[Any, dict[str, Any]]] = []
+    manager = self.env.termination_manager
+    for name in _REFERENCE_TERMINATIONS:
+      if name not in manager.active_terms:
+        raise RuntimeX2Error(f"tracking task is missing termination {name!r}")
+      index = manager.active_terms.index(name)
+      cfg = manager._term_cfgs[index]
+      original, params = cfg.func, dict(cfg.params)
+      self._reference_terms.append((original, params))
+
+      def masked(env: Any, _original: Any = original, **kwargs: Any) -> Any:
+        return _original(env, **kwargs) & torch.as_tensor(
+          self._vae_phase, dtype=torch.bool, device=env.device
+        )
+
+      cfg.func = masked
+    self._vae_phase = np.ones(self.num_envs, dtype=bool)
+
+  def _refresh(self, ids: torch.Tensor) -> None:
+    self.env.scene.write_data_to_sim()
+    self.env.sim.forward()
+    self.env.sim.sense()
+    self.command.update_relative_body_poses()
+    self.env.obs_buf = self.env.observation_manager.compute(
+      update_history=True, env_ids=ids
+    )
+
+  def reset_batch(
+    self, specs: Sequence[TrialSpec], *, env_ids: np.ndarray | None = None
+  ) -> None:
+    if not specs:
+      raise RuntimeX2Error("cannot reset an empty trial batch")
+    slots = (
+      np.arange(len(specs), dtype=np.int64)
+      if env_ids is None
+      else np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    )
+    if slots.size != len(specs):
+      raise RuntimeX2Error("trial slots and specs must align")
+    if np.any(slots >= self.num_envs):
+      raise RuntimeX2Error("trial batch exceeds shared environment slots")
+    ids = torch.as_tensor(slots, dtype=torch.long, device=self.device)
+    motion_codes = torch.as_tensor(
+      [self.teacher_ids.index(spec.motion_id) for spec in specs],
+      dtype=torch.long,
+      device=self.device,
+    )
+    if not torch.equal(self.command.motion_ids[ids], motion_codes):
+      self.command.select_motion_ids(ids, motion_codes)
+    for slot, spec in zip(slots.tolist(), specs, strict=True):
+      self.env.reset(
+        seed=spec.seed,
+        env_ids=torch.as_tensor([slot], dtype=torch.long, device=self.device),
+      )
+    for frame in sorted({spec.start_frame for spec in specs}):
+      frame_ids = ids[
+        torch.as_tensor(
+          [spec.start_frame == frame for spec in specs],
+          dtype=torch.bool,
+          device=self.device,
+        )
+      ]
+      if frame_ids.numel():
+        self.command.reset_to_frame(frame_ids, int(frame))
+    self._refresh(ids)
+    self._phase_ppo[slots] = False
+    self._vae_phase[slots] = True
+    self._handoff_frame[slots] = np.asarray(
+      [spec.start_frame for spec in specs], dtype=np.int64
+    )
+    self._trial_clock[slots] = 0.0
+    self._pre_frames[ids] = self.command.time_steps[ids]
+
+  def _snapshot(self) -> Any:
+    return self._capture_snapshot(
+      self.env,
+      cohort=self.cohort,
+      slices=self._slices,
+      schema=self._schema,
+      command=self.command,
+      teacher_id="multiple",
+      teacher_code=-1,
+      motion_id=self.command.motion_ids,
+      teacher_codes=self.command.teacher_codes,
+    )
+
+  def _world_state(self, ids: np.ndarray | None = None) -> WorldState:
+    data = self.robot.data
+    select = slice(None) if ids is None else torch.as_tensor(ids, device=self.device)
+    return WorldState(
+      data.root_link_pos_w[select].detach().cpu().numpy(),
+      data.root_link_quat_w[select].detach().cpu().numpy(),
+      data.root_link_lin_vel_w[select].detach().cpu().numpy(),
+      data.root_link_ang_vel_w[select].detach().cpu().numpy(),
+      data.body_link_pos_w[select][:, self._body_indexes].detach().cpu().numpy(),
+      data.body_link_lin_vel_w[select][:, self._body_indexes].detach().cpu().numpy(),
+    )
+
+  def _reference_metrics(self, ids: np.ndarray) -> dict[str, np.ndarray]:
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    tensor_ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+    gravity = self.robot.data.gravity_vec_w[tensor_ids]
+    anchor_z = (
+      (
+        self.command.anchor_pos_w[tensor_ids, 2]
+        - self.command.robot_anchor_pos_w[tensor_ids, 2]
+      )
+      .detach()
+      .cpu()
+      .numpy()
+    )
+    motion_gravity = quat_apply_inverse(
+      self.command.anchor_quat_w[tensor_ids], gravity
+    )[:, 2]
+    robot_gravity = quat_apply_inverse(
+      self.command.robot_anchor_quat_w[tensor_ids], gravity
+    )[:, 2]
+    gravity_z = (motion_gravity - robot_gravity).detach().cpu().numpy()
+    ee_names = _END_EFFECTOR_BODIES
+    command_bodies = tuple(self.command.cfg.body_names)
+    ee = [command_bodies.index(name) for name in ee_names]
+    end_effector = (
+      (
+        self.command.body_pos_relative_w[tensor_ids][:, ee, 2]
+        - self.command.robot_body_pos_w[tensor_ids][:, ee, 2]
+      )
+      .abs()
+      .max(dim=1)
+      .values.detach()
+      .cpu()
+      .numpy()
+    )
+    return {
+      "anchor_z_error": anchor_z,
+      "gravity_z_error": gravity_z,
+      "end_effector_z_error": end_effector,
+    }
+
+  def observe_vae_batch(self, env_ids: np.ndarray) -> Any:
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    snapshot = self._snapshot()
+    frames = self.command.time_steps.detach().cpu().numpy()[ids]
+    lengths = self.command.row_lengths.detach().cpu().numpy()[ids]
+    metrics = self._reference_metrics(ids)
+    from mjlab.tasks.tracking.diffusion.adapter import VaeObservationBatch
+
+    return VaeObservationBatch(
+      self._world_state(ids),
+      snapshot.packed.reference.detach().cpu().numpy()[ids],
+      snapshot.packed.conditioning.detach().cpu().numpy()[ids],
+      tuple(
+        self.teacher_ids[int(code)]
+        for code in self.command.motion_ids.detach().cpu().numpy()[ids]
+      ),
+      frames,
+      frames / np.maximum(lengths - 1, 1),
+      **metrics,
+    )
+
+  def _recovery_observation(self, ids: np.ndarray) -> np.ndarray:
+    from mjlab.envs import mdp as envs_mdp
+
+    tensor_ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+    gyro = envs_mdp.builtin_sensor(self.env, sensor_name="robot/imu_ang_vel")[
+      tensor_ids
+    ]
+    gravity = envs_mdp.projected_gravity_from_sensor(
+      self.env, sensor_name="robot/imu_upvector"
+    )[tensor_ids]
+    joint_pos = envs_mdp.joint_pos_rel(self.env, biased=True)[tensor_ids]
+    joint_vel = envs_mdp.joint_vel_rel(self.env)[tensor_ids]
+    actions = envs_mdp.last_action(self.env)[tensor_ids]
+    return (
+      torch.cat(
+        (gyro, gravity, joint_pos, joint_vel, actions, torch.zeros_like(gyro)), dim=1
+      )
+      .detach()
+      .cpu()
+      .numpy()
+    )
+
+  def observe_ppo_batch(self, env_ids: np.ndarray) -> Any:
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    frames = self._handoff_frame[ids]
+    from mjlab.tasks.tracking.diffusion.adapter import PpoObservationBatch
+
+    return PpoObservationBatch(
+      self._world_state(ids),
+      self._recovery_observation(ids),
+      tuple(
+        self.teacher_ids[int(code)]
+        for code in self.command.motion_ids.detach().cpu().numpy()[ids]
+      ),
+      frames,
+      frames / np.maximum(self.command.row_lengths.detach().cpu().numpy()[ids] - 1, 1),
+    )
+
+  def step_batch(self, action: np.ndarray) -> Any:
+    self._pre_frames = self.command.time_steps.detach().clone()
+    tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device)
+    self._last_result = self.env.step(tensor)
+    self._post_frames = self.command.time_steps.detach().clone()
+    return self._last_result
+
+  def post_step_evidence_batch(self, env_ids: np.ndarray) -> Any:
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    if self._last_result is None:
+      raise RuntimeX2Error("post-step evidence requested before a batch step")
+    terminated = self._last_result[2].detach().cpu().numpy().astype(bool)[ids]
+    truncated = self._last_result[3].detach().cpu().numpy().astype(bool)[ids]
+    pre = self._pre_frames.detach().cpu().numpy()[ids]
+    post = self._post_frames.detach().cpu().numpy()[ids]
+    lengths = self.command.row_lengths.detach().cpu().numpy()[ids]
+    boundary = (pre + 1 >= lengths) | (post >= lengths - 1)
+    teleport = (~boundary) & (post != pre + 1)
+    from mjlab.tasks.tracking.diffusion.adapter import PostStepBundleBatch
+    from mjlab.tasks.tracking.diffusion.qualification import StepEvidenceBatch
+
+    evidence = StepEvidenceBatch(
+      np.ones(ids.size, dtype=bool),
+      terminated,
+      truncated,
+      tuple(None for _ in ids),
+      np.isfinite(self.robot.data.root_link_pos_w.detach().cpu().numpy()[ids]).all(
+        axis=1
+      ),
+      np.zeros(ids.size, dtype=bool),
+      np.zeros(ids.size, dtype=bool),
+      np.zeros(ids.size, dtype=bool),
+      teleport,
+      boundary,
+      boundary,
+    )
+    timestamp = self._trial_clock[ids].copy()
+    self._trial_clock[ids] += self.period_seconds
+    return PostStepBundleBatch(
+      evidence,
+      timestamp,
+      self.observe_vae_batch(ids),
+    )
+
+  def switch_to_ppo_batch(self, env_ids: np.ndarray) -> None:
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    self._phase_ppo[ids] = True
+    self._vae_phase[ids] = False
+    self._handoff_frame[ids] = self._post_frames.detach().cpu().numpy()[ids]
+
+  def capture_initial_state_batch(
+    self, env_ids: np.ndarray
+  ) -> tuple[InitialStateSnapshot, ...]:
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    data = self.robot.data
+    result = []
+    for row in ids.tolist():
+      values = np.concatenate(
+        (
+          data.root_link_pos_w[row].detach().cpu().numpy(),
+          data.root_link_quat_w[row].detach().cpu().numpy(),
+          data.joint_pos[row].detach().cpu().numpy(),
+          data.joint_vel[row].detach().cpu().numpy(),
+        )
+      )
+      result.append(
+        InitialStateSnapshot(
+          0,
+          int(self.command.time_steps[row]),
+          tuple(float(np.round(value, 12)) for value in values),
+        )
+      )
+    return tuple(result)
+
+  def restore_initial_state_batch(
+    self, env_ids: np.ndarray, snapshots: Sequence[InitialStateSnapshot]
+  ) -> None:
+    actual = self.capture_initial_state_batch(env_ids)
+    if len(actual) != len(snapshots) or any(
+      tuple(current.signature) != tuple(expected.signature)
+      for current, expected in zip(actual, snapshots, strict=True)
+    ):
+      raise AdapterError("OU rows could not reproduce their clean partner states")
+
+  def reset_after_trial_batch(self, env_ids: np.ndarray) -> None:
+    ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+    self.env.reset(env_ids=ids)
+    rows = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    self._phase_ppo[rows] = False
+    self._vae_phase[rows] = True
+
+  def close(self) -> None:
+    self.env.close()
+
+
 class X2DiffusionRuntime:
-  """Cross-motion single-row runtime implementing the collector's env protocol."""
+  """Cross-motion single-row runtime implementing the env protocol."""
 
   def __init__(
     self,
@@ -807,14 +1152,25 @@ def build_x2_runtime(request: Any) -> Any:
     repo_root / selected_contract.recovery_onnx, action_contract
   )
 
-  runtime = X2DiffusionRuntime(cohort, rollout_ids, device=device)
-  for teacher_id in rollout_ids:
-    env = runtime.environment(teacher_id)
-    if env.joint_names != tuple(action_contract.joint_order):
-      raise RuntimeX2Error(
-        f"compiled joint order for {teacher_id} disagrees with the action contract"
-      )
-
+  runtime: Any
+  if request.max_envs > 1:
+    runtime: Any = X2MultiMotionEnvironment(
+      cohort,
+      rollout_ids,
+      num_envs=request.max_envs,
+      device=device,
+      seed=0,
+    )
+    batch_runtime = True
+  else:
+    runtime = X2DiffusionRuntime(cohort, rollout_ids, device=device)
+    for teacher_id in rollout_ids:
+      env = runtime.environment(teacher_id)
+      if env.joint_names != tuple(action_contract.joint_order):
+        raise RuntimeX2Error(
+          f"compiled joint order for {teacher_id} disagrees with the action contract"
+        )
+    batch_runtime = False
   collector = DiffusionCollector(
     runtime,
     vae,
@@ -873,6 +1229,7 @@ def build_x2_runtime(request: Any) -> Any:
       "trials": len(trials),
       "worker": worker,
       "workers": workers,
+      "batched": batch_runtime,
     },
   )
 
@@ -887,6 +1244,7 @@ __all__ = [
   "InitialStateSnapshot",
   "RuntimeX2Error",
   "X2DiffusionRuntime",
+  "X2MultiMotionEnvironment",
   "X2MotionEnvironment",
   "build_bulk_trials",
   "build_pilot_trials",
