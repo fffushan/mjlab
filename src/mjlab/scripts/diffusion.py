@@ -472,6 +472,8 @@ def _command_build_token_cache(args: argparse.Namespace) -> int:
     TokenCacheBusyError,
     WindowCacheError,
     _source_dataset_hash,
+    dataset_token_cache_path,
+    recover_cache_lock,
   )
 
   try:
@@ -495,6 +497,21 @@ def _command_build_token_cache(args: argparse.Namespace) -> int:
     payload["error"] = str(exc)
     print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
     return 1
+
+  if args.recover_lock:
+    recovered: list[dict[str, object]] = []
+    for split in requested:
+      target = dataset_token_cache_path(
+        source, loaded, split, motion_ids=args.motion, source_hash=source_hash
+      )
+      try:
+        removed = recover_cache_lock(target)
+        recovered.append({"split": split, "removed": bool(removed)})
+      except TokenCacheBusyError as exc:
+        recovered.append({"split": split, "removed": False, "error": str(exc)})
+      except WindowCacheError as exc:
+        recovered.append({"split": split, "removed": False, "error": str(exc)})
+    payload["recovered_locks"] = recovered
 
   failed = False
 
@@ -1456,6 +1473,14 @@ def build_parser() -> argparse.ArgumentParser:
     type=int,
     default=1,
     help="worker processes; 1 builds the cache in this process",
+  )
+  token_cache.add_argument(
+    "--recover-lock",
+    action="store_true",
+    help=(
+      "remove a stale writer lock for the requested splits before starting; "
+      "refuses while the recorded owner process is alive"
+    ),
   )
   token_cache.add_argument(
     "--lock-timeout",

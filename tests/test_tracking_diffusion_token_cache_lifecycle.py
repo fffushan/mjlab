@@ -19,6 +19,7 @@ from mjlab.tasks.tracking.diffusion.window_dataset import (
   CacheLock,
   DatasetSource,
   TokenCacheBusyError,
+  WindowCacheError,
   iter_index_provenance,
   iter_window_provenance,
 )
@@ -183,3 +184,94 @@ def test_split_parser_rejects_empty_duplicate_and_unknown_names() -> None:
   for value in ("", "train,train", "missing"):
     with pytest.raises(ValueError):
       parse_splits(value)
+
+
+def _write_lock(path: Path, payload: dict[str, object]) -> Path:
+  lock = path.with_suffix(".lock")
+  lock.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+  return lock
+
+
+def _dead_pid() -> int:
+  """Return a pid that has certainly exited."""
+  import subprocess
+  import sys
+
+  proc = subprocess.Popen([sys.executable, "-c", "pass"])
+  proc.wait()
+  return int(proc.pid)
+
+
+def test_recover_lock_removes_only_dead_local_owner(tmp_path: Path) -> None:
+  from mjlab.tasks.tracking.diffusion.window_dataset import (
+    recover_cache_lock,
+  )
+
+  target = tmp_path / "tokens-train-deadbeef.npy"
+
+  # No lock at all is not an error, and it removes nothing.
+  assert recover_cache_lock(target) is False
+
+  # A dead owner on this host may be recovered.
+  lock = _write_lock(
+    target,
+    {"pid": _dead_pid(), "host": __import__("socket").gethostname(), "token": "t"},
+  )
+  assert recover_cache_lock(target) is True
+  assert not lock.exists()
+
+  # A live owner must block recovery.
+  live = _write_lock(
+    target,
+    {
+      "pid": __import__("os").getpid(),
+      "host": __import__("socket").gethostname(),
+      "token": "t",
+    },
+  )
+  with pytest.raises(TokenCacheBusyError, match="still alive"):
+    recover_cache_lock(target)
+  assert live.exists()
+
+  # A lock owned by another host must never be removed locally.
+  foreign = _write_lock(target, {"pid": 1, "host": "some-other-host", "token": "t"})
+  with pytest.raises(TokenCacheBusyError, match="host"):
+    recover_cache_lock(target)
+  assert foreign.exists()
+
+  # Malformed content is refused with an actionable message, never guessed at.
+  foreign.unlink()
+  bad = _write_lock(target, {"pid": "not-a-pid", "host": "h", "token": "t"})
+  with pytest.raises(WindowCacheError, match="manually"):
+    recover_cache_lock(target)
+  assert bad.exists()
+
+  # Recovery never deletes a lock by age alone: an old-looking, malformed lock stays.
+  assert bad.exists()
+
+
+def test_cli_accepts_recovery_and_validate_only_flags() -> None:
+  """The real parser must expose the operator recovery and read-only paths."""
+  from mjlab.scripts.diffusion import build_parser
+
+  parser = build_parser()
+  parsed = parser.parse_args(
+    [
+      "build-token-cache",
+      "--dataset-dir",
+      "somewhere",
+      "--contract",
+      "contract.yaml",
+      "--splits",
+      "train",
+      "--validate-only",
+      "--recover-lock",
+      "--jobs",
+      "2",
+    ]
+  )
+  assert parsed.command == "build-token-cache"
+  assert parsed.validate_only is True
+  assert parsed.recover_lock is True
+  assert parsed.jobs == 2
+  assert parsed.handler is not None

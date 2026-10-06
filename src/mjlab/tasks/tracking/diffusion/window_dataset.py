@@ -1282,6 +1282,7 @@ __all__ = [
   "WindowRecord",
   "build_token_cache",
   "cache_lock_path",
+  "recover_cache_lock",
   "dataset_token_cache_path",
   "iter_index_provenance",
   "iter_window_provenance",
