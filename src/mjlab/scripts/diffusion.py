@@ -975,7 +975,15 @@ def _command_train(args: argparse.Namespace) -> int:
         # A normal training run is a read-only cache consumer.  Building is an
         # explicit preparation action, so a missing cache cannot trigger a
         # hidden worker pool or a partial cache publication.
-        if args.prepare_token_cache:
+        if args.require_prepared_cache and not args.prepare_token_cache:
+          prepared = validate_token_cache_read_only(
+            source,
+            loaded,
+            split,
+            motion_ids=selected_motions,
+            source_hash=source_hash,
+          )
+        else:
           prepared = prepare_token_cache(
             source,
             loaded,
@@ -989,14 +997,6 @@ def _command_train(args: argparse.Namespace) -> int:
             jobs=args.cache_jobs,
             source_hash=source_hash,
             lock_timeout=args.cache_lock_timeout,
-          )
-        else:
-          prepared = validate_token_cache_read_only(
-            source,
-            loaded,
-            split,
-            motion_ids=selected_motions,
-            source_hash=source_hash,
           )
         provenance = list(prepared.provenance)
         dataset = TokenWindowDataset(
@@ -1417,7 +1417,18 @@ def build_parser() -> argparse.ArgumentParser:
   train.add_argument(
     "--prepare-token-cache",
     action="store_true",
-    help="explicitly build missing token caches and provenance before training",
+    help=(
+      "build missing token caches and provenance before training; this is the "
+      "default behaviour, kept for explicit launch records"
+    ),
+  )
+  train.add_argument(
+    "--require-prepared-cache",
+    action="store_true",
+    help=(
+      "fail instead of building a missing token cache; use when the dataset "
+      "caches were prepared in advance"
+    ),
   )
   train.add_argument(
     "--cache-jobs",
@@ -1428,8 +1439,11 @@ def build_parser() -> argparse.ArgumentParser:
   train.add_argument(
     "--cache-lock-timeout",
     type=float,
-    default=30.0,
-    help="bounded writer-lock wait for explicit token-cache preparation",
+    default=1800.0,
+    help=(
+      "bounded writer-lock wait when several runs prepare the same cache; the "
+      "losers reuse the published cache instead of failing"
+    ),
   )
   train.add_argument("--json", type=Path)
   train.set_defaults(handler=_command_train)

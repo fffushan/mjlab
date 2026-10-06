@@ -77,3 +77,38 @@ def test_train_parser_requires_explicit_cache_preparation() -> None:
   assert args.cache_tokens is True
   assert args.prepare_token_cache is False
   assert args.cache_jobs == 1
+
+
+def test_train_cache_policy_defaults_to_prepare_with_strict_opt_in() -> None:
+  """Legacy behaviour must stay the default: prepare a missing cache.
+
+  The strict path exists for a dataset that was prepared in advance, and the
+  lock wait must be long enough for losers of a concurrent preparation to reuse
+  the published cache instead of failing.
+  """
+  from mjlab.scripts.diffusion import build_parser
+
+  parser = build_parser()
+  base = [
+    "train",
+    "--dataset-dir",
+    "somewhere",
+    "--config",
+    "config.yaml",
+    "--out",
+    "out",
+    "--contract",
+    "contract.yaml",
+  ]
+  legacy = parser.parse_args(base)
+  assert legacy.prepare_token_cache is False
+  assert legacy.require_prepared_cache is False
+  assert legacy.cache_lock_timeout >= 600.0, (
+    "a short lock wait makes concurrent preparers fail instead of reusing"
+  )
+
+  strict = parser.parse_args(base + ["--require-prepared-cache"])
+  assert strict.require_prepared_cache is True
+
+  explicit = parser.parse_args(base + ["--prepare-token-cache"])
+  assert explicit.prepare_token_cache is True
