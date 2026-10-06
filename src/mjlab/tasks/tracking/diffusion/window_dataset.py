@@ -12,7 +12,10 @@ import hashlib
 import json
 import math
 import os
+import socket
 import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +44,150 @@ _DEFAULT_MAX_CACHE_GIB = 8.0
 
 class WindowCacheError(DatasetError):
   """A token cache or its source metadata is invalid."""
+
+
+class TokenCacheBusyError(WindowCacheError):
+  """Another process owns the cache writer lock."""
+
+
+def cache_lock_path(path: str | Path) -> Path:
+  """Return the per-cache writer lock path.
+
+  The lock uses exclusive file creation.  This is safe when the cache directory
+  provides atomic ``O_EXCL`` creation, which includes local filesystems and NAS
+  mounts with normal close-to-open semantics.  A stale lock is never deleted by
+  this module.  An operator must remove it after checking the owning process.
+  """
+  return Path(path).with_suffix(".lock")
+
+
+class CacheLock:
+  """Bounded cross-process exclusion for one cache identity."""
+
+  def __init__(self, path: str | Path, *, timeout: float = 30.0) -> None:
+    if not np.isfinite(timeout) or timeout < 0.0:
+      raise DatasetError("cache lock timeout must be finite and non-negative")
+    self.path = cache_lock_path(path)
+    self.timeout = float(timeout)
+    self._contents: str | None = None
+
+  def __enter__(self) -> "CacheLock":
+    token = uuid.uuid4().hex
+    payload = {
+      "pid": os.getpid(),
+      "host": socket.gethostname(),
+      "token": token,
+      "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    contents = json.dumps(payload, sort_keys=True) + "\n"
+    deadline = time.monotonic() + self.timeout
+    while True:
+      try:
+        descriptor = os.open(
+          self.path,
+          os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+          0o644,
+        )
+        try:
+          os.write(descriptor, contents.encode("utf-8"))
+        finally:
+          os.close(descriptor)
+        self._contents = contents
+        return self
+      except FileExistsError:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+          raise TokenCacheBusyError(
+            f"token cache writer is busy: {self.path}; waited {self.timeout:.1f}s"
+          ) from None
+        time.sleep(min(0.1, remaining))
+      except OSError as exc:
+        raise WindowCacheError(
+          f"could not create token cache lock {self.path}"
+        ) from exc
+
+  def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+    contents = self._contents
+    self._contents = None
+    if contents is None:
+      return
+    try:
+      if self.path.read_text(encoding="utf-8") == contents:
+        self.path.unlink()
+    except OSError:
+      # Never remove a lock whose ownership cannot be established.  The caller
+      # already has the original build exception, if any.
+      return
+
+
+def recover_cache_lock(path: str | Path) -> bool:
+  """Remove one explicitly selected lock only when its local owner is dead.
+
+  This function does not inspect lock age.  It accepts only a lock created by
+  :class:`CacheLock`, requires the recorded host to be this host, and refuses
+  removal while the recorded process exists or cannot be checked.  A caller
+  must invoke this function explicitly after crash inspection.
+  """
+  lock_path = cache_lock_path(path)
+  if not lock_path.exists():
+    return False
+  try:
+    contents = lock_path.read_text(encoding="utf-8")
+    payload = json.loads(contents)
+  except (OSError, TypeError, json.JSONDecodeError) as exc:
+    raise WindowCacheError(
+      f"cannot recover malformed token cache lock {lock_path}; inspect and remove it manually"
+    ) from exc
+  if not isinstance(payload, dict):
+    raise WindowCacheError(
+      f"cannot recover malformed token cache lock {lock_path}; inspect and remove it manually"
+    )
+  pid = payload.get("pid")
+  host = payload.get("host")
+  token = payload.get("token")
+  if (
+    isinstance(pid, bool)
+    or not isinstance(pid, int)
+    or pid <= 0
+    or not isinstance(host, str)
+    or not host
+    or not isinstance(token, str)
+    or not token
+  ):
+    raise WindowCacheError(
+      f"cannot recover malformed token cache lock {lock_path}; inspect and remove it manually"
+    )
+  if host != socket.gethostname():
+    raise TokenCacheBusyError(
+      f"token cache lock belongs to host {host!r}; remove it on that host after inspection"
+    )
+  try:
+    os.kill(pid, 0)
+  except ProcessLookupError:
+    pass
+  except PermissionError as exc:
+    raise TokenCacheBusyError(
+      f"token cache lock owner pid {pid} cannot be checked; remove it after inspection"
+    ) from exc
+  except OSError as exc:
+    raise TokenCacheBusyError(
+      f"token cache lock owner pid {pid} cannot be checked; remove it after inspection"
+    ) from exc
+  else:
+    raise TokenCacheBusyError(
+      f"token cache lock owner pid {pid} is still alive; no lock was removed"
+    )
+  try:
+    if lock_path.read_text(encoding="utf-8") != contents:
+      raise TokenCacheBusyError(
+        "token cache lock changed during recovery; retry after inspection"
+      )
+    lock_path.unlink()
+  except TokenCacheBusyError:
+    raise
+  except OSError as exc:
+    raise WindowCacheError(f"could not remove token cache lock {lock_path}") from exc
+  return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +357,25 @@ class WindowProvenance:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidatedTokenCache:
+  """One cache pair validated once for reuse by a consumer."""
+
+  path: Path
+  metadata: Mapping[str, object]
+  cache: np.memmap
+  dataset_identity: Mapping[str, object] | None = None
+
+  def __post_init__(self) -> None:
+    path = Path(self.path)
+    if not isinstance(self.cache, np.memmap):
+      raise WindowCacheError("validated token cache must be a NumPy memmap")
+    object.__setattr__(self, "path", path)
+    object.__setattr__(self, "metadata", dict(self.metadata))
+    if self.dataset_identity is not None:
+      object.__setattr__(self, "dataset_identity", dict(self.dataset_identity))
+
+
+@dataclass(frozen=True, slots=True)
 class WindowRecord:
   """One materialized token window plus stable D1 provenance."""
 
@@ -348,6 +514,63 @@ def _iter_window_records(
       break
 
 
+def _iter_index_provenance(
+  loaded: LoadedDataset,
+  split: str,
+  *,
+  motion_ids: tuple[str, ...] | None,
+  limit: int | None,
+) -> Iterator[WindowProvenance]:
+  """Yield provenance directly from indexed raw rows without projecting tokens."""
+  selected = 0
+  for ref in loaded.refs(split):
+    rows = loaded.index._rows(ref)
+    if not rows:
+      raise DatasetError("indexed window contains no source rows")
+    first = rows[0]
+    if motion_ids is not None and first.motion_id not in motion_ids:
+      continue
+    phase = first.provenance.get("phase", "")
+    if phase not in {"", "clean", "ou"}:
+      phase = ""
+    noise = np.stack([np.asarray(row.ou_noise, dtype=np.float64) for row in rows])
+    if not np.isfinite(noise).all():
+      raise DatasetError("window provenance contains non-finite OU noise")
+    yield WindowProvenance(
+      split=split,
+      group_key=ref.group_key,
+      motion_id=first.motion_id,
+      phase=phase,
+      ou_noise_norm=float(np.linalg.norm(noise, axis=1).mean()),
+      pair_id=first.provenance.get("pair_id", ""),
+      start_tick=ref.start_tick,
+    )
+    selected += 1
+    if limit is not None and selected >= limit:
+      break
+
+
+def iter_index_provenance(
+  source: DatasetSource | LoadedDataset,
+  split: str,
+  *,
+  motion_ids: Sequence[str] | None = None,
+  limit: int | None = None,
+) -> Iterator[WindowProvenance]:
+  """Stream provenance from raw rows without calling ``WindowDataset._sample``."""
+  _validate_split(split)
+  if limit is not None and limit < 0:
+    raise DatasetError("limit must be non-negative")
+  selected_motions = _normalise_motion_ids(motion_ids)
+  _, loaded = _source_and_loaded(source)
+  yield from _iter_index_provenance(
+    loaded,
+    split,
+    motion_ids=selected_motions,
+    limit=limit,
+  )
+
+
 def iter_window_provenance(
   source: DatasetSource | LoadedDataset,
   split: str,
@@ -468,6 +691,7 @@ def dataset_token_cache_path(
   dtype: Any = np.float32,
   motion_ids: Sequence[str] | None = None,
   limit: int | None = None,
+  source_hash: str | None = None,
 ) -> Path:
   """Resolve the dataset-scoped token-cache path for this source identity.
 
@@ -476,7 +700,9 @@ def dataset_token_cache_path(
   same dataset shares it.
   """
   key = token_cache_identity_key(
-    source_hash=_source_dataset_hash(source, loaded),
+    source_hash=(
+      _source_dataset_hash(source, loaded) if source_hash is None else source_hash
+    ),
     split=split,
     contract_hash=loaded.contract.identity_hash(),
     projection_hash=_projection_identity(loaded.projection),
@@ -485,6 +711,35 @@ def dataset_token_cache_path(
     limit=limit,
   )
   return source.token_cache_path(split, key)
+
+
+def _source_for_loaded(loaded: LoadedDataset) -> DatasetSource:
+  """Resolve a source path for a loaded dataset without reopening it."""
+  return DatasetSource(
+    Path(loaded.store.root).parent,
+    Path(
+      "docs/plans/beyondmimic_diffusion_d0_contract.yaml"
+      if loaded.contract.projection_rows
+      else "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
+    ),
+  )
+
+
+def _cache_source_and_loaded(
+  source: DatasetSource | LoadedDataset,
+  loaded_dataset: LoadedDataset | None,
+) -> tuple[DatasetSource, LoadedDataset]:
+  if loaded_dataset is not None:
+    source_obj = (
+      source
+      if isinstance(source, DatasetSource)
+      else _source_for_loaded(loaded_dataset)
+    )
+    return source_obj, loaded_dataset
+  source_obj, loaded = _source_and_loaded(source)
+  if source_obj is None:
+    source_obj = _source_for_loaded(loaded)
+  return source_obj, loaded
 
 
 def _cache_metadata(
@@ -590,32 +845,11 @@ def _validate_cache(
   return metadata, array
 
 
-def _fill_token_cache_range(
-  payload: tuple[str, str, str, str, int, int, str],
-) -> tuple[int, int, int]:
-  """Materialise the tokens for one contiguous range of cache positions.
+def _fill_token_cache_range(payload: Any) -> tuple[int, ...]:
+  """Materialise one bounded, segment-owned cache task."""
+  from .token_cache_builder import _fill_token_cache_range as fill_range
 
-  Each worker owns a disjoint slice of the destination, so two workers never
-  write the same row.  The split's reference order is stable, so position N is
-  always the same window whatever worker computed it.
-  """
-  directory, contract_path, split, destination, start, stop, dtype_str = payload
-  source = DatasetSource(Path(directory), Path(contract_path))
-  loaded = source.load()
-  view = loaded.dataset(split)
-  refs = loaded.refs(split)
-  cache_dtype = np.dtype(dtype_str)
-  memmap = np.load(destination, mmap_mode="r+")
-  written = 0
-  try:
-    for position in range(start, stop):
-      record = _record_from_sample(view[position], refs[position], split)
-      memmap[position] = record.tokens.astype(cache_dtype, copy=False)
-      written += 1
-    memmap.flush()
-  finally:
-    del memmap
-  return start, stop, written
+  return fill_range(payload)
 
 
 def _fill_token_cache_parallel(
@@ -626,49 +860,18 @@ def _fill_token_cache_parallel(
   dtype: Any,
   jobs: int,
 ) -> None:
-  """Fill one temporary cache array from several processes.
+  """Fill a parent-created cache with bounded shard-local workers."""
+  from .token_cache_builder import fill_token_cache_parallel
 
-  The work is one window at a time and every window is independent, so the only
-  thing that has to stay fixed is each window's position.  Spawn is used rather
-  than fork because this runs after a dataset load, where inheriting a threaded
-  parent risks a deadlock.
-  """
-  import multiprocessing
-
-  chunk = max(1, math.ceil(count / max(1, jobs)))
-  ranges = [(start, min(start + chunk, count)) for start in range(0, count, chunk)]
-  payloads = [
-    (
-      str(source.directory),
-      str(source.contract_path),
-      split,
-      str(temporary_array),
-      start,
-      stop,
-      np.dtype(dtype).str,
-    )
-    for start, stop in ranges
-  ]
-  context = multiprocessing.get_context("spawn")
-  with context.Pool(len(payloads)) as pool:
-    results = pool.map(_fill_token_cache_range, payloads)
-
-  # A range that nobody wrote, or one written twice, would corrupt the cache
-  # silently, so the coverage of the workers is checked before anything else.
-  covered = sorted((start, stop) for start, stop, _ in results)
-  expected = list(ranges)
-  if covered != expected:
-    raise WindowCacheError(
-      f"parallel token cache covered {covered} instead of {expected}"
-    )
-  for start, stop, written in results:
-    if written != stop - start:
-      raise WindowCacheError(
-        f"parallel token cache wrote {written} rows for positions {start}:{stop}"
-      )
+  try:
+    fill_token_cache_parallel(temporary_array, source, split, count, dtype, jobs)
+  except WindowCacheError:
+    raise
+  except (DatasetError, OSError, RuntimeError, TypeError, ValueError) as exc:
+    raise WindowCacheError("parallel token cache materialization failed") from exc
 
 
-def build_token_cache(
+def _build_token_cache_unlocked(
   source: DatasetSource | LoadedDataset,
   split: str,
   path: str | Path,
@@ -677,6 +880,9 @@ def build_token_cache(
   dtype: Any = np.float32,
   max_cache_gib: float = _DEFAULT_MAX_CACHE_GIB,
   jobs: int = 1,
+  loaded_dataset: LoadedDataset | None = None,
+  source_hash: str | None = None,
+  validated_output: list[ValidatedTokenCache] | None = None,
 ) -> tuple[Path, int]:
   """Build or validate a bounded float32 ``.npy`` token cache.
 
@@ -702,17 +908,7 @@ def build_token_cache(
       "a parallel token cache does not support a motion filter; use jobs=1"
     )
 
-  source_obj, loaded = _source_and_loaded(source)
-  if source_obj is None:
-    source_obj = DatasetSource(
-      Path(loaded.store.root).parent,
-      Path(
-        "docs/plans/beyondmimic_diffusion_d0_contract.yaml"
-        if loaded.contract.projection_rows
-        else "docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"
-      ),
-    )
-  # The loaded index already knows this split's eligible windows, so the
+  source_obj, loaded = _cache_source_and_loaded(source, loaded_dataset)
   # projected size is available before the token walk.  With a motion
   # filter the count needs the records themselves.
   if selected_motions is None:
@@ -720,7 +916,7 @@ def build_token_cache(
   else:
     selected_count = sum(
       1
-      for _ in _iter_window_records(
+      for _ in _iter_index_provenance(
         loaded,
         split,
         motion_ids=selected_motions,
@@ -745,7 +941,9 @@ def build_token_cache(
       f"--max-cache-gib (train) or the max_cache_gib argument"
     )
 
-  source_hash = _source_dataset_hash(source_obj, loaded)
+  source_hash = (
+    _source_dataset_hash(source_obj, loaded) if source_hash is None else source_hash
+  )
   expected = _cache_metadata(
     source_hash=source_hash,
     split=split,
@@ -763,11 +961,14 @@ def build_token_cache(
   destination.parent.mkdir(parents=True, exist_ok=True)
   metadata_path = destination.with_suffix(".json")
   if destination.exists() or metadata_path.exists():
-    _validate_cache(destination, metadata_path, expected)
+    metadata, cache = _validate_cache(destination, metadata_path, expected)
+    if validated_output is not None:
+      validated_output.append(ValidatedTokenCache(destination, metadata, cache))
     return destination, selected_count
 
   temporary_array: Path | None = None
   temporary_metadata: Path | None = None
+  published_array = False
   try:
     with tempfile.NamedTemporaryFile(
       dir=destination.parent,
@@ -799,6 +1000,7 @@ def build_token_cache(
     content_sha256 = _sha256_file(temporary_array)
     os.replace(temporary_array, destination)
     temporary_array = None
+    published_array = True
 
     metadata = dict(expected)
     metadata["content_sha256"] = content_sha256
@@ -816,7 +1018,17 @@ def build_token_cache(
       handle.write("\n")
     os.replace(temporary_metadata, metadata_path)
     temporary_metadata = None
+    if validated_output is not None:
+      cache = np.load(destination, mmap_mode="r", allow_pickle=False)
+      if not isinstance(cache, np.memmap):
+        raise WindowCacheError("published token cache must be a NumPy .npy memmap")
+      validated_output.append(ValidatedTokenCache(destination, metadata, cache))
   except (OSError, ValueError) as exc:
+    if published_array and not metadata_path.exists():
+      # This process owns the newly published array and has not published its
+      # metadata pair.  Roll back only that owned partial publication so a
+      # normal failed build can be retried safely.
+      destination.unlink(missing_ok=True)
     raise WindowCacheError(f"could not write token cache {destination}") from exc
   finally:
     if temporary_array is not None:
@@ -824,6 +1036,36 @@ def build_token_cache(
     if temporary_metadata is not None:
       temporary_metadata.unlink(missing_ok=True)
   return destination, selected_count
+
+
+def build_token_cache(
+  source: DatasetSource | LoadedDataset,
+  split: str,
+  path: str | Path,
+  *,
+  motion_ids: Sequence[str] | None = None,
+  dtype: Any = np.float32,
+  max_cache_gib: float = _DEFAULT_MAX_CACHE_GIB,
+  jobs: int = 1,
+  loaded_dataset: LoadedDataset | None = None,
+  source_hash: str | None = None,
+  lock_timeout: float = 30.0,
+) -> tuple[Path, int]:
+  """Build or validate one cache under exclusive cross-process ownership."""
+  destination = Path(path)
+  destination.parent.mkdir(parents=True, exist_ok=True)
+  with CacheLock(destination, timeout=lock_timeout):
+    return _build_token_cache_unlocked(
+      source,
+      split,
+      destination,
+      motion_ids=motion_ids,
+      dtype=dtype,
+      max_cache_gib=max_cache_gib,
+      jobs=jobs,
+      loaded_dataset=loaded_dataset,
+      source_hash=source_hash,
+    )
 
 
 class TokenWindowDataset(torch.utils.data.Dataset):
@@ -846,6 +1088,7 @@ class TokenWindowDataset(torch.utils.data.Dataset):
     motion_ids: Sequence[str] | None = None,
     limit: int | None = None,
     expected_metadata: Mapping[str, object] | None = None,
+    validated_cache: ValidatedTokenCache | None = None,
   ) -> None:
     self.path = Path(path)
     metadata_path = self.path.with_suffix(".json")
@@ -884,7 +1127,7 @@ class TokenWindowDataset(torch.utils.data.Dataset):
     if expected_metadata is not None:
       if _identity_metadata(metadata) != _identity_metadata(expected_metadata):
         raise WindowCacheError("token cache metadata does not match expected metadata")
-    if source is not None:
+    if source is not None and validated_cache is None:
       source_obj, loaded = _source_and_loaded(source)
       if source_obj is None:
         source_obj = DatasetSource(
@@ -937,6 +1180,8 @@ class TokenWindowDataset(torch.utils.data.Dataset):
           "statistics": loaded.projection.statistics_sha256,
         },
       }
+    elif validated_cache is not None and validated_cache.dataset_identity is not None:
+      dataset_identity = dict(validated_cache.dataset_identity)
     else:
       dataset_identity = {
         "directory": str(self.path.parent),
@@ -948,7 +1193,16 @@ class TokenWindowDataset(torch.utils.data.Dataset):
         "limit": metadata.get("limit"),
       }
 
-    _, cache = _validate_cache(self.path, metadata_path, metadata)
+    if validated_cache is not None:
+      if validated_cache.path != self.path:
+        raise WindowCacheError("validated token cache path does not match dataset path")
+      if dict(validated_cache.metadata) != metadata:
+        raise WindowCacheError("token cache changed after validation")
+    _, cache = (
+      (validated_cache.metadata, validated_cache.cache)
+      if validated_cache is not None
+      else _validate_cache(self.path, metadata_path, metadata)
+    )
     if values is None:
       values = tuple()
     self.records = values
@@ -1017,14 +1271,19 @@ def sampling_weights(
 
 
 __all__ = [
+  "CacheLock",
   "DatasetSource",
   "LoadedDataset",
+  "TokenCacheBusyError",
   "TokenWindowDataset",
+  "ValidatedTokenCache",
   "WindowCacheError",
   "WindowProvenance",
   "WindowRecord",
   "build_token_cache",
+  "cache_lock_path",
   "dataset_token_cache_path",
+  "iter_index_provenance",
   "iter_window_provenance",
   "load_window_records",
   "sampling_weights",

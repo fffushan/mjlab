@@ -459,57 +459,134 @@ def _command_stats(args: argparse.Namespace) -> int:
 
 
 def _command_build_token_cache(args: argparse.Namespace) -> int:
-  """Build or validate the dataset-owned token cache for the requested splits.
-
-  The cache is derived metadata, so the dataset owns it.  A run that finds a
-  valid cache validates it and reuses it, so only the first build is expensive.
-  """
-  import time
-
+  """Prepare or validate dataset-owned token caches with a split report."""
+  from mjlab.tasks.tracking.diffusion.token_cache_lifecycle import (
+    CacheProvenanceError,
+    parse_splits,
+    prepare_token_cache,
+    validate_token_cache_read_only,
+  )
   from mjlab.tasks.tracking.diffusion.window_dataset import (
     _DEFAULT_MAX_CACHE_GIB,
     DatasetSource,
-    build_token_cache,
-    dataset_token_cache_path,
+    TokenCacheBusyError,
+    WindowCacheError,
+    _source_dataset_hash,
   )
 
-  source = DatasetSource(Path(args.dataset_dir), Path(args.contract))
-  loaded = source.load()
-  requested = [value.strip() for value in str(args.splits).split(",") if value.strip()]
+  try:
+    requested = parse_splits(args.splits)
+  except (ValueError, TypeError) as exc:
+    print(f"build-token-cache: {exc}", file=sys.stderr)
+    return 1
   ceiling = _DEFAULT_MAX_CACHE_GIB if args.max_cache_gib is None else args.max_cache_gib
-  payload: dict[str, object] = {"dataset": str(source.directory), "splits": {}}
-  entries: dict[str, object] = payload["splits"]  # type: ignore[assignment]
-  for split in requested:
-    path = dataset_token_cache_path(source, loaded, split, motion_ids=args.motion)
-    metadata_path = path.with_suffix(".json")
-    existed = path.is_file() and metadata_path.is_file()
-    started = time.perf_counter()
-    cache_path, count = build_token_cache(
-      source,
-      split,
-      path,
-      motion_ids=args.motion,
-      max_cache_gib=ceiling,
-      jobs=args.jobs,
-    )
-    seconds = round(time.perf_counter() - started, 1)
-    print(
-      f"token cache {split}: {cache_path} windows={count} "
-      f"{'reused' if existed else 'built'} in {seconds}s",
-      flush=True,
-    )
-    entries[split] = {
-      "path": str(cache_path),
-      "windows": count,
-      "reused": existed,
-      "seconds": seconds,
-      "bytes": cache_path.stat().st_size if cache_path.is_file() else None,
+  payload: dict[str, object] = {
+    "dataset": str(args.dataset_dir),
+    "mode": "validate-only" if args.validate_only else "build",
+    "splits": {},
+    "complete": False,
+  }
+  entries = cast(dict[str, object], payload["splits"])
+  try:
+    source = DatasetSource(Path(args.dataset_dir), Path(args.contract))
+    loaded = source.load()
+    source_hash = _source_dataset_hash(source, loaded)
+  except (OSError, RuntimeError, ValueError, TypeError) as exc:
+    payload["error"] = str(exc)
+    print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
+    return 1
+
+  failed = False
+
+  def ready_entry(item: object) -> bool:
+    if not isinstance(item, dict):
+      return False
+    return cast(dict[str, object], item).get("status") in {
+      "built",
+      "reused",
+      "ready",
     }
-  if args.json is not None:
-    Path(args.json).write_text(
-      json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-  return 0
+
+  for split in requested:
+    started = time.perf_counter()
+    entry: dict[str, object] = {"status": "failed", "seconds": 0.0}
+    try:
+      if args.validate_only:
+        prepared = validate_token_cache_read_only(
+          source,
+          loaded,
+          split,
+          motion_ids=args.motion,
+          source_hash=source_hash,
+        )
+        status = "ready"
+      else:
+        prepared = prepare_token_cache(
+          source,
+          loaded,
+          split,
+          motion_ids=args.motion,
+          max_cache_gib=ceiling,
+          jobs=args.jobs,
+          source_hash=source_hash,
+          lock_timeout=args.lock_timeout,
+        )
+        status = prepared.cache_status
+      entry.update(
+        {
+          "status": status,
+          "path": str(prepared.path),
+          "provenance_path": str(
+            prepared.path.with_name(f"{prepared.path.stem}.provenance.json")
+          ),
+          "windows": prepared.count,
+          "bytes": prepared.path.stat().st_size,
+          "provenance": prepared.provenance_status,
+        }
+      )
+      print(
+        f"token cache {split}: {status} windows={prepared.count} "
+        f"in {time.perf_counter() - started:.1f}s",
+        flush=True,
+      )
+    except TokenCacheBusyError as exc:
+      failed = True
+      entry.update({"status": "busy", "error": str(exc)})
+      print(f"token cache {split}: busy: {exc}", file=sys.stderr, flush=True)
+    except (
+      CacheProvenanceError,
+      WindowCacheError,
+      OSError,
+      RuntimeError,
+      ValueError,
+      TypeError,
+    ) as exc:
+      failed = True
+      entry.update(
+        {"status": "missing" if args.validate_only else "failed", "error": str(exc)}
+      )
+      print(
+        f"token cache {split}: {entry['status']}: {exc}", file=sys.stderr, flush=True
+      )
+    entry["seconds"] = round(time.perf_counter() - started, 3)
+    entries[split] = entry
+    # A report is persisted after each builder split.  Validate-only never
+    # writes a report file because it is a strictly read-only operation.
+    if args.json is not None and not args.validate_only:
+      payload["complete"] = (
+        not failed
+        and len(entries) == len(requested)
+        and all(ready_entry(item) for item in entries.values())
+      )
+      _json_write(args.json, payload)
+
+  payload["complete"] = (
+    not failed
+    and len(entries) == len(requested)
+    and all(ready_entry(item) for item in entries.values())
+  )
+  print(json.dumps(payload, indent=2, sort_keys=True))
+  return 0 if payload["complete"] else 1
 
 
 def _command_build_index(args: argparse.Namespace) -> int:
@@ -799,6 +876,10 @@ def _command_train(args: argparse.Namespace) -> int:
       StateLatentTransformer,
     )
     from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule
+    from mjlab.tasks.tracking.diffusion.token_cache_lifecycle import (
+      prepare_token_cache,
+      validate_token_cache_read_only,
+    )
     from mjlab.tasks.tracking.diffusion.trainer import DiffusionTrainer
     from mjlab.tasks.tracking.diffusion.training_config import (
       TrainingConfig,
@@ -810,9 +891,6 @@ def _command_train(args: argparse.Namespace) -> int:
       TokenWindowDataset,
       _projection_identity,
       _source_dataset_hash,
-      build_token_cache,
-      dataset_token_cache_path,
-      iter_window_provenance,
       load_window_records,
     )
 
@@ -841,6 +919,11 @@ def _command_train(args: argparse.Namespace) -> int:
     if args.epochs is not None:
       config = replace(config, epochs=args.epochs)
     config.validate(allow_long_run=args.allow_long_run)
+
+    if args.cache_tokens and args.prepare_token_cache and args.cache_jobs < 1:
+      raise ValueError("--cache-jobs must be one or more")
+    if args.cache_tokens and args.prepare_token_cache and args.cache_lock_timeout < 0:
+      raise ValueError("--cache-lock-timeout must be non-negative")
 
     contract = DiffusionContract.from_yaml(args.contract)
     source = DatasetSource.resolve(args.dataset_dir, contract_path=args.contract)
@@ -872,43 +955,42 @@ def _command_train(args: argparse.Namespace) -> int:
 
     def make_dataset(split: str) -> tuple[Any, list[Any], Path | None]:
       if args.cache_tokens:
-        # The cache belongs to the dataset: it is a function of the stored rows,
-        # the contract and the projection only, so every run over this dataset
-        # shares one file instead of rebuilding a private copy per run.
-        path = dataset_token_cache_path(
-          source,
-          loaded,
-          split,
-          motion_ids=selected_motions,
-        )
-        cache_path, cache_count = build_token_cache(
-          source,
-          split,
-          path,
-          motion_ids=selected_motions,
-          max_cache_gib=(
-            _DEFAULT_MAX_CACHE_GIB if args.max_cache_gib is None else args.max_cache_gib
-          ),
-        )
-        provenance = list(
-          iter_window_provenance(
+        # A normal training run is a read-only cache consumer.  Building is an
+        # explicit preparation action, so a missing cache cannot trigger a
+        # hidden worker pool or a partial cache publication.
+        if args.prepare_token_cache:
+          prepared = prepare_token_cache(
+            source,
             loaded,
             split,
             motion_ids=selected_motions,
+            max_cache_gib=(
+              _DEFAULT_MAX_CACHE_GIB
+              if args.max_cache_gib is None
+              else args.max_cache_gib
+            ),
+            jobs=args.cache_jobs,
+            source_hash=source_hash,
+            lock_timeout=args.cache_lock_timeout,
           )
-        )
-        if len(provenance) != cache_count:
-          raise RuntimeError(
-            f"token cache count changed while collecting {split} provenance"
+        else:
+          prepared = validate_token_cache_read_only(
+            source,
+            loaded,
+            split,
+            motion_ids=selected_motions,
+            source_hash=source_hash,
           )
+        provenance = list(prepared.provenance)
         dataset = TokenWindowDataset(
-          cache_path,
+          prepared.path,
           provenance,
           source=source,
           split=split,
           motion_ids=selected_motions,
+          validated_cache=prepared.cache,
         )
-        return dataset, provenance, cache_path
+        return dataset, provenance, prepared.path
 
       records = load_window_records(
         loaded,
@@ -1315,6 +1397,23 @@ def build_parser() -> argparse.ArgumentParser:
     ),
   )
   train.add_argument("--allow-long-run", action="store_true")
+  train.add_argument(
+    "--prepare-token-cache",
+    action="store_true",
+    help="explicitly build missing token caches and provenance before training",
+  )
+  train.add_argument(
+    "--cache-jobs",
+    type=int,
+    default=1,
+    help="worker processes for explicit token-cache preparation",
+  )
+  train.add_argument(
+    "--cache-lock-timeout",
+    type=float,
+    default=30.0,
+    help="bounded writer-lock wait for explicit token-cache preparation",
+  )
   train.add_argument("--json", type=Path)
   train.set_defaults(handler=_command_train)
 
@@ -1357,6 +1456,17 @@ def build_parser() -> argparse.ArgumentParser:
     type=int,
     default=1,
     help="worker processes; 1 builds the cache in this process",
+  )
+  token_cache.add_argument(
+    "--lock-timeout",
+    type=float,
+    default=30.0,
+    help="bounded writer-lock wait in seconds",
+  )
+  token_cache.add_argument(
+    "--validate-only",
+    action="store_true",
+    help="validate cache and provenance only; never create locks or write files",
   )
   token_cache.add_argument("--json", type=Path)
   token_cache.set_defaults(handler=_command_build_token_cache)
