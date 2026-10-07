@@ -8,7 +8,8 @@
 > real-time or hardware qualification. Use the [active contract](beyondmimic_diffusion_d1_no_mixtures_contract.yaml)
 > and [D4a plan](beyondmimic_diffusion_d4_keyframes_pose_guidance.md) rather
 > than this document's old model-quality/width claims. Export, sustained timing
-> and controller/vendor integration remain D5; hardware qualification is D6.
+> and controller/vendor integration remain D5; minimal hardware qualification is
+> D6. See the [D6 plan](beyondmimic_diffusion_d6_hardware_qualification.md).
 
 Audience: a fresh session that will build a **controller** (sim and later real robot)
 that runs the D2 state–latent diffusion generator for the AgiBot X2.

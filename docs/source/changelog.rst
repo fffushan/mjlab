@@ -4,6 +4,17 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the opt-in D5 controller lifecycle and execution bridge in
+  ``diffusion/controller.py`` and ``diffusion/controller_driver.py``. The bridge
+  preserves eight acknowledged measured bootstrap pairs, performs bounded
+  owner-decoder and spawned-planner warmup, requires explicit activation,
+  decodes only finite 31-D actions from selected raw 32-D execution rows, and
+  commits history only after literal-``True`` execution acknowledgement. The
+  CPU integration test uses a real ``BoundedPlannerExecutor`` and the actual
+  ``LatentPlanner.process`` callback with synthetic statistics, denoiser and
+  decoder inputs. It does not claim 50 Hz timing, physics, export, deployment,
+  simulator or hardware readiness.
+
 - Added the CPU-only D5 asynchronous latent runtime facade. It preserves the
   eight measured VAE bootstrap pairs, submits bounded raw 32-D latent planning,
   selects the execution-tick row, decodes it with current finite 99-D

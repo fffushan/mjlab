@@ -121,90 +121,106 @@ The worker steady-state availability interval remains near 20–40 ms.
 
 ## Remaining D5 work
 
-D5 is not complete. The remaining gates are:
+D5 is a research-reproduction runtime gate.
+It is not a production reliability program.
+Keep one essential test or measurement for each failure mode.
+Do not add exhaustive state-machine matrices, transport fuzzing, or broad
+regression suites as D5 completion conditions.
 
-### 1. Controller warmup and lifecycle
+### Completed D5 software slice
 
-The `mjlab` runtime warmup method is implemented and CPU-tested.
-The remaining controller-side work is:
+The CPU controller lifecycle and execution bridge are accepted.
+The essential CPU evidence is:
 
-- Call warmup before tracking becomes active.
-- Define behavior for warmup failure, worker exit, stale plans and shutdown.
-- Add tests for no command publication during warmup.
-- Add tests for current-state revalidation after warmup.
-- Preserve the eight measured bootstrap pairs and the no synthetic
-  standing/zero-action fallback contract.
+- one lifecycle smoke path: load, bootstrap, warmup, activate, step,
+  acknowledge and release;
+- one real spawned `LatentPlanner.process` path;
+- warmup suppression;
+- failed acknowledgement does not update history;
+- stale/task-invalid work is rejected;
+- reset/release cleanup is confirmed.
 
-### 2. Sustained runtime qualification
+The larger existing test suite is retained as optional hardening evidence.
+It is not a required D5 gate.
 
-Run a longer warmed actual-model workload.
-The workload must report:
+### 1. Sustained actual-model timing
 
-- end-to-end tick duration;
-- action coverage for every scheduled tick;
-- planner completion and first-use latency;
-- pending replacement count;
-- waiting and plan-exhaustion reasons;
-- stale-plan and reset behavior;
-- unguided and opt-in guided paths;
+Run one longer warmed workload with the actual denoiser, normalizer and VAE.
+Report only the measurements needed to decide whether the research runtime can
+meet its target:
+
+- scheduled ticks and actions produced;
+- end-to-end tick duration, including planner, decode and scheduling;
+- planner first-result latency and replacement count;
+- plan exhaustion or warning count;
+- one reset/stale-work check;
 - exact worker cleanup.
 
-The active contract requires a 20 ms end-to-end deadline.
-The test must not silently reduce the 50 Hz rate, 41-step window, 32-step horizon,
-backbone or 20 DDIM updates.
-The current evidence does not meet this gate.
+The target is a 50 Hz owner main loop with a 20 ms owner action-step budget.
+A new planner result does not need to arrive every 20 ms when a valid accepted
+trajectory remains available for reuse.
+Keep the 41-step window, 32-step horizon, backbone and 20 DDIM updates.
+Do not silently reduce the model or owner rate to obtain a pass.
+Planner latency and plan replacement remain required measurements and residual
+risks, not separate hard-real-time replanning gates.
+The 2026-10-07 local RTX 5080 run met this owner-loop criterion: 240 paced ticks
+at 49.9984 Hz and owner-step p99 5.3948 ms.
+It recorded 239/240 actions because the first production tick after warmup had
+no accepted production plan; this startup handover limitation is preserved but
+does not block the asynchronous owner-loop acceptance.
+This is a timing qualification, not a stability or quality claim.
+Guided and unguided timing do not both need qualification; qualify the selected
+paper-reproduction path and label the other path unmeasured.
 
-### 3. Numerical precision and export parity
+### 2. Numerical and export parity
 
-Implement and validate the selected deployment representation for the active
-167-channel model.
-The remaining checks include:
+Validate one deployment representation for the active 167-channel model.
+The essential checks are:
 
-- FP32 versus BF16/FP16 numerical parity;
-- denoiser input/output shape and mask semantics;
-- 20-update DDIM parity;
-- statistics-only normalization parity;
-- frozen VAE decoder parity;
-- exported artifact identity and load-time contract checks.
+- tensor shapes and clean-mask semantics;
+- statistics-only normalization;
+- 20-update DDIM output parity;
+- frozen VAE decoder action parity;
+- exported artifact load and contract identity.
 
-No denoiser deployment artifact has been accepted yet.
-The historical 231-channel export notes must not be applied to the active
-167-channel no-mixture model without a new contract check.
+FP32 versus BF16/FP16, compiled inference, CUDA graphs and TensorRT are optional
+engineering experiments. They are not D5 completion gates unless the selected
+deployment representation uses them.
+The historical 231-channel export notes cannot be reused without a new 167-channel
+contract check.
 
-### 4. Vendor simulator integration
+### 3. Minimal vendor-MuJoCo sim2sim check
 
-Run the independent vendor-MuJoCo sim2sim gate after the runtime and export
-contracts pass.
-The gate must include:
+Run one nominal actual-controller handover with the selected D5 artifact.
+The essential checks are:
 
-- the actual controller handover;
-- stale-plan handling;
-- injected delay and dropout cases;
-- safe release and cleanup;
-- action and state dimension checks;
-- unguided and, if enabled, guided paths;
-- a residual-risk report.
+- 167/99/31 dimension and frame contract;
+- action publication and current-state decoding;
+- one stale-plan or plan-exhaustion case;
+- explicit release and exact process cleanup;
+- a short residual-risk record.
 
-No vendor simulator or physics run has been performed for the D5 model-backed
-runtime.
+Delay sweeps, dropout matrices, guided-path comparison and repeated motion grids
+are optional diagnostics. They are not D5 completion gates.
+No simulator stability or hardware claim follows from this check.
 
-### 5. Versioned runtime bundle and residual-risk record
+### 4. Versioned runtime bundle
 
-Package the accepted runtime, model artifacts, normalizer, VAE interface and
-provenance as one versioned bundle.
-Record the exact source, artifact, contract and statistics identities.
-Keep software timing, simulator evidence and hardware readiness as separate
-claims.
+Package the accepted runtime, selected model artifact, statistics-only normalizer,
+VAE interface/artifact, active contract and hashes as one versioned bundle.
+Record the timing result, sim2sim result and unresolved risks separately.
+Do not call the bundle deployment-ready.
 
 ## Outside D5
 
-The following work is D6 or later, not a D5 completion condition:
+The following work is D6 or later and has a separate plan:
 
-- hardware state-estimator validation;
-- communication and target-topology validation;
-- physical safe handover and fallback validation;
-- bounded robot trials;
-- hardware stability or deployment acceptance.
+- hardware state-estimator and communication validation;
+- actual target topology and command mapping;
+- operator-authorized physical handover and fallback;
+- a small bounded robot trial.
+
+D5 success does not authorize robot operation.
 
 ## Status boundary
 
@@ -212,19 +228,36 @@ Completed D5-related evidence:
 
 - D5a latent planner, bounded executor and CPU runtime: accepted.
 - Direct model-backed loader and runtime wiring: implemented and scoped checks pass.
+- Controller lifecycle and execution bridge: accepted for the CPU software slice
+  and integrated into primary, uncommitted. Parent validation passed 27 new
+  controller cases and 132 adjacent cases. Independent recheck: OK with notes,
+  no P0/P1. The integration test uses a real spawned worker and the actual
+  `LatentPlanner.process` callback. [Report](../../logs/diagnostics/diffusion-d5-controller-cpu-20261007/REPORT.md).
+  This does not establish physical safety or timing readiness.
 - Actual checkpoint, statistics-only normalizer, frozen VAE and spawned GPU
   worker: loaded successfully on the local GPU.
 - Cold-start and request-replacement behavior: measured.
 - Owner decoder warmup effect: measured.
 - `AsyncLatentRuntime.warmup`: implemented and CPU-tested. It warms valid
   owner-decoder calls and one spawned planner result, then discards the plan.
+- Sustained actual-model owner-loop timing: **accepted under the asynchronous
+  trajectory-reuse criterion**. The local RTX 5080 run completed 240 paced
+  ticks at 49.9984 Hz; owner-step p99 was 5.3948 ms. Planner p95/p99 was
+  37.8172/39.7540 ms, with 13 requests superseded before submission. One first
+  post-warmup tick waited for a production plan. This remains a residual
+  startup and planner-latency risk, not a 50 Hz owner-loop blocker under the
+  accepted criterion. [Report](../../logs/diagnostics/diffusion-d5-gpu-sustained-20261007/REPORT.md).
 
 Not completed:
 
-- Controller-side warmup integration remains unimplemented.
-- Sustained 50 Hz action-coverage qualification;
-- numerical/export parity gate;
-- vendor-MuJoCo sim2sim gate;
-- versioned deployment runtime bundle.
+- Essential numerical/export parity;
+- minimal vendor-MuJoCo sim2sim check;
+- versioned runtime bundle and residual-risk record.
 
-No source files were changed by the investigation runs.
+The broader controller test matrix is optional hardening.
+The deferred controller cleanup notes are not D5 completion gates.
+
+No source files were changed by the historical GPU investigation runs.
+The controller source and tests are now integrated and accepted for CPU software.
+The observation and execution boundaries remain caller-supplied interfaces.
+No native simulator/controller loop, deployment or hardware was activated.
