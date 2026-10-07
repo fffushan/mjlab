@@ -380,6 +380,33 @@ class DistillationRunner:
     )
     return state
 
+  def drain_branch_work_unit(self) -> dict[str, int]:
+    """Apply the collection-barrier policy: drain, then clear, with counts.
+
+    The P0 contract fixes this policy as ``drain_and_clear_with_counts``.  A run
+    with no coverage component drains nothing and returns no counters, so a
+    disabled run writes exactly the checkpoint it wrote before.  A run whose
+    component is enabled needs the branch backend; until that backend exists the
+    drain cannot claim success, so it raises instead of dropping work silently.
+    """
+    coverage = getattr(self.collector, "coverage", None) if self.collector is not None else None
+    if coverage is None or not getattr(coverage, "enabled", False):
+      return {}
+    drain = getattr(coverage, "drain_for_barrier", None)
+    if not callable(drain):
+      raise RunnerValidationError(
+        "an enabled coverage run cannot checkpoint: the branch backend has no "
+        "drain_for_barrier handler, and the barrier policy is drain_and_clear_with_counts"
+      )
+    counts = drain()
+    if not isinstance(counts, dict):
+      raise RunnerValidationError("the coverage barrier drain must return counts")
+    return {
+      "coverage_barrier_drained": int(counts.get("drained", 0)),
+      "coverage_barrier_started": int(counts.get("started", 0)),
+      "coverage_barrier_dropped": int(counts.get("dropped", 0)),
+    }
+
   def save_cohort(
     self,
     path: str,
@@ -398,6 +425,10 @@ class DistillationRunner:
     self.trainer.assert_healthy()
     if reset_provenance is None:
       reset_provenance = self._reset_provenance_for_save()
+    # The barrier policy is fixed in the P0 contract: drain the bounded branch
+    # work unit, then clear the admitted-seed queue and keep the counts.
+    barrier_counts = self.drain_branch_work_unit()
+
     save_cohort_checkpoint(
       path,
       self.trainer,
@@ -406,6 +437,7 @@ class DistillationRunner:
       counters={
         "iteration": self.iteration,
         "segment_namespace": self._segment_namespace,
+        **barrier_counts,
       },
       schedule=schedule or {"max_iterations": self.config.max_iterations},
       resolved_config=resolved_config or {},

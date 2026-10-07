@@ -1129,6 +1129,48 @@ def _term_slices(cohort: CohortContract) -> dict[str, slice]:
   return result
 
 
+def _coverage_error(message: str) -> Exception:
+  """Build the coverage runtime error without importing the package at module load."""
+  from mjlab.tasks.tracking.distillation.coverage_environment import CoverageRuntimeError
+
+  return CoverageRuntimeError(message)
+
+
+def cached_policy_view_row(env: Any, index: int) -> torch.Tensor:
+  """One cached actor observation row, with no recompute and no new noise draw."""
+  observation = getattr(env, "observation_manager", None)
+  cached_method = getattr(observation, "cached_observations", None)
+  if not callable(cached_method):
+    raise _coverage_error(
+      "the environment has no cached_observations seam, so the coverage capture "
+      "cannot read the cached policy view"
+    )
+  cached = cached_method()
+  if not isinstance(cached, Mapping) or not isinstance(cached.get("actor"), torch.Tensor):
+    raise _coverage_error("cached actor observation is not a flat tensor")
+  actor = cached["actor"]
+  row = int(index)
+  if actor.ndim != 2 or not 0 <= row < actor.shape[0]:
+    raise _coverage_error(
+      f"cached actor observation row {row} is outside {tuple(actor.shape)}"
+    )
+  return actor[row].detach().clone()
+
+
+def executed_action_row(action: Any, index: int) -> torch.Tensor:
+  """One row of the last applied action, cloned so the capture owns it."""
+  if not isinstance(action, torch.Tensor):
+    raise _coverage_error(
+      "no action has been applied yet, so there is no executed action to capture"
+    )
+  row = int(index)
+  if action.ndim != 2 or not 0 <= row < action.shape[0]:
+    raise _coverage_error(
+      f"executed action row {row} is outside {tuple(action.shape)}"
+    )
+  return action[row].detach().clone()
+
+
 def _require_normalized_action(env: Any, action_dim: int, action: torch.Tensor) -> None:
   if not isinstance(action, torch.Tensor) or action.shape != (env.num_envs, action_dim):
     raise ValueError(f"action must have shape [{env.num_envs}, {action_dim}]")
@@ -1462,6 +1504,9 @@ class MultiMotionDistillationAdapter:
   def step(self, action: torch.Tensor) -> DistillationStep:
     """Execute one normalized action and return the post-step snapshot."""
     _require_normalized_action(self.env, self.cohort.actions.dim, action)
+    # The reference only.  A coverage capture clones it in
+    # coverage_executed_action, so a disabled run does no extra work.
+    self._coverage_last_action = action
     before = self.snapshot()
     _, reward, terminated, time_outs, extras = self.env.step(action)
     events = _consume_boundary_events(self.env, before.generation_id)
@@ -1478,6 +1523,22 @@ class MultiMotionDistillationAdapter:
 
   def close(self) -> None:
     self.env.close()
+  def coverage_cached_policy_view(self, index: int) -> torch.Tensor:
+    """Return one cached actor observation row for a coverage capture."""
+    return cached_policy_view_row(self.env, index)
+
+  def coverage_executed_action(self, index: int) -> torch.Tensor:
+    """Return the action this adapter last applied, without modification."""
+    return executed_action_row(getattr(self, "_coverage_last_action", None), index)
+
+  def coverage_reconstruct_next_boundary(self, action: torch.Tensor) -> None:
+    """Advance exactly one control-decimation boundary for a branch rollout.
+
+    The branch must not consume the boundary events, because those belong to the
+    main trajectory.  This is one ``env.step`` and nothing else.
+    """
+    _require_normalized_action(self.env, self.cohort.actions.dim, action)
+    self.env.step(action)
 
 
 def make_distillation_adapter(

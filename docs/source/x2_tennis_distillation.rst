@@ -911,3 +911,21 @@ ONNX exports through ``tests/tracking_distillation_fixtures.py``, so they run on
 CPU without private binary artifacts. The real tennis cohort is validated
 explicitly with the CLI command above; a skipped generated fixture on another
 machine is not evidence about the selected teachers.
+
+Difficult-state coverage inspection
+-----------------------------------
+
+The confirmed difficult-state policy is available as a read-only contract
+inspection. It does not construct a simulator or authorize collection::
+
+   uv run distill coverage-inspect --policy balance-recovery
+
+The output includes the canonical policy identity and reports live collection as
+``blocked_pending_p2_next_transition_parity`` until that separately authorized
+gate is established. Fixed-state fidelity evaluation is exposed as a CPU API in
+``mjlab.tasks.tracking.distillation.coverage_evaluator``. It splits complete
+source families before scoring and reports normalized teacher-action RMS/p95,
+optional target-position metrics, and motion/source/severity strata. It does
+not update normalizers and the existing 1,103-row hardware fixture remains
+held out. These reports are teacher-fidelity measurements on fixed states, not
+closed-loop stability, physics, training, deployment, or hardware evidence.

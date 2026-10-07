@@ -443,6 +443,7 @@ def build_multi_motion_environment(
   render_mode: str | None = None,
   seed: int | None = None,
   reset_policy: ResetPolicy | None = None,
+  coverage_policy: CoveragePolicy | None = None,
 ) -> ManagerBasedRlEnv:
   """Build one environment whose rows are pinned to different reference clips.
 
@@ -526,7 +527,32 @@ def build_multi_motion_environment(
     motion_cfg, plan, reset_policy=reset_policy
   )
 
+  if coverage_policy is not None:
+    # Opt-in only: a run with no policy keeps its exact recorder set.  The term
+    # forwards the pre-reset ids while the reached state is still live.
+    from mjlab.managers.recorder_manager import RecorderTermCfg
+    from mjlab.tasks.tracking.distillation.coverage_collector import (
+      CoveragePreResetRecorder,
+    )
+
+    cfg.recorders["coverage_pre_reset"] = RecorderTermCfg(func=CoveragePreResetRecorder)
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=render_mode)
+  if coverage_policy is not None:
+    # The collector owns the environment, so it is built once the env exists.
+    from mjlab.tasks.tracking.distillation.coverage_collector import (
+      CoverageStateOwner,
+      attach_coverage_collector,
+      build_coverage_collector,
+    )
+
+    # The component must see the object that carries the cached-view handler and the
+    # capture/restore fields, which is the fixed-topology state adapter, not the raw
+    # environment.  BranchState.capture uses it directly for the same reason.
+    coverage_owner = CoverageStateOwner(env)
+    collector = build_coverage_collector(coverage_owner, coverage_policy)
+    if collector is None:
+      raise ValueError("an enabled coverage policy must produce a collector")
+    attach_coverage_collector(env, collector)
   env.cfg.__dict__["_distillation_semantic_overrides"] = tuple(semantic_overrides)
   env.cfg.__dict__["_distillation_reset_policy"] = reset_policy
   env.cfg.__dict__["_distillation_seed_provenance"] = RuntimeSeedProvenance(

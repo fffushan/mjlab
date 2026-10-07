@@ -39,6 +39,7 @@ from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuf
 from mjlab.tasks.tracking.distillation.checkpoint import (
   CHECKPOINT_VERSION,
   COHORT_CHECKPOINT_VERSION,
+  COVERAGE_COHORT_CHECKPOINT_VERSION,
   STANDING_COHORT_CHECKPOINT_VERSION,
   CheckpointValidationError,
   CohortLifecycleState,
@@ -56,6 +57,8 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
 )
 from mjlab.tasks.tracking.distillation.cohort_setup import (
   CohortSetup,
+  require_coverage_execution,
+  resolve_coverage_policy,
   worker_env_seed,
 )
 from mjlab.tasks.tracking.distillation.collector import (
@@ -73,6 +76,7 @@ from mjlab.tasks.tracking.distillation.config import (
   load_manifest,
   resolve_cohort,
 )
+from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
 from mjlab.tasks.tracking.distillation.export import (
   ExportValidationError,
   export_bundle,
@@ -118,6 +122,7 @@ _COMMANDS = (
   "evaluate-cohort",
   "play",
   "export",
+  "coverage-inspect",
 )
 SamplingMode = Literal["start", "uniform"]
 ResetProfile = Literal["standing-start", "standing-window"]
@@ -310,6 +315,7 @@ def _checkpoint_version(path: Path) -> int | None:
       CHECKPOINT_VERSION,
       COHORT_CHECKPOINT_VERSION,
       STANDING_COHORT_CHECKPOINT_VERSION,
+      COVERAGE_COHORT_CHECKPOINT_VERSION,
     )
     else None
   )
@@ -320,6 +326,7 @@ def _is_cohort_checkpoint(path: Path) -> bool:
   return _checkpoint_version(Path(path)) in (
     COHORT_CHECKPOINT_VERSION,
     STANDING_COHORT_CHECKPOINT_VERSION,
+    COVERAGE_COHORT_CHECKPOINT_VERSION,
   )
 
 
@@ -790,9 +797,7 @@ def _device_substitution(
     stored_workers.get("devices") if isinstance(stored_workers, Mapping) else None
   )
   requested_devices = (
-    requested_workers.get("devices")
-    if isinstance(requested_workers, Mapping)
-    else None
+    requested_workers.get("devices") if isinstance(requested_workers, Mapping) else None
   )
   if stored_devices != requested_devices:
     changes["worker_devices"] = {
@@ -1983,7 +1988,7 @@ def _train_cohort(
   report_boundaries: ReportBoundaries,
   output_dir: Path | None,
   resume: Path | None,
-  reset_policy: ResetPolicy,
+  reset_policy: ResetPolicy, coverage_policy: Literal["off", "balance-recovery"] = "off",
 ) -> int:
   """Run the bounded shared-student M4 cohort collect/update lifecycle.
 
@@ -2017,6 +2022,8 @@ def _train_cohort(
         "start a new cohort run"
       )
     cohort = _resolve(manifest, repo_root)
+    resolved_coverage = resolve_coverage_policy(coverage_policy)
+    require_coverage_execution(resolved_coverage)
     setup = CohortSetup(
       manifest=manifest,
       repo_root=repo_root,
@@ -2025,6 +2032,7 @@ def _train_cohort(
       phase_policy=_COHORT_PHASE_POLICY,
       reset_policy=reset_policy,
       base_seed=seed,
+      coverage_policy=resolved_coverage,
     )
     if worker_devices:
       primary_build = _build_sharded_cohort_runner(
@@ -3521,6 +3529,35 @@ def _validate_teachers(
   return 0 if result["passed"] else 1
 
 
+def _coverage_inspect(
+  policy: Literal["off", "balance-recovery"] = "off",
+  output: Path | None = None,
+) -> int:
+  """Inspect the resolved coverage contract without constructing an environment."""
+  resolved = (
+    CoveragePolicy.off() if policy == "off" else CoveragePolicy.balance_recovery()
+  )
+  payload = {
+    "mode": resolved.mode,
+    "policy_identity": resolved.identity,
+    "policy": resolved.as_dict(),
+    "runtime": {
+      "enabled": resolved.enabled,
+      "live_collection": "blocked_pending_p2_next_transition_parity",
+      "physics": "not_run",
+      "training": "not_run",
+      "hardware": "not_run",
+    },
+  }
+  text = json.dumps(payload, indent=2, sort_keys=True)
+  if output is None:
+    print(text)
+  else:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text + "\\n")
+  return 0
+
+
 def main() -> None:
   if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
     _print_help(sys.stdout)
@@ -3537,6 +3574,7 @@ def main() -> None:
     "evaluate-cohort": _evaluate_cohort,
     "play": _play,
     "export": _export,
+    "coverage-inspect": _coverage_inspect,
   }
   raise SystemExit(
     tyro.cli(

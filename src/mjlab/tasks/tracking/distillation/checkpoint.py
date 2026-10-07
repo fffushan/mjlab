@@ -52,6 +52,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
 )
 from mjlab.tasks.tracking.distillation.collector import DAggerCollector
 from mjlab.tasks.tracking.distillation.config import CohortContract
+from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
 from mjlab.tasks.tracking.distillation.storage import (
   ReplayBufferProtocol,
@@ -65,6 +66,8 @@ from mjlab.tasks.tracking.distillation.vae_config import ModelSettings, VaeSchem
 CHECKPOINT_VERSION = 1
 COHORT_CHECKPOINT_VERSION = 2
 STANDING_COHORT_CHECKPOINT_VERSION = 3
+COVERAGE_COHORT_CHECKPOINT_VERSION = 4
+"""Explicit enabled difficult-state coverage cohort checkpoint format."""
 _CHECKPOINT_KIND = "mjlab-m3-distillation"
 _COHORT_CHECKPOINT_KIND = "mjlab-m4-cohort-distillation"
 _KIND_DESCRIPTIONS = {
@@ -166,6 +169,7 @@ class CohortMemberInference:
   relocated_artifact_roles: tuple[str, ...] = ()
   reset_provenance: ResetProvenance | None = None
   evaluation_reset_profile: str | None = None
+  coverage_policy_identity: str | None = None
 
   @property
   def teacher_ids(self) -> tuple[str, ...]:
@@ -672,6 +676,7 @@ def _validate_cohort_payload(
   expected_reset_provenance: ResetProvenance | None,
   collector: DAggerCollector | None,
   reset_rng_derived: bool = False,
+  allow_coverage_replay: bool = False,
 ) -> tuple[dict[str, Any], ReplayPolicy, ResetProvenance | None]:
   """Validate one multi-teacher cohort checkpoint before any mutation.
 
@@ -693,7 +698,7 @@ def _validate_cohort_payload(
     raise CheckpointValidationError(
       "version-3 standing cohort requires expected reset provenance for strict resume"
     )
-  live_policy = _live_replay_policy(replay)
+  live_policy = _live_replay_policy(replay, allow_coverage=allow_coverage_replay)
   clean = _validate_state_payload(
     payload,
     trainer,
@@ -986,16 +991,153 @@ def save_cohort_checkpoint(
   return _atomic_save(payload, Path(path))
 
 
-def _live_replay_policy(replay: ReplayBufferProtocol) -> ReplayPolicy:
-  """Replay policy of the live buffer, refusing anything but the M4 layout."""
+def _coverage_replay_policy(replay: ReplayBufferProtocol) -> ReplayPolicy:
+  """Read the v4 policy through the storage-owned integration hook."""
+  hook = getattr(replay, "coverage_replay_policy", None)
+  if not callable(hook):
+    raise CheckpointValidationError(
+      "v4 coverage replay must expose coverage_replay_policy(); "
+      "legacy replay layouts are not upgraded implicitly"
+    )
+  try:
+    policy = ReplayPolicy.from_dict(hook(), "live coverage replay policy")
+  except (CohortContractError, TypeError) as exc:
+    raise CheckpointValidationError(
+      f"invalid live coverage replay policy: {exc}"
+    ) from exc
+  if policy.kind != "coverage-protected-replay":
+    raise CheckpointValidationError(
+      f"v4 coverage replay has unsupported policy kind {policy.kind!r}"
+    )
+  return policy
+
+
+def save_coverage_cohort_checkpoint(
+  path: str | os.PathLike[str],
+  trainer: VaeDistillationTrainer,
+  replay: ReplayBufferProtocol,
+  *,
+  cohort: CohortIdentity,
+  coverage_policy: CoveragePolicy,
+  counters: Mapping[str, int] | None = None,
+  schedule: Mapping[str, Any] | None = None,
+  resolved_config: Mapping[str, Any] | None = None,
+  collector: DAggerCollector | None = None,
+  coverage_report: Mapping[str, Any] | None = None,
+) -> Path:
+  """Atomically save the opt-in v4 coverage envelope.
+
+  The storage object owns its replay-policy encoding. This function only adds
+  the immutable policy identity and does not serialize live branch state or
+  runtime handles. Existing v1-v3 writers remain untouched.
+  """
+  trainer.assert_healthy()
+  if not isinstance(coverage_policy, CoveragePolicy) or not coverage_policy.enabled:
+    raise CheckpointValidationError("v4 save requires an enabled CoveragePolicy")
+  if not isinstance(cohort, CohortIdentity):
+    raise CheckpointValidationError("v4 save needs the live CohortIdentity")
+  policy = _coverage_replay_policy(replay)
+  if cohort.replay.as_dict() != policy.as_dict():
+    raise CheckpointValidationError("cohort identity does not describe coverage replay")
+  payload = _payload(
+    trainer,
+    replay,
+    counters=counters or {},
+    schedule=schedule or {},
+    resolved_config=resolved_config or {},
+    collector=collector,
+  )
+  payload.update(
+    {
+      "kind": _COHORT_CHECKPOINT_KIND,
+      "version": COVERAGE_COHORT_CHECKPOINT_VERSION,
+      "cohort": cohort.as_dict(),
+      "cohort_digest": cohort.digest(),
+      "replay_policy": policy.as_dict(),
+      "coverage_policy": coverage_policy.as_dict(),
+      "coverage_policy_digest": coverage_policy.identity,
+      "coverage_report": dict(coverage_report or {}),
+    }
+  )
+  return _atomic_save(payload, Path(path))
+
+
+def load_coverage_cohort_checkpoint(
+  path: str | os.PathLike[str],
+  trainer: VaeDistillationTrainer,
+  replay: ReplayBufferProtocol,
+  *,
+  expected_cohort: CohortIdentity,
+  expected_policy: CoveragePolicy,
+  collector: DAggerCollector | None = None,
+  map_location: str | torch.device = "cpu",
+) -> CohortLifecycleState:
+  """Validate and restore v4 state transactionally, before mutating owners."""
+  payload = _load_payload(path, map_location)
+  if not isinstance(payload, Mapping) or payload.get("kind") != _COHORT_CHECKPOINT_KIND:
+    raise CheckpointValidationError("checkpoint is not a cohort coverage artifact")
+  if payload.get("version") != COVERAGE_COHORT_CHECKPOINT_VERSION:
+    raise CheckpointValidationError("checkpoint is not enabled v4 coverage format")
+  required = {"coverage_policy", "coverage_policy_digest", "coverage_report"}
+  if not required.issubset(payload):
+    raise CheckpointValidationError("v4 checkpoint is missing coverage identity fields")
+  try:
+    stored_policy = CoveragePolicy.from_dict(payload["coverage_policy"])
+  except Exception as exc:
+    raise CheckpointValidationError(
+      f"invalid checkpoint coverage policy: {exc}"
+    ) from exc
+  if stored_policy.identity != payload["coverage_policy_digest"]:
+    raise CheckpointValidationError("coverage policy digest does not match checkpoint")
+  if stored_policy.identity != expected_policy.identity:
+    raise CheckpointValidationError("coverage policy identity does not match live run")
+  live_policy = _coverage_replay_policy(replay)
+  if (
+    live_policy.as_dict() != ReplayPolicy.from_dict(payload["replay_policy"]).as_dict()
+  ):
+    raise CheckpointValidationError(
+      "live coverage replay policy does not match checkpoint"
+    )
+  # Reuse the established v2 validator on a copy after removing only v4's
+  # additive identity fields. A v4 artifact is never accepted by old loaders.
+  base = dict(payload)
+  base["version"] = COHORT_CHECKPOINT_VERSION
+  for key in required:
+    base.pop(key, None)
+  clean, policy, _ = _validate_cohort_payload(
+    base,
+    trainer,
+    replay,
+    expected_cohort=expected_cohort,
+    expected_reset_provenance=None,
+    collector=collector,
+    allow_coverage_replay=True,
+  )
+  _restore_state(clean, trainer, replay, collector)
+  return CohortLifecycleState(
+    counters=dict(clean["counters"]),
+    schedule=dict(clean["schedule"]),
+    resolved_config=dict(clean["resolved_config"]),
+    cohort=CohortIdentity.from_dict(clean["cohort"], "checkpoint cohort"),
+    replay_policy=policy,
+    resume_restarts_simulator=True,
+  )
+
+
+def _live_replay_policy(
+  replay: ReplayBufferProtocol, *, allow_coverage: bool = False
+) -> ReplayPolicy:
+  """Record the live replay policy, with coverage reserved for v4."""
   try:
     policy = ReplayPolicy.from_buffer(replay)
   except CohortContractError as exc:
     raise CheckpointValidationError(str(exc)) from exc
-  if policy.kind != BALANCED_REPLAY_KIND:
+  if policy.kind != BALANCED_REPLAY_KIND and not (
+    allow_coverage and policy.kind == "coverage-protected-replay"
+  ):
     raise CheckpointValidationError(
-      "a version-2 cohort checkpoint requires the per-motion balanced replay "
-      f"buffer, got {policy.kind!r}"
+      "a cohort checkpoint requires the per-motion balanced replay buffer "
+      f"(or v4 protected coverage replay), got {policy.kind!r}"
     )
   return policy
 
@@ -1324,6 +1466,7 @@ def load_cohort_member_inference(
   payload = _load_payload(path, "cpu")
   checkpoint_version = payload.get("version") if isinstance(payload, Mapping) else None
   enabled = checkpoint_version == STANDING_COHORT_CHECKPOINT_VERSION
+  coverage_enabled = checkpoint_version == COVERAGE_COHORT_CHECKPOINT_VERSION
   if isinstance(payload, Mapping) and payload.get("kind") == _CHECKPOINT_KIND:
     raise CheckpointValidationError(
       "checkpoint is a version-1 single-teacher artifact; read it with "
@@ -1336,6 +1479,7 @@ def load_cohort_member_inference(
   if checkpoint_version not in (
     COHORT_CHECKPOINT_VERSION,
     STANDING_COHORT_CHECKPOINT_VERSION,
+    COVERAGE_COHORT_CHECKPOINT_VERSION,
   ):
     raise CheckpointValidationError("unsupported cohort checkpoint version")
   _validate_evaluation_reset_profile(reset_profile)
@@ -1348,6 +1492,8 @@ def load_cohort_member_inference(
   if enabled:
     required.add("reset_provenance")
     required.add("replay")
+  if coverage_enabled:
+    required.update({"coverage_policy", "coverage_policy_digest", "coverage_report"})
   missing = required - set(payload)
   if missing:
     raise CheckpointValidationError(
@@ -1377,6 +1523,19 @@ def load_cohort_member_inference(
       "checkpoint cohort record and replay policy describe different replay partitions"
     )
   reset_provenance = None
+  coverage_identity = None
+  if coverage_enabled:
+    try:
+      coverage = CoveragePolicy.from_dict(payload["coverage_policy"])
+    except Exception as exc:
+      raise CheckpointValidationError(
+        f"checkpoint coverage policy is invalid: {exc}"
+      ) from exc
+    coverage_identity = coverage.identity
+    if coverage_identity != payload["coverage_policy_digest"]:
+      raise CheckpointValidationError(
+        "checkpoint coverage policy digest does not match"
+      )
   if enabled:
     try:
       reset_provenance = ResetProvenance.from_dict(
@@ -1426,6 +1585,7 @@ def load_cohort_member_inference(
     relocated_artifact_roles=relocated,
     reset_provenance=reset_provenance,
     evaluation_reset_profile=reset_profile,
+    coverage_policy_identity=coverage_identity,
   )
 
 
@@ -1433,6 +1593,7 @@ __all__ = [
   "CHECKPOINT_VERSION",
   "COHORT_CHECKPOINT_VERSION",
   "STANDING_COHORT_CHECKPOINT_VERSION",
+  "COVERAGE_COHORT_CHECKPOINT_VERSION",
   "CheckpointValidationError",
   "CohortLifecycleState",
   "CohortMemberInference",
@@ -1441,8 +1602,10 @@ __all__ = [
   "LifecycleState",
   "load_checkpoint",
   "load_cohort_checkpoint",
+  "load_coverage_cohort_checkpoint",
   "load_cohort_member_inference",
   "load_inference_checkpoint",
   "save_checkpoint",
   "save_cohort_checkpoint",
+  "save_coverage_cohort_checkpoint",
 ]

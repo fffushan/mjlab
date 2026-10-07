@@ -109,6 +109,7 @@ class CohortSetup:
   phase_policy: PhasePolicy
   reset_policy: ResetPolicy
   base_seed: int
+  coverage_policy: CoveragePolicy | None = None
 
   def resolve(self) -> CohortContract:
     """Load and validate the cohort manifest this setup names."""
@@ -145,3 +146,37 @@ class CohortSetup:
     """
     torch.manual_seed(worker_env_seed(self.base_seed, worker_index))
     return ConditionalVAE(schema, DEFAULT_MODEL_SETTINGS).to(device)
+
+COVERAGE_POLICY_CHOICES = ("off", "balance-recovery")
+
+
+def resolve_coverage_policy(choice: str) -> CoveragePolicy | None:
+  """Resolve a CLI choice to a coverage policy, or return None for off."""
+  if choice not in COVERAGE_POLICY_CHOICES:
+    raise ValueError(
+      f"unknown coverage policy {choice!r}; expected one of {COVERAGE_POLICY_CHOICES}"
+    )
+  if choice == "off":
+    return None
+  from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
+
+  return CoveragePolicy.balance_recovery()
+
+
+def require_coverage_execution(policy: CoveragePolicy | None) -> None:
+  """Fail closed while the collection execution path is absent.
+
+  The policy, metadata, perturbation, branch, storage and evaluator modules are
+  integrated and tested.  The worker reply, merge validation and cohort checkpoint
+  v4 slices are not.  Without them an enabled run would collect ordinary rows and
+  report coverage it never performed, so an enabled run must stop here.
+  """
+  if policy is None:
+    return
+  raise NotImplementedError(
+    "coverage collection has no execution path in this tree. The dry-run "
+    "inspection command reports the resolved policy, and no run may enable "
+    "collection until the worker reply, merge validation and cohort checkpoint v4 "
+    "slices exist. Live collection stays blocked; the contract records "
+    "execution_authorized: false."
+  )

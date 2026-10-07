@@ -1,9 +1,21 @@
 =========
-Changelog
-=========
-
 Added
 ^^^^^
+
+- Added an offline ``distill coverage-inspect`` contract/status surface and a
+  family-disjoint fixed-state difficult-state fidelity evaluator. It reports
+  teacher-label action RMS/p95 and optional target-position metrics without
+  constructing physics, updating normalizers, launching training, or including
+  the held-out hardware fixture; live collection remains fail-closed pending
+  separately established next-transition parity.
+
+- Integrated the isolated difficult-state coverage lanes into one tree. The merge
+  provenance is ``MERGE-MANIFEST.md`` and the acceptance record is
+  ``ACCEPTANCE-20261007.md``. Added ``CohortSetup.coverage_policy`` and the
+  ``--coverage-policy {off,balance-recovery}`` option on ``distill train``. A run
+  with an enabled policy refuses to start while the worker reply, merge validation
+  and cohort checkpoint v4 slices are absent, so an enabled run cannot collect
+  ordinary rows and report coverage it never performed.
 
 - Added the X2 PPO tracking task ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations``. It preserves the standing-start X2 task while using the Unitree G1 magnitudes for initial pose/velocity/joint-position randomization and external pushes.
 
