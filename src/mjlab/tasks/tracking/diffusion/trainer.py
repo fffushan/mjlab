@@ -24,6 +24,7 @@ from .checkpoint import (
 )
 from .contract import DiffusionContract
 from .noising import add_independent_noise, clean_mask, sample_levels, x0_target
+from .profiling import StepProfiler
 from .schedule import DiffusionSchedule
 from .training_config import (
   TrainingConfig,
@@ -362,6 +363,10 @@ class DiffusionTrainer:
     every = self.config.checkpoint_every
     self._next_periodic = every if every is not None else 0
 
+    # Inert unless MJLAB_DIFFUSION_PROFILE is set.  Records a bounded window of
+    # steady-state steps so the dominant cost of one step can be named.
+    self._profiler = StepProfiler.from_environment(self.output_dir)
+
     _set_seed(self.config.seed)
     if resume is not None:
       try:
@@ -653,6 +658,7 @@ class DiffusionTrainer:
           if self.global_step >= self._resolved_updates:
             stop = True
             break
+          self._profiler.on_step_start(self.global_step)
           clean = _as_tokens(batch)
           loss, prediction, target, k_state, k_latent = self._forward_loss(clean)
           metrics = _metrics(
@@ -682,6 +688,7 @@ class DiffusionTrainer:
                 best_validation_loss=self.best_validation_loss,
               )
               self._next_periodic = (self.global_step // every + 1) * every
+            self._profiler.on_step_end()
         if pending:
           # This is defensive: the normal last-batch flush above handles a
           # partial final group, but never discard gradients if a custom loader
@@ -764,6 +771,7 @@ class DiffusionTrainer:
     )
     if self._last_train_loss is None:
       raise TrainerError("training resolved to zero optimizer updates")
+    self._profiler.finish()
     return TrainResult(
       self.global_step,
       epochs_completed,
