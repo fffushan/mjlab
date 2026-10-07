@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pytest
+import yaml
 
 from mjlab.tasks.tracking.diffusion import ContractError, DiffusionContract
 
@@ -22,6 +25,26 @@ def test_no_mixture_yaml_is_versioned_and_has_physical_width() -> None:
   )
   assert contract.schema_version == "mjlab-x2-state-latent-d1-no-mixtures-v1"
   assert contract.projected_state_dimension == 135
+  assert contract.token_dimension == 167
+  assert contract.projection_rows == 0
+
+
+def test_no_mixture_mapping_defaults_legacy_projection_metadata() -> None:
+  payload = yaml.safe_load(
+    Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml").read_text()
+  )
+  projection = payload["preprocessing"]["projection"]
+  for key in (
+    "projected_dimension",
+    "token_dimension",
+    "seed",
+    "gaussian_rows",
+    "pseudoinverse_rcond",
+  ):
+    projection.pop(key, None)
+  contract = DiffusionContract.from_mapping(payload)
+  assert contract.state_dimension == 135
+  assert contract.latent_dimension == 32
   assert contract.token_dimension == 167
   assert contract.projection_rows == 0
 

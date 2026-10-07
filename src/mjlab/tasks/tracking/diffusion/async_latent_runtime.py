@@ -34,7 +34,7 @@ from .latent_planning import (
   TaskSnapshot,
   build_planning_packet,
 )
-from .projection import ProjectionBundle
+from .projection import StateLatentTransform, StateLatentTransformLike
 from .scheduler import (
   AcceptedRequestProvenance,
   Plan,
@@ -267,7 +267,8 @@ class AsyncLatentRuntime:
     self,
     executor: PlannerExecutor,
     *,
-    projection: ProjectionBundle,
+    projection: StateLatentTransformLike | None = None,
+    normalizer: StateLatentTransformLike | None = None,
     decode: Callable[[Tensor, Tensor], Tensor],
     generator: torch.Generator,
     contract: DiffusionContract = DEFAULT_CONTRACT,
@@ -287,10 +288,13 @@ class AsyncLatentRuntime:
       raise AsyncLatentRuntimeError("contract must be a DiffusionContract")
     if contract.identity_hash() != DEFAULT_CONTRACT.identity_hash():
       raise AsyncLatentRuntimeError("runtime requires the active no-mixture contract")
-    if not isinstance(projection, ProjectionBundle):
-      raise AsyncLatentRuntimeError("projection must be a ProjectionBundle")
-    if projection.contract.identity_hash() != contract.identity_hash():
-      raise AsyncLatentRuntimeError("projection contract identity differs from runtime")
+    if projection is not None and normalizer is not None:
+      raise AsyncLatentRuntimeError("pass only one of projection or normalizer")
+    transform = normalizer if normalizer is not None else projection
+    if transform is None or not isinstance(transform, StateLatentTransform):
+      raise AsyncLatentRuntimeError("a state/latent normalizer is required")
+    if transform.contract.identity_hash() != contract.identity_hash():
+      raise AsyncLatentRuntimeError("normalizer contract identity differs from runtime")
     if not callable(decode):
       raise AsyncLatentRuntimeError("decode must be callable")
     if not callable(clock):
@@ -329,7 +333,8 @@ class AsyncLatentRuntime:
       else _nonnegative_int(expected_source_frame, "expected_source_frame")
     )
     self.executor = executor
-    self.projection = projection
+    self.projection = transform
+    self.normalizer = transform
     self.contract = contract
     self.decode = decode
     self.device = resolved_device

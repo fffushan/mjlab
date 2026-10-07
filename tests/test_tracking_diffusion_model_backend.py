@@ -16,26 +16,29 @@ from mjlab.tasks.tracking.diffusion import model_backend
 from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
 from mjlab.tasks.tracking.diffusion.latent_planning import build_planning_packet
 from mjlab.tasks.tracking.diffusion.model import StateLatentTransformer
-from mjlab.tasks.tracking.diffusion.projection import FeatureStats, ProjectionBundle
+from mjlab.tasks.tracking.diffusion.projection import (
+  FeatureStats,
+  StateLatentNormalizer,
+)
 from mjlab.tasks.tracking.diffusion.replay_integration import LoadedDenoiser, LoadedVae
 from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule, InferenceGrid
 from mjlab.tasks.tracking.diffusion.scheduler import PlannerRequest
 
 
-def _projection() -> ProjectionBundle:
-  return ProjectionBundle.create(
+def _normalizer() -> StateLatentNormalizer:
+  return StateLatentNormalizer.create(
     FeatureStats(1, np.zeros(135), np.ones(135)),
     FeatureStats(1, np.zeros(32), np.ones(32)),
   )
 
 
 def _spec(tmp_path: Path) -> model_backend.ModelBackendSpec:
-  for name in ("contract", "checkpoint", "projection", "vae", "manifest"):
+  for name in ("contract", "checkpoint", "normalizer", "vae", "manifest"):
     (tmp_path / f"{name}.bin").write_bytes(b"fixture")
   return model_backend.ModelBackendSpec(
     contract_path=tmp_path / "contract.bin",
     diffusion_checkpoint=tmp_path / "checkpoint.bin",
-    projection_bundle=tmp_path / "projection.bin",
+    normalization_bundle=tmp_path / "normalizer.bin",
     vae_checkpoint=tmp_path / "vae.bin",
     vae_manifest=tmp_path / "manifest.bin",
     repo_root=tmp_path,
@@ -68,7 +71,7 @@ def test_planner_factory_loads_inside_factory_and_returns_raw_plan_processor(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
   spec = _spec(tmp_path)
-  projection = _projection()
+  normalizer = _normalizer()
   schedule = DiffusionSchedule.build()
   loaded = LoadedDenoiser(
     model=cast(StateLatentTransformer, _Denoiser()),
@@ -92,8 +95,8 @@ def test_planner_factory_loads_inside_factory_and_returns_raw_plan_processor(
   )
   monkeypatch.setattr(
     model_backend,
-    "load_projection_bundle",
-    lambda path, *, contract: projection,
+    "load_normalizer_bundle",
+    lambda path, *, contract: normalizer,
   )
 
   def fake_load_denoiser(path, **kwargs):
@@ -112,7 +115,7 @@ def test_planner_factory_loads_inside_factory_and_returns_raw_plan_processor(
   packet = build_planning_packet(
     [(make_state(index), np.zeros(32)) for index in range(8)],
     make_state(8),
-    projection=projection,
+    normalizer=normalizer,
     source_timestamp=0.0,
     source_tick=0,
     source_frame=0,
@@ -137,7 +140,7 @@ def test_owner_backend_loads_decoder_without_digest_gate(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
   spec = _spec(tmp_path)
-  projection = _projection()
+  normalizer = _normalizer()
 
   class _Decoder(nn.Module):
     def decode(self, latent: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
@@ -161,8 +164,8 @@ def test_owner_backend_loads_decoder_without_digest_gate(
   )
   monkeypatch.setattr(
     model_backend,
-    "load_projection_bundle",
-    lambda path, *, contract: projection,
+    "load_normalizer_bundle",
+    lambda path, *, contract: normalizer,
   )
 
   def fake_load_vae(path, **kwargs):
@@ -172,7 +175,27 @@ def test_owner_backend_loads_decoder_without_digest_gate(
   monkeypatch.setattr(model_backend, "load_vae_decoder", fake_load_vae)
   backend = model_backend.load_model_backend(spec)
   assert backend.contract is DEFAULT_CONTRACT
-  assert backend.projection is projection
+  assert backend.normalizer is normalizer
+  assert backend.projection is normalizer
   assert getattr(backend.decoder, "__self__", None) is loaded_vae.model
   assert captured["vae_checkpoint_sha256"] is None
   assert captured["device"] == torch.device("cpu")
+
+
+def test_statistics_only_normalizer_round_trip_has_no_matrix_fields(
+  tmp_path: Path,
+) -> None:
+  normalizer = _normalizer()
+  path = tmp_path / "normalizer.npz"
+  normalizer.save(path)
+  with np.load(path, allow_pickle=False) as data:
+    assert set(data.files) == {
+      "state_mean",
+      "state_std",
+      "latent_mean",
+      "latent_std",
+      "metadata",
+    }
+  loaded = StateLatentNormalizer.load(path)
+  tokens = loaded.make_tokens(np.zeros((1, 135)), np.zeros((1, 32)))
+  np.testing.assert_array_equal(tokens, np.zeros((1, 167)))

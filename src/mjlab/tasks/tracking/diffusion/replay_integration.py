@@ -1,7 +1,7 @@
 """Bounded offline real-model replay for the D3 handover seam.
 
 Loads the frozen D2 denoiser checkpoint (EMA-selected, contract-checked), the
-active no-mixture projection bundle, the frozen X2 VAE cohort member decoder
+active no-mixture normalization statistics, the frozen X2 VAE cohort member decoder
 and bounded recorded D1 pilot rows, then compares the
 :class:`ReferenceFreeContinuation` seam against a direct existing-sampler +
 denormalize + frozen-decoder path from identical generator state and input.
@@ -22,7 +22,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence, cast
 
 import numpy as np
 import torch
@@ -36,7 +36,13 @@ from .handover import (
 )
 from .model import DenoiserSettings, StateLatentTransformer
 from .noising import clean_mask as build_clean_mask
-from .projection import ProjectionBundle
+from .projection import (
+  ProjectionBundle,
+  ProjectionError,
+  StateLatentNormalizer,
+  StateLatentTransform,
+  StateLatentTransformLike,
+)
 from .sampler import SamplerConditions, SamplerConfig, sample_trajectory
 from .schedule import DiffusionSchedule, InferenceGrid, build_inference_grid
 from .state import WorldState
@@ -113,6 +119,18 @@ def verify_projection_consistency(
       )
 
 
+def verify_normalization_consistency(
+  checkpoint_hashes: Mapping[str, str], normalizer: StateLatentTransform
+) -> None:
+  """Fail closed unless the checkpoint recorded the supplied statistics."""
+  recorded = checkpoint_hashes.get("statistics")
+  if recorded != normalizer.statistics_sha256:
+    raise ReplayError(
+      "checkpoint normalization statistics differ from the supplied normalizer: "
+      f"checkpoint {recorded!r}, normalizer {normalizer.statistics_sha256!r}"
+    )
+
+
 def apply_ema_selection(
   model: nn.Module, ema_state: Mapping[str, Any] | None
 ) -> tuple[bool, int | None]:
@@ -159,7 +177,8 @@ def load_denoiser(
   checkpoint_path: str | Path,
   *,
   contract: DiffusionContract,
-  projection_bundle: ProjectionBundle,
+  projection_bundle: StateLatentTransformLike | None = None,
+  normalizer: StateLatentTransform | None = None,
   checkpoint_sha256: str | None = None,
   verify_projection_hashes: bool = True,
   verify_contract_identity: bool = True,
@@ -167,9 +186,16 @@ def load_denoiser(
   """Load the D2 denoiser with optional reproduction hash checks.
 
   The model, checkpoint schema and tensor dimensions are always validated.  A
-  caller may omit file/projection digests for fast paper reproduction when the
-  artifact files are supplied explicitly.
+  caller may omit file and normalizer digests for fast paper reproduction when
+  the artifact files are supplied explicitly.
   """
+  if projection_bundle is not None and normalizer is not None:
+    raise ReplayError("pass only one of projection_bundle or normalizer")
+  transforms = normalizer if normalizer is not None else projection_bundle
+  if transforms is None:
+    raise ReplayError("a state/latent normalizer is required")
+  if transforms.contract.identity_hash() != contract.identity_hash():
+    raise ReplayError("normalizer contract identity differs from active contract")
   if checkpoint_sha256 is not None:
     verify_file_digest(checkpoint_path, checkpoint_sha256, role="diffusion checkpoint")
   if not isinstance(verify_projection_hashes, bool):
@@ -188,7 +214,12 @@ def load_denoiser(
   except CheckpointError as exc:
     raise ReplayError(f"frozen denoiser checkpoint rejected: {exc}") from exc
   if verify_projection_hashes:
-    verify_projection_consistency(state.projection_hashes, projection_bundle)
+    if isinstance(transforms, StateLatentNormalizer):
+      verify_normalization_consistency(state.projection_hashes, transforms)
+    else:
+      verify_projection_consistency(
+        state.projection_hashes, cast(ProjectionBundle, transforms)
+      )
   ema_selected, ema_updates = apply_ema_selection(model, state.ema_state)
   model.eval()
   for parameter in model.parameters():
@@ -216,11 +247,21 @@ def load_denoiser(
 def load_projection_bundle(
   projection_path: str | Path, *, contract: DiffusionContract
 ) -> ProjectionBundle:
-  """Load the active no-mixture projection bundle."""
+  """Load the historical projection bundle for legacy replay paths."""
   try:
     return ProjectionBundle.load(projection_path, contract=contract)
   except Exception as exc:
     raise ReplayError(f"projection bundle rejected: {exc}") from exc
+
+
+def load_normalizer_bundle(
+  normalizer_path: str | Path, *, contract: DiffusionContract
+) -> StateLatentNormalizer:
+  """Load state and latent statistics without loading a projection matrix."""
+  try:
+    return StateLatentNormalizer.load(normalizer_path, contract=contract)
+  except (OSError, ProjectionError, ValueError) as exc:
+    raise ReplayError(f"normalizer bundle rejected: {exc}") from exc
 
 
 class VaeDecodeModule(Protocol):
@@ -626,7 +667,7 @@ def run_seam_replay(
       decode=seam_decode_and_count,
       schedule=schedule,
       grid=grid,
-      projection=projection,
+      projection=cast(StateLatentTransform, projection),
       contract=contract,
       device="cpu",
       generator=generator,
@@ -828,7 +869,7 @@ def main() -> None:
     args.checkpoint,
     contract=contract,
     checkpoint_sha256=args.checkpoint_sha256,
-    projection_bundle=projection,
+    projection_bundle=cast(StateLatentTransform, projection),
   )
   vae = load_vae_decoder(
     args.vae_checkpoint,
@@ -947,6 +988,7 @@ __all__ = [
   "apply_ema_selection",
   "load_active_contract",
   "load_denoiser",
+  "load_normalizer_bundle",
   "load_projection_bundle",
   "load_recorded_history",
   "load_vae_decoder",
@@ -954,6 +996,7 @@ __all__ = [
   "sha256_file",
   "synthetic_conditioning",
   "verify_file_digest",
+  "verify_normalization_consistency",
   "verify_projection_consistency",
 ]
 

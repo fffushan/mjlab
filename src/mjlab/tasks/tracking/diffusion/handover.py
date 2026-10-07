@@ -61,7 +61,7 @@ from torch import Tensor
 
 from .contract import DEFAULT_CONTRACT, DiffusionContract
 from .noising import clean_mask
-from .projection import ProjectionBundle
+from .projection import StateLatentTransformLike
 from .sampler import (
   SamplerConditions,
   SamplerConfig,
@@ -97,7 +97,7 @@ def _require_no_mixture(contract: DiffusionContract) -> None:
 
 
 def _require_matching_projection(
-  projection: ProjectionBundle, contract: DiffusionContract
+  projection: StateLatentTransformLike, contract: DiffusionContract
 ) -> None:
   projection_contract = getattr(projection, "contract", None)
   if projection_contract is None or not hasattr(projection_contract, "identity_hash"):
@@ -204,7 +204,7 @@ def build_reference_free_plan(
   history: HandoverHistory,
   current_state: WorldState,
   *,
-  projection: ProjectionBundle,
+  projection: StateLatentTransformLike,
   tick: int,
   contract: DiffusionContract = DEFAULT_CONTRACT,
   device: str | torch.device = "cpu",
@@ -340,7 +340,7 @@ class ReferenceFreeContinuation:
     decode: DecodeFn,
     schedule: DiffusionSchedule,
     grid: InferenceGrid,
-    projection: ProjectionBundle,
+    projection: StateLatentTransformLike,
     contract: DiffusionContract = DEFAULT_CONTRACT,
     device: str | torch.device = "cpu",
     generator: torch.Generator,

@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -117,6 +117,156 @@ def fit_feature_stats(
   return moments.finish(std_floor)
 
 
+def _statistics_hash(state_stats: FeatureStats, latent_stats: FeatureStats) -> str:
+  payload = json.dumps(
+    {"state": state_stats.as_dict(), "latent": latent_stats.as_dict()},
+    sort_keys=True,
+    separators=(",", ":"),
+  ).encode()
+  return hashlib.sha256(payload).hexdigest()
+
+
+@runtime_checkable
+class StateLatentTransform(Protocol):
+  """Normalization operations shared by active and legacy bundles."""
+
+  @property
+  def contract(self) -> DiffusionContract: ...
+
+  @property
+  def statistics_sha256(self) -> str: ...
+
+  def project_state(self, state: np.ndarray) -> np.ndarray: ...
+
+  def inverse_state(self, state: np.ndarray, /) -> np.ndarray: ...
+
+  def normalize_latent(self, latent: np.ndarray) -> np.ndarray: ...
+
+  def denormalize_latent(self, latent: np.ndarray) -> np.ndarray: ...
+
+  def make_tokens(self, state: np.ndarray, latent: np.ndarray) -> np.ndarray: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StateLatentNormalizer:
+  """Statistics-only normalization for the active 135+32 representation.
+
+  The normalizer does not store or apply a state projection.  ``project_state``
+  and ``inverse_state`` are compatibility names for callers that still use the
+  historical ``ProjectionBundle`` interface.
+  """
+
+  contract: DiffusionContract
+  state_stats: FeatureStats
+  latent_stats: FeatureStats
+  statistics_sha256: str
+
+  def __post_init__(self) -> None:
+    if self.contract.token_dimension != (
+      self.contract.state_dimension + self.contract.latent_dimension
+    ):
+      raise ProjectionError("normalizer contract must have a 135+32 token layout")
+    if self.state_stats.mean.size != self.contract.state_dimension:
+      raise ProjectionError("normalizer state statistics width does not match contract")
+    if self.latent_stats.mean.size != self.contract.latent_dimension:
+      raise ProjectionError(
+        "normalizer latent statistics width does not match contract"
+      )
+    expected = _statistics_hash(self.state_stats, self.latent_stats)
+    if self.statistics_sha256 != expected:
+      raise ProjectionError("normalizer statistics hash mismatch")
+
+  @classmethod
+  def create(
+    cls,
+    state_stats: FeatureStats,
+    latent_stats: FeatureStats,
+    *,
+    contract: DiffusionContract = DEFAULT_CONTRACT,
+  ) -> "StateLatentNormalizer":
+    return cls(
+      contract=contract,
+      state_stats=state_stats,
+      latent_stats=latent_stats,
+      statistics_sha256=_statistics_hash(state_stats, latent_stats),
+    )
+
+  @classmethod
+  def load(
+    cls, path: str | Path, *, contract: DiffusionContract = DEFAULT_CONTRACT
+  ) -> "StateLatentNormalizer":
+    """Load means and standard deviations without requiring matrix fields."""
+    try:
+      with np.load(path, allow_pickle=False) as data:
+        metadata = json.loads(str(data["metadata"].item()))
+        bundle_contract = metadata.get("contract", {})
+        if bundle_contract.get("schema_version") != contract.schema_version:
+          raise ProjectionError("normalizer contract schema mismatch")
+        state_meta = metadata["state_stats"]
+        latent_meta = metadata["latent_stats"]
+        state = FeatureStats(
+          int(state_meta["count"]), data["state_mean"], data["state_std"]
+        )
+        latent = FeatureStats(
+          int(latent_meta["count"]), data["latent_mean"], data["latent_std"]
+        )
+        recorded = str(metadata.get("statistics_sha256", ""))
+    except ProjectionError:
+      raise
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+      raise ProjectionError(f"invalid statistics-only normalizer {path}") from exc
+    expected = _statistics_hash(state, latent)
+    if recorded and recorded != expected:
+      raise ProjectionError("normalizer statistics hash mismatch")
+    return cls(contract, state, latent, expected)
+
+  def normalize_state(self, state: np.ndarray) -> np.ndarray:
+    return self.state_stats.normalize(state)
+
+  def denormalize_state(self, state: np.ndarray) -> np.ndarray:
+    return self.state_stats.denormalize(state)
+
+  def project_state(self, state: np.ndarray) -> np.ndarray:
+    return self.normalize_state(state)
+
+  def inverse_state(self, state: np.ndarray) -> np.ndarray:
+    return self.denormalize_state(state)
+
+  def normalize_latent(self, latent: np.ndarray) -> np.ndarray:
+    return self.latent_stats.normalize(latent)
+
+  def denormalize_latent(self, latent: np.ndarray) -> np.ndarray:
+    return self.latent_stats.denormalize(latent)
+
+  def make_tokens(self, state: np.ndarray, latent: np.ndarray) -> np.ndarray:
+    normalized_state = self.normalize_state(state)
+    normalized_latent = self.normalize_latent(latent)
+    if normalized_state.shape[:-1] != normalized_latent.shape[:-1]:
+      raise ProjectionError("state and latent leading dimensions differ")
+    return np.concatenate((normalized_state, normalized_latent), axis=-1)
+
+  def as_dict(self) -> dict[str, object]:
+    return {
+      "contract": self.contract.as_dict(),
+      "state_stats": self.state_stats.as_dict(),
+      "latent_stats": self.latent_stats.as_dict(),
+      "statistics_sha256": self.statistics_sha256,
+    }
+
+  def save(self, path: str | Path) -> None:
+    """Persist only statistics and metadata for the active representation."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+      path,
+      state_mean=self.state_stats.mean,
+      state_std=self.state_stats.std,
+      latent_mean=self.latent_stats.mean,
+      latent_std=self.latent_stats.std,
+      metadata=np.asarray(json.dumps(self.as_dict(), sort_keys=True)),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionBundle:
   """Normalized state/latent statistics plus P and its Moore-Penrose inverse."""
@@ -166,12 +316,7 @@ class ProjectionBundle:
     ).hexdigest()
 
   def statistics_hash(self) -> str:
-    payload = json.dumps(
-      {"state": self.state_stats.as_dict(), "latent": self.latent_stats.as_dict()},
-      sort_keys=True,
-      separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
+    return _statistics_hash(self.state_stats, self.latent_stats)
 
   @classmethod
   def create(
@@ -317,4 +462,15 @@ class ProjectionBundle:
     return bundle
 
 
-__all__ = ["FeatureStats", "ProjectionBundle", "ProjectionError", "fit_feature_stats"]
+StateLatentTransformLike = ProjectionBundle | StateLatentTransform
+
+
+__all__ = [
+  "FeatureStats",
+  "ProjectionBundle",
+  "ProjectionError",
+  "StateLatentNormalizer",
+  "StateLatentTransform",
+  "StateLatentTransformLike",
+  "fit_feature_stats",
+]

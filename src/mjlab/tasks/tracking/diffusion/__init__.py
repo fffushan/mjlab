@@ -75,6 +75,9 @@ from .projection import (
   FeatureStats,
   ProjectionBundle,
   ProjectionError,
+  StateLatentNormalizer,
+  StateLatentTransform,
+  StateLatentTransformLike,
   fit_feature_stats,
 )
 from .qualification import (
@@ -198,6 +201,9 @@ __all__ = [
   "FeatureStats",
   "ProjectionBundle",
   "ProjectionError",
+  "StateLatentNormalizer",
+  "StateLatentTransform",
+  "StateLatentTransformLike",
   "rebuild_no_mixture_dataset",
   "ModelBackend",
   "ModelBackendError",

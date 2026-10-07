@@ -167,7 +167,7 @@ class DiffusionContract:
     state = payload.get("state", {})
     window = payload.get("window", {})
     prep = payload.get("preprocessing", {})
-    proj = prep.get("projection", {})
+    proj = prep.get("projection") or {}
     dims = payload.get("vae", {}).get("dimensions", {})
     try:
       fractions = tuple(float(x) for x in prep["split_fractions"])
@@ -185,14 +185,18 @@ class DiffusionContract:
         current_index=int(window["current_index"]),
         future_steps=int(window["future_steps"]),
         window_steps=int(window["total_steps"]),
-        projected_state_dimension=int(proj["projected_dimension"]),
-        token_dimension=int(proj["token_dimension"]),
+        projected_state_dimension=int(
+          proj.get("projected_dimension", state["raw_dimension"])
+        ),
+        token_dimension=int(
+          proj.get("token_dimension", int(state["raw_dimension"]) + int(dims["latent"]))
+        ),
         split_seed=int(prep["split_seed"]),
         split_fractions=(fractions[0], fractions[1], fractions[2]),
         std_floor=float(prep["std_floor"]),
-        projection_seed=int(proj["seed"]),
-        projection_rows=int(proj["gaussian_rows"]),
-        projection_rcond=float(proj["pseudoinverse_rcond"]),
+        projection_seed=int(proj.get("seed", 42)),
+        projection_rows=int(proj.get("gaussian_rows", 0)),
+        projection_rcond=float(proj.get("pseudoinverse_rcond", 1.0e-12)),
         vae_checkpoint=str(payload["vae"]["checkpoint"]),
         vae_sha256=str(payload["vae"]["sha256"]),
         recovery_onnx=str(payload["recovery"]["onnx"]),

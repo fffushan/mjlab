@@ -26,12 +26,12 @@ from .async_latent_runtime import AsyncLatentRuntime
 from .contract import DiffusionContract
 from .latent_planning import LatentPlanner
 from .planner_executor import BoundedPlannerExecutor
-from .projection import ProjectionBundle
+from .projection import StateLatentTransform
 from .replay_integration import (
   LoadedVae,
   load_active_contract,
   load_denoiser,
-  load_projection_bundle,
+  load_normalizer_bundle,
   load_vae_decoder,
 )
 from .scheduler import Plan, PlannerRequest
@@ -52,11 +52,14 @@ class ModelBackendSpec:
 
   contract_path: str | Path
   diffusion_checkpoint: str | Path
-  projection_bundle: str | Path
   vae_checkpoint: str | Path
   vae_manifest: str | Path
   repo_root: str | Path
   vae_member: str
+  normalization_bundle: str | Path | None = None
+  # Legacy keyword accepted for callers that still use the old name.  The
+  # active D5 loader reads only state/latent statistics from this path.
+  projection_bundle: str | Path | None = None
   planner_device: str = "cpu"
   decoder_device: str = "cpu"
   model_identity: str | None = None
@@ -64,10 +67,26 @@ class ModelBackendSpec:
   verify_projection_hashes: bool = False
 
   def __post_init__(self) -> None:
+    if self.normalization_bundle is None and self.projection_bundle is None:
+      raise ModelBackendError(
+        "normalization_bundle or legacy projection_bundle is required"
+      )
+    if self.normalization_bundle is not None and self.projection_bundle is not None:
+      if str(self.normalization_bundle) != str(self.projection_bundle):
+        raise ModelBackendError(
+          "normalization_bundle and projection_bundle must refer to one file"
+        )
+    normalizer_path = (
+      self.normalization_bundle
+      if self.normalization_bundle is not None
+      else self.projection_bundle
+    )
+    assert normalizer_path is not None
+    object.__setattr__(self, "normalization_bundle", str(normalizer_path))
     for name in (
       "contract_path",
       "diffusion_checkpoint",
-      "projection_bundle",
+      "normalization_bundle",
       "vae_checkpoint",
       "vae_manifest",
       "repo_root",
@@ -94,6 +113,13 @@ class ModelBackendSpec:
       raise ModelBackendError("verify_projection_hashes must be a boolean")
 
   @property
+  def resolved_normalization_bundle(self) -> str:
+    """Return the active statistics-only normalizer path."""
+
+    assert self.normalization_bundle is not None
+    return str(self.normalization_bundle)
+
+  @property
   def resolved_model_identity(self) -> str:
     """Stable local identity without requiring a checkpoint digest."""
 
@@ -115,7 +141,7 @@ class ModelBackendSpec:
     for name in (
       "contract_path",
       "diffusion_checkpoint",
-      "projection_bundle",
+      "normalization_bundle",
       "vae_checkpoint",
       "vae_manifest",
     ):
@@ -133,8 +159,14 @@ class ModelBackend:
 
   spec: ModelBackendSpec
   contract: DiffusionContract
-  projection: ProjectionBundle
+  normalizer: StateLatentTransform
   vae: LoadedVae
+
+  @property
+  def projection(self) -> StateLatentTransform:
+    """Legacy alias for callers migrating from ProjectionBundle."""
+
+    return self.normalizer
 
   @property
   def model_identity(self) -> str:
@@ -165,14 +197,14 @@ class ModelPlannerFactory:
   def __call__(self) -> Callable[[PlannerRequest], Plan]:
     self.spec.validate_paths()
     contract = load_active_contract(self.spec.contract_path)
-    projection = load_projection_bundle(
-      self.spec.projection_bundle,
+    normalizer = load_normalizer_bundle(
+      self.spec.resolved_normalization_bundle,
       contract=contract,
     )
     loaded = load_denoiser(
       self.spec.diffusion_checkpoint,
       contract=contract,
-      projection_bundle=projection,
+      normalizer=normalizer,
       checkpoint_sha256=None,
       verify_projection_hashes=self.spec.verify_projection_hashes,
       verify_contract_identity=False,
@@ -188,7 +220,7 @@ class ModelPlannerFactory:
       denoiser=model,
       schedule=loaded.schedule,
       grid=loaded.grid,
-      projection=projection,
+      normalizer=normalizer,
       contract=contract,
       device=device,
       vae_identity=self.spec.resolved_vae_identity,
@@ -198,13 +230,16 @@ class ModelPlannerFactory:
 
 
 def load_model_backend(spec: ModelBackendSpec) -> ModelBackend:
-  """Load the owner-side contract, projection bundle and VAE decoder."""
+  """Load the owner-side contract, normalizer and VAE decoder."""
 
   if not isinstance(spec, ModelBackendSpec):
     raise ModelBackendError("spec must be a ModelBackendSpec")
   spec.validate_paths()
   contract = load_active_contract(spec.contract_path)
-  projection = load_projection_bundle(spec.projection_bundle, contract=contract)
+  normalizer = load_normalizer_bundle(
+    spec.resolved_normalization_bundle,
+    contract=contract,
+  )
   try:
     decoder_device = torch.device(spec.decoder_device)
     torch.empty(0, device=decoder_device)
@@ -219,7 +254,7 @@ def load_model_backend(spec: ModelBackendSpec) -> ModelBackend:
     vae_checkpoint_sha256=None,
     device=decoder_device,
   )
-  return ModelBackend(spec, contract, projection, vae)
+  return ModelBackend(spec, contract, normalizer, vae)
 
 
 def build_model_backed_runtime(
@@ -234,8 +269,9 @@ def build_model_backed_runtime(
 ) -> AsyncLatentRuntime:
   """Construct the concrete D5 runtime from explicit model paths.
 
-  The VAE is loaded in the owner process.  The denoiser and projection bundle
-  are loaded inside the executor's spawned worker by ``ModelPlannerFactory``.
+  The VAE is loaded in the owner process.  The denoiser and statistics-only
+  normalizer are loaded inside the executor's spawned worker by
+  ``ModelPlannerFactory``.
   """
 
   backend = load_model_backend(spec)
@@ -243,7 +279,7 @@ def build_model_backed_runtime(
   try:
     return AsyncLatentRuntime(
       executor,
-      projection=backend.projection,
+      normalizer=backend.normalizer,
       decode=backend.decoder,
       generator=generator,
       contract=backend.contract,

@@ -41,7 +41,7 @@ from .handover import (
 )
 from .inpainting import TimedStateKeyframe, inpaint_keyframes
 from .pose_costs import PoseCostWeights, TimedPoseGoal
-from .projection import ProjectionBundle
+from .projection import ProjectionBundle, StateLatentTransformLike
 from .sampler import SamplerConditions, SamplerConfig, sample_trajectory
 from .schedule import DiffusionSchedule, InferenceGrid, build_inference_grid
 from .scheduler import FrozenContext, Plan, PlannerRequest
@@ -651,7 +651,7 @@ def _target_from_input(value: object, *, hard: bool) -> TaskTargetSnapshot:
 
 
 def _projection_identity(
-  projection: ProjectionBundle, contract: DiffusionContract
+  projection: StateLatentTransformLike, contract: DiffusionContract
 ) -> str:
   projection_contract = getattr(projection, "contract", None)
   if projection_contract is None or not hasattr(projection_contract, "identity_hash"):
@@ -660,12 +660,14 @@ def _projection_identity(
     raise LatentPlanningError(
       "projection contract identity differs from active contract"
     )
-  fields = {
+  fields: dict[str, str] = {
     "contract": contract.identity_hash(),
     "statistics": str(projection.statistics_sha256),
-    "matrix": str(projection.matrix_sha256),
-    "pseudoinverse": str(projection.pseudoinverse_sha256),
   }
+  for name in ("matrix_sha256", "pseudoinverse_sha256"):
+    value = getattr(projection, name, None)
+    if value is not None:
+      fields[name.removesuffix("_sha256")] = str(value)
   return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
@@ -1037,7 +1039,8 @@ def build_planning_packet(
   history: HandoverHistory | Iterable[object],
   current_state: WorldState,
   *,
-  projection: ProjectionBundle,
+  projection: StateLatentTransformLike | None = None,
+  normalizer: StateLatentTransformLike | None = None,
   source_timestamp: float,
   source_tick: int,
   source_frame: int,
@@ -1062,6 +1065,12 @@ def build_planning_packet(
   random = rng if rng is not None else generator
   if random is None:
     raise LatentPlanningError("an explicit request-local torch.Generator is required")
+  if projection is not None and normalizer is not None:
+    raise LatentPlanningError("pass only one of projection or normalizer")
+  transform = normalizer if normalizer is not None else projection
+  if transform is None:
+    raise LatentPlanningError("a state/latent normalizer is required")
+  projection = transform
   if (
     contract.schema_version != DEFAULT_CONTRACT.schema_version
     or contract.projection_rows != 0
@@ -1123,7 +1132,7 @@ def build_planning_packet(
       base_plan,
       current_snapshot.to_world_state(),
       spec.keyframes,
-      projection=projection,
+      projection=cast(ProjectionBundle, projection),
       contract=contract,
     )
   tokens, mask = _snapshot_plan(base_plan)
@@ -1303,7 +1312,8 @@ class LatentPlanner:
     denoiser: Callable[[Tensor, Tensor], Tensor],
     schedule: DiffusionSchedule,
     grid: InferenceGrid,
-    projection: ProjectionBundle,
+    projection: StateLatentTransformLike | None = None,
+    normalizer: StateLatentTransformLike | None = None,
     contract: DiffusionContract = DEFAULT_CONTRACT,
     device: str | torch.device = "cpu",
     sampler_config: SamplerConfig | None = None,
@@ -1332,6 +1342,12 @@ class LatentPlanner:
       raise LatentPlanningError(
         "latent planning requires the frozen 20-jump inference grid"
       )
+    if projection is not None and normalizer is not None:
+      raise LatentPlanningError("pass only one of projection or normalizer")
+    transform = normalizer if normalizer is not None else projection
+    if transform is None:
+      raise LatentPlanningError("a state/latent normalizer is required")
+    projection = transform
     _projection_identity(projection, contract)
     try:
       resolved_device = torch.device(device)
@@ -1423,7 +1439,7 @@ class LatentPlanner:
     if task_spec is not None and task_spec.goals:
       conditioning = TaskConditioning(
         task_spec,
-        projection=self.projection,
+        projection=cast(ProjectionBundle, self.projection),
         contract=self.contract,
       )
       sampler = conditioning.sampler_factory(plan, current_state)
@@ -1535,7 +1551,7 @@ class LatentPlanner:
         expected,
         packet.current_world_state(),
         spec.keyframes,
-        projection=self.projection,
+        projection=cast(ProjectionBundle, self.projection),
         contract=self.contract,
       )
     expected_tokens, expected_mask = _snapshot_plan(expected)
