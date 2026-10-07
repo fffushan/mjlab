@@ -115,6 +115,18 @@ def _wait_for_wire(executor: BoundedPlannerExecutor, timeout: float = 3.0):
   return results[0]
 
 
+def test_wait_for_completion_wakes_without_draining_result() -> None:
+  executor = BoundedPlannerExecutor(_round_trip_factory)
+  try:
+    executor.submit(_request())
+    assert executor.wait_for_completion(3.0)
+    results = tuple(executor.poll())
+    assert len(results) == 1
+    assert results[0].plan is not None
+  finally:
+    executor.shutdown()
+
+
 def _wire_bytes(wire: tuple[object, ...]) -> bytes:
   return b"W" + pickle.dumps(wire, protocol=pickle.HIGHEST_PROTOCOL)
 

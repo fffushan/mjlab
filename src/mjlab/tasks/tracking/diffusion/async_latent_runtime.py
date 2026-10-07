@@ -240,6 +240,36 @@ class RuntimeStep:
 
 
 @dataclass(frozen=True, slots=True)
+class WarmupReport:
+  """Evidence that the owner decoder and planner worker were warmed."""
+
+  decoder_calls: int
+  planner_request_sequence_id: int
+  planner_plan_sequence_id: int
+  elapsed_seconds: float
+
+  def __post_init__(self) -> None:
+    decoder_calls = _nonnegative_int(self.decoder_calls, "decoder_calls")
+    if decoder_calls == 0:
+      raise AsyncLatentRuntimeError("decoder_calls must be positive")
+    request_sequence = _nonnegative_int(
+      self.planner_request_sequence_id, "planner_request_sequence_id"
+    )
+    plan_sequence = _nonnegative_int(
+      self.planner_plan_sequence_id, "planner_plan_sequence_id"
+    )
+    if request_sequence == 0 or plan_sequence == 0:
+      raise AsyncLatentRuntimeError("warmup sequence IDs must be positive")
+    elapsed = _finite(self.elapsed_seconds, "elapsed_seconds")
+    if elapsed < 0.0:
+      raise AsyncLatentRuntimeError("elapsed_seconds must be non-negative")
+    object.__setattr__(self, "decoder_calls", decoder_calls)
+    object.__setattr__(self, "planner_request_sequence_id", request_sequence)
+    object.__setattr__(self, "planner_plan_sequence_id", plan_sequence)
+    object.__setattr__(self, "elapsed_seconds", elapsed)
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingExecution:
   execution_id: int
   state: WorldState
@@ -259,8 +289,9 @@ class AsyncLatentRuntime:
 
   ``source_timestamp`` and the injected ``clock`` use the same monotonic clock
   domain.  A plan is rejected if it is older than ``max_source_age_seconds`` or
-  newer than ``max_future_skew_seconds``.  No standing or robot fallback is
-  emitted for any failure.
+  newer than ``max_future_skew_seconds``.  ``max_fallback_ticks`` is a warning
+  threshold only; fallback continues through the accepted plan horizon.  No
+  standing or robot fallback is emitted for any failure.
   """
 
   def __init__(
@@ -440,6 +471,160 @@ class AsyncLatentRuntime:
     if self._shutdown:
       return (SchedulerEvent(SchedulerStatus.SHUTDOWN, "runtime is shut down"),)
     return self.scheduler.poll()
+
+  def warmup(
+    self,
+    current_state: WorldState,
+    conditioning: Sequence[float] | np.ndarray,
+    *,
+    tick: int,
+    source_frame: int = 0,
+    task: object | None = None,
+    task_revision: str | None = None,
+    decoder_calls: int = 3,
+    timeout_seconds: float = 10.0,
+  ) -> WarmupReport:
+    """Warm the owner decoder and one spawned planner inference.
+
+    The method requires the real eight-pair bootstrap history and a current
+    measured state.  It decodes a valid bootstrap latent locally, submits a
+    valid planner snapshot to the worker, waits only during startup, validates
+    one returned plan, and then resets scheduler state so the warmup result
+    cannot become a control action.  The caller must keep the controller in a
+    safe non-tracking state until this method returns successfully.
+    """
+
+    self._require_open()
+    started = time.monotonic()
+    tick_value = _nonnegative_int(tick, "warmup tick")
+    calls = _nonnegative_int(decoder_calls, "decoder_calls")
+    if calls == 0:
+      raise AsyncLatentRuntimeError("decoder_calls must be positive")
+    timeout = _finite(timeout_seconds, "timeout_seconds")
+    if timeout <= 0.0:
+      raise AsyncLatentRuntimeError("timeout_seconds must be positive")
+    try:
+      frame_value = _nonnegative_int(source_frame, "source_frame")
+      state = _copy_state(current_state)
+      conditioning_values = _copy_vector(
+        conditioning, "decoder conditioning", _CONDITIONING_DIM
+      )
+      snapshot_task = TaskSnapshot.from_inputs(task, revision=task_revision)
+    except (AsyncLatentRuntimeError, LatentPlanningError) as exc:
+      raise AsyncLatentRuntimeError(str(exc)) from exc
+    if (
+      self.expected_source_frame is not None
+      and frame_value != self.expected_source_frame
+    ):
+      raise AsyncLatentRuntimeError("source_frame differs from expected_source_frame")
+    if self._pending_execution is not None:
+      raise AsyncLatentRuntimeError(
+        "warmup cannot run while an action awaits execution acknowledgement"
+      )
+    if not self.history.ready:
+      raise AsyncLatentRuntimeError(
+        f"eight measured bootstrap pairs are required; got {self.history_size}"
+      )
+
+    # Invalidate any old accepted plan before the warmup request.  An older
+    # active worker request remains owned and is drained by the wait below.
+    self.scheduler.reset()
+    self._task_snapshot = snapshot_task
+    warmup_generator = torch.Generator(device=self.planner_device)
+    warmup_generator.set_state(self._generator.get_state().detach().clone())
+    seed_latent = np.array(self.history.pairs[-1].latent, copy=True)
+    for _ in range(calls):
+      self._decode_action(seed_latent, conditioning_values)
+      self._synchronize_decoder_device()
+
+    now = self._now()
+    try:
+      packet = build_planning_packet(
+        self.history,
+        state,
+        projection=self.projection,
+        source_timestamp=now,
+        source_tick=tick_value,
+        source_frame=frame_value,
+        period_seconds=self.period_seconds,
+        task=snapshot_task,
+        task_revision=snapshot_task.revision,
+        generator=warmup_generator,
+        contract=self.contract,
+        vae_identity=self.vae_identity,
+        model_identity=self.model_identity,
+        projection_identity=self._projection_identity,
+      )
+      self._projection_identity = packet.projection_identity
+      self._advance_generator(warmup_generator)
+      self.scheduler.request(
+        np.asarray((packet.source_tick, packet.source_timestamp), dtype=np.float64),
+        source_timestamp=packet.source_timestamp,
+        source_tick=packet.source_tick,
+        context=packet.as_context(),
+      )
+      events = self.scheduler.poll()
+    except (AsyncLatentRuntimeError, LatentPlanningError, SchedulerError) as exc:
+      self.scheduler.reset()
+      raise AsyncLatentRuntimeError(f"warmup request failed: {exc}") from exc
+    except BaseException as exc:
+      self.scheduler.reset()
+      raise AsyncLatentRuntimeError(f"warmup request failed: {exc}") from exc
+
+    waiter = getattr(self.executor, "wait_for_completion", None)
+    deadline = time.monotonic() + timeout
+    while self.scheduler.accepted_plan is None:
+      for event in events:
+        if event.status in (
+          SchedulerStatus.INVALID_OUTPUT,
+          SchedulerStatus.PLANNER_EXCEPTION,
+        ):
+          self.scheduler.reset()
+          raise AsyncLatentRuntimeError(f"warmup planner failed: {event.detail}")
+      remaining = deadline - time.monotonic()
+      if remaining <= 0.0:
+        self.scheduler.reset()
+        raise AsyncLatentRuntimeError(f"planner warmup timed out after {timeout:g}s")
+      if not callable(waiter):
+        self.scheduler.reset()
+        raise AsyncLatentRuntimeError(
+          "planner executor does not support bounded warmup waiting"
+        )
+      try:
+        ready = bool(waiter(remaining))
+      except BaseException as exc:
+        self.scheduler.reset()
+        raise AsyncLatentRuntimeError(f"planner warmup wait failed: {exc}") from exc
+      if not ready:
+        self.scheduler.reset()
+        raise AsyncLatentRuntimeError(f"planner warmup timed out after {timeout:g}s")
+      try:
+        events = self.scheduler.poll()
+      except BaseException as exc:
+        self.scheduler.reset()
+        raise AsyncLatentRuntimeError(f"planner warmup poll failed: {exc}") from exc
+
+    accepted = self.scheduler.accepted_plan
+    origin = self.scheduler.accepted_request_provenance
+    if accepted is None or origin is None:
+      self.scheduler.reset()
+      raise AsyncLatentRuntimeError("planner warmup returned no accepted plan")
+    validation = self._validate_plan(
+      accepted, origin, self._now(), frame_value, snapshot_task
+    )
+    if validation is not None:
+      self.scheduler.reset()
+      raise AsyncLatentRuntimeError(
+        f"planner warmup returned an invalid plan: {validation[1]}"
+      )
+    report = WarmupReport(
+      decoder_calls=calls,
+      planner_request_sequence_id=origin.request_sequence_id,
+      planner_plan_sequence_id=accepted.plan_sequence_id,
+      elapsed_seconds=time.monotonic() - started,
+    )
+    self.scheduler.reset()
+    return report
 
   def step(
     self,
@@ -686,9 +871,10 @@ class AsyncLatentRuntime:
       raise AsyncLatentRuntimeError("monotonic clock value must be non-negative")
     return value
 
-  def _advance_generator(self) -> None:
+  def _advance_generator(self, generator: torch.Generator | None = None) -> None:
+    target = self._generator if generator is None else generator
     try:
-      torch.rand(1, generator=self._generator, device=self.planner_device)
+      torch.rand(1, generator=target, device=target.device)
     except (RuntimeError, TypeError) as exc:
       raise AsyncLatentRuntimeError(
         "could not advance request-local planner-device RNG"
@@ -843,6 +1029,10 @@ class AsyncLatentRuntime:
       task_mode=cast(str, metadata["task_mode"]),
     )
 
+  def _synchronize_decoder_device(self) -> None:
+    if self.device.type == "cuda":
+      torch.cuda.synchronize(self.device)
+
   def _decode_action(
     self, latent: np.ndarray, conditioning: Sequence[float] | np.ndarray
   ) -> np.ndarray:
@@ -929,4 +1119,5 @@ __all__ = [
   "ExecutionProvenance",
   "RuntimeStatus",
   "RuntimeStep",
+  "WarmupReport",
 ]

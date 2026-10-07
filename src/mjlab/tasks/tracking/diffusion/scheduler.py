@@ -8,8 +8,10 @@ deterministic polling loop.
 The control consumer is synchronous. It selects the row for the execution tick
 from the newest accepted plan. A result belongs to the newest submitted request
 in the current policy generation; a newer pending request does not invalidate
-that active request. When a planner is late, the consumer can use a bounded
-suffix of the last accepted plan. Reset and policy switch invalidate queued and
+that active request. When a planner is late, the consumer can use later rows
+from that plan while the trajectory remains valid. The ``max_fallback_ticks``
+value is a warning threshold only; it does not reject an action before the
+accepted trajectory ends. Reset and policy switch invalidate queued and
 accepted work but retain active ownership until its matching completion arrives.
 Release and shutdown stop the executor. This is an action-trajectory primitive,
 not a latent planner or current-proprioception decoder integration.
@@ -82,6 +84,7 @@ class SchedulerStatus(str, Enum):
 
   ACTION = "action"
   FALLBACK_ACTION = "fallback_action"
+  FALLBACK_WARNING = "fallback_warning"
   NO_PLAN = "no_plan"
   PLAN_NOT_YET_VALID = "plan_not_yet_valid"
   PLAN_EXHAUSTED = "plan_exhausted"
@@ -281,11 +284,13 @@ class RuntimeScheduler:
   At most one request is pending and at most one request is in flight.
   Calling :meth:`request` replaces an unsubmitted request. A newer pending
   request does not invalidate the active completion. After first selecting a
-  new plan at tick T, its fallback suffix is valid only through
-  T + ``max_fallback_ticks`` (inclusive). Skipped ticks count toward this limit,
-  which is independent of trajectory length. Plan replacement is immediate:
-  future-valid plans return no action until their start tick, and expired plans
-  return no action. The previous plan is never restored after replacement.
+  new plan at tick T, its fallback suffix is used until a newer plan replaces
+  it or the trajectory ends. ``max_fallback_ticks`` emits one warning event
+  when the fallback count reaches the configured threshold; it is not a hard
+  action limit. Skipped ticks count toward this warning threshold. Plan
+  replacement is immediate: future-valid plans return no action until their
+  start tick, and expired plans return no action. The previous plan is never
+  restored after replacement.
   """
 
   DEFAULT_PERIOD_SECONDS = 0.020
@@ -341,6 +346,7 @@ class RuntimeScheduler:
     self._new_plan_since_consume = False
     self._fallback_ticks = 0
     self._plan_first_use_tick: int | None = None
+    self._fallback_warning_emitted = False
     self._last_control_tick: int | None = None
     self._fault: SchedulerEvent | None = None
     self._released = False
@@ -505,6 +511,7 @@ class RuntimeScheduler:
         event,
         plan.plan_sequence_id,
       )
+    warning_event: SchedulerEvent | None = None
     if self._new_plan_since_consume:
       self._fallback_ticks = 0
       self._plan_first_use_tick = control_tick
@@ -513,16 +520,17 @@ class RuntimeScheduler:
     else:
       assert self._plan_first_use_tick is not None
       self._fallback_ticks = control_tick - self._plan_first_use_tick
-      if self._fallback_ticks > self.max_fallback_ticks:
-        self._accepted_plan = None
-        self._accepted_request_sequence = None
-        self._accepted_request_provenance = None
-        return self._closed_step(
-          control_tick,
-          SchedulerStatus.PLAN_EXHAUSTED,
-          "bounded previous-plan suffix is exhausted",
-          event,
-          plan.plan_sequence_id,
+      if (
+        self._fallback_ticks >= self.max_fallback_ticks
+        and not self._fallback_warning_emitted
+      ):
+        self._fallback_warning_emitted = True
+        warning_event = SchedulerEvent(
+          SchedulerStatus.FALLBACK_WARNING,
+          f"fallback warning: plan {plan.plan_sequence_id} has been used for "
+          f"{self._fallback_ticks} fallback ticks; threshold "
+          f"{self.max_fallback_ticks} reached; continuing until trajectory end",
+          plan_sequence_id=plan.plan_sequence_id,
         )
       status = SchedulerStatus.FALLBACK_ACTION
     action = plan.actions[control_tick - plan.valid_from_tick]
@@ -535,7 +543,13 @@ class RuntimeScheduler:
       return self._closed_step(
         control_tick, fault.status, fault.detail, fault, plan.plan_sequence_id
       )
-    return SchedulerStep(status, action, control_tick, event, plan.plan_sequence_id)
+    return SchedulerStep(
+      status,
+      action,
+      control_tick,
+      warning_event if warning_event is not None else event,
+      plan.plan_sequence_id,
+    )
 
   def reset(self) -> SchedulerEvent:
     """Invalidate pending requests, accepted plans, and planner faults."""
@@ -741,6 +755,7 @@ class RuntimeScheduler:
     self._new_plan_since_consume = True
     self._fallback_ticks = 0
     self._plan_first_use_tick = None
+    self._fallback_warning_emitted = False
     return SchedulerEvent(
       SchedulerStatus.ACTION,
       "plan accepted",

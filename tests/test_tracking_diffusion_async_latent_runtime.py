@@ -165,6 +165,12 @@ class _DelayedExecutor(_ImmediateExecutor):
     return super().poll()
 
 
+class _WarmupDelayedExecutor(_DelayedExecutor):
+  def wait_for_completion(self, timeout_seconds: float) -> bool:
+    del timeout_seconds
+    return self.pending is not None
+
+
 class _FailureExecutor(_ImmediateExecutor):
   def poll(self) -> tuple[PlannerResult, ...]:
     if self.pending is None:
@@ -311,6 +317,40 @@ def test_late_plan_selects_execution_row_and_decodes_current_state() -> None:
   assert runtime.history.pairs[-1].state.root_position[0] == pytest.approx(
     second_state.root_position[0]
   )
+  runtime.release()
+
+
+def test_warmup_warms_decoder_and_discards_planner_action() -> None:
+  clock = _Clock(10.0)
+  decoder = _Decoder()
+  runtime = _runtime(
+    _WarmupDelayedExecutor(_plan_for_request),
+    clock,
+    decoder=decoder,
+  )
+  _bootstrap(runtime)
+  generator_state = runtime._generator.get_state().detach().clone()
+
+  report = runtime.warmup(
+    make_state(8),
+    np.full(99, 2.0),
+    tick=8,
+    decoder_calls=2,
+  )
+  assert report.decoder_calls == 2
+  assert report.planner_request_sequence_id == 1
+  assert report.planner_plan_sequence_id == 1
+  assert report.elapsed_seconds >= 0.0
+  assert torch.equal(generator_state, runtime._generator.get_state())
+  assert len(decoder.latents) == 2
+  assert runtime.history_size == 8
+  assert runtime.scheduler.accepted_plan is None
+  assert runtime._pending_execution is None
+
+  action = runtime.step(make_state(8), np.full(99, 3.0), tick=8)
+  assert action.status is RuntimeStatus.ACTION
+  assert len(decoder.latents) == 3
+  assert runtime.acknowledge(action, success=True)
   runtime.release()
 
 

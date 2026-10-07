@@ -29,6 +29,21 @@ Added
   semantic-identity gates. The active schema and 135-state/32-latent/167-token
   dimensional checks remain enforced.
 
+Changed
+^^^^^^^
+
+- Changed D5 fallback scheduling so ``max_fallback_ticks`` is a structured
+  warning threshold rather than an action limit. The runtime continues to use
+  later rows of the accepted latent trajectory until a newer plan replaces it
+  or the trajectory reaches its valid end tick. Invalid, stale, reset and
+  shutdown conditions remain fail-closed.
+
+- Added D5 startup warmup for the owner-side VAE decoder and the spawned
+  diffusion planner. ``AsyncLatentRuntime.warmup`` uses valid bootstrap data,
+  waits on the bounded worker completion signal, validates and discards the
+  warmup plan, and leaves the controller ready for a fresh active request.
+  Warmup does not publish an action or claim controller readiness.
+
 
 =========
 Added

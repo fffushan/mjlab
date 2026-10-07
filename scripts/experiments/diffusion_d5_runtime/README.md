@@ -12,6 +12,27 @@ malformed files fail at load time. This entrypoint is not a timing or deployment
 gate.
 
 
+There is an explicit startup warmup method:
+
+```python
+report = runtime.warmup(
+    current_state,
+    conditioning,
+    tick=current_tick,
+    decoder_calls=3,
+    timeout_seconds=10.0,
+)
+```
+
+`warmup` requires the eight measured bootstrap pairs. It runs valid owner-side
+VAE decoder calls, submits one valid planner request, waits on the bounded
+worker completion signal, validates the returned plan and then resets scheduler
+state. The warmup plan is never returned as an action and must not be sent to a
+robot. Keep the controller in its safe non-tracking state until the call
+returns successfully. A concrete `BoundedPlannerExecutor` is required because
+startup warmup uses its bounded completion wait; normal `step` calls remain
+nonblocking.
+
 ## Runtime contract
 
 `AsyncLatentRuntime` owns a `RuntimeScheduler` and receives a
@@ -36,8 +57,11 @@ Raw latent rows are never published as robot commands. Future rows are not
 predecoded. A returned action is not entered into history until the caller
 confirms it with `runtime.acknowledge(step, success=True)`. A failed
 acknowledgement, failed decode, planner failure, stale plan, future plan,
-malformed plan, or exhausted plan returns an explicit no-action status. There
-is no standing or robot fallback.
+malformed plan, or trajectory-horizon exhaustion returns an explicit no-action
+status. A newer plan replaces the accepted plan immediately. The
+`max_fallback_ticks` setting is a warning threshold only; it does not stop
+fallback before the accepted 33-row trajectory ends. There is no standing or
+robot fallback.
 
 Call `acknowledge_bootstrap(..., success=True)` after each measured VAE
 bootstrap execution. The facade requires eight successful pairs before it

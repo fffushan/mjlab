@@ -139,8 +139,13 @@ this slice does not activate the mjlab or vendor simulator.
    invalidate the relevant work and history. Rebuild eight measured pairs when
    the physical/history boundary requires it.
 9. Task revision changes invalidate old task work but must not fabricate history.
-10. On exhaustion or invalid data, return an explicit no-action status. Do not
-    select a standing policy or physical fallback without separate validation.
+10. On trajectory-horizon exhaustion or invalid data, return an explicit
+    no-action status. Do not select a standing policy or physical fallback
+    without separate validation.
+
+The `max_fallback_ticks` setting is a warning threshold only. It does not
+invalidate an accepted plan before its valid trajectory horizon. Emit one
+structured fallback warning per accepted plan when the threshold is reached.
 
 Fake-clock tests must cover on-time and late completions, current-state decoding,
 execution-row selection, prefix history, task snapshots, source-age expiry,

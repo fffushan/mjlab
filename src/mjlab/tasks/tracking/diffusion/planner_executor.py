@@ -525,6 +525,24 @@ class BoundedPlannerExecutor(PlannerExecutor):
       self._record_fatal(f"planner worker exited with code {process.exitcode}")
     return tuple(results)
 
+  def wait_for_completion(self, timeout_seconds: float) -> bool:
+    """Wait for a result frame or exact worker exit without draining it.
+
+    The caller must invoke :meth:`poll` after this method returns ``True``.
+    This method exists for bounded startup warmup; normal control ticks use
+    nonblocking :meth:`poll` only.
+    """
+
+    timeout = _validate_timeout(timeout_seconds, "timeout_seconds", allow_zero=True)
+    if self._closed:
+      return False
+    receiver = self._result_receiver
+    process = self._process
+    if receiver is None or process is None:
+      raise PlannerExecutorError("planner executor IPC is not initialized")
+    ready_sources = wait_connections((receiver, process.sentinel), timeout=timeout)
+    return receiver in ready_sources or process.sentinel in ready_sources
+
   def shutdown(self) -> None:
     """Close submissions and stop the exact worker within a bounded deadline."""
 

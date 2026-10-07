@@ -224,28 +224,51 @@ def test_plan_actions_are_selected_at_consecutive_ticks() -> None:
   np.testing.assert_array_equal(third.action, [3.0])
 
 
-def test_late_result_uses_only_bounded_previous_plan_suffix() -> None:
+def test_late_result_uses_plan_until_trajectory_horizon_and_warns() -> None:
   scheduler, executor = make_scheduler(max_fallback_ticks=1)
-  submit_and_accept(scheduler, executor, sequence=1)
+  submit_and_accept(
+    scheduler,
+    executor,
+    sequence=1,
+    plan=make_plan(1, values=tuple(float(i) for i in range(8))),
+  )
   assert (
     scheduler.consume(control_tick=0, timestamp=0.0).status is SchedulerStatus.ACTION
   )
-  assert (
-    scheduler.consume(control_tick=1, timestamp=0.02).status
-    is SchedulerStatus.FALLBACK_ACTION
-  )
-  exhausted = scheduler.consume(control_tick=2, timestamp=0.04)
+  warning = scheduler.consume(control_tick=1, timestamp=0.02)
+  assert warning.status is SchedulerStatus.FALLBACK_ACTION
+  assert warning.action is not None
+  assert warning.action.tolist() == [1.0]
+  assert warning.event is not None
+  assert warning.event.status is SchedulerStatus.FALLBACK_WARNING
+
+  later = scheduler.consume(control_tick=5, timestamp=0.10)
+  assert later.status is SchedulerStatus.FALLBACK_ACTION
+  assert later.action is not None
+  assert later.action.tolist() == [5.0]
+  assert later.event is None
+
+  end = scheduler.consume(control_tick=7, timestamp=0.14)
+  assert end.status is SchedulerStatus.FALLBACK_ACTION
+  exhausted = scheduler.consume(control_tick=8, timestamp=0.16)
   assert exhausted.status is SchedulerStatus.PLAN_EXHAUSTED
   assert exhausted.action is None
 
 
-def test_plan_exhaustion_fails_closed_even_with_long_trajectory() -> None:
+def test_plan_exhaustion_depends_on_trajectory_horizon_not_warning_threshold() -> None:
   scheduler, executor = make_scheduler(max_fallback_ticks=0)
-  submit_and_accept(scheduler, executor, sequence=1)
+  submit_and_accept(
+    scheduler, executor, sequence=1, plan=make_plan(1, values=(1.0, 2.0))
+  )
   assert scheduler.consume(control_tick=0, timestamp=0.0).action is not None
-  exhausted = scheduler.consume(control_tick=1, timestamp=0.02)
+  fallback = scheduler.consume(control_tick=1, timestamp=0.02)
+  assert fallback.status is SchedulerStatus.FALLBACK_ACTION
+  assert fallback.action is not None
+  assert fallback.event is not None
+  assert fallback.event.status is SchedulerStatus.FALLBACK_WARNING
+  exhausted = scheduler.consume(control_tick=2, timestamp=0.04)
   assert exhausted.status is SchedulerStatus.PLAN_EXHAUSTED
-  assert exhausted.event is not None
+  assert exhausted.action is None
 
 
 def test_reset_invalidates_accepted_plan_and_drains_old_in_flight_request() -> None:
@@ -648,7 +671,7 @@ def test_period_requires_a_finite_positive_real_scalar(value: object) -> None:
     RuntimeScheduler(FakeExecutor(), period_seconds=cast(float, value))
 
 
-def test_fallback_expires_on_elapsed_ticks_not_consume_calls() -> None:
+def test_fallback_warning_uses_elapsed_ticks_not_consume_calls() -> None:
   scheduler, executor = make_scheduler(max_fallback_ticks=1)
   submit_and_accept(
     scheduler,
@@ -659,12 +682,15 @@ def test_fallback_expires_on_elapsed_ticks_not_consume_calls() -> None:
   assert (
     scheduler.consume(control_tick=0, timestamp=0.0).status is SchedulerStatus.ACTION
   )
-  expired = scheduler.consume(control_tick=5, timestamp=0.10)
-  assert expired.status is SchedulerStatus.PLAN_EXHAUSTED
-  assert expired.action is None
+  warning = scheduler.consume(control_tick=5, timestamp=0.10)
+  assert warning.status is SchedulerStatus.FALLBACK_ACTION
+  assert warning.action is not None
+  assert warning.action.tolist() == [5.0]
+  assert warning.event is not None
+  assert warning.event.status is SchedulerStatus.FALLBACK_WARNING
 
 
-def test_tick_jump_within_fallback_bound_selects_execution_tick_row() -> None:
+def test_tick_jump_selects_execution_tick_row_after_warning_threshold() -> None:
   scheduler, executor = make_scheduler(max_fallback_ticks=2)
   submit_and_accept(
     scheduler, executor, sequence=1, plan=make_plan(1, values=(10.0, 11.0, 12.0, 13.0))
@@ -673,7 +699,15 @@ def test_tick_jump_within_fallback_bound_selects_execution_tick_row() -> None:
   step = scheduler.consume(control_tick=2, timestamp=0.04)
   assert step.status is SchedulerStatus.FALLBACK_ACTION
   np.testing.assert_array_equal(step.action, [12.0])
-  assert scheduler.consume(control_tick=3, timestamp=0.06).action is None
+  assert step.event is not None
+  assert step.event.status is SchedulerStatus.FALLBACK_WARNING
+  last = scheduler.consume(control_tick=3, timestamp=0.06)
+  assert last.status is SchedulerStatus.FALLBACK_ACTION
+  np.testing.assert_array_equal(last.action, [13.0])
+  assert (
+    scheduler.consume(control_tick=4, timestamp=0.08).status
+    is SchedulerStatus.PLAN_EXHAUSTED
+  )
 
 
 def test_future_plan_replacement_fails_closed_until_valid() -> None:
