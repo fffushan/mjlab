@@ -24,6 +24,7 @@ from .checkpoint import (
 )
 from .contract import DiffusionContract
 from .noising import add_independent_noise, clean_mask, sample_levels, x0_target
+from .perf_switches import PerfSwitches
 from .profiling import StepProfiler
 from .schedule import DiffusionSchedule
 from .training_config import (
@@ -142,6 +143,42 @@ def _finite_tensor(value: Tensor, name: str) -> None:
     raise TrainerError(f"{name} contains NaN or Inf")
 
 
+class _FiniteGuard:
+  """Collect finiteness flags and read them in one synchronisation.
+
+  The immediate form of this check costs one device synchronisation per call.
+  It is worth that cost for a small number of high-value tensors, such as the
+  loss before a backward pass. It is not worth it for the per-parameter sweeps
+  after a backward pass and after the optimizer step, which the step profile
+  measured at about 170 calls per update. Flags stay on the device until a
+  flush, so those sweeps cost one read each while detection stays inside the
+  same update.
+  """
+
+  def __init__(self) -> None:
+    self._pending: list[tuple[str, Tensor]] = []
+
+  def check(self, value: Tensor, name: str) -> None:
+    if value.numel() == 0:
+      return
+    self._pending.append((name, torch.isfinite(value).all()))
+
+  def flush(self) -> None:
+    """Read the collected flags. Raise on the first non-finite tensor."""
+    if not self._pending:
+      return
+    pending, self._pending = self._pending, []
+    combined = torch.stack([flag.reshape(()) for _, flag in pending]).all()
+    if bool(combined):
+      return
+    # Slow path, entered only after a failure, so it can afford one read per
+    # tensor to name the offending value.
+    for name, flag in pending:
+      if not bool(flag):
+        raise TrainerError(f"{name} contains NaN or Inf")
+    raise TrainerError("a checked tensor contains NaN or Inf")
+
+
 def _as_tokens(batch: Any) -> Tensor:
   if isinstance(batch, Tensor):
     tokens = batch
@@ -249,12 +286,20 @@ def _mean_or_zero(value: Tensor) -> float:
   return float(value.mean().item()) if value.numel() else 0.0
 
 
+def _mean_tensor_or_zero(value: Tensor) -> Tensor:
+  if value.numel() == 0:
+    return torch.zeros((), device=value.device, dtype=torch.float32)
+  return value.mean().float()
+
+
 def _metrics(
   prediction: Tensor,
   target: Tensor,
   k_state: Tensor,
   k_latent: Tensor,
   unknown: Tensor,
+  *,
+  single_read: bool = False,
 ) -> dict[str, float]:
   squared = (prediction.float() - target.float()).square()
   state_width = _STATE_DIMENSION
@@ -264,15 +309,15 @@ def _metrics(
   unknown_sq = squared[unknown_batched]
   unknown_state_mask = unknown_batched[..., :state_width]
   unknown_latent_mask = unknown_batched[..., state_width:]
-  values: dict[str, float] = {
-    "loss": _mean_or_zero(squared),
-    "total_mse": _mean_or_zero(squared),
-    "state_mse": _mean_or_zero(state),
-    "latent_mse": _mean_or_zero(latent),
-    "unknown_mse": _mean_or_zero(unknown_sq),
-    "unknown_state_mse": _mean_or_zero(state[unknown_state_mask]),
-    "unknown_latent_mse": _mean_or_zero(latent[unknown_latent_mask]),
-  }
+  pairs: list[tuple[str, Tensor]] = [
+    ("loss", _mean_tensor_or_zero(squared)),
+    ("total_mse", _mean_tensor_or_zero(squared)),
+    ("state_mse", _mean_tensor_or_zero(state)),
+    ("latent_mse", _mean_tensor_or_zero(latent)),
+    ("unknown_mse", _mean_tensor_or_zero(unknown_sq)),
+    ("unknown_state_mse", _mean_tensor_or_zero(state[unknown_state_mask])),
+    ("unknown_latent_mse", _mean_tensor_or_zero(latent[unknown_latent_mask])),
+  ]
   for prefix, levels, width_slice in (
     ("state", k_state, (..., slice(0, state_width))),
     ("latent", k_latent, (..., slice(state_width, None))),
@@ -280,8 +325,15 @@ def _metrics(
     selected_values = squared[width_slice]
     for bucket, mask in _level_bucket(levels):
       expanded = mask.unsqueeze(-1).expand_as(selected_values)
-      values[f"{prefix}_mse_{bucket}"] = _mean_or_zero(selected_values[expanded])
-  return values
+      pairs.append(
+        (f"{prefix}_mse_{bucket}", _mean_tensor_or_zero(selected_values[expanded]))
+      )
+  if single_read:
+    # One transfer for the whole metric set. The values are unchanged because
+    # only the read is batched, not the reduction.
+    scalars = torch.stack([value.reshape(()) for _, value in pairs]).tolist()
+    return {name: float(scalar) for (name, _), scalar in zip(pairs, scalars, strict=True)}
+  return {name: float(value.item()) for name, value in pairs}
 
 
 def _average_metrics(values: Sequence[Mapping[str, float]]) -> dict[str, float]:
@@ -366,6 +418,8 @@ class DiffusionTrainer:
     # Inert unless MJLAB_DIFFUSION_PROFILE is set.  Records a bounded window of
     # steady-state steps so the dominant cost of one step can be named.
     self._profiler = StepProfiler.from_environment(self.output_dir)
+    self._finite = _FiniteGuard()
+    self._perf = PerfSwitches.from_environment()
 
     _set_seed(self.config.seed)
     if resume is not None:
@@ -508,7 +562,7 @@ class DiffusionTrainer:
       sampler=sampler,
       shuffle=sampler is None,
       generator=self.sampler_generator if sampler is None else None,
-      num_workers=0,
+      num_workers=self._perf.loader_workers,
       drop_last=False,
     )
 
@@ -587,14 +641,28 @@ class DiffusionTrainer:
     if not pending:
       raise TrainerError("optimizer update has no accumulated micro-batches")
     divisor = float(len(pending))
-    for parameter in self.model.parameters():
-      if parameter.grad is not None:
-        parameter.grad.div_(divisor)
-        _finite_tensor(parameter.grad, "gradient")
+    if self._perf.finite_combined:
+      # One combined check per update instead of one check per parameter. The
+      # parameter set is fully covered; only the dispatch count falls.
+      for parameter in self.model.parameters():
+        if parameter.grad is not None:
+          parameter.grad.div_(divisor)
+      grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+      if grads:
+        _finite_tensor(torch.cat([g.reshape(-1) for g in grads]), "stacked gradients")
+      self._finite.flush()
+    else:
+      for parameter in self.model.parameters():
+        if parameter.grad is not None:
+          parameter.grad.div_(divisor)
+          self._finite.check(parameter.grad, "gradient")
     gradient_norm = torch.nn.utils.clip_grad_norm_(
       self.model.parameters(), self.config.max_grad_norm
     )
-    _finite_tensor(torch.as_tensor(gradient_norm), "clipped gradient norm")
+    self._finite.check(torch.as_tensor(gradient_norm), "clipped gradient norm")
+    # One read for every flag above, before the optimizer step: a non-finite
+    # gradient must still stop the step rather than reach the weights.
+    self._finite.flush()
     learning_rate = warmup_cosine_learning_rate(
       update_index,
       total_updates=self._resolved_updates,
@@ -604,8 +672,16 @@ class DiffusionTrainer:
     for group in self.optimizer.param_groups:
       group["lr"] = learning_rate
     self.optimizer.step()
-    for parameter in self.model.parameters():
-      _finite_tensor(parameter, "model parameter")
+    if self._perf.finite_combined:
+      parameters = [p.detach() for p in self.model.parameters()]
+      if parameters:
+        _finite_tensor(
+          torch.cat([p.reshape(-1) for p in parameters]), "stacked parameters"
+        )
+    else:
+      for parameter in self.model.parameters():
+        self._finite.check(parameter, "model parameter")
+      self._finite.flush()
     self.optimizer.zero_grad(set_to_none=True)
     decay = self.ema.update(self.model)
     self.global_step = update_index + 1
@@ -667,6 +743,7 @@ class DiffusionTrainer:
             k_state,
             k_latent,
             self._unknown_mask,
+            single_read=self._perf.metrics_single_read,
           )
           pending.append(metrics)
           loss.backward()
