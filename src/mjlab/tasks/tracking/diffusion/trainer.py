@@ -72,18 +72,36 @@ class ExponentialMovingAverage:
       name: value.detach().clone() for name, value in model.state_dict().items()
     }
 
-  def update(self, model: nn.Module) -> float:
-    """Update the shadow after one optimizer step and return its decay."""
+  def update(self, model: nn.Module, *, foreach: bool = False) -> float:
+    """Update the shadow after one optimizer step and return its decay.
+
+    ``foreach`` replaces one multiply and one add per tensor with the batched
+    form. The arithmetic per tensor is identical, so the shadows stay
+    bit-identical; only the dispatch count falls.
+    """
     self.updates += 1
     decay = ema_decay(self.updates, power=self.power, max_decay=self.max_decay)
     with torch.no_grad():
-      for name, value in model.state_dict().items():
+      state = model.state_dict()
+      for name in state:
         if name not in self.shadow:
           raise TrainerError(f"model parameter {name!r} appeared after EMA setup")
-        if torch.is_floating_point(value):
-          self.shadow[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
-        else:
-          self.shadow[name].copy_(value.detach())
+      if foreach:
+        float_names = [n for n, v in state.items() if torch.is_floating_point(v)]
+        shadows = [self.shadow[n] for n in float_names]
+        sources = [state[n].detach() for n in float_names]
+        if shadows:
+          torch._foreach_mul_(shadows, decay)
+          torch._foreach_add_(shadows, sources, alpha=1.0 - decay)
+        for name, value in state.items():
+          if not torch.is_floating_point(value):
+            self.shadow[name].copy_(value.detach())
+      else:
+        for name, value in state.items():
+          if torch.is_floating_point(value):
+            self.shadow[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+          else:
+            self.shadow[name].copy_(value.detach())
     return decay
 
   def copy_to(self, model: nn.Module) -> None:
@@ -332,7 +350,9 @@ def _metrics(
     # One transfer for the whole metric set. The values are unchanged because
     # only the read is batched, not the reduction.
     scalars = torch.stack([value.reshape(()) for _, value in pairs]).tolist()
-    return {name: float(scalar) for (name, _), scalar in zip(pairs, scalars, strict=True)}
+    return {
+      name: float(scalar) for (name, _), scalar in zip(pairs, scalars, strict=True)
+    }
   return {name: float(value.item()) for name, value in pairs}
 
 
@@ -420,6 +440,9 @@ class DiffusionTrainer:
     self._profiler = StepProfiler.from_environment(self.output_dir)
     self._finite = _FiniteGuard()
     self._perf = PerfSwitches.from_environment()
+    # Compiled as a callable over the module, never as the module itself: a
+    # compiled module renames its state-dict entries and would break resume.
+    self._compiled_model: Any = None
 
     _set_seed(self.config.seed)
     if resume is not None:
@@ -571,6 +594,19 @@ class DiffusionTrainer:
       return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
+  def _model_forward(self, tokens: Tensor, step_ids: Tensor) -> Tensor:
+    """Call the denoiser, optionally through a compiled wrapper.
+
+    The wrapper closes over the module, so the module itself stays untouched
+    and its state-dict keys keep their names.
+    """
+    if not self._perf.compiled_forward:
+      return self.model(tokens, step_ids)
+    if self._compiled_model is None:
+      model = self.model
+      self._compiled_model = torch.compile(lambda t, s: model(t, s), dynamic=False)
+    return self._compiled_model(tokens, step_ids)
+
   def _forward_loss(
     self, clean: Tensor
   ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -603,12 +639,12 @@ class DiffusionTrainer:
     )
     step_ids = torch.stack((k_state, k_latent), dim=-1)
     if not self._fp32_checked:
-      prediction = self.model(noised.tokens, step_ids)
+      prediction = self._model_forward(noised.tokens, step_ids)
       _finite_tensor(prediction, "FP32 denoiser output")
       self._fp32_checked = True
     else:
       with self._autocast():
-        prediction = self.model(noised.tokens, step_ids)
+        prediction = self._model_forward(noised.tokens, step_ids)
       _finite_tensor(prediction, "denoiser output")
     target = x0_target(clean)
     state_weight = float(self.config.state_loss_weight)
@@ -683,7 +719,7 @@ class DiffusionTrainer:
         self._finite.check(parameter, "model parameter")
       self._finite.flush()
     self.optimizer.zero_grad(set_to_none=True)
-    decay = self.ema.update(self.model)
+    decay = self.ema.update(self.model, foreach=self._perf.ema_foreach)
     self.global_step = update_index + 1
     result = _average_metrics(pending)
     result["learning_rate"] = learning_rate

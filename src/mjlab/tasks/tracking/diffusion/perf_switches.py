@@ -51,17 +51,27 @@ class PerfSwitches:
   finite_combined: bool = False
   metrics_single_read: bool = False
   loader_workers: int = 0
+  ema_foreach: bool = False
+  compiled_forward: bool = False
   label: str = "default"
 
   @property
   def active(self) -> bool:
-    return self.finite_combined or self.metrics_single_read or self.loader_workers > 0
+    return (
+      self.finite_combined
+      or self.metrics_single_read
+      or self.loader_workers > 0
+      or self.ema_foreach
+      or self.compiled_forward
+    )
 
   @classmethod
   def from_environment(cls) -> "PerfSwitches":
     finite_combined = _flag("MJLAB_DIFFUSION_FINITE_COMBINED")
     metrics_single_read = _flag("MJLAB_DIFFUSION_METRICS_SINGLE_READ")
     loader_workers = _count("MJLAB_DIFFUSION_LOADER_WORKERS")
+    ema_foreach = _flag("MJLAB_DIFFUSION_EMA_FOREACH")
+    compiled_forward = _flag("MJLAB_DIFFUSION_COMPILED_FORWARD")
     label = os.environ.get("MJLAB_DIFFUSION_PERF_LABEL", "").strip()
     if not label:
       parts: list[str] = []
@@ -71,10 +81,16 @@ class PerfSwitches:
         parts.append("metrics1")
       if loader_workers:
         parts.append(f"workers{loader_workers}")
+      if ema_foreach:
+        parts.append("ema4")
+      if compiled_forward:
+        parts.append("compiled")
       label = "+".join(parts) if parts else "default"
     return cls(
       finite_combined=finite_combined,
       metrics_single_read=metrics_single_read,
       loader_workers=loader_workers,
+      ema_foreach=ema_foreach,
+      compiled_forward=compiled_forward,
       label=label,
     )
