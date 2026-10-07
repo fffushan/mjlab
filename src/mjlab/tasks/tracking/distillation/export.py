@@ -54,7 +54,7 @@ BUNDLE_VERSION = 2
 COHORT_BUNDLE_VERSION = 3
 BUNDLE_FORMAT = "mjlab-vae-tracking"
 EXPORT_OPSET = 18
-MAX_COHORT_MEMBERS = 16  # the C++ descriptor parser admits at most 16 members
+MAX_COHORT_MEMBERS = 256  # bounded v3 descriptor member count accepted by all consumers
 
 
 class ExportValidationError(ValueError):

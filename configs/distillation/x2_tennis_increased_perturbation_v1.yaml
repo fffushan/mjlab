@@ -5,9 +5,9 @@
 # trained from the increased-perturbation PPO runs under
 # logs/rsl_rl/agibot_x2_tracking_increated_perturbations/.
 #
-# This manifest intentionally contains only the six new teachers. Combining
-# them with the existing 15-member cohort would exceed the VAE exporter's
-# 16-member ceiling and would confound this teacher-family comparison.
+# This manifest intentionally contains only the six new teachers. The 256-member
+# bundle bound leaves room for larger cohorts; this split preserves the intended
+# teacher-family comparison.
 version: 1
 name: x2-tennis-teachers-increased-perturbation-v1
 robot: agibot_x2

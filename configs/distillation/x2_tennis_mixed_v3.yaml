@@ -13,7 +13,7 @@
 # robot, base_task, version and sampling_weight are deliberately IDENTICAL to v2,
 # so a run from this manifest differs from the 8-teacher v2 runs in teacher count
 # and motion coverage only (15 members, one per distinct motion, under the
-# exporter's 16-member ceiling).
+# exporter's current 256-member bound).
 #
 # v2 remains valid and unchanged: the 16384/8192 sharded runs and their cohort
 # evaluations pin its manifest_sha256 and artifact digests.
