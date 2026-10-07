@@ -1,0 +1,345 @@
+# P0 design data ONLY: not a supported runnable training configuration.
+# No collector implementation or resource allocation is authorized by this file.
+version: 1
+contract_id: x2-vae-balance-recovery-p0-v1
+status: user_confirmed_settings_implementation_authorized
+settings_confirmed_by_user: true
+# This document is still design data; it cannot authorize a training launch.
+execution_authorized: false
+implementation_status: not_implemented
+
+# The collection-barrier seed-queue policy is fixed here and must not change on
+# resume.  User decision, 2026-10-07: DRAIN AND CLEAR.
+#   * A checkpoint is written only at a quiescent barrier.
+#   * A bounded branch work unit is drained before the save.
+#   * The admitted-seed queue is then cleared, and the counts of drained, started
+#     and dropped seeds are recorded for diagnosis.
+#   * A resume therefore starts a fresh main and branch reset under a new
+#     namespace.  It makes no claim of live physics continuation, and the
+#     per-environment trigger counters are not restored.
+# The alternative, persisting the queue, needs the full restore layout of up to 64
+# BranchState snapshots and stays closed until P2 restore parity is measured.
+barrier_seed_queue_policy: drain_and_clear_with_counts
+barrier_seed_queue_user_decision: "2026-10-07"
+
+scope:
+  cohort_manifest: configs/distillation/x2_tennis_mixed_v3.yaml
+  manifest_sha256: 4b73aca9450d8186bdf2c12ab375899ec4d1420e7efe9e705aa160fa260b057a
+  initial_test_member: tennis_001
+  support: fixed_topology_x2_builtin_position_actuators
+  root_body: pelvis
+  anchor_body: torso_link
+  physics_dt_s: 0.005
+  control_decimation: 4
+  reference_fps: 50
+  reference_dim: 68
+  conditioning_dim: 99
+  latent_dim: 32
+  action_dim: 31
+  coverage_default: "off"
+  unsupported_initially:
+    - mesh_variants
+    - learned_or_recurrent_actuators
+    - stateful_noise_models_without_explicit_restore_handler
+    - additional_stateful_events_without_explicit_restore_handler
+    - cross_backend_or_cross_precision_restore
+
+objective:
+  reconstruction: existing_sum_over_actions_then_mean_over_samples
+  kl: existing_gaussian_kl
+  beta: unchanged_from_run
+  outcome_loss_weights: null
+  joint_loss_weights: null
+  teacher_selection: frozen_manifest_routing
+  normalizer_updates: once_per_unique_fresh_row
+
+perturbations:
+  tier_probabilities: {baseline: 0.60, moderate: 0.30, strong: 0.10}
+  # Entries are symmetric maximum magnitudes, not independently active axes.
+  # Baseline full resets delegate to the existing reset draw/application path.
+  root_reset_envelopes:
+    baseline:
+      position_m: {x: 0.025, y: 0.025, z: 0.005}
+      rotation_rad: {roll: 0.05, pitch: 0.05, yaw: 0.10}
+      linear_velocity_m_s: {x: 0.25, y: 0.25, z: 0.10}
+      angular_velocity_rad_s: {roll: 0.26, pitch: 0.26, yaw: 0.39}
+    moderate:
+      position_m: {x: 0.05, y: 0.05, z: 0.005}
+      rotation_rad: {roll: 0.15, pitch: 0.15, yaw: 0.10}
+      linear_velocity_m_s: {x: 0.50, y: 0.50, z: 0.10}
+      angular_velocity_rad_s: {roll: 0.75, pitch: 0.75, yaw: 0.39}
+    strong:
+      position_m: {x: 0.075, y: 0.075, z: 0.005}
+      rotation_rad: {roll: 0.30, pitch: 0.30, yaw: 0.20}
+      linear_velocity_m_s: {x: 1.00, y: 1.00, z: 0.10}
+      angular_velocity_rad_s: {roll: 1.50, pitch: 1.50, yaw: 0.78}
+  reset_excitation_probabilities: {root_only: 0.40, joint_chain_only: 0.40, coupled: 0.20}
+  root_direction_probabilities: {sagittal: 0.40, lateral: 0.40, yaw: 0.10, horizontal_translation: 0.10}
+  joint_chain_probabilities: {left_sagittal: 0.25, right_sagittal: 0.25, left_lateral: 0.15, right_lateral: 0.15, waist: 0.20}
+  joint_chains:
+    left_sagittal: [left_hip_pitch_joint, left_knee_joint, left_ankle_pitch_joint]
+    right_sagittal: [right_hip_pitch_joint, right_knee_joint, right_ankle_pitch_joint]
+    left_lateral: [left_hip_roll_joint, left_ankle_roll_joint]
+    right_lateral: [right_hip_roll_joint, right_ankle_roll_joint]
+    waist: [waist_yaw_joint, waist_pitch_joint, waist_roll_joint]
+  joint_position_envelopes_rad:
+    # Overrides apply only to selected joints; others keep baseline +/-0.05.
+    baseline: {all: 0.05}
+    moderate: {hip_pitch: 0.10, knee: 0.10, ankle_pitch: 0.08, hip_roll: 0.08, ankle_roll: 0.08, waist_pitch_roll: 0.08, waist_yaw: 0.05}
+    strong: {hip_pitch: 0.20, knee: 0.20, ankle_pitch: 0.15, hip_roll: 0.15, ankle_roll: 0.15, waist_pitch_roll: 0.15, waist_yaw: 0.10}
+  joint_velocity_delta_envelopes_rad_s:
+    baseline: {all: 0.0}
+    moderate: {selected_chain: 0.50}
+    strong: {selected_chain: 1.00, knee: 1.50}
+  reset_rules:
+    translation_and_velocity_frame: world
+    orientation_composition: left_multiply_world_xyz_delta_quaternion
+    selected_axes: replace_baseline_draw_not_add_second_draw
+    unselected_axes: baseline_envelope
+    selected_joint_draws: independent_uniform_within_one_selected_chain
+    angular_root_direction: selected_rotation_axis_and_corresponding_velocity_axis
+    translation_root_direction: one_uniform_axis_from_x_y_with_only_that_position_velocity_enhanced
+    root_z_envelope: never_expanded_in_v1
+    joint_clipping: existing_soft_limits_report_requested_and_realized
+    repair_invalid_state: forbidden
+  runtime:
+    position_teleports: forbidden
+    root_velocity_mode: additive_delta_world_frame
+    joint_velocity_mode: additive_delta_selected_chain
+    root_delta_envelopes: root_reset_envelopes_tier_velocities_only
+    selected_axis_rules:
+      sagittal: [linear_x, angular_pitch]
+      lateral: [linear_y, angular_roll]
+      yaw: [angular_yaw]
+    inactive_root_delta_axes: zero
+    joint_delta_application: independent_uniform_per_joint_within_one_selected_chain
+    excitation_probabilities: {root_only: 0.40, joint_chain_only: 0.40, coupled: 0.20}
+    root_direction_probabilities: {sagittal: 0.45, lateral: 0.45, yaw: 0.10}
+    linear_z_delta_m_s: 0.0
+    per_segment_opportunity_probability: 0.50
+    max_events_per_segment: 1
+    segment_frame_selection: uniformly_choose_eligible_phase_bin_then_integer_frame
+    no_eligible_frame: skip_with_reason
+    target_phase_bins: 5
+    min_segment_age_steps: 10
+    min_steps_remaining: 5
+    placement: after_interval_events_before_pre_reset_capture_and_single_forward_observation
+    no_observation_recompute_in_collector: true
+    inherited_push_robot: retained_unchanged_main_only
+
+triggers:
+  diagnostic_state: current_unbiased_physics_at_cached_policy_snapshot
+  thresholds:
+    reference_relative_root_gravity_angle_rad: 0.17453292519943295 # 10 degrees
+    reference_relative_anchor_gravity_angle_rad: 0.17453292519943295
+    reference_relative_anchor_rotation_angle_rad: 0.2617993877991494 # 15 degrees
+    root_angular_velocity_error_rad_s: 1.0
+    selected_legs_waist_joint_position_rms_rad: 0.20
+    selected_legs_waist_joint_velocity_rms_rad_s: 1.0
+  absolute_tilt: report_only_no_trigger
+  teacher_student_disagreement: report_only_no_trigger
+  condition: any_threshold_crossing_or_scheduled_event_or_physical_termination
+  rearm_low_fraction: 0.75
+  low_dwell_steps: 5
+  cooldown_steps: 25
+  trigger_crossing_during_cooldown: defer_one_pending_flag_emit_when_high_after_cooldown
+  max_threshold_candidates_per_segment: 2
+  # Terminal candidates bypass threshold cooldown, not queue/work budgets.
+  terminal_candidates_bypass_threshold_cooldown: true
+  terminal_capture: bounded_reservoir_before_full_snapshot_copy_report_uncaptured_rows
+  valid_admitted_terminal_labels: retain_regardless_teacher_outcome
+  timeout_only_branch: false
+  difficulty_bands: {nominal_max_normalized_score: 1.0, moderate_max_normalized_score: 2.0}
+
+branch:
+  environment: isolated_from_main
+  future_new_disturbances: none
+  copied_existing_applied_forces: preserved
+  source_dr_and_delays: preserved
+  first_policy_view_pre_step: exact_cached_view_no_noise_resample
+  terminal_policy_view: reconstruct_next_boundary_once_with_branch_rng
+  initial_reference: source_clip_frame
+  reference_advance: exactly_once_per_executed_control_transition
+  reference_wrap_or_timer_teleport: forbidden_stop_with_boundary_reason
+  inherited_timeout: preserve_source_remaining_time
+  first_failure: original_tracking_termination_terms_diagnostic_only
+  manual_reset_pending: explicit_collection_lifecycle_not_private_flag_clear
+  horizon_control_steps: 100
+  max_transitions_after_first_failure: 10
+  # Finite endpoint labels retained before stopping; outcomes do not filter labels.
+  retain_finite_stop_label: true
+  floor_dwell:
+    predicate: absolute_root_tilt_ge_and_root_height_le
+    tilt_rad: 1.3089969389957472 # 75 degrees
+    root_height_above_env_origin_m: 0.30
+    consecutive_steps: 5
+    interpretation: collection_cap_not_contact_or_numerical_invalidity
+  hard_stops:
+    - nonfinite_raw_physics_or_policy_inputs_or_teacher_output
+    - invalid_quaternion_norm_error_gt_0.001
+    - solver_or_contact_capacity_error
+    - restore_contract_mismatch
+  fail_collection_on_infrastructure_error: true
+  diagnostic_recovery:
+    normalized_difficulty_score_lt: 0.75
+    no_original_tracking_failure: true
+    consecutive_steps: 10
+    continue_to_horizon_after_recovery: true
+  budgets_per_worker:
+    branch_slots: 32
+    terminal_reserved_branch_starts_per_call: 13
+    pre_step_event_reserved_branch_starts_per_call: 51
+    unused_start_reservations: may_borrow_other_category_after_quota_round
+    max_admitted_seeds_per_call: 64
+    max_candidate_snapshots: 256
+    max_candidate_snapshot_bytes: 67108864 # 64 MiB
+    max_branch_resident_bytes: 1073741824 # 1 GiB provisional measured startup cap
+    max_physics_row_steps_fraction_of_main_call: 0.10
+    candidate_snapshot_bytes_include_copied_model_history_and_targets: true
+    budget_exhausted_partial_branch: report_budget_censored_keep_valid_collected_rows
+    count_idle_padded_world_steps: true
+    work_budget_carryover: false
+    finish_each_call_quiescent: true
+    pending_queue_on_call_end: discard_with_reason_and_counts
+    bootstrap_branches: disabled
+    bound_exceeded: report_not_silently_resize
+  candidate_admission:
+    terminal_reserved_slots: 51 # remaining 205 for pre-step/event seeds
+    selection: bounded_stratified_reservoir_without_teacher_outcome_preference
+    min_one_slot_per_selected_motion_if_capacity_allows: true
+
+snapshot:
+  format: x2-distillation-branch-state-v1
+  capture_instants: [cached_pre_step, raw_reached_pre_reset]
+  units: native_sim_tensors_plus_explicit_world_frame_provenance
+  coordinate_restore: translate_source_origin_to_destination_origin_no_rotation
+  dynamic_fields:
+    - time
+    - qpos
+    - qvel
+    - act
+    - history
+    - qacc_warmstart
+    - ctrl
+    - qfrc_applied
+    - xfrc_applied
+    - eq_active
+    - mocap_pos
+    - mocap_quat
+    - userdata
+  # Sensor-stage outputs may be stale by design at the pre-step instant.
+  cached_fields: [sensordata, qacc, qacc_smooth, act_dot, teacher_actor_view, student_reference, student_conditioning]
+  # Sleeping is not required for the first fixed-topology X2 support target.
+  sleeping_if_enabled: reject_until_explicit_handler_and_parity_test
+  extra_active_state: [stateful_contact_sensor_history, nan_guard_state_if_enabled]
+  expanded_model_fields:
+    - actuator_acc0
+    - actuator_biasprm
+    - actuator_forcerange
+    - actuator_gainprm
+    - body_inertia
+    - body_invweight0
+    - body_ipos
+    - body_iquat
+    - body_mass
+    - body_subtreemass
+    - dof_armature
+    - dof_damping
+    - dof_frictionloss
+    - dof_invweight0
+    - geom_aabb
+    - geom_friction
+    - geom_rbound
+    - geom_size
+    - jnt_actfrcrange
+    - tendon_actfrcrange
+    - tendon_invweight0
+    - tendon_length0
+  entity_and_manager_state:
+    - encoder_bias_and_default_pose_limits
+    - action_manager_current_previous_previous_previous
+    - action_term_raw_and_processed_targets
+    - entity_actuator_target_tensors
+    - unique_fused_actuator_delay_buffers_and_alias_layout
+    - observation_term_delay_buffers_and_encoder_packet_schedule
+    - active_observation_history_and_noise_bias
+    - command_phase_timer_relative_alignment_boundary_and_init_metadata
+    - episode_counters_event_timers_and_branch_metadata
+  history_restore: chronological_rows_repacked_at_destination_global_pointer
+  post_copy_forward: recompute_derived_geometry_without_overwriting_pre_step_cached_policy_view
+  warmstart_restore: preserve_copied_warmstart_for_next_step_even_if_forward_modifies_it
+  storage_copy: owned_in_place_no_tensor_pointer_replacement
+  random_isolation: branch_process_or_scoped_full_rng_state_save_restore
+  equality_gate:
+    discrete_metadata_and_copied_history: exact
+    pre_step_teacher_and_student_inputs: exact_cached_tensors
+    replay_teacher_action_at_identical_input: {atol: 0.000002, rtol: 0.000001}
+    recomputed_geometry: {atol: 0.00001, rtol: 0.00001}
+    next_transition_physics_parity: must_be_measured_in_P2_before_support_claim
+
+replay:
+  total_capacity: inherit_run_value
+  protected_capacity_fraction: 0.20
+  protected_draw_fraction: 0.20
+  preserve_existing_motion_weights: true
+  global_phase_bins: 0
+  protected_phase_bins: 5
+  protected_categories: [student_difficult, teacher_continuation, finite_post_failure]
+  category_capacity_shares: {student_difficult: 0.50, teacher_continuation: 0.40, finite_post_failure: 0.10}
+  category_draw_shares: {student_difficult: 0.50, teacher_continuation: 0.40, finite_post_failure: 0.10}
+  source_category_precedence: finite_post_failure_then_teacher_continuation_then_student_difficult
+  teacher_continuation_nominal_severity: store_in_moderate_cell_with_actual_score_retained
+  finite_post_failure_nominal_severity: store_in_moderate_cell_with_actual_score_retained
+  finite_post_failure_definition: source_terminal_or_branch_state_with_original_tracking_failure_active
+  severity_bands: [moderate, strong]
+  protected_cell_geometry: category_phase_severity_with_family_subreservoir
+  motion_archive_capacity_rule: floor_fraction_of_existing_motion_quota
+  cell_quota_rule: deterministic_largest_remainder_category_then_phase_then_severity
+  replacement: per_cell_family_reservoir_then_row_reservoir
+  family_reservoir_capacity_per_cell: max_1_floor_cell_capacity_div_32_for_nonempty_cells
+  family_row_reservoir_capacity: min_32_cell_capacity
+  unused_cell_remainder: remains_reserved_reported
+  max_rows_per_family_per_cell: 32
+  max_rows_per_family_per_motion_archive: 256
+  family_motion_cap_overflow: reject_additional_rows_with_counter_no_silent_duplicate
+  max_rows_per_family_per_microbatch: 32
+  max_rows_per_family_per_microbatch: 32
+  archive_min_families_per_motion_for_sampling: 8
+  sampling: without_replacement_per_microbatch_no_outcome_preference
+  replay_microbatch_rounding: floor_fraction_times_motion_draw_count
+  protected_category_rounding: deterministic_largest_remainder
+  recent_archive_duplicate_resolution: exclude_ids_already_drawn_in_microbatch_then_backfill_unique_recent
+  recent_shortage_behavior: replay_not_ready_skip_update_with_reason_no_replacement
+  unfilled_archive_draws: backfill_recent_with_report
+  recent_archive_row_id_duplicates_in_microbatch: forbidden
+  future_outcome_table: diagnostic_only
+
+persistence:
+  proposed_enabled_cohort_checkpoint_version: 4
+  coverage_off_versions: unchanged
+  old_checkpoint_plus_coverage_strict_resume: reject
+  changed_coverage_policy_strict_resume: reject
+  physical_simulator_resume: restart_with_new_namespace
+  pending_physics_branches_saved: false
+  pending_seeds_saved: false
+  archive_rng_and_family_counters_saved: true
+  existing_cohort_digest_algorithm: unchanged
+  snapshot_layout_inference: forbidden_unknown_active_component_is_error
+  no_next_reference_frame: retain_raw_endpoint_not_fabricated_label
+  model_only_loading_and_export: unchanged_neural_contract_new_version_dispatch_required
+
+benchmark:
+  family_split_percent: {train: 80, validation: 10, test: 10}
+  split_unit: root_student_trajectory_plus_all_descendant_teacher_branches
+  hash_algorithm: sha256
+  hash_domain: x2-coverage-family-split-v1
+  minimum_families_per_reported_motion_severity_cell: 32
+  minimum_distinct_rows_per_reported_motion_severity_cell: 256
+  hardware_fixture: held_out_repeated_engineering_diagnostic
+  quality_thresholds: predeclare_after_independent_benchmark_variability_measurement_before_training
+
+acceptance:
+  P0: documented_contract_and_source_inventory_only
+  P1: pure_contract_validation_and_disabled_path_tests
+  P2: capture_restore_and_next_transition_parity_before_live_branch_support
+  simulation_or_training_launch: requires_separate_authorization
