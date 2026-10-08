@@ -1,8 +1,7 @@
-"""Focused tests for the environment-gated performance switches.
+"""Focused tests for the diffusion performance switches.
 
-Every switch must default to current behaviour, because the training arms run
-with the same code and set none of these variables. The two value-preserving
-switches are tested for exact parity, not for approximate agreement.
+l1, l4 and l6 are default-on. The environment variables remain explicit
+opt-out controls for matched comparisons and rollback.
 """
 
 from __future__ import annotations
@@ -32,11 +31,25 @@ def _clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(name, raising=False)
 
 
-def test_all_switches_default_off() -> None:
+def test_adopted_switches_default_on() -> None:
   switches = PerfSwitches.from_environment()
-  assert switches.finite_combined is False
+  assert switches.finite_combined is True
   assert switches.metrics_single_read is False
   assert switches.loader_workers == 0
+  assert switches.ema_foreach is True
+  assert switches.compiled_forward is True
+  assert switches.label == "finite+ema4+compiled"
+  assert switches.active is True
+
+
+def test_adopted_switches_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("MJLAB_DIFFUSION_FINITE_COMBINED", "0")
+  monkeypatch.setenv("MJLAB_DIFFUSION_EMA_FOREACH", "0")
+  monkeypatch.setenv("MJLAB_DIFFUSION_COMPILED_FORWARD", "0")
+  switches = PerfSwitches.from_environment()
+  assert switches.finite_combined is False
+  assert switches.ema_foreach is False
+  assert switches.compiled_forward is False
   assert switches.label == "default"
   assert switches.active is False
 
