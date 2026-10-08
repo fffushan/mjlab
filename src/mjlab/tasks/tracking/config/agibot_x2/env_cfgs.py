@@ -22,6 +22,8 @@ from mjlab.sensor import BuiltinSensorCfg, ContactMatch, ContactSensorCfg, ObjRe
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import VELOCITY_RANGE, make_tracking_env_cfg
 
+from .vendor_gains import apply_vendor_rl_gains
+
 # The 12 collision spheres per foot in the ankle-roll body.
 _FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
 
@@ -414,6 +416,78 @@ def agibot_x2_flat_tracking_increated_perturbations_env_cfg(
   if push is not None:
     push.interval_range_s = (1.0, 3.0)
     push.params["velocity_range"] = dict(VELOCITY_RANGE)
+  return cfg
+
+
+def agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
+  play: bool = False,
+  anchor_body_name: str = "torso_link",
+  imu_source: X2TrackingImuSource = "pelvis",
+) -> ManagerBasedRlEnvCfg:
+  """Increased-perturbation tracking with the vendor reference-policy PD gains.
+
+  Identical to
+  :func:`agibot_x2_flat_tracking_increated_perturbations_env_cfg` except that
+  the robot's servo gains are the vendor's own reference-policy values
+  (:data:`~.vendor_gains.X2_VENDOR_RL_GAINS`) instead of mjlab's measured native
+  stable-stand profile. Every other quantity stays as it is in the base task --
+  observations, rewards, terminations, domain randomization, the motion
+  command's perturbation ranges, effort limits, armature, friction loss and the
+  action scale -- so a run of this task isolates the gain change.
+
+  The action scale is deliberately *not* recomputed from the vendor gains. It is
+  reused exactly as the base task has it, because the base scale is a fixed
+  interface (its per-group floors were chosen for reachability and for the 25%
+  torque budget of the *mjlab* gains). Recomputing it would change a second
+  quantity at the same time and make the gain change unattributable. The
+  consequence is that a unit action now reaches a different fraction of the
+  torque budget on the groups whose vendor Kp is higher (hip pitch 30.0% against
+  25%, ankle roll 33.3%, waist pitch/roll 41.7%); the effort limit itself is
+  unchanged, so those joints saturate sooner rather than acting out of range.
+  """
+  cfg = agibot_x2_flat_tracking_increated_perturbations_env_cfg(
+    play=play,
+    anchor_body_name=anchor_body_name,
+    imu_source=imu_source,
+  )
+  apply_vendor_rl_gains(cfg.scene.entities["robot"])
+  return cfg
+
+
+def agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg(
+  play: bool = False,
+  anchor_body_name: str = "torso_link",
+  imu_source: X2TrackingImuSource = "pelvis",
+) -> ManagerBasedRlEnvCfg:
+  """Vendor-gain tracking with no randomization of the servo PD gains.
+
+  Identical to
+  :func:`agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg`
+  except that the ``randomize_pd_gains`` event is removed. That event is the
+  only term in these tasks that randomizes the servo gains kp and kd: the parent
+  draws one scale per environment from ``(0.7, 1.3)`` and applies it to both,
+  because it sets ``shared_gain_scale``. Without it, every episode runs the
+  nominal vendor gains. The event writes only the solver's actuator
+  ``gainprm``/``biasprm`` fields, so removing it is the whole change.
+
+  The passive ``randomize_joint_damping`` axis is deliberately kept: it
+  randomizes the model's ``<joint damping>`` property (about 0.03 on an X2 hip
+  against a Kd of 4), which is a transmission property and not a servo gain. So
+  is the 0-2 physics-step per-actuator command delay, which models the 50 Hz
+  transport to the motors.
+
+  One caveat worth knowing: the axes come from ``MJLAB_DR_AXES`` at build time.
+  If that variable excludes ``pd_gains`` to begin with, the parent has no such
+  event and this task builds exactly like its parent. The variable is unset by
+  default (all axes on) and the job queue does not set it, so under the queue
+  this task differs from its parent by the removed event only.
+  """
+  cfg = agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
+    play=play,
+    anchor_body_name=anchor_body_name,
+    imu_source=imu_source,
+  )
+  cfg.events.pop("randomize_pd_gains", None)
   return cfg
 
 
