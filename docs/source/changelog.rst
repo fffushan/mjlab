@@ -64,6 +64,13 @@ Added
 Changed
 ^^^^^^^
 
+- Changed diffusion token-cache reuse and preparation. Existing valid caches are
+  checked before the build-size ceiling. Missing provenance can use the same
+  bounded shard-local worker plan as token materialization. Published caches
+  record file identity and skip a repeated full digest when the identity is
+  unchanged. Direct dataset and audit validation still force a full digest
+  check.
+
 - Changed D5 fallback scheduling so ``max_fallback_ticks`` is a structured
   warning threshold rather than an action limit. The runtime continues to use
   later rows of the accepted latent trajectory until a newer plan replaces it

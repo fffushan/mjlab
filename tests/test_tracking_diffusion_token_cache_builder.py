@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
 from pathlib import Path
 
 import numpy as np
@@ -20,13 +21,28 @@ from mjlab.tasks.tracking.diffusion import (
   WindowIndex,
   build_token_cache,
   fit_training_statistics,
+  window_dataset,
 )
-from mjlab.tasks.tracking.diffusion import token_cache_builder as builder
+from mjlab.tasks.tracking.diffusion import (
+  token_cache_builder as builder,
+)
 from mjlab.tasks.tracking.diffusion.dataset import (
+  DatasetError,
   save_window_index,
   store_manifest_sha256,
 )
 from mjlab.tasks.tracking.diffusion.storage import TrajectoryRow
+from mjlab.tasks.tracking.diffusion.token_cache_builder import (
+  build_provenance_parallel,
+)
+from mjlab.tasks.tracking.diffusion.token_cache_lifecycle import (
+  prepare_token_cache,
+  provenance_cache_path,
+)
+from mjlab.tasks.tracking.diffusion.window_dataset import (
+  WindowCacheError,
+  iter_index_provenance,
+)
 
 CONTRACT_PATH = Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml")
 
@@ -293,3 +309,129 @@ def test_worker_failure_joins_owned_children_and_leaves_no_publishable_array(
     )
   assert not missing_destination.exists()
   assert not [child for child in multiprocessing.active_children() if child.is_alive()]
+
+
+def test_parallel_provenance_matches_sequential_for_every_split(tmp_path) -> None:
+  source = _synthetic_source(
+    tmp_path,
+    {
+      "group-a": "train",
+      "group-b": "train",
+      "group-c": "validation",
+      "group-d": "test",
+    },
+    {"group-a": 59, "group-b": 67, "group-c": 73, "group-d": 79},
+    shard_rows=7,
+  )
+  loaded = source.load()
+  checked = 0
+  for split in ("test", "train", "validation"):
+    if not loaded.refs(split):
+      continue
+    sequential = tuple(
+      iter_index_provenance(loaded, split, motion_ids=None, limit=None)
+    )
+    parallel = build_provenance_parallel(
+      loaded,
+      split=split,
+      jobs=3,
+      directory=source.directory,
+      contract_path=source.contract_path,
+      cache_path=source.directory / "offline" / "unused.npy",
+      dtype=np.float32,
+    )
+    assert parallel == sequential
+    assert len(parallel) == len(loaded.refs(split))
+    checked += 1
+  assert checked == 3
+
+
+def test_parallel_prepared_provenance_bytes_match_sequential(tmp_path) -> None:
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  first = prepare_token_cache(source, loaded, "train", jobs=1)
+  sidecar = provenance_cache_path(first.path)
+  sequential_bytes = sidecar.read_bytes()
+  sidecar.unlink()
+  second = prepare_token_cache(source, loaded, "train", jobs=4)
+  assert second.provenance_status == "built"
+  assert second.provenance == first.provenance
+  assert provenance_cache_path(second.path).read_bytes() == sequential_bytes
+
+
+def test_parallel_provenance_rejects_a_motion_filter(tmp_path) -> None:
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  with pytest.raises(DatasetError, match="motion filter"):
+    prepare_token_cache(source, loaded, "train", motion_ids=["001"], jobs=4)
+
+
+def test_reused_cache_skips_the_digest_when_the_file_is_unchanged(
+  tmp_path, monkeypatch
+) -> None:
+  """A second start must not re-read the whole cache."""
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  prepare_token_cache(source, loaded, "train", jobs=1)
+
+  digests: list[Path] = []
+  original = window_dataset._sha256_file
+
+  def traced(path):
+    digests.append(Path(path))
+    return original(path)
+
+  monkeypatch.setattr(window_dataset, "_sha256_file", traced)
+  again = prepare_token_cache(source, loaded, "train", jobs=1)
+  assert again.cache_status == "reused"
+  assert digests == []
+
+
+def test_changed_cache_file_is_digest_verified(tmp_path, monkeypatch) -> None:
+  """A later modification invalidates the recorded identity and is verified."""
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  prepared = prepare_token_cache(source, loaded, "train", jobs=1)
+  os.utime(prepared.path, ns=(0, 0))
+
+  digests: list[Path] = []
+  original = window_dataset._sha256_file
+
+  def traced(path):
+    digests.append(Path(path))
+    return original(path)
+
+  monkeypatch.setattr(window_dataset, "_sha256_file", traced)
+  again = prepare_token_cache(source, loaded, "train", jobs=1)
+  assert again.cache_status == "reused"
+  assert digests == [prepared.path]
+
+
+def test_fast_path_accepts_in_place_edit_that_restores_mtime(tmp_path) -> None:
+  """Record the limit of the identity check, and that verify_hash closes it."""
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  prepared = prepare_token_cache(source, loaded, "train", jobs=1)
+  path = prepared.path
+  metadata_path = path.with_suffix(".json")
+  before = os.stat(path)
+
+  raw = bytearray(path.read_bytes())
+  raw[-1] ^= 0xFF
+  path.write_bytes(bytes(raw))
+  os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+  metadata = json.loads(metadata_path.read_text())
+  window_dataset._validate_cache(path, metadata_path, metadata)
+  with pytest.raises(WindowCacheError):
+    window_dataset._validate_cache(path, metadata_path, metadata, verify_hash=True)

@@ -275,3 +275,27 @@ def test_cli_accepts_recovery_and_validate_only_flags() -> None:
   assert parsed.recover_lock is True
   assert parsed.jobs == 2
   assert parsed.handler is not None
+
+
+def test_existing_cache_above_the_ceiling_is_reused_not_refused(
+  tmp_path: Path,
+) -> None:
+  """A published cache must stay usable even when it exceeds the ceiling.
+
+  The ceiling guards a build.  Checking it first made the real 12.47 GiB train
+  cache unusable at the default 8 GiB, which is how the first real reuse attempt
+  failed.
+  """
+  import mjlab.tasks.tracking.diffusion.window_dataset as wd
+
+  source = _owned_source(tmp_path)
+  target = tmp_path / "ceiling.npy"
+  wd.build_token_cache(source, "train", target, jobs=1)
+  size_gib = target.stat().st_size / (1024**3)
+
+  # A ceiling far below the published size must not block reuse.
+  again, count = wd.build_token_cache(
+    source, "train", target, jobs=1, max_cache_gib=max(1e-6, size_gib / 100.0)
+  )
+  assert again == target
+  assert count > 0

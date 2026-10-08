@@ -304,12 +304,16 @@ def validate_token_cache_coverage(
     )
 
 
-def _run_workers(payloads: Sequence[_WorkerPayload]) -> tuple[WorkerResult, ...]:
+def _run_workers(
+  payloads: Sequence[_WorkerPayload], worker: Any = None
+) -> tuple[Any, ...]:
   """Run only the pool owned by this builder and always join it."""
+  if worker is None:
+    worker = _fill_token_cache_range
   context = multiprocessing.get_context("spawn")
   pool = context.Pool(processes=len(payloads))
   try:
-    results = pool.map(_fill_token_cache_range, payloads)
+    results = pool.map(worker, payloads)
   except BaseException:
     pool.terminate()
     pool.join()
@@ -358,7 +362,82 @@ def fill_token_cache_parallel(
   validate_token_cache_coverage(count, payloads, results)
 
 
+def _fill_provenance_range(payload: _WorkerPayload) -> tuple[tuple[int, Any], ...]:
+  """Return provenance for the exact output positions owned by one worker."""
+  if not payload.plans:
+    return ()
+  from .window_dataset import window_provenance_from_rows
+
+  contract = DiffusionContract.from_yaml(payload.contract_path)
+  directory = Path(payload.directory)
+  store_root = directory / "store"
+  if not (store_root / "manifest.json").is_file():
+    raise DatasetError(f"dataset store manifest is missing: {store_root}")
+  store = AppendOnlyShardStore(store_root, contract=contract)
+  rows_by_segment = _required_rows(store, payload)
+  refs = tuple(ref for plan in payload.plans for ref in plan.refs)
+  index = _BoundedWindowIndex(store, refs, rows_by_segment, contract)
+  records: list[tuple[int, Any]] = []
+  for plan in payload.plans:
+    for position, ref in zip(plan.positions, plan.refs, strict=True):
+      records.append(
+        (
+          position,
+          window_provenance_from_rows(payload.split, ref, index._rows(ref)),
+        )
+      )
+  return tuple(records)
+
+
+def build_provenance_parallel(
+  loaded: Any,
+  *,
+  split: str,
+  jobs: int,
+  directory: str | Path,
+  contract_path: str | Path,
+  cache_path: str | Path,
+  dtype: Any,
+) -> tuple[Any, ...]:
+  """Build window provenance with bounded, segment-owned workers.
+
+  The returned tuple is ordered by output position, so it equals the tuple the
+  sequential preparation builds for the same split.
+  """
+  if jobs < 1:
+    raise DatasetError("jobs must be one or more")
+  refs = loaded.refs(split)
+  if not refs:
+    return ()
+  payloads = plan_token_cache_workers(
+    store=loaded.store,
+    refs=refs,
+    directory=directory,
+    contract_path=contract_path,
+    split=split,
+    destination=cache_path,
+    dtype=dtype,
+    jobs=jobs,
+  )
+  if not payloads:
+    raise DatasetError("parallel provenance has no worker payloads")
+  results: tuple[tuple[tuple[int, Any], ...], ...] = _run_workers(
+    payloads, _fill_provenance_range
+  )
+  validate_token_cache_coverage(
+    len(refs),
+    payloads,
+    tuple(tuple(sorted(position for position, _ in result)) for result in results),
+  )
+  ordered: dict[int, Any] = {}
+  for result in results:
+    for position, record in result:
+      ordered[position] = record
+  return tuple(ordered[position] for position in range(len(refs)))
+
+
 __all__ = [
+  "build_provenance_parallel",
   "fill_token_cache_parallel",
   "plan_token_cache_workers",
   "validate_token_cache_coverage",

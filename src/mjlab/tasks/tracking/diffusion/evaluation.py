@@ -1015,7 +1015,7 @@ def _validate_audit_cache(
     if isinstance(metadata.get("content_sha256"), str)
     else None,
   )
-  _validate_cache(cache, metadata_path, expected)
+  _validate_cache(cache, metadata_path, expected, verify_hash=True)
   return {
     "valid": True,
     "window_count": metadata.get("window_count"),

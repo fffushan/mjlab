@@ -34,11 +34,11 @@ from .dataset import (
   WindowRef,
 )
 from .projection import ProjectionBundle, ProjectionError
-from .storage import AppendOnlyShardStore
+from .storage import AppendOnlyShardStore, TrajectoryRow
 
 _SPLITS = ("train", "validation", "test")
 _CACHE_VERSION = "mjlab-x2-diffusion-token-cache-v2"
-_CACHE_NON_IDENTITY_KEYS = frozenset(("created_at", "content_sha256"))
+_CACHE_NON_IDENTITY_KEYS = frozenset(("created_at", "content_sha256", "file_identity"))
 _DEFAULT_MAX_CACHE_GIB = 8.0
 
 
@@ -511,6 +511,34 @@ def _iter_window_records(
       break
 
 
+def window_provenance_from_rows(
+  split: str, ref: WindowRef, rows: Sequence[TrajectoryRow]
+) -> WindowProvenance:
+  """Build one provenance record from the rows of a single window.
+
+  The sequential and parallel provenance paths both call this function, so a
+  parallel preparation cannot drift from the sequential one.
+  """
+  if not rows:
+    raise DatasetError("indexed window contains no source rows")
+  first = rows[0]
+  phase = first.provenance.get("phase", "")
+  if phase not in {"", "clean", "ou"}:
+    phase = ""
+  noise = np.stack([np.asarray(row.ou_noise, dtype=np.float64) for row in rows])
+  if not np.isfinite(noise).all():
+    raise DatasetError("window provenance contains non-finite OU noise")
+  return WindowProvenance(
+    split=split,
+    group_key=ref.group_key,
+    motion_id=first.motion_id,
+    phase=phase,
+    ou_noise_norm=float(np.linalg.norm(noise, axis=1).mean()),
+    pair_id=first.provenance.get("pair_id", ""),
+    start_tick=ref.start_tick,
+  )
+
+
 def _iter_index_provenance(
   loaded: LoadedDataset,
   split: str,
@@ -522,26 +550,9 @@ def _iter_index_provenance(
   selected = 0
   for ref in loaded.refs(split):
     rows = loaded.index._rows(ref)
-    if not rows:
-      raise DatasetError("indexed window contains no source rows")
-    first = rows[0]
-    if motion_ids is not None and first.motion_id not in motion_ids:
+    if motion_ids is not None and rows and rows[0].motion_id not in motion_ids:
       continue
-    phase = first.provenance.get("phase", "")
-    if phase not in {"", "clean", "ou"}:
-      phase = ""
-    noise = np.stack([np.asarray(row.ou_noise, dtype=np.float64) for row in rows])
-    if not np.isfinite(noise).all():
-      raise DatasetError("window provenance contains non-finite OU noise")
-    yield WindowProvenance(
-      split=split,
-      group_key=ref.group_key,
-      motion_id=first.motion_id,
-      phase=phase,
-      ou_noise_norm=float(np.linalg.norm(noise, axis=1).mean()),
-      pair_id=first.provenance.get("pair_id", ""),
-      start_tick=ref.start_tick,
-    )
+    yield window_provenance_from_rows(split, ref, rows)
     selected += 1
     if limit is not None and selected >= limit:
       break
@@ -752,6 +763,7 @@ def _cache_metadata(
   shape: tuple[int, int, int],
   created_at: str | None,
   content_sha256: str | None,
+  file_identity: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
   metadata: dict[str, object] = {
     "format": _CACHE_VERSION,
@@ -766,6 +778,8 @@ def _cache_metadata(
     "limit": limit,
     "content_sha256": content_sha256,
   }
+  if file_identity is not None:
+    metadata["file_identity"] = dict(file_identity)
   if created_at is not None:
     metadata["created_at"] = created_at
   return metadata
@@ -797,12 +811,48 @@ def _sha256_file(path: Path) -> str:
   return digest.hexdigest()
 
 
+def _file_identity(path: str | Path) -> dict[str, int]:
+  """Return the identity of one cache file: size, mtime, inode and device."""
+  stat = os.stat(path)
+  return {
+    "size": int(stat.st_size),
+    "mtime_ns": int(stat.st_mtime_ns),
+    "inode": int(stat.st_ino),
+    "device": int(stat.st_dev),
+  }
+
+
+def _file_identity_matches(path: str | Path, recorded: object) -> bool:
+  """Report whether a file still matches the identity recorded at build time.
+
+  A copy, a move across devices, or any write changes at least one field, so a
+  mismatch degrades to the strong verification path instead of accepting the
+  file.
+  """
+  if not isinstance(recorded, dict) or not recorded:
+    return False
+  stored = cast("Mapping[str, object]", recorded)
+  try:
+    current = _file_identity(path)
+  except OSError:
+    return False
+  return all(stored.get(key) == value for key, value in current.items())
+
+
 def _validate_cache(
   path: Path,
   metadata_path: Path,
   expected: Mapping[str, object],
+  *,
+  verify_hash: bool = False,
 ) -> tuple[dict[str, object], np.memmap]:
-  """Validate identity, shape and bytes; digest verification is O(file size)."""
+  """Validate identity, shape and bytes.
+
+  The content digest is verified only when the file no longer matches the
+  identity recorded at build time, or when the caller asks for the digest
+  explicitly.  Reading the whole cache costs minutes on a shared filesystem,
+  and production starts must not pay it repeatedly.
+  """
   if not path.is_file() or not metadata_path.is_file():
     raise WindowCacheError(
       f"token cache requires both {path.name} and {metadata_path.name}"
@@ -834,11 +884,12 @@ def _validate_cache(
     raise WindowCacheError(
       "token cache is missing a valid content_sha256; rebuild the cache"
     )
-  actual_sha256 = _sha256_file(path)
-  if actual_sha256 != content_sha256:
-    raise WindowCacheError(
-      "token cache content_sha256 does not match the .npy bytes; rebuild the cache"
-    )
+  if verify_hash or not _file_identity_matches(path, metadata.get("file_identity")):
+    actual_sha256 = _sha256_file(path)
+    if actual_sha256 != content_sha256:
+      raise WindowCacheError(
+        "token cache content_sha256 does not match the .npy bytes; rebuild the cache"
+      )
   return metadata, array
 
 
@@ -931,13 +982,6 @@ def _build_token_cache_unlocked(
     f"token cache projected size: {projected_bytes} bytes ({projected_gib:.6f} GiB), "
     f"{selected_count} windows"
   )
-  if projected_gib > max_cache_gib:
-    raise WindowCacheError(
-      f"token cache for split {split!r} would require {projected_gib:.6f} GiB, "
-      f"above max_cache_gib={max_cache_gib:.6f}; raise the ceiling with "
-      f"--max-cache-gib (train) or the max_cache_gib argument"
-    )
-
   source_hash = (
     _source_dataset_hash(source_obj, loaded) if source_hash is None else source_hash
   )
@@ -962,6 +1006,16 @@ def _build_token_cache_unlocked(
     if validated_output is not None:
       validated_output.append(ValidatedTokenCache(destination, metadata, cache))
     return destination, selected_count
+
+  # The ceiling guards a build, not a reuse.  Checking it earlier refused an
+  # existing valid cache whose size exceeds the current ceiling, which made a
+  # published 12.47 GiB train cache unusable at the default 8 GiB.
+  if projected_gib > max_cache_gib:
+    raise WindowCacheError(
+      f"token cache for split {split!r} would require {projected_gib:.6f} GiB, "
+      f"above max_cache_gib={max_cache_gib:.6f}; raise the ceiling with "
+      f"--max-cache-gib (train) or the max_cache_gib argument"
+    )
 
   temporary_array: Path | None = None
   temporary_metadata: Path | None = None
@@ -995,12 +1049,14 @@ def _build_token_cache_unlocked(
     del memmap
     assert temporary_array is not None
     content_sha256 = _sha256_file(temporary_array)
+    file_identity = _file_identity(temporary_array)
     os.replace(temporary_array, destination)
     temporary_array = None
     published_array = True
 
     metadata = dict(expected)
     metadata["content_sha256"] = content_sha256
+    metadata["file_identity"] = file_identity
     metadata["created_at"] = datetime.now(timezone.utc).isoformat()
     with tempfile.NamedTemporaryFile(
       dir=metadata_path.parent,
@@ -1198,7 +1254,7 @@ class TokenWindowDataset(torch.utils.data.Dataset):
     _, cache = (
       (validated_cache.metadata, validated_cache.cache)
       if validated_cache is not None
-      else _validate_cache(self.path, metadata_path, metadata)
+      else _validate_cache(self.path, metadata_path, metadata, verify_hash=True)
     )
     if values is None:
       values = tuple()

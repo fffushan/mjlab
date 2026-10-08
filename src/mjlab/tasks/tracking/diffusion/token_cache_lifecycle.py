@@ -468,9 +468,22 @@ def prepare_token_cache(
       records = validate_provenance_cache(cache, loaded, split, motion_ids=motion_ids)
       provenance_status = "reused"
     else:
-      records = tuple(
-        iter_index_provenance(loaded, split, motion_ids=motion_ids, limit=None)
-      )
+      if jobs > 1:
+        from .token_cache_builder import build_provenance_parallel
+
+        records = build_provenance_parallel(
+          loaded,
+          split=split,
+          jobs=jobs,
+          directory=source.directory,
+          contract_path=source.contract_path,
+          cache_path=cache.path,
+          dtype=dtype,
+        )
+      else:
+        records = tuple(
+          iter_index_provenance(loaded, split, motion_ids=motion_ids, limit=None)
+        )
       if len(records) != cache_count:
         raise CacheProvenanceError("provenance count does not match token cache")
       _write_provenance(
