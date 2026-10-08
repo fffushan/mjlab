@@ -4,6 +4,14 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the bounded D5 numerical/export parity gate under
+  ``scripts/experiments/diffusion_d5_parity/``. It checks the active
+  135-state/32-latent/167-token and 99-conditioning/31-action contract,
+  statistics-only normalization, clean-mask semantics and 20-update DDIM
+  output, then exports and reloads ONNX denoiser and VAE-decoder artifacts for
+  CPU FP32 comparison. It is one-time frozen-artifact evidence and does not
+  claim simulator, deployment, quality or hardware readiness.
+
 - Added the opt-in D5 controller lifecycle and execution bridge in
   ``diffusion/controller.py`` and ``diffusion/controller_driver.py``. The bridge
   preserves eight acknowledged measured bootstrap pairs, performs bounded
