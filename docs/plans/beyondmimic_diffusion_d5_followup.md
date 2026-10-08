@@ -248,10 +248,18 @@ Completed D5-related evidence:
   startup and planner-latency risk, not a 50 Hz owner-loop blocker under the
   accepted criterion. [Report](../../logs/diagnostics/diffusion-d5-gpu-sustained-20261007/REPORT.md).
 
+- Essential numerical/export parity passed on 2026-10-08 (+08) with the active
+  local artifacts. The gate checked `167/99/31` dimensions, statistics-only
+  normalization, legacy identity-matrix compatibility fields, the `8`-history
+  clean mask, an independent `20`-update DDIM oracle, exported denoiser and
+  VAE-decoder ONNX loading, contract metadata and CPU FP32 parity. The report
+  is [D5 parity](../../logs/diagnostics/diffusion-d5-parity-20261008-run8/REPORT.json).
+  The report records denoiser max absolute error `4.4107e-6` and decoder max
+  absolute error `1.3709e-6` against `atol=rtol=1e-5`.
+
 Not completed:
 
-- Essential numerical/export parity;
-- minimal vendor-MuJoCo sim2sim check;
+- Minimal vendor-MuJoCo sim2sim check;
 - versioned runtime bundle and residual-risk record.
 
 The broader controller test matrix is optional hardening.

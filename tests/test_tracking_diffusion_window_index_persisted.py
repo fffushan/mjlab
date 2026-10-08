@@ -21,6 +21,7 @@ from mjlab.tasks.tracking.diffusion import (
 )
 from mjlab.tasks.tracking.diffusion.dataset import (
   DatasetError,
+  build_window_index,
   load_window_index,
   save_window_index,
   store_manifest_sha256,
@@ -122,33 +123,59 @@ def test_persisted_index_is_refused_for_another_contract(tmp_path) -> None:
     )
 
 
-def test_parallel_build_is_identical_to_sequential(tmp_path) -> None:
-  """Partitioned work must reproduce the sequential index exactly."""
-  from mjlab.tasks.tracking.diffusion.dataset import (
-    build_window_index,
-    segment_shard_plan,
-  )
-
-  store = AppendOnlyShardStore(tmp_path / "store", max_rows_per_shard=17)
+def _geometry_store(tmp_path, episodes, rows_per_episode, shard_rows):
+  store = AppendOnlyShardStore(tmp_path / "store", max_rows_per_shard=shard_rows)
   rows = []
-  for episode in "abcdef":
-    rows += [make_row(i, group=f"fam-{episode}", episode=episode) for i in range(41)]
+  for episode in episodes:
+    rows += [
+      make_row(index, group=f"fam-{episode}", episode=episode)
+      for index in range(rows_per_episode)
+    ]
   store.append(rows)
   assignments = SplitAssignments(
-    {f"fam-{e}": ("train", "test")[index % 2] for index, e in enumerate("abcdef")}
+    {
+      f"fam-{episode}": ("train", "test")[position % 2]
+      for position, episode in enumerate(episodes)
+    }
   )
+  return store, assignments
 
-  plan = segment_shard_plan(store)
-  assert plan is not None
-  assert len(plan) == 6
-  # Neighbouring segments share a boundary shard, so their extents overlap.
-  assert any(
-    plan[position + 1][1] < plan[position][2] for position in range(len(plan) - 1)
-  )
+
+def test_parallel_build_keeps_segments_inside_a_shard(tmp_path) -> None:
+  """The regression this test exists for: interior segments must survive.
+
+  With 41-row segments in 300-row shards, most segments begin and end inside one
+  shard.  A partition deriving its work from shard first/last identities sees
+  only the few segments touching a boundary and silently drops the rest, which
+  is exactly what happened on the real 607-shard dataset: 30,228 references
+  instead of 609,376.  The first version of this test could not catch it, because
+  17-row shards forced every segment to straddle a boundary.
+  """
+  episodes = "abcdefghijkl"
+  store, assignments = _geometry_store(tmp_path, episodes, 41, 300)
+  assert store.shard_count >= 2
+
+  sequential, how = build_window_index(store, assignments, jobs=1)
+  assert how == "sequential"
+  assert len(sequential) == len(episodes)
+
+  for jobs in (2, 3, 12):
+    parallel, how_parallel = build_window_index(store, assignments, jobs=jobs)
+    assert how_parallel.startswith("parallel")
+    assert len(parallel.refs) == len(episodes)
+    assert parallel.refs == sequential.refs
+    assert parallel.coverage() == sequential.coverage()
+
+
+def test_parallel_build_is_identical_when_every_segment_straddles_shards(
+  tmp_path,
+) -> None:
+  episodes = "abcdef"
+  store, assignments = _geometry_store(tmp_path, episodes, 41, 17)
 
   sequential, how_sequential = build_window_index(store, assignments, jobs=1)
   assert how_sequential == "sequential"
-  assert len(sequential) == 6
+  assert len(sequential) == len(episodes)
 
   for jobs in (2, 3, 6):
     parallel, how = build_window_index(store, assignments, jobs=jobs)

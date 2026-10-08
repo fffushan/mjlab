@@ -20,13 +20,15 @@ GUI usability is done: no GUI polish or required GUI extension in this slice.
 
 No training, new teachers/datasets, normalization fitting, new learned objective,
 mixture/root-emphasis features, alternative sampler, inference optimization,
-controller/x2_docker/export/deployment/hardware, remote jobs, new physics batch.
-The user later authorized the scoped implementation/docs commit after acceptance;
-push and physical execution remain unauthorized. CPU analytic tests, recorded-data
-processing and frozen-asset static preflight are authorized implementation gates.
+controller/x2_docker/export/deployment/hardware, remote jobs or new physics
+batch beyond the explicitly bounded D4 behavior matrix. The user authorized the
+scoped D4 implementation and bounded behavior validation. Push, deployment and
+hardware execution remain unauthorized. CPU analytic tests, recorded-data
+processing, frozen-asset preflight and the bounded headless cases are authorized
+implementation/validation gates.
 Slow frozen-model numerical checks must be parent-monitored, never detached by
-children. Navigation/velocity/obstacle costs and transition-quality campaigns are
-later D4 slices, not scope creep here.
+children. Navigation/velocity/obstacle costs and transition-quality campaigns
+are separate work, not scope creep here.
 
 ## Source and isolation
 
@@ -221,12 +223,13 @@ D4hook files. Preserve D3 zero-guidance trajectory/action parity and all existin
 GUI/headless guards. A model unable to improve a task is truthful quality evidence,
 not grounds to silently tune/retrain or mark guidance implemented without a VJP.
 
-Final artifact: isolated integratedsource snapshot/hashmanifest, component reports,
-review/disposition, testlogs, taskconfig example/preparation instructions and
-limitations. No physical-success/realtime/deployment claim. The next decision is
-an explicitly budgeted keyframe/poseguided mjlab trial; it is NOT launched here.
+Final artifact: integrated source snapshot/hash manifest, component reports,
+review/disposition, test logs, task-config examples, bounded physics reports and
+limitations. No physical-success, real-time or deployment claim. D4 is closed for
+its agreed implementation and bounded behavior validation scope. The next phase
+is D5 runtime, export and sim2sim work.
 
-Operational status: **D4a implementation accepted (2026-10-05 +08:00)**.
+Operational status: **D4 closed (2026-10-06 +08:00)**.
 [Durable final report/source/reviews/parent gates](../../logs/diagnostics/diffusion-d4-keyframes-pose-guidance-20261004/REPORT.md).
 Parent222focused /402diffusiontests pass,1GPUskip; scopedRuff/Ty/Pyright/diff
 clean,76fixturecopies/sources and mathcores unchanged. R1–R7 plus postobserver
@@ -235,13 +238,14 @@ frozen-model numericalprobe passes (80forwards/20VJPs,0physics/encoder); hard
 keyframes affect decodedactions, softλ0.1 effect small/notqualityproof.
 Monitor8 exact29-file finalCLIpreflight passes, allfrozen/task/source hashes
 match,0runtime/inference/physicscalls. Failedshell/legacy-metadata attempts
-remain historical; no physicalretry or tuning.
-The user later authorized a scoped implementation/docs commit after the parent
-acceptance gates passed. Push, deployment and physical execution remain
-unauthorized.
-Task configuration is opt-in/headless; accepted GUI unchanged. Next boundary is
-an explicitly authorized/budgeted guidedphysicalrehearsal, NOTlaunched here.
-Velocity/navigation/obstacle/transition-quality and D5/D6 remain separate.
-Mission`ca02f7e5-db92-4261-98b9-3aac9aaf2a8d` closed as completed after persistence;
-progress28 reached configuredfirecap, no loops remain configured.
+remain historical. The later bounded behavior matrix completed with five full
+valid reports; no physical retry or tuning followed. The VAE baseline reached
+step budget in all five cases. The diffusion branch fell in `u0`, `g1`, `k1` and
+`c3`; `x0` recorded tick-0 expiry and then fell. Target scoring and guidance
+counts are preserved in the D4 behavior report. These results do not establish
+stability, quality, or fall causation.
+Primary source/docs are committed as `80f45505e` on `fxy/test/tracking-exp` (no
+push). Task configuration is opt-in/headless; accepted GUI unchanged. Velocity,
+navigation, obstacle, transition-quality, model-polishing and D5/D6 work remain
+separate.
 [Final routing](../../../worktrees/mjlab/d4-control-20261004T171154Z/orchestration/launch.json).

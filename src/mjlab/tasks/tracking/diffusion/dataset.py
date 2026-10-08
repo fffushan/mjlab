@@ -524,21 +524,47 @@ def load_window_index(
     names = [str(value) for value in payload["split_names"]]
     if tuple(names) != _split_names():
       raise DatasetError("window index split names differ")
-    run_ids = [str(value) for value in payload["run_ids"]]
-    episode_ids = [str(value) for value in payload["episode_ids"]]
-    segment_ids = [str(value) for value in payload["segment_ids"]]
-    group_keys = [str(value) for value in payload["group_keys"]]
+    run_ids = payload["run_ids"].tolist()
+    episode_ids = payload["episode_ids"].tolist()
+    segment_ids = payload["segment_ids"].tolist()
+    group_keys = payload["group_keys"].tolist()
     count = int(payload["ref_count"])
+    # Hoist every per-ref array out of the npz ONCE.  Subscripting the NpzFile
+    # inside the comprehension re-opens the zip member and builds a fresh memmap
+    # on each of the millions of reads, which cost about 0.5 ms per access and
+    # made loading an index far more expensive than rebuilding it.
+    ref_run = payload["ref_run"].tolist()
+    ref_env = payload["ref_env"].tolist()
+    ref_episode = payload["ref_episode"].tolist()
+    ref_segment = payload["ref_segment"].tolist()
+    ref_start = payload["ref_start"].tolist()
+    ref_split = payload["ref_split"].tolist()
+    ref_group = payload["ref_group"].tolist()
+    ref_length = payload["ref_length"].tolist()
+    for name, values in (
+      ("ref_run", ref_run),
+      ("ref_env", ref_env),
+      ("ref_episode", ref_episode),
+      ("ref_segment", ref_segment),
+      ("ref_start", ref_start),
+      ("ref_split", ref_split),
+      ("ref_group", ref_group),
+      ("ref_length", ref_length),
+    ):
+      if len(values) != count:
+        raise DatasetError(
+          f"window index {name} holds {len(values)} entries for {count} refs"
+        )
     refs = tuple(
       WindowRef(
-        run_ids[int(payload["ref_run"][position])],
-        int(payload["ref_env"][position]),
-        episode_ids[int(payload["ref_episode"][position])],
-        segment_ids[int(payload["ref_segment"][position])],
-        int(payload["ref_start"][position]),
-        cast(SplitName, names[int(payload["ref_split"][position])]),
-        group_keys[int(payload["ref_group"][position])],
-        int(payload["ref_length"][position]),
+        run_ids[ref_run[position]],
+        ref_env[position],
+        episode_ids[ref_episode[position]],
+        segment_ids[ref_segment[position]],
+        ref_start[position],
+        cast(SplitName, names[ref_split[position]]),
+        group_keys[ref_group[position]],
+        ref_length[position],
       )
       for position in range(count)
     )
@@ -604,93 +630,90 @@ def _ref_sort_key(ref: WindowRef) -> tuple[object, ...]:
   )
 
 
+def shard_partitions(store: AppendOnlyShardStore, jobs: int) -> list[tuple[int, int]]:
+  """Contiguous shard ranges, balanced by the manifest's row counts.
+
+  Shard boundaries do not align with segment boundaries, so a range is only a
+  hint about who reads what.  Ownership of a segment is decided by the row that
+  starts it, never by which range contains most of it.
+  """
+  counts = [int(item["rows"]) for item in store.shard_items()]
+  if not counts:
+    return []
+  target = max(1, -(-sum(counts) // jobs))
+  parts: list[tuple[int, int]] = []
+  start = 0
+  weight = 0
+  for index, count in enumerate(counts):
+    weight += count
+    if weight >= target and len(parts) < jobs - 1:
+      parts.append((start, index + 1))
+      start = index + 1
+      weight = 0
+  if start < len(counts):
+    parts.append((start, len(counts)))
+  return parts
+
+
 def _segment_key(segment: tuple[str, int, str, str]) -> str:
   return "|".join(str(part) for part in segment)
 
 
-def _identity_segment_key(value: object) -> str | None:
+def _identity_key(value: object) -> str | None:
   """Read a shard manifest's first/last identity as a segment key."""
   if not isinstance(value, (list, tuple)) or len(value) < 4:
     return None
   return "|".join(str(part) for part in value[:4])
 
 
-def segment_shard_plan(store: AppendOnlyShardStore) -> list[tuple[str, int, int]] | None:
-  """Derive each segment's shard extent from manifest metadata only.
-
-  A shard records the identity of its first and last row, so a segment's extent
-  follows without reading any row.  Returns ``None`` when the store does not look
-  segment-contiguous, and the caller must then not partition the work.
-  """
-  items = store.shard_items()
-  starts: dict[str, int] = {}
-  ends: dict[str, int] = {}
-  order: list[str] = []
-  for index, item in enumerate(items):
-    first = _identity_segment_key(item.get("first"))
-    last = _identity_segment_key(item.get("last"))
-    if first is None or last is None:
-      return None
-    for key in (first, last):
-      if key not in starts:
-        starts[key] = index
-        order.append(key)
-      ends[key] = index
-  for position in range(1, len(order)):
-    # Shard extents must advance with the segment order and never overlap.
-    if starts[order[position]] < ends[order[position - 1]]:
-      return None
-  return [(key, starts[key], ends[key] + 1) for key in order]
-
-
-def _partition_plan(
-  plan: Sequence[tuple[str, int, int]], jobs: int
-) -> list[tuple[int, int, tuple[str, ...]]]:
-  """Split the plan into contiguous groups of roughly equal shard extent."""
-  total = sum(stop - start for _, start, stop in plan)
-  target = max(1, -(-total // jobs))
-  groups: list[list[tuple[str, int, int]]] = []
-  current: list[tuple[str, int, int]] = []
-  weight = 0
-  for entry in plan:
-    current.append(entry)
-    weight += entry[2] - entry[1]
-    if weight >= target and len(groups) < jobs - 1:
-      groups.append(current)
-      current = []
-      weight = 0
-  if current:
-    groups.append(current)
-  return [
-    (
-      min(entry[1] for entry in group),
-      max(entry[2] for entry in group),
-      tuple(entry[0] for entry in group),
-    )
-    for group in groups
-  ]
-
-
 def _build_refs_worker(
-  payload: tuple[str, DiffusionContract, dict[str, str], int, int, tuple[str, ...]],
+  payload: tuple[str, DiffusionContract, dict[str, str], int, int],
 ) -> tuple[WindowRef, ...]:
-  """Worker entry point: read only the assigned shards, emit assigned segments.
+  """Emit refs for the segments that START inside this worker's shard range.
 
-  Rows of neighbouring segments are visible in the boundary shards and are
-  deliberately ignored, so a segment is always handled whole.
+  Rows are trial-relative, so a segment's first row has tick 0.  Ownership is
+  decided by that row, never by which range holds most of a segment, so the
+  union of the workers is exactly the store.
+
+  A segment can be longer than one shard, so the worker keeps reading further
+  shards while the shard it has just read ends inside one of its own segments.
+  The manifest's per-shard last identity says which segment a shard ends in, so
+  this needs no data read to decide.  If a segment still does not form a
+  contiguous tick run, the worker raises instead of emitting a truncated set.
   """
-  store_root, contract, group_to_split, start, stop, keys = payload
+  store_root, contract, group_to_split, start, stop = payload
   store = AppendOnlyShardStore(store_root, contract=contract)
   assignments = SplitAssignments(group_to_split, contract.split_seed)
-  wanted = set(keys)
-  by_segment: dict[tuple[str, int, str, str], list[TrajectoryRow]] = {}
-  for row in store.iter_rows_range(start, stop):
-    segment = (row.run_id, row.env_id, row.episode_id, row.segment_id)
-    if _segment_key(segment) in wanted:
-      by_segment.setdefault(segment, []).append(row)
+  items = store.shard_items()
+  total = len(items)
+  rows_of: dict[tuple[str, int, str, str], list[TrajectoryRow]] = {}
+  starts_here: set[tuple[str, int, str, str]] = set()
+
+  def absorb(shard_index: int, owned: bool) -> None:
+    for row in store.iter_rows_range(shard_index, shard_index + 1):
+      segment = (row.run_id, row.env_id, row.episode_id, row.segment_id)
+      rows_of.setdefault(segment, []).append(row)
+      if owned and row.tick == 0:
+        starts_here.add(segment)
+
+  read_end = stop
+  for shard_index in range(start, read_end):
+    absorb(shard_index, shard_index < stop)
+  while read_end < total:
+    boundary = _identity_key(items[read_end - 1].get("last"))
+    if boundary is None or boundary not in {_segment_key(s) for s in starts_here}:
+      break
+    absorb(read_end, False)
+    read_end += 1
+
   refs: list[WindowRef] = []
-  for segment_rows in by_segment.values():
-    refs.extend(_segment_refs(segment_rows, assignments, contract))
+  for segment in sorted(starts_here):
+    rows = sorted(rows_of[segment], key=lambda row: row.tick)
+    if [row.tick for row in rows] != list(range(len(rows))):
+      raise DatasetError(
+        "parallel index build saw an incomplete segment; refusing to drop windows"
+      )
+    refs.extend(_segment_refs(rows, assignments, contract))
   return tuple(refs)
 
 
@@ -701,39 +724,34 @@ def build_window_index(
   jobs: int = 1,
   contract: DiffusionContract = DEFAULT_CONTRACT,
 ) -> tuple[WindowIndex, str]:
-  """Build the index, partitioned across processes when the store allows it.
+  """Build the index, partitioned across processes when asked.
 
-  Returns the index and how it was produced.  A store that does not look
-  segment-contiguous falls back to the sequential builder rather than risking a
-  partition that splits a segment.
+  A segment is emitted by exactly the worker whose range contains its first row.
+  Partitioning is by shard range, so nothing is assumed about where segment
+  boundaries fall.
   """
   if jobs <= 1:
     return WindowIndex.build(store, assignments, contract=contract), "sequential"
-  plan = segment_shard_plan(store)
-  if not plan:
+  parts = shard_partitions(store, jobs)
+  if len(parts) <= 1:
     return (
       WindowIndex.build(store, assignments, contract=contract),
-      "sequential-not-segment-contiguous",
+      "sequential-single-part",
     )
-  groups = _partition_plan(plan, jobs)
-  if len(groups) <= 1:
-    return WindowIndex.build(store, assignments, contract=contract), "sequential-single-part"
   group_to_split = dict(assignments.group_to_split)
   payloads = [
-    (str(store.root), contract, group_to_split, start, stop, keys)
-    for start, stop, keys in groups
+    (str(store.root), contract, group_to_split, start, stop) for start, stop in parts
   ]
   import multiprocessing
 
   context = multiprocessing.get_context("fork")
   with context.Pool(processes=len(payloads)) as pool:
-    parts = pool.map(_build_refs_worker, payloads)
-  refs = [ref for part in parts for ref in part]
+    collected = pool.map(_build_refs_worker, payloads)
+  refs = [ref for part in collected for ref in part]
   refs.sort(key=_ref_sort_key)
-  return (
-    WindowIndex(store, assignments, refs, contract=contract),
-    f"parallel-{len(groups)}",
-  )
+  return WindowIndex(
+    store, assignments, refs, contract=contract
+  ), f"parallel-{len(parts)}"
 
 
 __all__ = [
@@ -751,5 +769,5 @@ __all__ = [
   "store_manifest_sha256",
   "window_index_path",
   "build_window_index",
-  "segment_shard_plan",
+  "shard_partitions",
 ]
