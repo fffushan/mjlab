@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # GPU queue dispatcher: runs pending jobs from jobs.tsv on free GPUs, at most
 # MAX_CONCURRENT at a time and never more than ONE job per GPU.
+# Only GPUs in ALLOW_GPUS (default 0,1,2,3) are used; cards 4-7 are reserved for
+# other users, so the allowlist caps the queue whatever MAX_CONCURRENT says.
 # Never evicts a running job; only uses GPUs with no compute process.
 set -uo pipefail
 cd /home/fushan/mjlab
@@ -12,8 +14,12 @@ LOG="$QUEUE_DIR/queue.log"
 POLL_SECONDS="${POLL_SECONDS:-60}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-8}"
 MEM_FREE_MIB="${MEM_FREE_MIB:-1000}"
-# GPUs to never use (e.g. a device with degraded DMA: see queue.log notes).
-EXCLUDE_GPUS="${EXCLUDE_GPUS:-4,5,6,7}"
+# GPUs the dispatcher may use. This allowlist is the hard cap: it holds even if
+# a caller sets EXCLUDE_GPUS=none or raises MAX_CONCURRENT.
+ALLOW_GPUS="${ALLOW_GPUS:-0,1,2,3}"
+# GPUs to never use even when they are allowed (e.g. a device with degraded DMA:
+# see queue.log notes). Empty by default.
+EXCLUDE_GPUS="${EXCLUDE_GPUS:-}"
 LAUNCH_ROOT="$QUEUE_DIR/runs"
 LOG_ROOT="${LOG_ROOT:-/home/fushan/mjlab/runs}"
 NUM_ENVS="${NUM_ENVS:-8192}"
@@ -42,16 +48,21 @@ gpu_free() {
   [ "${mem:-99999}" -lt "$MEM_FREE_MIB" ] && ! grep -qxF "$uuid" <<<"$busy"
 }
 
-gpu_excluded() {
+gpu_in_list() {
   local gpu="$1" e
-  for e in ${EXCLUDE_GPUS//,/ }; do [ "$e" = "$gpu" ] && return 0; done
+  for e in ${2//,/ }; do [ "$e" = "$gpu" ] && return 0; done
   return 1
 }
+
+gpu_allowed() { gpu_in_list "$1" "$ALLOW_GPUS"; }
+
+gpu_excluded() { gpu_in_list "$1" "$EXCLUDE_GPUS"; }
 
 list_free_gpus() {
   local n i
   n=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
   for ((i = 0; i < n; i++)); do
+    gpu_allowed "$i" || continue
     gpu_excluded "$i" && continue
     gpu_free "$i" && echo "$i"
   done
@@ -90,6 +101,7 @@ FTR
 # Launch the first pending job on exactly this GPU. Returns 0 when it started.
 launch_one_on_gpu() {
   local gpu="$1" row id session command
+  gpu_allowed "$gpu" || return 1
   gpu_excluded "$gpu" && return 1
   gpu_free "$gpu" || return 1
   for row in "${ROWS[@]}"; do
@@ -106,7 +118,7 @@ launch_one_on_gpu() {
   return 1
 }
 
-log "dispatcher start: max_concurrent=$MAX_CONCURRENT poll=${POLL_SECONDS}s num_envs=$NUM_ENVS log_root=$LOG_ROOT exclude_gpus=${EXCLUDE_GPUS:-none}"
+log "dispatcher start: max_concurrent=$MAX_CONCURRENT poll=${POLL_SECONDS}s num_envs=$NUM_ENVS allow_gpus=${ALLOW_GPUS:-all} exclude_gpus=${EXCLUDE_GPUS:-none} log_root=$LOG_ROOT"
 
 while true; do
   mapfile -t ROWS < <(grep -v '^[[:space:]]*#' "$JOBS" | grep -v '^[[:space:]]*$')

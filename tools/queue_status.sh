@@ -40,6 +40,7 @@ MODE=status
 SHOW_JOBS=0
 SHOW_DISPATCH=0
 LOG_TAIL=0
+RESTART_ALLOW=""
 RESTART_EXCLUDE=""
 ADD_ID=""
 ADD_ARGS=()
@@ -64,7 +65,8 @@ Usage: $SCRIPT_NAME [OPTIONS] 'ssh -p PORT user@host'
   --remove ID   Remove a non-running job row. Running jobs are refused.
   --stop        Run the remote queue stop.sh (running jobs keep going).
   --restart     Restart only the dispatcher; running jobs keep going.
-  --exclude-gpus LIST  Dispatcher exclusion list for --restart (use 'none' for all GPUs).
+  --allow-gpus LIST    Dispatcher GPU allowlist for --restart (default 0,1,2,3).
+  --exclude-gpus LIST  Extra dispatcher exclusion list for --restart (default none).
   --tail N      Also print the last N lines of the remote queue.log.
   --dispatch    Also print tmux/process status for the dispatcher.
 
@@ -105,6 +107,12 @@ while [ $# -gt 0 ]; do
         echo "error: --restart cannot be combined with another queue action" >&2; exit 2
       fi
       MODE=restart; shift ;;
+    --allow-gpus)
+      if [ "$MODE" != restart ] || [ $# -lt 2 ]; then
+        echo "error: --allow-gpus is only valid after --restart" >&2; exit 2
+      fi
+      RESTART_ALLOW="$2"
+      shift 2 ;;
     --exclude-gpus)
       if [ "$MODE" != restart ] || [ $# -lt 2 ]; then
         echo "error: --exclude-gpus is only valid after --restart" >&2; exit 2
@@ -289,8 +297,10 @@ case "${MODE:-status}" in
       tmux kill-session -t queue-dispatch
       sleep 1
     fi
-    EXCLUDE_GPUS="$RESTART_EXCLUDE" tmux new-session -d -s queue-dispatch "EXCLUDE_GPUS=$RESTART_EXCLUDE bash $QUEUE/dispatch.sh"
-    echo "dispatcher restarted (exclude_gpus=${RESTART_EXCLUDE:-none}; running jobs untouched)"
+    ALLOW_GPUS="$RESTART_ALLOW" EXCLUDE_GPUS="$RESTART_EXCLUDE" \
+      tmux new-session -d -s queue-dispatch \
+      "ALLOW_GPUS=$RESTART_ALLOW EXCLUDE_GPUS=$RESTART_EXCLUDE bash $QUEUE/dispatch.sh"
+    echo "dispatcher restarted (allow_gpus=${RESTART_ALLOW:-0,1,2,3}; exclude_gpus=${RESTART_EXCLUDE:-none}; running jobs untouched)"
     ;;
   stop)
     if [ -x "$QUEUE/stop.sh" ]; then
@@ -342,7 +352,7 @@ fi
 # ---------------------------------------------------------------------------
 # Run it
 # ---------------------------------------------------------------------------
-if ! "${SSH_CMD[@]}" "MODE=$MODE SHOW_JOBS=$SHOW_JOBS LOG_TAIL=$LOG_TAIL SHOW_DISPATCH=$SHOW_DISPATCH RESTART_EXCLUDE=$RESTART_EXCLUDE ADD_ID=$ADD_ID ADD_COMMAND_B64=$ADD_COMMAND_B64 REMOVE_ID=$REMOVE_ID bash -s" <<< "$REMOTE_SCRIPT"; then
+if ! "${SSH_CMD[@]}" "MODE=$MODE SHOW_JOBS=$SHOW_JOBS LOG_TAIL=$LOG_TAIL SHOW_DISPATCH=$SHOW_DISPATCH RESTART_ALLOW=$RESTART_ALLOW RESTART_EXCLUDE=$RESTART_EXCLUDE ADD_ID=$ADD_ID ADD_COMMAND_B64=$ADD_COMMAND_B64 REMOVE_ID=$REMOVE_ID bash -s" <<< "$REMOTE_SCRIPT"; then
   echo "error: remote command failed (SSH reachable? queue present?)" >&2
   exit 3
 fi
