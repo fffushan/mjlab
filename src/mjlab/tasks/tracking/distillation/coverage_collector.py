@@ -14,6 +14,7 @@ import torch
 
 from mjlab.managers.recorder_manager import RecorderTerm
 
+from .branch_state import BranchState
 from .coverage_environment import CoverageEnvironmentComponent, TerminalCapture
 from .teacher_branches import (
   BranchBudget,
@@ -195,6 +196,18 @@ class CoverageStateOwner:
 
       self._adapter = X2FixedTopologyStateAdapter(self._env, source_row=0)
     return self._adapter
+
+  def coverage_mvp_policy_state(self, index: int) -> BranchState:
+    """Capture only cached policy inputs and routing for the one-step MVP."""
+    from .x2_state_adapter import X2FixedTopologyStateAdapter
+
+    adapter = X2FixedTopologyStateAdapter(self._env, source_row=index)
+    return BranchState(
+      fields=adapter.coverage_policy_inputs(),
+      manager_state={"command": {"row": adapter.coverage_command_row()}},
+      metadata={"capture_profile": "mvp-one-step"},
+      capture_instant="raw_reached_pre_reset",
+    )
 
   def coverage_cached_policy_view(self, index: int) -> Any:
     return self.adapter.coverage_cached_policy_view(index)

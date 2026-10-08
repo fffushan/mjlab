@@ -1,6 +1,8 @@
 # X2 VAE difficult-state coverage — implementation plan
 
-Status: **full P1–P6 implementation is not complete; the bounded MVP path is implemented and validated in the primary checkout**. The MVP captures physical terminal states before reset, labels them once with the frozen teacher, inserts them into ordinary replay, and keeps the existing VAE objective. It requires a passing restore-parity report. Multi-step teacher branches, runtime coverage perturbations and protected replay remain deferred.
+Status: **full P1–P6 implementation is not complete; the bounded MVP path is implemented and validated in the primary checkout**. The one-step MVP stores an explicit policy-input snapshot and routing metadata.
+It does not use the full physics snapshot for training. Multi-step teacher
+branches, runtime coverage perturbations and protected replay remain deferred.
 
 MVP evidence: ``logs/diagnostics/vae-coverage-mvp-20261008/`` contains the
 restore-parity report and bounded training/resume smoke artifacts. The smoke is

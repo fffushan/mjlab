@@ -258,8 +258,13 @@ class CoverageEnvironmentComponent:
 
   def _capture_terminal(self, index: Any, termination: Any) -> TerminalCapture:
     index = int(index)
-    state = BranchState.capture(
-      self.environment, env_index=index, capture_instant="raw_reached_pre_reset"
+    capture_policy = getattr(self.environment, "coverage_mvp_policy_state", None)
+    state = (
+      capture_policy(index)
+      if callable(capture_policy)
+      else BranchState.capture(
+        self.environment, env_index=index, capture_instant="raw_reached_pre_reset"
+      )
     )
     cached = _owned(self.environment.coverage_cached_policy_view(index))
     action = _owned(self.environment.coverage_executed_action(index))
@@ -278,6 +283,10 @@ class CoverageEnvironmentComponent:
     env_index: int | None = None,
     synthetic: bool = False,
   ) -> BranchState:
+    if capture.state.metadata.get("capture_profile") == "mvp-one-step":
+      raise CoverageRuntimeError(
+        "the one-step MVP capture does not support branch reconstruction"
+      )
     if not self.live_ready and not synthetic:
       raise CoverageRuntimeError(
         "terminal reconstruction is fail-closed pending explicit parity evidence"

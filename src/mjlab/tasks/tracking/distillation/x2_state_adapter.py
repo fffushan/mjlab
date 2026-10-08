@@ -1077,6 +1077,19 @@ class X2FixedTopologyStateAdapter:
       ):
         raise BranchStateError("mocap quaternion norm invalid")
 
+  def coverage_policy_inputs(self) -> dict[str, torch.Tensor]:
+    """Return the cached MVP policy inputs without full physics capture."""
+    return self._derive_policy_inputs()
+
+  def coverage_command_row(self) -> dict[str, torch.Tensor]:
+    """Return the routing fields needed by one-step coverage replay."""
+    assert self.source_row is not None
+    command = self.env.command_manager.get_term("motion")
+    return {
+      name: _owned(_row_required(getattr(command, name), self.source_row, name))
+      for name in ("motion_ids", "time_steps", "_teacher_codes", "segment_ids")
+    }
+
   def coverage_cached_policy_view(self, index: int) -> torch.Tensor:
     """One cached actor observation row, cloned.  No recompute, no noise draw."""
     from mjlab.tasks.tracking.distillation.adapter import cached_policy_view_row

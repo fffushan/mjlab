@@ -58,12 +58,17 @@ Added
 
 - Added the MVP difficult-state coverage execution path. ``distill train`` now
   accepts ``--coverage-policy difficult-state-coverage`` and a matching
-  ``--coverage-parity-evidence`` report. The path captures physical terminal
-  states before reset, obtains one frozen-teacher label from cached 164-D actor
-  inputs, inserts the resulting 68/99/31 row into ordinary replay, reports
-  capture/label/insertion counters, and preserves the unchanged VAE objective.
-  Branch continuation, runtime coverage perturbations and protected replay
-  quotas remain deferred.
+  ``--coverage-parity-evidence`` report. The one-step profile captures physical
+  terminal states before reset, stores cached 68/99 inputs and routing metadata,
+  obtains one frozen-teacher label from the cached 164-D actor view, inserts the
+  resulting row into ordinary replay, reports capture/label/insertion counters,
+  and preserves the unchanged VAE objective. Branch continuation, runtime
+  coverage perturbations and protected replay quotas remain deferred.
+
+- Fixed the CPU difficult-state coverage MVP capture path. It uses an explicit
+  policy-input snapshot instead of touching unsupported CPU Warp vector fields.
+  Full physics snapshot restoration remains reserved for the deferred branch
+  path.
 
 Changed
 ^^^^^^^
