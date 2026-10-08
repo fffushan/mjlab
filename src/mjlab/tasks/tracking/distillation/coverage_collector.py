@@ -198,21 +198,56 @@ class CoverageStateOwner:
     return self._adapter
 
   def coverage_mvp_policy_state(self, index: int) -> BranchState:
-    """Capture only cached policy inputs and routing for the one-step MVP."""
-    from .x2_state_adapter import X2FixedTopologyStateAdapter
-
-    adapter = X2FixedTopologyStateAdapter(self._env, source_row=index)
+    """Capture one aligned pre-step policy row for the one-step MVP."""
+    snapshot = getattr(self._env, "_coverage_pre_step_snapshot", None)
+    if snapshot is None:
+      raise RuntimeError(
+        "coverage MVP capture has no aligned pre-step snapshot; refusing a "
+        "mixed-time terminal row"
+      )
+    batch = snapshot.teacher_observation.shape[0]
+    if not isinstance(index, int) or not 0 <= index < batch:
+      raise RuntimeError("coverage MVP capture row is outside the pre-step snapshot")
+    teacher_codes = snapshot.teacher_codes
+    if teacher_codes is None:
+      teacher_codes = torch.full(
+        (batch,), int(snapshot.teacher_code), dtype=torch.int64
+      )
+    fields = {
+      "teacher_actor_view": snapshot.teacher_observation[index].detach().clone(),
+      "student_reference": snapshot.packed.reference[index].detach().clone(),
+      "student_conditioning": snapshot.packed.conditioning[index].detach().clone(),
+      "previous_action": snapshot.features.previous_action[index].detach().clone(),
+    }
+    command_row = {
+      "motion_ids": snapshot.motion_id[index].detach().clone().to(dtype=torch.int64),
+      "_teacher_codes": teacher_codes[index].detach().clone().to(dtype=torch.int64),
+      "time_steps": snapshot.reference_frame[index]
+      .detach()
+      .clone()
+      .to(dtype=torch.int64),
+      "segment_ids": snapshot.segment_id[index].detach().clone().to(dtype=torch.int64),
+    }
     return BranchState(
-      fields=adapter.coverage_policy_inputs(),
-      manager_state={"command": {"row": adapter.coverage_command_row()}},
-      metadata={"capture_profile": "mvp-one-step"},
-      capture_instant="raw_reached_pre_reset",
+      fields=fields,
+      manager_state={"command": {"row": command_row}},
+      metadata={
+        "capture_profile": "mvp-one-step",
+        "source_kind": "terminal_predecessor",
+      },
+      capture_instant="cached_pre_step",
     )
 
   def coverage_cached_policy_view(self, index: int) -> Any:
+    snapshot = getattr(self._env, "_coverage_pre_step_snapshot", None)
+    if snapshot is not None:
+      return snapshot.teacher_observation[index].detach().clone()
     return self.adapter.coverage_cached_policy_view(index)
 
   def coverage_executed_action(self, index: int) -> Any:
+    action = getattr(self._env, "_coverage_pre_step_action", None)
+    if isinstance(action, torch.Tensor):
+      return action[index].detach().clone()
     return self.adapter.coverage_executed_action(index)
 
   def __getattr__(self, name: str) -> Any:

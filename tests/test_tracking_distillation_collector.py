@@ -179,6 +179,7 @@ def test_coverage_capture_gets_one_step_teacher_label_and_replay_row() -> None:
     "captures": 1,
     "teacher_labels": 1,
     "replay_inserted": 1,
+    "terminal_predecessor_rows": 1,
   }
   assert len(replay) == 3
   assert result.coverage_batch.reference_frame.tolist() == [7]

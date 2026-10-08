@@ -2168,9 +2168,9 @@ def test_cohort_resume_default_phase_bins_zero_is_compatible(
 ) -> None:
   """A checkpoint recorded before --phase-bins resumes with the default 0.
 
-  The stored resolved configuration carries no ``phase_bins`` entry; the
-  comparison must treat that as the documented default (density-proportional
-  within-motion draws) instead of refusing the resume.
+  The stored resolved configuration carries no ``phase_bins`` or
+  ``coverage_sampling`` entry; the comparison must treat both as documented
+  defaults instead of refusing the resume.
   """
   calls: list[dict] = []
   adapters: list[_MultiAdapter] = []
@@ -2191,6 +2191,8 @@ def test_cohort_resume_default_phase_bins_zero_is_compatible(
   stored = payload["resolved_config"]
   assert "phase_bins" in stored["replay"]
   del stored["replay"]["phase_bins"]
+  assert "coverage_sampling" in stored["replay"]
+  del stored["replay"]["coverage_sampling"]
   torch.save(payload, first)
 
   second_dir = tmp_path / "second"

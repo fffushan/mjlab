@@ -61,7 +61,12 @@ def test_require_coverage_execution_accepts_passing_parity_evidence(tmp_path) ->
   evidence = tmp_path / "parity.json"
   evidence.write_text(
     '{"kind":"x2-vae-coverage-restore-parity-v1",'
-    '"status":"pass","manifest_sha256":"manifest"}'
+    '"status":"pass","manifest_sha256":"manifest",'
+    '"policy_input_exact":true,'
+    '"schema":{"reference_dim":68,"conditioning_dim":99,"latent_dim":32,"action_dim":31},'
+    '"policy_input_max_abs_error":{"teacher_actor_view":0.0,'
+    '"student_reference":0.0,"student_conditioning":0.0,"previous_action":0.0},'
+    '"teacher_ids":["inc000"]}'
   )
   result = require_coverage_execution(policy, evidence, manifest_sha256="manifest")
   assert result["kind"] == "x2-vae-coverage-restore-parity-v1"
@@ -69,7 +74,18 @@ def test_require_coverage_execution_accepts_passing_parity_evidence(tmp_path) ->
   assert len(result["sha256"]) == 64
 
 
-def test_cohort_setup_defaults_to_no_coverage_policy() -> None:
+def test_require_coverage_execution_rejects_incomplete_parity_evidence(
+  tmp_path,
+) -> None:
+  policy = resolve_coverage_policy("difficult-state-coverage")
+  evidence = tmp_path / "incomplete.json"
+  evidence.write_text(
+    '{"kind":"x2-vae-coverage-restore-parity-v1",'
+    '"status":"pass","manifest_sha256":"manifest"}'
+  )
+  with pytest.raises(ValueError, match="exact policy-input parity"):
+    require_coverage_execution(policy, evidence, manifest_sha256="manifest")
+
   setup = CohortSetup(
     manifest=Path("manifest.yaml"),
     repo_root=Path("."),

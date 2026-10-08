@@ -59,7 +59,7 @@ Added
 - Added the MVP difficult-state coverage execution path. ``distill train`` now
   accepts ``--coverage-policy difficult-state-coverage`` and a matching
   ``--coverage-parity-evidence`` report. The one-step profile captures physical
-  terminal states before reset, stores cached 68/99 inputs and routing metadata,
+  terminal-predecessor rows before reset, stores cached 68/99 inputs and routing metadata,
   obtains one frozen-teacher label from the cached 164-D actor view, inserts the
   resulting row into ordinary replay, reports capture/label/insertion counters,
   and preserves the unchanged VAE objective. Branch continuation, runtime

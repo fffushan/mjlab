@@ -1327,6 +1327,9 @@ class DAggerCollector:
           coverage_report["replay_inserted"] = (
             coverage_report.get("replay_inserted", 0) + rows
           )
+          coverage_report["terminal_predecessor_rows"] = (
+            coverage_report.get("terminal_predecessor_rows", 0) + rows
+          )
       snapshot = next_snapshot
       self._snapshot = snapshot
       self._requires_reset = False

@@ -528,8 +528,9 @@ def build_multi_motion_environment(
   cfg.commands["motion"] = make_multi_motion_cfg(
     motion_cfg, plan, reset_policy=reset_policy
   )
+  coverage_enabled = coverage_policy is not None and coverage_policy.enabled
 
-  if coverage_policy is not None:
+  if coverage_enabled:
     # Opt-in only: a run with no policy keeps its exact recorder set.  The term
     # forwards the pre-reset ids while the reached state is still live.
     from mjlab.managers.recorder_manager import RecorderTermCfg
@@ -539,7 +540,7 @@ def build_multi_motion_environment(
 
     cfg.recorders["coverage_pre_reset"] = RecorderTermCfg(func=CoveragePreResetRecorder)
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=render_mode)
-  if coverage_policy is not None:
+  if coverage_enabled:
     # The collector owns the environment, so it is built once the env exists.
     from mjlab.tasks.tracking.distillation.coverage_collector import (
       CoverageStateOwner,

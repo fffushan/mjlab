@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -139,6 +141,20 @@ class CohortSetup:
       if joint_order is None
       else make_schema(self.schema_mode, joint_order=joint_order)
     )
+    if self.coverage_policy is not None:
+      if self.schema_mode != "gravity":
+        raise ValueError(
+          "difficult-state coverage MVP requires the gravity 68/99 schema"
+        )
+      if (
+        schema.reference_dim,
+        schema.conditioning_dim,
+        schema.latent_dim,
+        schema.action_dim,
+      ) != (68, 99, 32, 31):
+        raise ValueError(
+          "difficult-state coverage MVP requires schema dimensions 68/99/32/31"
+        )
     return make_multi_teacher_distillation_adapter(
       cohort,
       self.teacher_ids,
@@ -190,6 +206,7 @@ def require_coverage_execution(
   parity_evidence: Path | str | None = None,
   *,
   manifest_sha256: str | None = None,
+  expected_teacher_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
   """Validate the bounded MVP execution gate and return evidence metadata.
 
@@ -216,6 +233,44 @@ def require_coverage_execution(
     raise ValueError("coverage parity evidence has an unsupported kind")
   if payload.get("status") != "pass":
     raise ValueError("coverage parity evidence must have status 'pass'")
+  if payload.get("policy_input_exact") is not True:
+    raise ValueError("coverage parity evidence must prove exact policy-input parity")
+  schema = payload.get("schema")
+  expected_schema = {
+    "reference_dim": 68,
+    "conditioning_dim": 99,
+    "latent_dim": 32,
+    "action_dim": 31,
+  }
+  if schema != expected_schema:
+    raise ValueError("coverage parity evidence has the wrong 68/99/32/31 schema")
+  errors = payload.get("policy_input_max_abs_error")
+  required_errors = {
+    "teacher_actor_view",
+    "student_reference",
+    "student_conditioning",
+    "previous_action",
+  }
+  if not isinstance(errors, Mapping) or set(errors) != required_errors:
+    raise ValueError("coverage parity evidence has incomplete policy-input errors")
+  for name in required_errors:
+    value = errors[name]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      raise ValueError(f"coverage parity error {name!r} is not numeric")
+    if not math.isfinite(float(value)) or float(value) != 0.0:
+      raise ValueError(f"coverage parity error {name!r} is not exactly zero")
+  teacher_ids = payload.get("teacher_ids")
+  if (
+    not isinstance(teacher_ids, list)
+    or not teacher_ids
+    or any(not isinstance(value, str) or not value for value in teacher_ids)
+    or len(set(teacher_ids)) != len(teacher_ids)
+  ):
+    raise ValueError("coverage parity evidence has invalid teacher IDs")
+  if expected_teacher_ids is not None and tuple(teacher_ids) != tuple(
+    expected_teacher_ids
+  ):
+    raise ValueError("coverage parity evidence belongs to a different teacher cohort")
   if manifest_sha256 is not None and payload.get("manifest_sha256") != manifest_sha256:
     raise ValueError("coverage parity evidence belongs to a different cohort manifest")
   digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -225,4 +280,6 @@ def require_coverage_execution(
     "path": str(path),
     "sha256": digest,
     "manifest_sha256": payload.get("manifest_sha256"),
+    "teacher_ids": list(teacher_ids),
+    "schema": dict(expected_schema),
   }

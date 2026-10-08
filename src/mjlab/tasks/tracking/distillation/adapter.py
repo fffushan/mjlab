@@ -1530,6 +1530,8 @@ class MultiMotionDistillationAdapter:
     # coverage_executed_action, so a disabled run does no extra work.
     self._coverage_last_action = action
     before = self.snapshot()
+    self.env._coverage_pre_step_snapshot = before
+    self.env._coverage_pre_step_action = action.detach().clone()
     _, reward, terminated, time_outs, extras = self.env.step(action)
     events = _consume_boundary_events(self.env, before.generation_id)
     if events is not None:

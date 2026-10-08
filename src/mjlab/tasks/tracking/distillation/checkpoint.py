@@ -170,6 +170,7 @@ class CohortMemberInference:
   reset_provenance: ResetProvenance | None = None
   evaluation_reset_profile: str | None = None
   coverage_policy_identity: str | None = None
+  coverage_parity_evidence_sha256: str | None = None
 
   @property
   def teacher_ids(self) -> tuple[str, ...]:
@@ -1524,6 +1525,7 @@ def load_cohort_member_inference(
     )
   reset_provenance = None
   coverage_identity = None
+  coverage_evidence_sha256 = None
   if coverage_enabled:
     try:
       coverage = CoveragePolicy.from_dict(payload["coverage_policy"])
@@ -1571,6 +1573,39 @@ def load_cohort_member_inference(
   resolved_config = _mapping(
     payload.get("resolved_config", {}), "checkpoint resolved_config"
   )
+  coverage_config = resolved_config.get("coverage")
+  if (
+    isinstance(coverage_config, Mapping)
+    and coverage_config.get("mode") == "difficult-state-coverage"
+  ):
+    nested_identity = coverage_config.get("policy_identity")
+    expected_identity = CoveragePolicy.difficult_state_coverage().identity
+    if not isinstance(nested_identity, str) or nested_identity != expected_identity:
+      raise CheckpointValidationError(
+        "resolved coverage policy identity is missing or invalid"
+      )
+    if coverage_identity is not None and coverage_identity != nested_identity:
+      raise CheckpointValidationError(
+        "top-level and resolved coverage policy identities differ"
+      )
+    coverage_identity = nested_identity
+    evidence = coverage_config.get("parity_evidence")
+    if not isinstance(evidence, Mapping):
+      raise CheckpointValidationError("resolved coverage parity evidence is missing")
+    if evidence.get("status") != "pass":
+      raise CheckpointValidationError(
+        "resolved coverage parity evidence is not passing"
+      )
+    evidence_sha = evidence.get("sha256")
+    if not isinstance(evidence_sha, str) or len(evidence_sha) != 64:
+      raise CheckpointValidationError(
+        "resolved coverage parity evidence digest is invalid"
+      )
+    coverage_evidence_sha256 = evidence_sha
+  elif coverage_enabled:
+    raise CheckpointValidationError(
+      "enabled coverage checkpoint has no resolved coverage identity"
+    )
   del payload
   return CohortMemberInference(
     model=model,
@@ -1586,6 +1621,7 @@ def load_cohort_member_inference(
     reset_provenance=reset_provenance,
     evaluation_reset_profile=reset_profile,
     coverage_policy_identity=coverage_identity,
+    coverage_parity_evidence_sha256=coverage_evidence_sha256,
   )
 
 

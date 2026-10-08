@@ -729,7 +729,8 @@ def _resume_compatible_value(key: str, stored: Any, requested: Any) -> Any:
   sub-key is filled in on the stored side before the comparison.  Currently:
   ``replay.phase_bins`` (cohort entries only) defaults to 0 in checkpoints
   that predate the option; single-teacher replay entries never carry it, so
-  they are compared verbatim.  Likewise ``runtime.workers`` defaults to the
+  they are compared verbatim.  ``replay.coverage_sampling`` defaults to false
+  in coverage-off checkpoints that predate the MVP.  Likewise ``runtime.workers``
   single-process identity in cohort checkpoints recorded before multi-worker
   collection existed, because a single-process run is exactly what those
   checkpoints used.  That default is applied to the whole worker object, never
@@ -744,6 +745,7 @@ def _resume_compatible_value(key: str, stored: Any, requested: Any) -> Any:
   ):
     stored_equivalent = dict(stored)
     stored_equivalent.setdefault("phase_bins", 0)
+    stored_equivalent.setdefault("coverage_sampling", False)
     return stored_equivalent
   if (
     key == "runtime"
@@ -928,6 +930,8 @@ def _member_inference_report(inference) -> dict[str, Any] | None:
     "teacher_code": inference.teacher_code,
     "artifact_hashes": dict(inference.artifact_hashes),
     "relocated_artifact_roles": list(inference.relocated_artifact_roles),
+    "coverage_policy_identity": inference.coverage_policy_identity,
+    "coverage_parity_evidence_sha256": inference.coverage_parity_evidence_sha256,
   }
 
 
@@ -2082,6 +2086,7 @@ def _train_cohort(
       resolved_coverage,
       coverage_parity_evidence,
       manifest_sha256=cohort.manifest.sha256,
+      expected_teacher_ids=teacher_ids,
     )
     setup = CohortSetup(
       manifest=manifest,
