@@ -13,6 +13,16 @@ values for them. The same file also carries a ``joint_default`` table with
 *different* values (ankle pitch ``40/4`` there against ``40/2`` in ``rl_config``);
 those describe a different control mode and must not be mixed with this one.
 
+Deliberate deviation from the vendor file: the three waist joints are retuned,
+because the vendor damping left a sustained high-frequency waist vibration on the
+robot. The change is ``waist_yaw`` ``40.1792/2.5579`` -> ``40/4`` and
+``waist_pitch``/``waist_roll`` ``200/2`` -> ``200/4``; every other joint keeps its
+vendor value. The retune was chosen from two recorded hardware trials
+(``/home/agiuser/data/20261008T094713Z_vendor-dr-005-vib`` and
+``20261008T124731Z_tune-kd-001``) and removes the measured 20-30 Hz waist
+vibration, at the cost of a small waist-yaw position-RMSE increase. It is an
+operator-selected hardware fix, not a re-measurement of the vendor servo gains.
+
 mjlab configures gains per actuator group, while the vendor table is per joint,
 so :func:`apply_vendor_rl_gains` matches joint names against each group's own
 ``target_names_expr`` and refuses a group whose joints disagree.
@@ -31,13 +41,13 @@ from mjlab.entity import EntityCfg
 X2_VENDOR_RL_GAINS: dict[str, tuple[float, float]] = {
   "left_hip_pitch_joint": (120.0, 5.0),
   "right_hip_pitch_joint": (120.0, 5.0),
-  "waist_yaw_joint": (40.1792, 2.5579),
+  "waist_yaw_joint": (40.0, 4.0),
   "left_hip_roll_joint": (100.0, 4.0),
   "right_hip_roll_joint": (100.0, 4.0),
-  "waist_pitch_joint": (200.0, 2.0),
+  "waist_pitch_joint": (200.0, 4.0),
   "left_hip_yaw_joint": (100.0, 4.0),
   "right_hip_yaw_joint": (100.0, 4.0),
-  "waist_roll_joint": (200.0, 2.0),
+  "waist_roll_joint": (200.0, 4.0),
   "left_knee_joint": (150.0, 5.0),
   "right_knee_joint": (150.0, 5.0),
   "left_shoulder_pitch_joint": (50.0, 3.0),

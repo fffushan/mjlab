@@ -1,0 +1,61 @@
+version: 1
+name: x2-tennis-teachers-vendor-gains-dr-waist-kd4-v1
+robot: agibot_x2
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations-Vendor-Gains
+teachers:
+- id: vgk000
+  checkpoint: logs/distillation/teachers/vgk000/model_29999.pt
+  motion: data/tennis/single_000_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk000/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk000/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk000/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk001
+  checkpoint: logs/distillation/teachers/vgk001/model_29999.pt
+  motion: data/tennis/single_001_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk001/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk001/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk001/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk002
+  checkpoint: logs/distillation/teachers/vgk002/model_29999.pt
+  motion: data/tennis/single_002_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk002/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk002/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk002/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk003
+  checkpoint: logs/distillation/teachers/vgk003/model_29999.pt
+  motion: data/tennis/single_003_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk003/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk003/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk003/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk004
+  checkpoint: logs/distillation/teachers/vgk004/model_29999.pt
+  motion: data/tennis/single_004_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk004/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk004/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk004/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk005
+  checkpoint: logs/distillation/teachers/vgk005/model_29999.pt
+  motion: data/tennis/single_005_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk005/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk005/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk005/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk006
+  checkpoint: logs/distillation/teachers/vgk006/model_29999.pt
+  motion: data/tennis/single_006_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk006/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk006/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk006/model_29999.onnx
+  sampling_weight: 1.0
+- id: vgk007
+  checkpoint: logs/distillation/teachers/vgk007/model_29999.pt
+  motion: data/tennis/single_007_zhanghongyu_agibot_x2_tracking.npz
+  env_config: logs/distillation/teachers/vgk007/params/env.yaml
+  agent_config: logs/distillation/teachers/vgk007/params/agent.yaml
+  onnx: logs/distillation/teachers/vgk007/model_29999.onnx
+  sampling_weight: 1.0
