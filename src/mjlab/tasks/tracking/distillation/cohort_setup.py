@@ -159,7 +159,7 @@ class CohortSetup:
     ).to(device)
 
 
-COVERAGE_POLICY_CHOICES = ("off", "balance-recovery")
+COVERAGE_POLICY_CHOICES = ("off", "difficult-state-coverage")
 
 
 def resolve_coverage_policy(choice: str) -> CoveragePolicy | None:
@@ -170,7 +170,7 @@ def resolve_coverage_policy(choice: str) -> CoveragePolicy | None:
     )
   if choice == "off":
     return None
-  return CoveragePolicy.balance_recovery()
+  return CoveragePolicy.difficult_state_coverage()
 
 
 def require_coverage_execution(policy: CoveragePolicy | None) -> None:

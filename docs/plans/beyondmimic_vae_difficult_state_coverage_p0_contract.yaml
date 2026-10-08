@@ -1,7 +1,7 @@
 # P0 design data ONLY: not a supported runnable training configuration.
 # No collector implementation or resource allocation is authorized by this file.
 version: 1
-contract_id: x2-vae-balance-recovery-p0-v1
+contract_id: x2-vae-difficult-state-coverage-p0-v1
 status: user_confirmed_settings_implementation_authorized
 settings_confirmed_by_user: true
 # This document is still design data; it cannot authorize a training launch.

@@ -73,7 +73,9 @@ def candidate(ordinal, kind="finite_post_failure", capture_fn=None, estimate=32)
 
 
 def test_candidate_reservations_are_simultaneous_not_last_call_capacity():
-  component = CoverageEnvironmentComponent(object(), CoveragePolicy.balance_recovery())
+  component = CoverageEnvironmentComponent(
+    object(), CoveragePolicy.difficult_state_coverage()
+  )
   component.admit_snapshot_candidates([candidate(i) for i in range(60)])
   component.admit_snapshot_candidates(
     [candidate(i, "student_difficult") for i in range(205)]
@@ -85,7 +87,9 @@ def test_candidate_reservations_are_simultaneous_not_last_call_capacity():
 
 
 def test_old_captures_not_returned_as_new_fresh_rows():
-  component = CoverageEnvironmentComponent(object(), CoveragePolicy.balance_recovery())
+  component = CoverageEnvironmentComponent(
+    object(), CoveragePolicy.difficult_state_coverage()
+  )
   first = component.admit_snapshot_candidates([candidate(0)])
   second = component.admit_snapshot_candidates([candidate(1)])
   assert len(first) == 1
@@ -93,7 +97,9 @@ def test_old_captures_not_returned_as_new_fresh_rows():
 
 
 def test_combined_estimate_checked_before_expensive_callback():
-  component = CoverageEnvironmentComponent(object(), CoveragePolicy.balance_recovery())
+  component = CoverageEnvironmentComponent(
+    object(), CoveragePolicy.difficult_state_coverage()
+  )
   component._terminal_bytes_cap = 32
   component.admit_snapshot_candidates([candidate(0)])
   calls = []
@@ -107,7 +113,9 @@ def test_combined_estimate_checked_before_expensive_callback():
 
 
 def test_actual_owned_bytes_overflow_is_rejected_after_copy_without_retention():
-  component = CoverageEnvironmentComponent(object(), CoveragePolicy.balance_recovery())
+  component = CoverageEnvironmentComponent(
+    object(), CoveragePolicy.difficult_state_coverage()
+  )
   component._terminal_bytes_cap = 8
 
   def large_capture():

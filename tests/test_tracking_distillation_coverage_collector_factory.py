@@ -18,7 +18,9 @@ def test_a_disabled_policy_builds_nothing() -> None:
 
 
 def test_an_enabled_policy_builds_a_collector() -> None:
-  collector = build_coverage_collector(object(), CoveragePolicy.balance_recovery())
+  collector = build_coverage_collector(
+    object(), CoveragePolicy.difficult_state_coverage()
+  )
   assert isinstance(collector, CoverageCollector)
   assert collector.enabled is True
 

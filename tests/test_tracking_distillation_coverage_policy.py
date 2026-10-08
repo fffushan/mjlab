@@ -19,11 +19,11 @@ def test_off_is_immutable_and_does_not_consume_rng() -> None:
   sample_reset_perturbation(policy, left)
   assert left.random() == right.random()
   with pytest.raises((AttributeError, TypeError)):
-    policy.mode = "balance-recovery"  # type: ignore[misc]
+    policy.mode = "difficult-state-coverage"  # type: ignore[misc]
 
 
 def test_confirmed_policy_round_trips_with_stable_identity() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   assert policy.enabled
   assert policy.identity == CoveragePolicy.from_dict(policy.as_dict()).identity
   assert dict(policy.scope)["reference_dim"] == 68
@@ -39,8 +39,8 @@ def test_confirmed_policy_round_trips_with_stable_identity() -> None:
 
 def test_malformed_policy_and_nonfinite_values_are_rejected() -> None:
   with pytest.raises(CoveragePolicyError):
-    CoveragePolicy.from_dict({"mode": "balance-recovery"})
-  payload = CoveragePolicy.balance_recovery().as_dict()
+    CoveragePolicy.from_dict({"mode": "difficult-state-coverage"})
+  payload = CoveragePolicy.difficult_state_coverage().as_dict()
   payload["tier_probabilities"]["strong"] = float("nan")
   with pytest.raises(CoveragePolicyError):
     CoveragePolicy.from_dict(json.loads(json.dumps(payload, allow_nan=True)))
@@ -49,7 +49,7 @@ def test_malformed_policy_and_nonfinite_values_are_rejected() -> None:
 
 
 def test_nested_direct_policy_validators_reject_malformed_settings() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   from dataclasses import replace
 
   with pytest.raises(CoveragePolicyError):

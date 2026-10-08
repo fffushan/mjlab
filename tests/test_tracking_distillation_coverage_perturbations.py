@@ -19,7 +19,7 @@ from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
 
 
 def test_reset_and_runtime_directions_are_bounded_and_world_frame() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   rng = np.random.default_rng(7)
   reset = sample_reset_perturbation(policy, rng)
   root = (
@@ -53,7 +53,7 @@ def test_off_perturbations_are_noops_and_runtime_event_is_bounded() -> None:
     )
     is None
   )
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   event = schedule_phase_event(
     policy,
     np.random.default_rng(2),
@@ -76,7 +76,7 @@ def test_off_perturbations_are_noops_and_runtime_event_is_bounded() -> None:
 
 
 def test_selected_reset_axes_do_not_expand_inactive_axes() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   rng = np.random.default_rng(11)
   envelopes = dict(policy.root_reset_envelopes)
   for _ in range(200):
@@ -115,7 +115,7 @@ def test_world_quaternion_composition_and_rejection() -> None:
 
 
 def test_trigger_score_bands_and_cooldown() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   threshold = dict(policy.triggers.thresholds)["root_angular_velocity_error_rad_s"]
   assert trigger_severity(
     {"root_angular_velocity_error_rad_s": threshold}, policy
@@ -158,7 +158,7 @@ class _AlternatingRng(_MaxRng):
 
 
 def test_reset_envelopes_are_single_draw_and_directional() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   rng = _MaxRng()
   position, rotation, linear, angular = _root_draw(
     policy, rng, "strong", "horizontal_translation", runtime=False
@@ -180,7 +180,7 @@ def test_reset_envelopes_are_single_draw_and_directional() -> None:
 
 
 def test_reset_joint_velocity_deltas_use_selected_chain_envelopes() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   max_rng = _MaxRng()
   position, velocity = _joints(policy, max_rng, "strong", "waist", runtime=False)
   assert max_rng.uniform_calls == 6
@@ -205,7 +205,7 @@ def test_reset_joint_velocity_deltas_use_selected_chain_envelopes() -> None:
 
 
 def test_trigger_cap_and_disabled_path_are_side_effect_free() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   state = TriggerState(armed=False, cooldown=1, pending=True, threshold_candidates=2)
   emitted, _, reason = trigger_candidate(
     {"root_angular_velocity_error_rad_s": 2.0}, policy, state
@@ -228,7 +228,7 @@ def test_trigger_cap_and_disabled_path_are_side_effect_free() -> None:
 
 
 def test_disarmed_high_trigger_does_not_repeatedly_emit() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   state = TriggerState(armed=False)
   assert not trigger_candidate(
     {"root_angular_velocity_error_rad_s": 2.0}, policy, state
@@ -240,7 +240,7 @@ def test_disarmed_high_trigger_does_not_repeatedly_emit() -> None:
 
 
 def test_continuous_high_requires_rearm_before_second_candidate() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   state = TriggerState()
   high = {"root_angular_velocity_error_rad_s": 2.0}
   emissions = [trigger_candidate(high, policy, state)[0] for _ in range(60)]
@@ -250,7 +250,7 @@ def test_continuous_high_requires_rearm_before_second_candidate() -> None:
 
 
 def test_rearmed_crossing_during_cooldown_is_deferred_once() -> None:
-  policy = CoveragePolicy.balance_recovery()
+  policy = CoveragePolicy.difficult_state_coverage()
   state = TriggerState()
   high = {"root_angular_velocity_error_rad_s": 2.0}
   assert trigger_candidate(high, policy, state)[0]

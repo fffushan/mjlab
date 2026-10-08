@@ -425,7 +425,9 @@ def test_terminal_reconstruction_has_explicit_synthetic_only_escape_hatch():
   destination = FakeEnv(3)
   state = BranchState.capture(source, env_index=4)
   capture = TerminalCapture(state, torch.zeros(1), torch.zeros(1), "done")
-  component = CoverageEnvironmentComponent(source, CoveragePolicy.balance_recovery())
+  component = CoverageEnvironmentComponent(
+    source, CoveragePolicy.difficult_state_coverage()
+  )
   with pytest.raises(CoverageRuntimeError, match="fail-closed"):
     component.reconstruct_terminal(capture, destination, env_index=1)
 

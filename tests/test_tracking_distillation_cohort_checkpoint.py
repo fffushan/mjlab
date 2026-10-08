@@ -2160,7 +2160,7 @@ def test_coverage_off_versions_keep_their_behaviour_and_v4_is_the_enabled_format
       trainer,
       trainer.replay,
       expected_cohort=identity,
-      expected_policy=resolve_coverage_policy("balance-recovery"),
+      expected_policy=resolve_coverage_policy("difficult-state-coverage"),
       collector=collector,
     )
   assert_state_unchanged(trainer, trainer.replay, collector, before)
@@ -2193,6 +2193,6 @@ def test_a_legacy_replay_cannot_be_saved_as_enabled_v4(
       trainer,
       trainer.replay,
       cohort=identity,
-      coverage_policy=resolve_coverage_policy("balance-recovery"),
+      coverage_policy=resolve_coverage_policy("difficult-state-coverage"),
       coverage_report={"recapture_candidates": 0},
     )

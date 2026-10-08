@@ -1998,7 +1998,7 @@ def _train_cohort(
   output_dir: Path | None,
   resume: Path | None,
   reset_policy: ResetPolicy,
-  coverage_policy: Literal["off", "balance-recovery"] = "off",
+  coverage_policy: Literal["off", "difficult-state-coverage"] = "off",
 ) -> int:
   """Run the bounded shared-student M4 cohort collect/update lifecycle.
 
@@ -3548,12 +3548,14 @@ def _validate_teachers(
 
 
 def _coverage_inspect(
-  policy: Literal["off", "balance-recovery"] = "off",
+  policy: Literal["off", "difficult-state-coverage"] = "off",
   output: Path | None = None,
 ) -> int:
   """Inspect the resolved coverage contract without constructing an environment."""
   resolved = (
-    CoveragePolicy.off() if policy == "off" else CoveragePolicy.balance_recovery()
+    CoveragePolicy.off()
+    if policy == "off"
+    else CoveragePolicy.difficult_state_coverage()
   )
   payload = {
     "mode": resolved.mode,

@@ -14,13 +14,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-CoverageMode = Literal["off", "balance-recovery"]
+CoverageMode = Literal["off", "difficult-state-coverage"]
 CoverageTier = Literal["baseline", "moderate", "strong"]
 RootDirection = Literal["sagittal", "lateral", "yaw", "horizontal_translation"]
 ExcitationKind = Literal["root_only", "joint_chain_only", "coupled"]
 
 POLICY_VERSION = 1
-POLICY_KIND = "x2-vae-balance-recovery-p0-v1"
+POLICY_KIND = "x2-vae-difficult-state-coverage-p0-v1"
 
 
 class CoveragePolicyError(ValueError):
@@ -331,7 +331,7 @@ class CoveragePolicy:
   )
 
   def __post_init__(self) -> None:
-    if self.mode not in ("off", "balance-recovery"):
+    if self.mode not in ("off", "difficult-state-coverage"):
       raise CoveragePolicyError(f"invalid coverage mode {self.mode!r}")
     if isinstance(self.version, bool) or self.version != POLICY_VERSION:
       raise CoveragePolicyError(f"unsupported coverage policy version {self.version}")
@@ -506,7 +506,7 @@ class CoveragePolicy:
     return cls()
 
   @classmethod
-  def balance_recovery(cls) -> CoveragePolicy:
+  def difficult_state_coverage(cls) -> CoveragePolicy:
     def root(
       position: dict[str, float],
       rotation: dict[str, float],
@@ -543,7 +543,7 @@ class CoveragePolicy:
       ),
     }
     return cls(
-      mode="balance-recovery",
+      mode="difficult-state-coverage",
       scope=(
         ("cohort_manifest", "configs/distillation/x2_tennis_mixed_v3.yaml"),
         (
@@ -632,10 +632,10 @@ class CoveragePolicy:
       # Off remains strict: accepting an enabled-looking partial policy could
       # accidentally change RNG/checkpoint semantics.
       raise CoveragePolicyError("off policy must contain only mode/version")
-    if mode != "balance-recovery":
+    if mode != "difficult-state-coverage":
       raise CoveragePolicyError(f"invalid coverage mode {mode!r}")
     # The enabled contract is immutable P0 data; reject partial or altered data.
-    expected = cls.balance_recovery()
+    expected = cls.difficult_state_coverage()
     candidate = dict(payload)
     candidate.pop("contract_id", None)
     expected_payload = expected.as_dict()
@@ -726,7 +726,7 @@ def draw_uniform(rng: Any, magnitude: float) -> float:
 # Explicit aliases make the narrow runtime/replay handoff discoverable without
 # coupling either caller to the concrete classmethod spelling.
 load_coverage_policy = CoveragePolicy.from_dict
-make_coverage_policy = CoveragePolicy.balance_recovery
+make_coverage_policy = CoveragePolicy.difficult_state_coverage
 
 
 def coverage_policy_identity(policy: CoveragePolicy) -> str:

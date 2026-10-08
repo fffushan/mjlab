@@ -24,17 +24,19 @@ from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
 
 
 def test_coverage_policy_choices_match_the_inspect_command() -> None:
-  assert COVERAGE_POLICY_CHOICES == ("off", "balance-recovery")
+  assert COVERAGE_POLICY_CHOICES == ("off", "difficult-state-coverage")
 
 
 def test_resolve_coverage_policy_off_returns_none() -> None:
   assert resolve_coverage_policy("off") is None
 
 
-def test_resolve_coverage_policy_enabled_returns_the_balance_recovery_policy() -> None:
-  policy = resolve_coverage_policy("balance-recovery")
+def test_resolve_coverage_policy_enabled_returns_the_difficult_state_coverage_policy() -> (
+  None
+):
+  policy = resolve_coverage_policy("difficult-state-coverage")
   assert policy is not None
-  assert policy.identity == CoveragePolicy.balance_recovery().identity
+  assert policy.identity == CoveragePolicy.difficult_state_coverage().identity
   assert policy.enabled is True
 
 
@@ -48,7 +50,7 @@ def test_require_coverage_execution_allows_the_disabled_path() -> None:
 
 
 def test_require_coverage_execution_fails_closed_when_enabled() -> None:
-  policy = resolve_coverage_policy("balance-recovery")
+  policy = resolve_coverage_policy("difficult-state-coverage")
   with pytest.raises(NotImplementedError) as excinfo:
     require_coverage_execution(policy)
   message = str(excinfo.value)
@@ -71,7 +73,7 @@ def test_cohort_setup_defaults_to_no_coverage_policy() -> None:
 
 
 def test_cohort_setup_keeps_an_enabled_policy() -> None:
-  policy = resolve_coverage_policy("balance-recovery")
+  policy = resolve_coverage_policy("difficult-state-coverage")
   setup = CohortSetup(
     manifest=Path("manifest.yaml"),
     repo_root=Path("."),

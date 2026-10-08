@@ -129,7 +129,7 @@ def test_terminal_reconstruction_is_fail_closed_until_explicit_parity():
   source = FakeState()
   component = CoverageEnvironmentComponent(source, CoveragePolicy.off())
   assert not component.enabled
-  enabled = CoveragePolicy.balance_recovery()
+  enabled = CoveragePolicy.difficult_state_coverage()
   component = CoverageEnvironmentComponent(source, enabled)
   component.preflight()
   with pytest.raises(CoverageRuntimeError, match="fail-closed"):

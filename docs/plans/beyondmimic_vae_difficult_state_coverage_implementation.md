@@ -125,7 +125,7 @@ Persist the complete resolved policy, not just a profile name:
 - Archive capacity, admission strata, replacement rule and draw fraction.
 - Collection source/row identity layout and held-out split rules.
 
-Suggested interface: `--coverage-policy off|balance-recovery` plus an explicit
+Suggested interface: `--coverage-policy off|difficult-state-coverage` plus an explicit
 coverage config file. Final Tyro names are to be checked during implementation.
 Do not overload `--reset-policy`, which already describes standing/reference
 initialization. Do not automatically enable the new path from a saved PPO config.

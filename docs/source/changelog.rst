@@ -57,7 +57,7 @@ Added
 - Integrated the difficult-state coverage lanes into one tree. The merge
   provenance is ``MERGE-MANIFEST.md`` and the acceptance record is
   ``ACCEPTANCE-20261007.md``. Added ``CohortSetup.coverage_policy`` and the
-  ``--coverage-policy {off,balance-recovery}`` option on ``distill train``.
+  ``--coverage-policy {off,difficult-state-coverage}`` option on ``distill train``.
   An enabled policy still stops at the execution gate until live collection
   evidence is accepted.
 

@@ -539,7 +539,9 @@ class ProtectedCoverageReplayBuffer:
       raise ReplayValidationError("dtype must be a floating-point torch dtype")
     self.capacity = capacity
     self.schema = schema
-    self.policy = policy if policy is not None else CoveragePolicy.balance_recovery()
+    self.policy = (
+      policy if policy is not None else CoveragePolicy.difficult_state_coverage()
+    )
     if not self.policy.enabled:
       raise ReplayValidationError(
         "protected coverage replay requires an enabled policy"

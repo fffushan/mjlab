@@ -918,7 +918,7 @@ Difficult-state coverage inspection
 The confirmed difficult-state policy is available as a read-only contract
 inspection. It does not construct a simulator or authorize collection::
 
-   uv run distill coverage-inspect --policy balance-recovery
+   uv run distill coverage-inspect --policy difficult-state-coverage
 
 The output includes the canonical policy identity and reports live collection as
 ``blocked_pending_p2_next_transition_parity`` until that separately authorized
