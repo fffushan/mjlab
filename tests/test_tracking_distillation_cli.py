@@ -398,6 +398,78 @@ def test_cli_prints_help_without_a_command(
   assert "usage: distill <COMMAND> [OPTIONS]" in captured.out
 
 
+def test_single_teacher_derived_budget_trains_and_resumes_legacy_metadata(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  _resolved_cohort(tmp_path)
+  calls: list[dict] = []
+  _install_fake_adapter(monkeypatch, calls)
+  common = [
+    "distill",
+    "train",
+    "--manifest",
+    str(tmp_path / "configs" / "tiny_teachers.yaml"),
+    "--repo-root",
+    str(tmp_path),
+    "--teacher-id",
+    TEACHER_ID,
+    "--envs-per-motion",
+    "2",
+    "--collection-steps",
+    "2",
+    "--minibatch-size",
+    "2",
+    "--accumulation-steps",
+    "2",
+    "--draw-to-collection-ratio",
+    "2",
+    "--replay-retention-iterations",
+    "2",
+    "--seed",
+    "7",
+    "--checkpoint-every",
+    "0",
+    "--progress-every",
+    "0",
+  ]
+  first = tmp_path / "derived"
+  assert invoke(monkeypatch, [*common, "--output-dir", str(first)]) == 0
+  report = json.loads(capsys.readouterr().out)
+  assert calls[0]["num_envs"] == 2
+  assert report["schedule"]["updates_per_iteration"] == 2
+  assert sum(update["samples"] for update in report["iterations"][0]["updates"]) == 8
+  assert report["resolved_config"]["sample_budget"]["resolved"]["replay_capacity"] == 8
+  checkpoint = first / "checkpoint-final.pt"
+  payload = torch.load(checkpoint, weights_only=True)
+  # Old artifacts have no budget metadata; resolved settings still suffice.
+  del payload["resolved_config"]["sample_budget"]
+  legacy = tmp_path / "no-budget-metadata.pt"
+  torch.save(payload, legacy)
+  assert (
+    invoke(
+      monkeypatch,
+      [
+        *common,
+        "--resume",
+        str(legacy),
+        "--max-iterations",
+        "2",
+        "--output-dir",
+        str(tmp_path / "resumed"),
+      ],
+    )
+    == 0
+  )
+  resumed = json.loads(capsys.readouterr().out)
+  assert resumed["iteration"] == 2
+  assert (
+    resumed["resolved_config"]["sample_budget"]["requested"]["draw_to_collection_ratio"]
+    == 2
+  )
+
+
 def test_train_cli_applies_seed_before_construction_and_saves_full_provenance(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -491,7 +563,17 @@ def test_train_cli_applies_seed_before_construction_and_saves_full_provenance(
     "replay",
     "model",
     "resumed_from",
+    "sample_budget",
   }
+  budget = provenance["sample_budget"]
+  assert budget["requested"] == {
+    "envs_per_motion": None,
+    "draw_to_collection_ratio": None,
+    "replay_retention_iterations": None,
+  }
+  assert budget["resolved"]["fresh_rows_per_iteration"] == 2
+  assert budget["resolved"]["training_draws_per_iteration"] == 12
+  assert budget["motions"][0]["teacher_id"] == TEACHER_ID
   assert provenance["provenance_version"] == PROVENANCE_VERSION
   assert provenance["command"] == "train"
   assert provenance["teacher_id"] == TEACHER_ID
@@ -729,6 +811,10 @@ def _train_with_tiny_cohort(
       "1",
       "--replay-capacity",
       "24",
+      "--minibatch-size",
+      "4",
+      "--accumulation-steps",
+      "3",
       "--seed",
       "7",
       *extra,

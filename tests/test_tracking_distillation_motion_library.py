@@ -232,6 +232,98 @@ def test_out_of_clip_and_invalid_indexes_are_rejected(
   ]
 
 
+def test_valid_flat_index_uses_one_boolean_guard_and_returns_owned_indices(
+  selected_library: MotionLibrary,
+) -> None:
+  ids = torch.tensor([1, 0, 1], dtype=torch.int32)
+  frames = torch.tensor([4, 1, 0], dtype=torch.int16)
+  with torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU]
+  ) as profile:
+    index = selected_library.flat_index(ids, frames)
+  item_count = sum(
+    event.count for event in profile.key_averages() if event.key == "aten::item"
+  )
+  assert item_count == 1
+  assert index.tolist() == [6, 1, 2]
+  index.zero_()
+  assert selected_library.flat_index(ids, frames).tolist() == [6, 1, 2]
+
+
+@pytest.mark.parametrize(
+  "ids,frames,expected",
+  [
+    ([-1, 1], [-1, 5], "motion_ids must be in"),
+    ([0, 2], [2, -1], "motion_ids must be in"),
+    ([-9223372036854775808, 1], [0, 4], "motion_ids must be in"),
+    ([0, 9223372036854775807], [0, 0], "motion_ids must be in"),
+    ([0, 1], [-1, 5], "non-negative"),
+    ([0, 1], [2, 5], "local frame 2 is outside its clip"),
+  ],
+)
+def test_combined_guard_preserves_invalid_input_precedence(
+  selected_library: MotionLibrary,
+  ids,
+  frames,
+  expected,
+) -> None:
+  with pytest.raises(MotionLibraryError, match=expected):
+    selected_library.flat_index(torch.tensor(ids), torch.tensor(frames))
+
+
+def test_flat_index_rechecks_in_place_changes_and_empty_inputs(
+  selected_library: MotionLibrary,
+) -> None:
+  ids = torch.tensor([0, 1])
+  frames = torch.tensor([0, 4])
+  before = selected_library.mapping_digest()
+  assert selected_library.flat_index(ids, frames).tolist() == [0, 6]
+  frames[0] = 1
+  assert selected_library.flat_index(ids, frames).tolist() == [1, 6]
+  ids[0] = 1
+  assert selected_library.flat_index(ids, frames).tolist() == [3, 6]
+  frames[0] = 5
+  with pytest.raises(MotionLibraryError, match="outside its clip"):
+    selected_library.flat_index(ids, frames)
+  empty = torch.empty(0, dtype=torch.long)
+  assert selected_library.flat_index(empty, empty).shape == (0,)
+  assert selected_library.mapping_digest() == before
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="local CUDA unavailable")
+def test_combined_guard_cuda_preserves_bounds_mutations_and_single_host_check(
+  tmp_path: Path,
+) -> None:
+  library = MotionLibrary.from_clips(clip_specs(tmp_path), device="cuda:0")
+  ids = torch.tensor([0, 1], device="cuda:0")
+  frames = torch.tensor([1, 4], device="cuda:0")
+  library.flat_index(ids, frames)  # Warm up before counting host decisions.
+  torch.cuda.synchronize()
+  with torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU]
+  ) as profile:
+    index = library.flat_index(ids, frames)
+  assert index.cpu().tolist() == [1, 6]
+  assert (
+    sum(event.count for event in profile.key_averages() if event.key == "aten::item")
+    == 1
+  )
+  for invalid in (-1, 2, -9223372036854775808, 9223372036854775807):
+    ids[0] = invalid
+    with pytest.raises(MotionLibraryError, match="motion_ids must be in"):
+      library.flat_index(ids, frames)
+    torch.cuda.synchronize()  # A safe speculative gather must not poison CUDA.
+  ids[0] = 0
+  frames[0] = -1
+  with pytest.raises(MotionLibraryError, match="non-negative"):
+    library.flat_index(ids, frames)
+  frames[0] = 2
+  with pytest.raises(MotionLibraryError, match="outside its clip"):
+    library.flat_index(ids, frames)
+  frames[0] = 0
+  assert library.flat_index(ids, frames).cpu().tolist() == [0, 6]
+
+
 def test_body_queries_require_a_resolved_selection(library: MotionLibrary) -> None:
   with pytest.raises(MotionLibraryError, match="with_body_selection"):
     library.body_pos_w(torch.tensor([0]), torch.tensor([0]))

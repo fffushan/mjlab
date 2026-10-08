@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -40,7 +40,7 @@ from mjlab.tasks.tracking.distillation.checkpoint import (
   CheckpointValidationError,
   save_checkpoint,
 )
-from mjlab.tasks.tracking.distillation.cohort_setup import worker_env_seed
+from mjlab.tasks.tracking.distillation.cohort_setup import CohortSetup, worker_env_seed
 from mjlab.tasks.tracking.distillation.collector import (
   EvaluationResult,
   EvaluationSegment,
@@ -219,6 +219,7 @@ class _MultiAdapter:
       [teacher.entry.sampling_weight for teacher in selected],
       num_envs,
       teacher_ids=[teacher.id for teacher in selected],
+      generator=(None if seed is None else torch.Generator().manual_seed(seed)),
     )
     self.audit = SimpleNamespace(
       slots=slots,
@@ -851,6 +852,178 @@ def test_evaluate_cohort_rejects_a_non_cohort_checkpoint(
 
 
 # --- train / resume / evaluate / cohort evaluation end to end -------------------
+
+
+def test_cohort_derived_budget_reaches_training_checkpoint_and_resume(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """Real replay/Adam/checkpoint path; only the simulator is replaced."""
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema)
+  common = [
+    "distill",
+    "train",
+    "--manifest",
+    str(MANIFEST),
+    "--repo-root",
+    str(REPO_ROOT),
+    "--teacher-ids",
+    _teacher_ids_arg(TEACHER_IDS),
+    "--envs-per-motion",
+    "2",
+    "--collection-steps",
+    "2",
+    "--draw-to-collection-ratio",
+    "1.5",
+    "--replay-retention-iterations",
+    "2",
+    "--minibatch-size",
+    "2",
+    "--accumulation-steps",
+    "2",
+    "--seed",
+    "7",
+    "--checkpoint-every",
+    "0",
+    "--progress-every",
+    "0",
+  ]
+  first = tmp_path / "derived"
+  assert invoke(monkeypatch, [*common, "--output-dir", str(first)]) == 0
+  captured = capsys.readouterr()
+  report = json.loads(captured.out)
+  assert calls[0]["num_envs"] == 4
+  assert report["cohort"]["slot_counts"] == [2, 2]
+  assert report["schedule"]["updates_per_iteration"] == 3
+  assert report["replay"]["capacity"] == 16
+  assert report["iterations"][0]["collection"]["samples"] == 8
+  assert len(report["iterations"][0]["updates"]) == 3
+  assert sum(update["samples"] for update in report["iterations"][0]["updates"]) == 12
+  assert [item["drawn"] for item in report["replay"]["motions"]] == [6, 6]
+  metadata = report["resolved_config"]["sample_budget"]
+  assert metadata["requested"] == {
+    "envs_per_motion": 2,
+    "draw_to_collection_ratio": 1.5,
+    "replay_retention_iterations": 2.0,
+  }
+  assert metadata["resolved"]["draw_to_collection_ratio"] == 1.5
+  assert [item["fresh_rows_per_iteration"] for item in metadata["motions"]] == [4, 4]
+  checkpoint = first / "checkpoint-final.pt"
+  payload = torch.load(checkpoint, weights_only=True)
+  assert payload["resolved_config"]["sample_budget"] == metadata
+
+  # Same resolved settings are allowed with explicit totals. Budget formulas
+  # are audit metadata, not a new resume invariant for old artifacts.
+  explicit = [
+    "distill",
+    "train",
+    "--manifest",
+    str(MANIFEST),
+    "--repo-root",
+    str(REPO_ROOT),
+    "--teacher-ids",
+    _teacher_ids_arg(TEACHER_IDS),
+    "--num-envs",
+    "4",
+    "--collection-steps",
+    "2",
+    "--updates-per-iteration",
+    "3",
+    "--replay-capacity",
+    "16",
+    "--minibatch-size",
+    "2",
+    "--accumulation-steps",
+    "2",
+    "--seed",
+    "7",
+    "--checkpoint-every",
+    "0",
+    "--progress-every",
+    "0",
+    "--resume",
+    str(checkpoint),
+    "--max-iterations",
+    "2",
+  ]
+  assert (
+    invoke(monkeypatch, [*explicit, "--output-dir", str(tmp_path / "resumed")]) == 0
+  )
+  resumed = json.loads(capsys.readouterr().out)
+  assert resumed["iteration"] == 2
+  assert len(resumed["iterations"][0]["updates"]) == 3
+  assert (
+    resumed["resolved_config"]["sample_budget"]["requested"]["envs_per_motion"] is None
+  )
+
+  # A new target that changes the resolved update schedule still fails resume.
+  changed = list(common)
+  changed[changed.index("--draw-to-collection-ratio") + 1] = "2"
+  assert (
+    invoke(
+      monkeypatch,
+      [
+        *changed,
+        "--resume",
+        str(checkpoint),
+        "--max-iterations",
+        "2",
+        "--output-dir",
+        str(tmp_path / "refused"),
+      ],
+    )
+    == 1
+  )
+  refused = capsys.readouterr()
+  assert "updates_per_iteration" in refused.err
+  assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_derived_budget_dispatches_resolved_totals_to_sharded_builder(
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  records: list[dict] = []
+
+  def fake_sharded(**kwargs):
+    records.append(kwargs)
+    raise DistillationError("stop after derived dispatch")
+
+  monkeypatch.setattr(distill, "_build_sharded_cohort_runner", fake_sharded)
+  assert (
+    invoke(
+      monkeypatch,
+      [
+        "distill",
+        "train",
+        "--teacher-ids",
+        _teacher_ids_arg(TEACHER_IDS),
+        "--envs-per-motion",
+        "3",
+        "--collection-steps",
+        "2",
+        "--draw-to-collection-ratio",
+        "1",
+        "--replay-retention-iterations",
+        "2",
+        "--minibatch-size",
+        "2",
+        "--accumulation-steps",
+        "2",
+        "--worker-devices",
+        "('cpu','cpu')",
+      ],
+    )
+    == 1
+  )
+  assert "stop after derived dispatch" in capsys.readouterr().err
+  assert records[0]["num_envs"] == 6
+  assert records[0]["updates_per_iteration"] == 3
+  assert records[0]["replay_capacity"] == 24
+  assert records[0]["worker_devices"] == ("cpu", "cpu")
 
 
 def test_cohort_train_saves_a_version_two_checkpoint_and_member_reports(
@@ -2597,7 +2770,7 @@ def test_runtime_card_names_are_audited_rather_than_compared() -> None:
   the worker count, the environments per worker, the seed scheme, ``num_envs``
   or the resolved seed remains a refusal.
   """
-  stored = {
+  stored: dict[str, Any] = {
     "device": "cuda:4",
     "num_envs": 8,
     "seed": 7,
@@ -2878,7 +3051,7 @@ def test_shard_descriptions_must_agree_on_the_whole_cohort_contract() -> None:
   compared as a whole record, because the identity records it as a whole -- so a
   new audit field cannot silently escape the check.
   """
-  setup = SimpleNamespace(base_seed=5)
+  setup = cast(CohortSetup, SimpleNamespace(base_seed=5))
   first = _shard_description()
   assert (
     distill._require_one_shard_contract([first, _shard_description(1)], setup) is first
@@ -2943,10 +3116,10 @@ def test_shards_may_differ_in_their_own_per_row_clip_assignment() -> None:
   refused a legitimate three-GPU run on its first real execution -- which is why
   the comparison excludes exactly that member and keeps comparing the rest.
   """
-  setup = SimpleNamespace(base_seed=5)
+  setup = cast(CohortSetup, SimpleNamespace(base_seed=5))
   # Three rows over two motions: every motion keeps at least one row, so both
   # allocations are valid and only the assignment differs.
-  shared = dict(weights=(0.5, 0.5), teacher_ids=("a", "b"))
+  shared: dict[str, Any] = dict(weights=(0.5, 0.5), teacher_ids=("a", "b"))
   mine = _with_audit(
     _shard_description(0),
     slots=MotionSlotAllocation(counts=(2, 1), row_motion_ids=(0, 0, 1), **shared),
@@ -2973,7 +3146,7 @@ def test_a_contract_refusal_names_the_differing_field() -> None:
   The refusal that stopped the first real run named only the record, which cost
   a full smoke cycle to diagnose.
   """
-  setup = SimpleNamespace(base_seed=5)
+  setup = cast(CohortSetup, SimpleNamespace(base_seed=5))
   first = _shard_description()
   other = _with_audit(first, additional_gravity_policy="doubled")
 
@@ -3005,7 +3178,7 @@ def test_shard_descriptions_check_each_environment_seed_against_its_index() -> N
   that shard i carries the seed its index derives, which is what makes the
   identity's single seed record and a sharded resume describe the same run.
   """
-  setup = SimpleNamespace(base_seed=5)
+  setup = cast(CohortSetup, SimpleNamespace(base_seed=5))
   first = _shard_description()
   derived = worker_env_seed(setup.base_seed, 1)
   correct = _with_audit(

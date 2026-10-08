@@ -67,7 +67,9 @@ def test_config_preserves_accepted_defaults_and_rejects_invalid_values() -> None
   config = TrainingConfig()
   assert config.learning_rate == pytest.approx(5e-4)
   assert config.beta == pytest.approx(0.01)
-  assert config.accumulation_steps == 15
+  assert config.accumulation_steps == 2
+  assert config.minibatch_size == 16_384
+  assert config.accumulation_steps * config.minibatch_size == 32_768
   with pytest.raises(ValueError, match="positive"):
     TrainingConfig(learning_rate=0.0)
   with pytest.raises(ValueError, match="finite"):

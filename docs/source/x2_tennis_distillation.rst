@@ -225,16 +225,109 @@ Selection syntax
 ``--teacher-ids`` (plural) selects the cohort path. The two are mutually
 exclusive and supplying both is refused **before any environment is
 constructed**. With neither flag the single-teacher path keeps the historical
-``tennis_000`` default, so every existing invocation behaves exactly as before.
+``tennis_000`` selection. Training batch defaults are described below; existing
+runs must repeat their saved batch settings on resume.
 
 This repository's shared Tyro configuration
 (``mjlab.TYRO_FLAGS``) sets ``UsePythonSyntaxForLiteralCollections``, so a
-collection flag takes a **Python literal** rather than a space-separated list:
+command-line flag takes a **Python literal** rather than a space-separated list:
 ``--teacher-ids "('tennis_000','tennis_001')"``. A single element keeps the
 trailing comma (``--teacher-ids "('tennis_000',)"``), because without it the
 literal is a string and not a tuple. The same spelling applies to
 ``evaluate-cohort --teacher-ids``; omitting it there evaluates every manifest
 teacher in manifest order.
+
+Collection-linked sample budgets
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Three optional flags link collection, supervision and retention. The formulas
+use the number of **selected motions**, not the manifest's total teacher count.
+
+* ``--envs-per-motion E`` derives ``num_envs = selected_motions * E``.
+* ``--draw-to-collection-ratio r`` derives
+  ``updates = ceil(r * num_envs * collection_steps / effective_batch)``.
+* ``--replay-retention-iterations h`` derives
+  ``replay_capacity = ceil(h * num_envs * collection_steps)``.
+
+``effective_batch = minibatch_size * accumulation_steps``. These two settings
+remain independent throughput controls. The defaults are microbatch **16384**
+and accumulation **2**, for an effective batch of **32768**. These are measured
+engineering defaults, not the paper's accumulation setting. CPU smoke tests
+must pass small explicit values. The draw ratio changes the number of complete
+optimizer updates, not the effective batch or learning rate.
+
+Existing checkpoints keep their saved batch settings. Resume must repeat those
+settings explicitly; equal effective batch alone does not permit a different
+microbatch/accumulation split.
+
+Each flag replaces one explicit total. Do not combine ``--envs-per-motion``
+with ``--num-envs``, the draw ratio with ``--updates-per-iteration``, or the
+retention horizon with ``--replay-capacity``. Conflicts fail before environment
+construction, even when an explicit value equals the old default. Other pairs
+can be configured independently. Unset pairs keep the historical defaults:
+1 environment, 1 update, and 16384 replay rows.
+
+.. code-block:: bash
+
+   # Example settings only. This command launches training when executed.
+   uv run distill train --manifest configs/distillation/x2_tennis.yaml \
+     --repo-root . --teacher-ids "('tennis_000','tennis_001')" \
+     --envs-per-motion 1024 --collection-steps 32 \
+     --draw-to-collection-ratio 1 --replay-retention-iterations 2 \
+     --minibatch-size 16384 --accumulation-steps 2 \
+     --device cuda:0 --max-iterations 10000 --seed 7 \
+     --output-dir logs/distillation/collection-linked-example
+
+At these example settings, each added equal-weight motion contributes 32768
+new rows, one optimizer update, and 65536 replay rows per iteration. This is
+budget arithmetic, not a validated quality recommendation.
+
+A fixed collection total can also use derived supervision. With
+``--num-envs 28672 --collection-steps 32 --minibatch-size 4096
+--accumulation-steps 8 --draw-to-collection-ratio 0.5``, the runner uses 14
+updates and 458752 draws for 917504 new rows. Integer updates round upward;
+reports show the achieved ratio, which can exceed the requested ratio.
+
+The ratio denominator is the nominal main-collection row count. Bootstrap,
+evaluation and extra terminal-predecessor coverage rows do not increase the
+resolved iteration budget. The numerator includes **all** replay draws.
+If protected sampling is added, its draws must fit inside this total. A draw
+can select an old or repeated row. The budget does not guarantee unique-row,
+phase, severity or full-motion coverage. Zero collection steps remain valid
+for legacy replay-only schedules, but cannot use derived draw/retention ratios.
+
+The existing manifest weights still control slot allocation, replay quotas
+and expected draws. With unequal weights, ``envs-per-motion`` is the mean
+allocation, not a minimum. Worker shards round their allocations separately.
+The derived environment total must divide evenly across workers; no silent
+rounding changes that total. Each worker must still represent every selected
+motion. Small or uneven allocations can produce different per-motion ratios.
+
+Reports and checkpoints add ``resolved_config.sample_budget``. It records
+requested inputs, resolved totals, expected per-motion draws, live slot counts
+and replay horizons. Existing iteration reports contain measured collection
+and optimizer sample counts. Budget inputs are audit metadata. Resume compares
+the resulting runtime, schedule, trainer and replay settings as before. An
+explicit-total invocation can resume a derived-budget run when those settings
+match; changing the resolved update count still fails resume.
+
+Collection implementation notes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The multi-motion command reuses validated flat reference indices while the
+exact motion/frame tensors and their version counters remain unchanged.
+Subset reset, frame advance, wrap, tensor replacement and restore writes force
+revalidation. Inference tensors have no version counters and remain uncached.
+Public motion-library queries still validate each call. Returned reference
+values remain owned tensors; the cache holds indices, not policy observations.
+
+Per-motion collection statistics keep owned pre-step metadata until report
+construction. Frame coverage, initialization counts and disagreement scalars
+are transferred in batches. Teacher/motion mapping checks still occur before
+each simulator step. Counts and tick-order disagreement sums keep their prior
+meaning. This does not change teacher labels, executed actions or reset RNGs.
+Local component benchmarks measure these paths only; full collector speed and
+long-run memory effects require separate validation.
 
 What M4 constructs
 ^^^^^^^^^^^^^^^^^^

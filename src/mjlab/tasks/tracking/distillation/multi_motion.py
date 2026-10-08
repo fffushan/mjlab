@@ -417,6 +417,9 @@ class MultiMotionCommand(SegmentMotionCommand):
       )
 
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self._reference_index_cache: (
+      tuple[torch.Tensor, int, torch.Tensor, int, MotionLibrary, torch.Tensor] | None
+    ) = None
     self.body_pos_relative_w = torch.zeros(
       self.num_envs, len(cfg.body_names), 3, device=self.device
     )
@@ -482,6 +485,42 @@ class MultiMotionCommand(SegmentMotionCommand):
 
   # Reference queries.
 
+  def _reference_index(self) -> torch.Tensor:
+    """Reuse validated indices only for the exact unchanged input tensors.
+
+    Tensor versions also track writes through views, subset reset, wrap and
+    restore. Replacement tensors/library force a fresh validation. Inference
+    tensors have no version counter, so that path deliberately never caches.
+    """
+    ids, frames = self.motion_ids, self.time_steps
+    if ids.is_inference() or frames.is_inference():
+      self._reference_index_cache = None
+      return self.library.flat_index(ids, frames)
+    ids_version, frames_version = ids._version, frames._version
+    cached = self._reference_index_cache
+    if (
+      cached is not None
+      and cached[0] is ids
+      and cached[1] == ids_version
+      and cached[2] is frames
+      and cached[3] == frames_version
+      and cached[4] is self.library
+    ):
+      return cached[5]
+    index = self.library.flat_index(ids, frames)
+    self._reference_index_cache = (
+      ids,
+      ids_version,
+      frames,
+      frames_version,
+      self.library,
+      index,
+    )
+    return index
+
+  def _reference_value(self, name: str) -> torch.Tensor:
+    return self.library._gather_at_index(name, self._reference_index())
+
   @property
   def motion(self) -> MotionLoader:
     """Refuse the single-clip loader: no scalar clip length bounds mixed rows.
@@ -502,67 +541,57 @@ class MultiMotionCommand(SegmentMotionCommand):
     frames = self.library.clamp_local_frames(
       self.motion_ids, self.time_steps + self.row_lookahead_steps
     )
+    index = self.library.flat_index(self.motion_ids, frames)
     return torch.cat(
       [
-        self.library.joint_pos(self.motion_ids, frames),
-        self.library.joint_vel(self.motion_ids, frames),
+        self.library._gather_at_index("joint_pos", index),
+        self.library._gather_at_index("joint_vel", index),
       ],
       dim=1,
     )
 
   @property
   def joint_pos(self) -> torch.Tensor:
-    return self.library.joint_pos(self.motion_ids, self.time_steps)
+    return self._reference_value("joint_pos")
 
   @property
   def joint_vel(self) -> torch.Tensor:
-    return self.library.joint_vel(self.motion_ids, self.time_steps)
+    return self._reference_value("joint_vel")
 
   @property
   def body_pos_w(self) -> torch.Tensor:
-    return (
-      self.library.body_pos_w(self.motion_ids, self.time_steps)
-      + self._env.scene.env_origins[:, None, :]
-    )
+    return self._reference_value("body_pos_w") + self._env.scene.env_origins[:, None, :]
 
   @property
   def body_quat_w(self) -> torch.Tensor:
-    return self.library.body_quat_w(self.motion_ids, self.time_steps)
+    return self._reference_value("body_quat_w")
 
   @property
   def body_lin_vel_w(self) -> torch.Tensor:
-    return self.library.body_lin_vel_w(self.motion_ids, self.time_steps)
+    return self._reference_value("body_lin_vel_w")
 
   @property
   def body_ang_vel_w(self) -> torch.Tensor:
-    return self.library.body_ang_vel_w(self.motion_ids, self.time_steps)
+    return self._reference_value("body_ang_vel_w")
 
   @property
   def anchor_pos_w(self) -> torch.Tensor:
     return (
-      self.library.body_pos_w(self.motion_ids, self.time_steps)[
-        :, self.motion_anchor_body_index
-      ]
+      self._reference_value("body_pos_w")[:, self.motion_anchor_body_index]
       + self._env.scene.env_origins
     )
 
   @property
   def anchor_quat_w(self) -> torch.Tensor:
-    return self.library.body_quat_w(self.motion_ids, self.time_steps)[
-      :, self.motion_anchor_body_index
-    ]
+    return self._reference_value("body_quat_w")[:, self.motion_anchor_body_index]
 
   @property
   def anchor_lin_vel_w(self) -> torch.Tensor:
-    return self.library.body_lin_vel_w(self.motion_ids, self.time_steps)[
-      :, self.motion_anchor_body_index
-    ]
+    return self._reference_value("body_lin_vel_w")[:, self.motion_anchor_body_index]
 
   @property
   def anchor_ang_vel_w(self) -> torch.Tensor:
-    return self.library.body_ang_vel_w(self.motion_ids, self.time_steps)[
-      :, self.motion_anchor_body_index
-    ]
+    return self._reference_value("body_ang_vel_w")[:, self.motion_anchor_body_index]
 
   # Command term hooks.
 

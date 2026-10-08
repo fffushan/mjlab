@@ -4,6 +4,19 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added command-local reuse of validated motion-reference indices. Reuse ends
+  when motion/frame tensors are replaced or their version counters change;
+  inference tensors use the validating uncached path. Public library queries
+  still validate every call. Per-motion collection counters now defer report
+  scalar transfers while preserving pre-step mapping checks and owned metadata.
+
+- Added configurable collection-linked VAE distillation budgets.
+  ``distill train`` can derive environment counts from selected motions,
+  optimizer updates from a draw-to-collection ratio, and replay capacity from
+  a retention horizon. Reports and checkpoints include resolved totals and
+  live per-motion allocations. Explicit legacy totals remain supported;
+  conflicting explicit and derived settings fail before construction.
+
 - Added the bounded D5 numerical/export parity gate under
   ``scripts/experiments/diffusion_d5_parity/``. It checks the active
   135-state/32-latent/167-token and 99-conditioning/31-action contract,
@@ -72,6 +85,15 @@ Added
 
 Changed
 ^^^^^^^
+
+- Changed VAE distillation defaults to a 16384-row microbatch and two
+  accumulation steps, preserving a 32768-row effective batch. Explicit batch
+  options remain supported. Existing checkpoints still require their stored
+  microbatch and accumulation settings on resume.
+
+- Reduced valid multi-motion reference-index checks to one combined host
+  Boolean decision. Invalid motion/frame inputs retain detailed rejection
+  and error precedence. No reference cache or sampling change is introduced.
 
 - Changed diffusion token-cache reuse and preparation. Existing valid caches are
   checked before the build-size ceiling. Missing provenance can use the same

@@ -475,6 +475,146 @@ def test_lookahead_clamps_inside_the_row_clip(tmp_path: Path) -> None:
   assert lookahead[0, 0] < SENTINEL_BASE
 
 
+def test_reference_index_reuse_invalidates_for_mutation_restore_and_replacement(
+  harness: tuple[MultiMotionCommand, _FakeEnv],
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  command, _ = harness
+  command.time_steps = torch.tensor([0, 1, 0, 2])
+  calls = []
+  original = MotionLibrary.flat_index
+
+  def tracked(self, ids, frames):
+    calls.append((ids.clone(), frames.clone()))
+    return original(self, ids, frames)
+
+  monkeypatch.setattr(MotionLibrary, "flat_index", tracked)
+  command._reference_index_cache = None
+  expected = command.library.joint_pos(command.motion_ids, command.time_steps)
+  calls.clear()
+  assert torch.equal(command.joint_pos, expected)
+  _ = command.joint_vel, command.body_pos_w, command.anchor_quat_w
+  assert len(calls) == 1
+  command.joint_pos.zero_()  # Gather output cannot mutate a cached index/reference.
+  assert torch.equal(command.joint_pos, expected)
+  assert len(calls) == 1
+  command.time_steps[:1].add_(1)  # View mutation changes the base version.
+  _ = command.joint_pos
+  assert len(calls) == 2
+  command.time_steps.copy_(torch.tensor([0, 1, 0, 2]))  # Restore-like mutation.
+  assert torch.equal(command.joint_pos, expected)
+  assert len(calls) == 3
+  command.time_steps = command.time_steps.clone()
+  _ = command.joint_vel
+  assert len(calls) == 4
+  command.motion_ids = command.motion_ids.clone()
+  _ = command.joint_pos
+  assert len(calls) == 5
+  selection = command.library.body_selection
+  assert selection is not None
+  command.library = command.library.with_body_selection(selection)
+  _ = command.anchor_pos_w
+  assert len(calls) == 6
+  command.time_steps[0] = 2  # Over-long frame in the two-frame clip.
+  with pytest.raises(MotionLibraryError, match="outside its clip"):
+    _ = command.joint_pos
+  command.time_steps[0] = 0
+  assert torch.equal(command.joint_pos, expected)
+  command.motion_ids[0] = -1
+  with pytest.raises(MotionLibraryError, match="motion_ids must be in"):
+    _ = command.joint_vel
+
+
+def test_reference_cache_does_not_reuse_inference_tensor_versions(
+  harness: tuple[MultiMotionCommand, _FakeEnv],
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  command, _ = harness
+  calls = []
+  original = MotionLibrary.flat_index
+
+  def tracked(self, ids, frames):
+    calls.append(1)
+    return original(self, ids, frames)
+
+  monkeypatch.setattr(MotionLibrary, "flat_index", tracked)
+  with torch.inference_mode():
+    command.time_steps = torch.tensor([0, 1, 0, 2])
+    _ = command.joint_pos, command.joint_vel
+    assert len(calls) == 2
+    command.time_steps[0] = 1
+    assert torch.equal(command.joint_pos[0], source_joint_pos(command.library, 0, 1))
+  assert command._reference_index_cache is None
+
+
+def test_reference_reuse_preserves_subset_reset_and_lookahead(
+  harness: tuple[MultiMotionCommand, _FakeEnv],
+) -> None:
+  command, env = harness
+  stabilize(command)
+  command.time_steps = torch.tensor([1, 2, 0, 3])
+  before = command.joint_pos.clone()
+  command.reset_to_frame(torch.tensor([1]), 0)
+  after = command.joint_pos
+  assert torch.equal(after[[0, 2, 3]], before[[0, 2, 3]])
+  assert torch.equal(after[1], source_joint_pos(command.library, 1, 0))
+  lookahead = command.lookahead_command
+  assert lookahead.shape == (4, 0)  # Disabled lookahead stays zero-width.
+  command._update_command()
+  assert torch.equal(
+    command.joint_pos,
+    command.library.joint_pos(command.motion_ids, command.time_steps),
+  )
+  env.reset(env_ids=torch.tensor([0, 2]))
+  assert torch.equal(
+    command.joint_pos,
+    command.library.joint_pos(command.motion_ids, command.time_steps),
+  )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_reference_index_reuse_tracks_cuda_subset_restore_and_bounds(
+  tmp_path: Path,
+) -> None:
+  specs = [
+    MotionClipSpec(
+      teacher_id=f"m{index}",
+      motion_file=write_reference_clip(
+        tmp_path / f"cuda-clip{index}.npz",
+        frames=frames,
+        joint_dim=JOINT_DIM,
+        bodies=SOURCE_BODIES,
+      ),
+    )
+    for index, frames in enumerate((2, 5))
+  ]
+  library = MotionLibrary.from_clips(specs, device="cuda:0")
+  command = object.__new__(MultiMotionCommand)
+  command.library = library
+  command.motion_ids = torch.tensor([0, 1], device="cuda:0")
+  command.time_steps = torch.tensor([1, 4], device="cuda:0")
+  command._reference_index_cache = None
+  before = command.joint_pos
+  with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+    _ = command.joint_vel
+  assert sum(e.count for e in p.key_averages() if e.key == "aten::item") == 0
+  command.time_steps[:1].copy_(torch.tensor([0], device="cuda:0"))
+  assert torch.equal(command.joint_pos[1], before[1])
+  assert torch.equal(
+    command.joint_pos, library.joint_pos(command.motion_ids, command.time_steps)
+  )
+  command.motion_ids[0] = -1
+  with pytest.raises(MotionLibraryError, match="motion_ids must be in"):
+    _ = command.joint_pos
+  torch.cuda.synchronize()
+  command.motion_ids[0] = 0
+  command.time_steps[0] = 2
+  with pytest.raises(MotionLibraryError, match="outside its clip"):
+    _ = command.joint_pos
+  command.time_steps[0] = 1
+  assert torch.equal(command.joint_pos, before)
+
+
 # Selection seam.
 
 

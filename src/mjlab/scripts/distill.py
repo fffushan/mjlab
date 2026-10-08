@@ -106,12 +106,20 @@ from mjlab.tasks.tracking.distillation.runner import (
   DistillationRunner,
   RunnerConfig,
 )
+from mjlab.tasks.tracking.distillation.sample_budget import (
+  SampleBudget,
+  resolve_sample_budget,
+)
 from mjlab.tasks.tracking.distillation.sharded_collection import ShardedCollection
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
 from mjlab.tasks.tracking.distillation.teachers import build_cohort_teacher_bank
 from mjlab.tasks.tracking.distillation.trainer import (
   TrainingConfig,
   VaeDistillationTrainer,
+)
+from mjlab.tasks.tracking.distillation.training_config import (
+  DEFAULT_ACCUMULATION_STEPS,
+  DEFAULT_MINIBATCH_SIZE,
 )
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
 from mjlab.tasks.tracking.distillation.worker import WorkerPool, worker_specs
@@ -1270,7 +1278,7 @@ def _cohort_resolved_config(
   repo_root: Path,
   sampling_mode: str,
   reset_policy_dict: Mapping[str, Any],
-  base_task: str,
+  base_task: str | None,
   identity: CohortIdentity,
   task_id: str | None,
   device: str,
@@ -1880,8 +1888,8 @@ def _train_single(
   teacher_probability: float = 0.0,
   evaluate_every: int = 0,
   evaluation_steps: int = 0,
-  minibatch_size: int = 256,
-  accumulation_steps: int = 15,
+  minibatch_size: int = DEFAULT_MINIBATCH_SIZE,
+  accumulation_steps: int = DEFAULT_ACCUMULATION_STEPS,
   replay_capacity: int = 16_384,
   learning_rate: float = 5e-4,
   beta: float = 0.01,
@@ -1893,6 +1901,7 @@ def _train_single(
   reset_policy: ResetPolicy = _REFERENCE_RESET_POLICY,
   output_dir: Path | None = None,
   resume: Path | None = None,
+  sample_budget: SampleBudget | None = None,
 ) -> int:
   """Run the bounded native single-teacher (M3) collect/update lifecycle."""
   runner = None
@@ -1920,6 +1929,7 @@ def _train_single(
       evaluation_steps=evaluation_steps,
       rollout_latent=rollout_latent,
     )
+    assert runner.collector is not None  # The single-teacher builder is in-process.
     seed_audit = _seed_audit(runner.collector.adapter)
     _require_requested_seed_applied(seed, seed_audit)
     resolved_config = _resolved_config(
@@ -1938,6 +1948,13 @@ def _train_single(
       resume=resume,
       checkpoint_every=checkpoint_every,
     )
+    if sample_budget is not None:
+      resolved_config["sample_budget"] = sample_budget.as_dict(
+        teacher_ids=(teacher_id,),
+        slot_counts=(num_envs,),
+        weights=(1.0,),
+        replay_quotas=(runner.replay.capacity,),
+      )
     resume_audit = None
     if resume is not None:
       state = runner.resume(
@@ -2008,7 +2025,7 @@ def _train_single(
     print(f"[FAIL] {exc}", file=sys.stderr)
     return 1
   finally:
-    if runner is not None:
+    if runner is not None and runner.collector is not None:
       close = getattr(runner.collector.adapter, "close", None)
       if callable(close):
         close()
@@ -2048,6 +2065,7 @@ def _train_cohort(
   reset_policy: ResetPolicy,
   coverage_policy: Literal["off", "difficult-state-coverage"] = "off",
   coverage_parity_evidence: Path | None = None,
+  sample_budget: SampleBudget | None = None,
 ) -> int:
   """Run the bounded shared-student M4 cohort collect/update lifecycle.
 
@@ -2186,6 +2204,13 @@ def _train_cohort(
       coverage_policy=resolved_coverage,
       coverage_evidence=coverage_evidence,
     )
+    if sample_budget is not None:
+      resolved_config["sample_budget"] = sample_budget.as_dict(
+        teacher_ids=identity.teacher_ids,
+        slot_counts=identity.slots.counts,
+        weights=identity.slots.weights,
+        replay_quotas=runner.replay.quota.quotas,
+      )
     resume_audit = None
     if resume is not None:
       # ``resume_cohort`` reproduces the whole stored cohort record strictly
@@ -2304,17 +2329,20 @@ def _train(
   teacher_ids: tuple[str, ...] = (),
   task_id: str | None = None,
   device: str = "cpu",
-  num_envs: int = 1,
+  num_envs: int | None = None,
   max_iterations: int = 1,
   bootstrap_steps: int = 0,
   collection_steps: int = 32,
-  updates_per_iteration: int = 1,
+  updates_per_iteration: int | None = None,
   teacher_probability: float = 0.0,
   evaluate_every: int = 0,
   evaluation_steps: int = 0,
-  minibatch_size: int = 256,
-  accumulation_steps: int = 15,
-  replay_capacity: int = 16_384,
+  minibatch_size: int = DEFAULT_MINIBATCH_SIZE,
+  accumulation_steps: int = DEFAULT_ACCUMULATION_STEPS,
+  replay_capacity: int | None = None,
+  envs_per_motion: int | None = None,
+  draw_to_collection_ratio: float | None = None,
+  replay_retention_iterations: float | None = None,
   phase_bins: int | None = None,
   worker_devices: tuple[str, ...] | None = None,
   learning_rate: float = 5e-4,
@@ -2344,10 +2372,29 @@ def _train(
   configuration uses Python literal syntax for collections, so the plural form
   is ``--teacher-ids ('tennis_000','tennis_001')``; a single element keeps a
   trailing comma (``--teacher-ids ('tennis_000',)``).  With neither flag the
-  single-teacher path uses the historical ``tennis_000`` default, so an existing
-  invocation behaves exactly as before.  A cohort run always samples phases
-  uniformly and records that policy as an explicit private override, and it
-  saves and resumes version-2 cohort checkpoints instead of version-1 ones.
+  single-teacher path uses the historical ``tennis_000`` default. A cohort run
+  always samples phases uniformly and records that policy as an explicit
+  private override. It saves and resumes version-2 cohort checkpoints instead
+  of version-1 ones.
+
+  ``envs_per_motion`` derives ``num_envs = selected_motion_count * value``.
+  It replaces ``num_envs``; unequal manifest weights still distribute the total
+  by the existing policy, so the value is a mean, not a per-motion minimum.
+  ``draw_to_collection_ratio`` derives complete optimizer updates as
+  ``ceil(ratio * num_envs * collection_steps / (minibatch_size *
+  accumulation_steps))`` and replaces ``updates_per_iteration``.
+  ``replay_retention_iterations`` derives replay capacity as
+  ``ceil(horizon * num_envs * collection_steps)`` and replaces ``replay_capacity``.
+  Each derived option is mutually exclusive with its corresponding explicit
+  total. Unset pairs keep historical defaults (1 environment, 1 update, 16384
+  replay rows). Minibatch size defaults to 16384 and accumulation to 2,
+  giving an effective batch of 32768. Both remain configurable throughput
+  settings. CPU smoke tests should pass small explicit values. Existing runs
+  must repeat their stored minibatch and accumulation values on resume.
+  The ratio covers TOTAL replay draws, including any coverage rows; it does not
+  guarantee unique-row exposure. Reports/checkpoints record requested budgets,
+  resolved totals, and live per-motion allocations. These budget inputs are
+  audit-only: resume still checks the resolved runtime, schedule and replay.
 
   ``phase_bins`` applies only to the cohort path (``--teacher-ids``): unset
   (the default) keeps the historical density-proportional within-motion draw,
@@ -2444,6 +2491,21 @@ def _train(
       )
     )
   try:
+    sample_budget = resolve_sample_budget(
+      motion_count=len(teacher_ids) if teacher_ids else 1,
+      num_envs=num_envs,
+      envs_per_motion=envs_per_motion,
+      collection_steps=collection_steps,
+      minibatch_size=minibatch_size,
+      accumulation_steps=accumulation_steps,
+      updates_per_iteration=updates_per_iteration,
+      draw_to_collection_ratio=draw_to_collection_ratio,
+      replay_capacity=replay_capacity,
+      replay_retention_iterations=replay_retention_iterations,
+    )
+    num_envs = sample_budget.num_envs
+    updates_per_iteration = sample_budget.updates_per_iteration
+    replay_capacity = sample_budget.replay_capacity
     resolved_worker_devices = _resolve_worker_devices(worker_devices, num_envs=num_envs)
   except ValueError as exc:
     return _fail(exc)
@@ -2494,6 +2556,7 @@ def _train(
       reset_policy=resolved_reset_policy,
       coverage_policy=coverage_policy,
       coverage_parity_evidence=coverage_parity_evidence,
+      sample_budget=sample_budget,
     )
   return _train_single(
     manifest=manifest,
@@ -2521,6 +2584,7 @@ def _train(
     report_boundaries=report_boundaries,
     output_dir=output_dir,
     resume=resume,
+    sample_budget=sample_budget,
   )
 
 

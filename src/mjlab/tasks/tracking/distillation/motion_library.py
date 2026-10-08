@@ -516,6 +516,23 @@ class MotionLibrary:
 
   # Reference gathers.
 
+  def _gather_at_index(self, name: str, index: torch.Tensor) -> torch.Tensor:
+    """Private command seam; index must come from this library's flat_index.
+
+    Public queries below still validate every call. The command may reuse a
+    validated index only while its exact motion/frame tensor versions match.
+    Advanced indexing returns fresh values; no mutable reference view escapes.
+    """
+    if name == "joint_pos":
+      return self._joint_pos[index]
+    if name == "joint_vel":
+      return self._joint_vel[index]
+    if self._selection_index is None:
+      raise MotionLibraryError(
+        "body references need a resolved body selection; call with_body_selection"
+      )
+    return self._flat_body(name)[index][:, self._selection_index]
+
   def joint_pos(
     self, motion_ids: torch.Tensor, local_frames: torch.Tensor
   ) -> torch.Tensor:
@@ -565,16 +582,24 @@ class MotionLibrary:
     frames = self._index_tensor(local_frames, "local_frames")
     self._require_same_shape(ids, frames)
     if ids.numel():
-      if bool((ids < 0).any()) or bool((ids >= self.num_motions).any()):
-        raise MotionLibraryError(
-          f"motion_ids must be in [0, {self.num_motions}); ids "
-          f"[{int(ids.min())}, {int(ids.max())}] were requested"
-        )
-      counts = self._frame_counts[ids]
-      if bool((frames < 0).any()):
-        raise MotionLibraryError("local_frames must be non-negative")
-      if bool((frames >= counts).any()):
-        offending = int(frames[frames >= counts][0])
+      # Use safe ids for the speculative length gather. Invalid ids still fail
+      # below before they can address reference storage. Combine all valid-path
+      # checks into one host Boolean conversion instead of four CUDA waits.
+      invalid_ids = (ids < 0) | (ids >= self.num_motions)
+      counts = self._frame_counts[ids.clamp(0, self.num_motions - 1)]
+      negative_frames = frames < 0
+      long_frames = frames >= counts
+      if bool((invalid_ids | negative_frames | long_frames).any()):
+        # Keep detailed diagnostics and their historical precedence on the
+        # exceptional path; optimization must not accept malformed inputs.
+        if bool(invalid_ids.any()):
+          raise MotionLibraryError(
+            f"motion_ids must be in [0, {self.num_motions}); ids "
+            f"[{int(ids.min())}, {int(ids.max())}] were requested"
+          )
+        if bool(negative_frames.any()):
+          raise MotionLibraryError("local_frames must be non-negative")
+        offending = int(frames[long_frames][0])
         raise MotionLibraryError(
           f"local frame {offending} is outside its clip; clip lengths are "
           "per-row and frames are never padded or carried into the next clip"

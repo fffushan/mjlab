@@ -14,7 +14,7 @@ no optimizer, normalizer update, checkpoint, or CLI lifecycle.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
@@ -642,6 +642,10 @@ class _MotionRecord:
   frame_max: int | None = None
   initialization_samples: dict[str, int] = field(default_factory=dict)
   early_transition_samples: dict[str, int] = field(default_factory=dict)
+  _pending_frames: list[
+    tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, int]
+  ] = field(default_factory=list, repr=False)
+  _pending_statistics: list[torch.Tensor] = field(default_factory=list, repr=False)
 
   def observe_tick(
     self,
@@ -651,27 +655,69 @@ class _MotionRecord:
     segment_age: torch.Tensor | None = None,
     early_window_frames: int = 25,
   ) -> None:
-    self.frames.update(int(value) for value in torch.unique(frames).tolist())
-    lowest = int(frames.min().item())
-    highest = int(frames.max().item())
+    # Keep owned PRE-step metadata until report construction. No per-frame,
+    # per-kind CUDA scalar conversion belongs in the collection tick loop.
+    self._pending_frames.append(
+      (
+        frames.detach().clone(),
+        None if initialization_kind is None else initialization_kind.detach().clone(),
+        None if segment_age is None else segment_age.detach().clone(),
+        early_window_frames,
+      )
+    )
+
+  def _flush_statistics(self) -> None:
+    if self._pending_statistics:
+      # Preserve each tick's float32 disagreement sum, then add Python doubles
+      # in tick order as before. Counts are exact for supported batch sizes.
+      values = torch.stack(self._pending_statistics).cpu().tolist()
+      for teacher_steps, disagreement in values:
+        self.teacher_steps += int(teacher_steps)
+        self.disagreement_sum += float(disagreement)
+      self.student_steps = self.samples - self.teacher_steps
+      self._pending_statistics.clear()
+    if not self._pending_frames:
+      return
+    chunks = self._pending_frames
+    packed = torch.cat(
+      [
+        torch.stack(
+          (
+            frames.to(torch.int64),
+            torch.zeros_like(frames) if kinds is None else kinds.to(torch.int64),
+            torch.zeros_like(frames) if ages is None else ages.to(torch.int64),
+          ),
+          dim=1,
+        )
+        for frames, kinds, ages, _ in chunks
+      ]
+    ).cpu()
+    all_frames = packed[:, 0]
+    self.frames.update(int(value) for value in torch.unique(all_frames).tolist())
+    lowest, highest = int(all_frames.min()), int(all_frames.max())
     self.frame_min = lowest if self.frame_min is None else min(self.frame_min, lowest)
     self.frame_max = highest if self.frame_max is None else max(self.frame_max, highest)
-    if initialization_kind is not None:
-      names = {0: "unknown", 1: "reference", 2: "standing"}
-      for kind in torch.unique(initialization_kind).tolist():
+    start = 0
+    names = {0: "unknown", 1: "reference", 2: "standing"}
+    for frames, kinds, ages, window in chunks:
+      rows = packed[start : start + frames.numel()]
+      start += frames.numel()
+      if kinds is None:
+        continue
+      for kind in torch.unique(rows[:, 1]).tolist():
         label = names.get(int(kind), "unknown")
-        rows = initialization_kind == kind
-        count = int(rows.sum().item())
-        self.initialization_samples[label] = (
-          self.initialization_samples.get(label, 0) + count
-        )
-        if segment_age is not None:
-          early = rows & (segment_age < early_window_frames)
+        mask = rows[:, 1] == kind
+        self.initialization_samples[label] = self.initialization_samples.get(
+          label, 0
+        ) + int(mask.sum())
+        if ages is not None:
           self.early_transition_samples[label] = self.early_transition_samples.get(
             label, 0
-          ) + int(early.sum().item())
+          ) + int((mask & (rows[:, 2] < window)).sum())
+    self._pending_frames.clear()
 
   def build(self, motion_id: int) -> MotionCollectionStats:
+    self._flush_statistics()
     return MotionCollectionStats(
       motion_id=motion_id,
       teacher_id=self.teacher_id,
@@ -726,11 +772,17 @@ def _observe_motion_tick(
         f"motion {motion} was labeled by teacher codes {record.teacher_code} and "
         f"{code} in one collection call; the motion-to-teacher mapping changed"
       )
-    record.samples += int(rows.sum().item())
-    record.teacher_steps += int(teacher_rows[rows].sum().item())
-    record.student_steps += int((~teacher_rows[rows]).sum().item())
-    record.disagreement_sum += float(disagreement[rows].sum().item())
-    record.disagreement_rows += int(rows.sum().item())
+    count = reference_frame[rows].numel()
+    record.samples += count
+    record.disagreement_rows += count
+    record._pending_statistics.append(
+      torch.stack(
+        (
+          teacher_rows[rows].sum().to(torch.float64),
+          disagreement[rows].sum().detach().to(torch.float64),
+        )
+      )
+    )
     record.observe_tick(
       reference_frame[rows],
       initialization_kind=(
@@ -1197,7 +1249,8 @@ class DAggerCollector:
           reset_codes,
         )
       )
-    disagreements: list[float] = []
+    disagreements: list[torch.Tensor] = []
+    teacher_row_counts: list[torch.Tensor] = []
     fresh_batches: list[LabeledReplayBatch] = []
     coverage_batches: list[LabeledReplayBatch] = []
     coverage_report: dict[str, int] = {}
@@ -1245,10 +1298,8 @@ class DAggerCollector:
         self._invalidate_on_failure(exc)
         raise
       row_disagreement = (teacher_action - student_action).abs().mean(dim=-1)
-      disagreement = float(row_disagreement.mean().item())
-      disagreements.append(disagreement)
-      teacher_steps += int(use_teacher.sum().item())
-      student_steps += int((~use_teacher).sum().item())
+      disagreements.append(row_disagreement.mean().detach())
+      teacher_row_counts.append(use_teacher.sum())
       try:
         # Attributing before the step keeps every counter on the PRE-step state,
         # so a row that the step resampled into another clip is still counted
@@ -1299,7 +1350,7 @@ class DAggerCollector:
           raise CollectionNumericalError(
             "enabled coverage collector has no MVP capture drain"
           )
-        captures = tuple(drain())
+        captures = tuple(cast(Iterable[Any], drain()))
         coverage_report["captures"] = coverage_report.get("captures", 0) + len(captures)
         if captures:
           try:
@@ -1342,13 +1393,17 @@ class DAggerCollector:
       if fresh_batch is None
       else FreshTrainingData(fresh_batch, config.collector_iteration)
     )
+    teacher_steps = int(torch.stack(teacher_row_counts).sum().item())
+    student_steps = samples - teacher_steps
+    # Keep the historical tick-order Python sum; only scalar transfer is batched.
+    tick_disagreements = torch.stack(disagreements).cpu().tolist()
     return CollectionResult(
       ticks,
       samples,
       teacher_steps,
       student_steps,
       tuple(boundaries),
-      sum(disagreements) / len(disagreements) if disagreements else 0.0,
+      sum(tick_disagreements) / len(tick_disagreements),
       tuple(diagnostics),
       fresh_data,
       _build_motion_stats(records),

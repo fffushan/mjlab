@@ -14,6 +14,14 @@ from typing import Literal
 
 TrainingLatentMode = Literal["sampled"]
 
+DEFAULT_MINIBATCH_SIZE = 16_384
+DEFAULT_ACCUMULATION_STEPS = 2
+"""Measured eight-teacher GPU starting point; effective batch is 32768.
+
+These are engineering defaults, not paper hyperparameters or a quality claim.
+CPU smoke tests and old checkpoint resumes should set their batch sizes explicitly.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class TrainingConfig:
@@ -28,8 +36,8 @@ class TrainingConfig:
 
   learning_rate: float = 5e-4
   beta: float = 0.01
-  accumulation_steps: int = 15
-  minibatch_size: int = 256
+  accumulation_steps: int = DEFAULT_ACCUMULATION_STEPS
+  minibatch_size: int = DEFAULT_MINIBATCH_SIZE
   latent_mode: TrainingLatentMode = "sampled"
   numerical_controls: bool = False
 
@@ -59,4 +67,10 @@ class TrainingConfig:
 DistillationTrainingConfig = TrainingConfig
 
 
-__all__ = ["DistillationTrainingConfig", "TrainingConfig", "TrainingLatentMode"]
+__all__ = [
+  "DEFAULT_ACCUMULATION_STEPS",
+  "DEFAULT_MINIBATCH_SIZE",
+  "DistillationTrainingConfig",
+  "TrainingConfig",
+  "TrainingLatentMode",
+]
