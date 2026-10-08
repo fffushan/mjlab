@@ -445,6 +445,7 @@ def build_multi_motion_environment(
   seed: int | None = None,
   reset_policy: ResetPolicy | None = None,
   coverage_policy: CoveragePolicy | None = None,
+  coverage_parity_evidence: str | None = None,
 ) -> ManagerBasedRlEnv:
   """Build one environment whose rows are pinned to different reference clips.
 
@@ -553,6 +554,11 @@ def build_multi_motion_environment(
     collector = build_coverage_collector(coverage_owner, coverage_policy)
     if collector is None:
       raise ValueError("an enabled coverage policy must produce a collector")
+    if coverage_parity_evidence is None:
+      raise ValueError(
+        "an enabled coverage policy needs restore-parity evidence before construction"
+      )
+    collector.authorize_live(coverage_parity_evidence)
     attach_coverage_collector(env, collector)
   env.cfg.__dict__["_distillation_semantic_overrides"] = tuple(semantic_overrides)
   env.cfg.__dict__["_distillation_reset_policy"] = reset_policy

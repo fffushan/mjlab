@@ -28,6 +28,7 @@ from mjlab.tasks.tracking.distillation.config import (
   DistillationError,
   ResolvedTeacher,
 )
+from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
 from mjlab.tasks.tracking.distillation.environment import (
   ReferenceBoundaryEvents,
   RuntimeSeedProvenance,
@@ -1606,6 +1607,8 @@ def make_multi_teacher_distillation_adapter(
   schema: VaeSchema | None = None,
   seed: int | None = None,
   reset_policy: ResetPolicy | None = None,
+  coverage_policy: CoveragePolicy | None = None,
+  coverage_parity_evidence: str | None = None,
 ) -> MultiMotionDistillationAdapter:
   """Build one mixed-slot env, audit every selected clip, and adapt it.
 
@@ -1624,6 +1627,8 @@ def make_multi_teacher_distillation_adapter(
     render_mode=render_mode,
     seed=seed,
     reset_policy=reset_policy,
+    coverage_policy=coverage_policy,
+    coverage_parity_evidence=coverage_parity_evidence,
   )
   try:
     bank = build_cohort_teacher_bank(cohort, device=device)

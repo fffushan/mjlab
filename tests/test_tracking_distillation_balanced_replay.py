@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -742,6 +743,46 @@ def test_normalizers_count_every_fresh_raw_row_once_not_balanced_draws() -> None
   with pytest.raises(TrainerValidationError, match="already used"):
     trainer.update_normalizers_from_new_data(fresh, update_id="collector-0")
   assert float(model.reference_normalizer.state_dict()["count"]) == 8
+
+
+def test_coverage_sampling_forces_one_unknown_mvp_row() -> None:
+  base = make_motion_batch([0, 0, 0, 1, 1, 1])
+  batch = replace(
+    base,
+    initialization_kind=torch.tensor([1, 1, 0, 1, 1, 0], dtype=torch.int64),
+    segment_initial_reference_frame=torch.zeros(6, dtype=torch.int64),
+    segment_age=torch.zeros(6, dtype=torch.int64),
+  )
+  buffer = BalancedReplayBuffer(
+    8,
+    DEFAULT_SCHEMA,
+    {0: 1.0, 1: 1.0},
+    teacher_codes=CODES,
+    frame_counts=FRAMES,
+    provenance_enabled=True,
+    coverage_sampling=True,
+  )
+  buffer.insert(batch)
+
+  drawn = buffer.sample(4, generator=torch.Generator().manual_seed(3))
+
+  assert drawn.initialization_kind is not None
+  assert bool((drawn.initialization_kind == 0).any().item())
+  assert buffer.coverage_drawn >= 1
+  report = buffer.report().as_dict()
+  assert report["coverage_sampling"] is True
+  assert report["coverage_drawn"] >= 1
+  restored = BalancedReplayBuffer(
+    8,
+    DEFAULT_SCHEMA,
+    {0: 1.0, 1: 1.0},
+    teacher_codes=CODES,
+    frame_counts=FRAMES,
+    provenance_enabled=True,
+    coverage_sampling=True,
+  )
+  restored.load_state_dict(buffer.state_dict())
+  assert restored.coverage_drawn == buffer.coverage_drawn
 
 
 def test_report_exposes_capacity_occupancy_and_coverage() -> None:

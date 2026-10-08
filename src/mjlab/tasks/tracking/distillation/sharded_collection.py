@@ -39,6 +39,7 @@ from mjlab.tasks.tracking.distillation.collector import (
   RolloutLatent,
   SegmentBoundary,
   aggregate_evaluation_metrics,
+  concat_replay_batches,
 )
 from mjlab.tasks.tracking.distillation.storage import (
   LabeledReplayBatch,
@@ -364,6 +365,31 @@ def _move_batch(batch: LabeledReplayBatch, device: torch.device) -> LabeledRepla
   )
 
 
+def _merge_coverage_batches(
+  replies: Sequence[CollectReply], *, device: torch.device
+) -> LabeledReplayBatch | None:
+  """Merge one-step coverage rows and namespace worker-local segments."""
+  batches: list[LabeledReplayBatch] = []
+  for index, reply in enumerate(replies):
+    batch = reply.coverage_batch
+    if batch is None:
+      continue
+    if batch.batch_size:
+      local = batch.episode_id
+      if (
+        int(local.min().item()) < 0 or int(local.max().item()) >= WORKER_SEGMENT_STRIDE
+      ):
+        raise ShardedCollectionError(
+          f"worker {index} produced coverage segment ids outside the worker range"
+        )
+    namespaced = replace(
+      batch,
+      episode_id=batch.episode_id + index * WORKER_SEGMENT_STRIDE,
+    )
+    batches.append(_move_batch(namespaced, device))
+  return concat_replay_batches(batches)
+
+
 def merge_collection_replies(
   replies: Sequence[CollectReply],
   *,
@@ -397,17 +423,21 @@ def merge_collection_replies(
       entry = initialization_resets.setdefault(motion, {})
       for kind, count in counts.items():
         entry[kind] = entry.get(kind, 0) + count
+  coverage_batch = _merge_coverage_batches(replies, device=device)
+  coverage_report: dict[str, int] = {}
+  for reply in replies:
+    for name, value in reply.coverage_report.items():
+      coverage_report[name] = coverage_report.get(name, 0) + int(value)
+  disagreement_mean = _weighted_mean(
+    [(reply.disagreement_mean, reply.samples) for reply in replies], empty=0.0
+  )
   return CollectionResult(
     ticks=ticks,
     samples=samples,
     teacher_steps=sum(reply.teacher_steps for reply in replies),
     student_steps=sum(reply.student_steps for reply in replies),
     boundaries=tuple(boundaries),
-    disagreement_mean=float(
-      _weighted_mean(
-        [(reply.disagreement_mean, reply.samples) for reply in replies], empty=0.0
-      )
-    ),
+    disagreement_mean=0.0 if disagreement_mean is None else disagreement_mean,
     diagnostics=tuple(diagnostics),
     fresh_data=FreshTrainingData(batch, iteration),
     motion_stats=merge_motion_stats(
@@ -416,6 +446,8 @@ def merge_collection_replies(
     ),
     eligible_resets=eligible_resets,
     initialization_resets=initialization_resets,
+    coverage_batch=coverage_batch,
+    coverage_report=coverage_report,
   )
 
 
@@ -635,7 +667,12 @@ class ShardedCollection:
       assert result.fresh_data is not None
       # The insert is the first durable effect of the iteration and it happens
       # only here, after every shard has answered and the merged rows validate.
-      self.replay.insert(result.fresh_data.batch)
+      all_rows = [result.fresh_data.batch]
+      if result.coverage_batch is not None:
+        all_rows.append(result.coverage_batch)
+      merged_rows = concat_replay_batches(all_rows)
+      assert merged_rows is not None
+      self.replay.insert(merged_rows)
     except BaseException as exc:
       self._requires_reset = True
       self._invalidation_cause = f"{type(exc).__name__}: {exc}"

@@ -346,6 +346,8 @@ class BalancedReplayReport:
   ready: bool
   unready_motion_ids: tuple[int, ...]
   motions: tuple[MotionReplayStats, ...]
+  coverage_sampling: bool = False
+  coverage_drawn: int = 0
 
   @property
   def occupancy(self) -> float:
@@ -353,7 +355,7 @@ class BalancedReplayReport:
     return self.retained / self.capacity
 
   def as_dict(self) -> dict[str, Any]:
-    return {
+    result: dict[str, Any] = {
       "capacity": self.capacity,
       "retained": self.retained,
       "inserted": self.inserted,
@@ -363,6 +365,14 @@ class BalancedReplayReport:
       "unready_motion_ids": list(self.unready_motion_ids),
       "motions": [motion.as_dict() for motion in self.motions],
     }
+    if self.coverage_sampling:
+      result.update(
+        {
+          "coverage_sampling": True,
+          "coverage_drawn": self.coverage_drawn,
+        }
+      )
+    return result
 
 
 @dataclass(slots=True)
@@ -438,6 +448,7 @@ class BalancedReplayBuffer:
     dtype: torch.dtype | None = None,
     provenance_enabled: bool | None = None,
     phase_bins: int = 0,
+    coverage_sampling: bool = False,
   ) -> None:
     if not isinstance(schema, VaeSchema):
       raise ReplayValidationError("schema must be a VaeSchema")
@@ -479,6 +490,8 @@ class BalancedReplayBuffer:
     self._dtype = dtype
     self._size = 0
     self._provenance_enabled = provenance_enabled
+    self._coverage_sampling = bool(coverage_sampling)
+    self._coverage_drawn = 0
     self._layout = _storage_layout(schema, bool(provenance_enabled))
     self._partitions = {
       motion_id: _MotionPartition(motion_id=motion_id, quota=quota.quota_for(motion_id))
@@ -565,6 +578,16 @@ class BalancedReplayBuffer:
   def phase_bins(self) -> int:
     """Configured within-motion phase-balancing cells; 0 is disabled."""
     return self._phase_bins
+
+  @property
+  def coverage_sampling(self) -> bool:
+    """Whether one unknown/protected MVP row is forced into each draw."""
+    return self._coverage_sampling
+
+  @property
+  def coverage_drawn(self) -> int:
+    """Count MVP coverage rows included in replay draws."""
+    return self._coverage_drawn
 
   @property
   def unready_motion_ids(self) -> tuple[int, ...]:
@@ -655,6 +678,8 @@ class BalancedReplayBuffer:
       ready=self.ready,
       unready_motion_ids=self.unready_motion_ids,
       motions=motions,
+      coverage_sampling=self._coverage_sampling,
+      coverage_drawn=self._coverage_drawn,
     )
 
   def _partition(self, motion_id: int) -> _MotionPartition:
@@ -1018,10 +1043,24 @@ class BalancedReplayBuffer:
       )
       storage = partition.storage
       assert storage is not None
+      if self._coverage_sampling and "initialization_kind" in storage:
+        active = _active_indices(partition, storage["reference"].device)
+        unknown = active[storage["initialization_kind"][active] == 0]
+        selected_unknown = storage["initialization_kind"][indices] == 0
+        if unknown.numel() and not bool(selected_unknown.any().item()):
+          pick = torch.randint(
+            unknown.numel(), (1,), device=random_device, generator=generator
+          )
+          forced = unknown[pick.to(device=unknown.device)].reshape(1)
+          indices = indices.clone()
+          indices[0] = forced[0]
+        self._coverage_drawn += int(
+          (storage["initialization_kind"][indices] == 0).sum().item()
+        )
       for name, _ in self._layout:
         parts.setdefault(name, []).append(storage[name][indices])
       partition.drawn += count
-      if storage is not None and "initialization_kind" in storage:
+      if "initialization_kind" in storage:
         names = {0: "unknown", 1: "reference", 2: "standing"}
         for kind in torch.unique(storage["initialization_kind"][indices]).tolist():
           label = names.get(int(kind), "unknown")
@@ -1066,6 +1105,9 @@ class BalancedReplayBuffer:
     }
     if self._provenance_enabled:
       state["layout"] = "provenance-v1"
+    if self._coverage_sampling:
+      state["coverage_sampling"] = True
+      state["coverage_drawn"] = self._coverage_drawn
     return state
 
   @staticmethod
@@ -1109,29 +1151,46 @@ class BalancedReplayBuffer:
   def _validated_state(
     self, state: Mapping[str, Any]
   ) -> tuple[
-    dict[int, _MotionPartition], torch.device | None, torch.dtype | None, bool
+    dict[int, _MotionPartition], torch.device | None, torch.dtype | None, bool, int
   ]:
     """Validate one complete checkpoint state into a candidate replacement."""
     enabled = state.get("layout") == "provenance-v1"
-    required = {
-      "kind",
-      "version",
-      "capacity",
-      "schema",
-      "device",
-      "dtype",
-      "motion_ids",
-      "weights",
-      "quotas",
-      "teacher_codes",
-      "frame_counts",
-      "size",
-      "partitions",
-    } | ({"layout"} if enabled else set())
+    coverage_enabled = state.get("coverage_sampling") is True
+    required = (
+      {
+        "kind",
+        "version",
+        "capacity",
+        "schema",
+        "device",
+        "dtype",
+        "motion_ids",
+        "weights",
+        "quotas",
+        "teacher_codes",
+        "frame_counts",
+        "size",
+        "partitions",
+      }
+      | ({"layout"} if enabled else set())
+      | ({"coverage_sampling", "coverage_drawn"} if coverage_enabled else set())
+    )
     if set(state) != required:
       raise ReplayValidationError("replay state has missing or unknown fields")
     if self._provenance_enabled is not None and enabled != self._provenance_enabled:
       raise ReplayValidationError("replay checkpoint layout does not match buffer")
+    if coverage_enabled != self._coverage_sampling:
+      raise ReplayValidationError("replay coverage sampling does not match buffer")
+    if coverage_enabled:
+      coverage_drawn = state["coverage_drawn"]
+      if (
+        isinstance(coverage_drawn, bool)
+        or not isinstance(coverage_drawn, int)
+        or coverage_drawn < 0
+      ):
+        raise ReplayValidationError("replay coverage draw counter is invalid")
+    else:
+      coverage_drawn = 0
     if state["kind"] != _STATE_KIND:
       raise ReplayValidationError("replay state is not a balanced motion replay")
     if state["version"] != _STATE_VERSION:
@@ -1214,7 +1273,7 @@ class BalancedReplayBuffer:
       raise ReplayValidationError(
         f"replay size {size} disagrees with the {total} retained partition rows"
       )
-    return candidate, device, dtype, enabled
+    return candidate, device, dtype, enabled, coverage_drawn
 
   @staticmethod
   def _resolved_storage_policy(
@@ -1350,7 +1409,7 @@ class BalancedReplayBuffer:
     """
     if not isinstance(state, Mapping):
       raise ReplayValidationError("replay state must be a mapping")
-    partitions, device, dtype, enabled = self._validated_state(state)
+    partitions, device, dtype, enabled, coverage_drawn = self._validated_state(state)
     if self._device is not None and device is not None and self._device != device:
       raise ReplayValidationError("checkpoint replay device does not match buffer")
     if self._dtype is not None and dtype is not None and self._dtype != dtype:
@@ -1359,6 +1418,7 @@ class BalancedReplayBuffer:
     self._device = device
     self._dtype = dtype
     self._provenance_enabled = enabled
+    self._coverage_drawn = coverage_drawn
     self._layout = _storage_layout(self.schema, enabled)
     self._partitions = partitions
     if self._phase_bins:

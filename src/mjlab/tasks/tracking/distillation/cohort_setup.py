@@ -17,8 +17,11 @@ to the checkpoint: iteration ``k`` always draws the same randomness for worker
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -114,6 +117,7 @@ class CohortSetup:
   schema_mode: str = "gravity"
   numerical_controls: bool = False
   coverage_policy: CoveragePolicy | None = None
+  coverage_parity_evidence: str | None = None
 
   def resolve(self) -> CohortContract:
     """Load and validate the cohort manifest this setup names."""
@@ -128,7 +132,13 @@ class CohortSetup:
     environment exactly, because the derivation adds zero for the first worker.
     """
     cohort = self.resolve()
-    schema = make_schema(self.schema_mode, joint_order=cohort.actions.joint_names)
+    actions = getattr(cohort, "actions", None)
+    joint_order = getattr(actions, "joint_names", None)
+    schema = (
+      make_schema(self.schema_mode)
+      if joint_order is None
+      else make_schema(self.schema_mode, joint_order=joint_order)
+    )
     return make_multi_teacher_distillation_adapter(
       cohort,
       self.teacher_ids,
@@ -139,6 +149,8 @@ class CohortSetup:
       seed=worker_env_seed(self.base_seed, worker_index),
       reset_policy=self.reset_policy,
       schema=schema,
+      coverage_policy=self.coverage_policy,
+      coverage_parity_evidence=self.coverage_parity_evidence,
     )
 
   def build_student(
@@ -173,13 +185,44 @@ def resolve_coverage_policy(choice: str) -> CoveragePolicy | None:
   return CoveragePolicy.difficult_state_coverage()
 
 
-def require_coverage_execution(policy: CoveragePolicy | None) -> None:
-  """Fail closed while live coverage collection remains gated."""
+def require_coverage_execution(
+  policy: CoveragePolicy | None,
+  parity_evidence: Path | str | None = None,
+  *,
+  manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+  """Validate the bounded MVP execution gate and return evidence metadata.
+
+  The MVP does not execute teacher branches.  It does require a measured
+  restore-parity report before it accepts captured states for training.
+  """
   if policy is None:
-    return
-  raise NotImplementedError(
-    "coverage collection has no execution path in this tree. The dry-run "
-    "inspection command reports the resolved policy, and no run may enable "
-    "collection until the live producer and collection gates are accepted. "
-    "Live collection stays blocked; the contract records execution_authorized: false."
-  )
+    return {}
+  if parity_evidence is None or not str(parity_evidence).strip():
+    raise ValueError(
+      "difficult-state coverage requires --coverage-parity-evidence pointing to "
+      "a passing restore-parity report"
+    )
+  path = Path(parity_evidence)
+  if not path.is_file():
+    raise ValueError(f"coverage parity evidence does not exist: {path}")
+  try:
+    payload = json.loads(path.read_text())
+  except (OSError, json.JSONDecodeError) as exc:
+    raise ValueError(f"coverage parity evidence is not valid JSON: {path}") from exc
+  if not isinstance(payload, dict):
+    raise ValueError("coverage parity evidence must contain a JSON object")
+  if payload.get("kind") != "x2-vae-coverage-restore-parity-v1":
+    raise ValueError("coverage parity evidence has an unsupported kind")
+  if payload.get("status") != "pass":
+    raise ValueError("coverage parity evidence must have status 'pass'")
+  if manifest_sha256 is not None and payload.get("manifest_sha256") != manifest_sha256:
+    raise ValueError("coverage parity evidence belongs to a different cohort manifest")
+  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+  return {
+    "kind": payload["kind"],
+    "status": payload["status"],
+    "path": str(path),
+    "sha256": digest,
+    "manifest_sha256": payload.get("manifest_sha256"),
+  }

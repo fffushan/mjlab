@@ -52,11 +52,40 @@ class CoverageCollector:
   ) -> tuple[TerminalCapture, ...]:
     if not self.enabled:
       return ()
+    if isinstance(termination, dict):
+      terminated = termination.get("terminated")
+      if isinstance(terminated, torch.Tensor):
+        if terminated.ndim != 1 or terminated.shape[0] != env_ids.shape[0]:
+          raise ValueError("coverage termination flags must align with env_ids")
+        env_ids = env_ids[terminated.to(device=env_ids.device, dtype=torch.bool)]
+        if env_ids.numel() == 0:
+          return ()
     captures = self.component.capture_raw_reached_pre_reset(
       env_ids, termination=termination
     )
     self._captures.extend(captures)
     return captures
+
+  def authorize_live(self, parity_evidence: str) -> None:
+    """Authorize capture/restore against measured parity evidence."""
+    self.component.authorize_live(parity_evidence)
+
+  def drain_terminal_captures(self) -> tuple[TerminalCapture, ...]:
+    """Return captures not yet consumed by the training collector."""
+    captures = tuple(self._captures)
+    self._captures.clear()
+    self.component.take_terminal_captures()
+    return captures
+
+  def drain_for_barrier(self) -> dict[str, int]:
+    """Drain the MVP capture queue at a checkpoint barrier.
+
+    The MVP has no pending teacher branches.  The method still implements the
+    fixed barrier seam so a checkpoint cannot silently retain live captures.
+    """
+    drained = len(self._captures)
+    self.drain_terminal_captures()
+    return {"drained": drained, "started": 0, "dropped": 0}
 
   def admit(self, seed: BranchSeed) -> bool:
     if not self.enabled:
@@ -117,17 +146,26 @@ class CoveragePreResetRecorder(RecorderTerm):
     collector = getattr(env, COVERAGE_COLLECTOR_ATTRIBUTE, None)
     if collector is None or not getattr(collector, "enabled", False):
       return
-    collector.record_pre_reset(env_ids, termination=_termination_reason(env))
+    collector.record_pre_reset(env_ids, termination=_termination_reason(env, env_ids))
     self.records += 1
 
 
-def _termination_reason(env: Any) -> dict[str, Any]:
-  """Name the active termination terms at the pre-reset instant, when available."""
+def _termination_reason(env: Any, env_ids: torch.Tensor) -> dict[str, Any]:
+  """Return per-row termination status at the pre-reset instant."""
+  result: dict[str, Any] = {}
+  for name in ("reset_terminated", "reset_time_outs"):
+    value = getattr(env, name, None)
+    if isinstance(value, torch.Tensor):
+      if value.ndim != 1 or value.shape[0] <= int(env_ids.max().item()):
+        raise ValueError(f"{name} does not cover the reset environment rows")
+      result[name.removeprefix("reset_")] = (
+        value.index_select(0, env_ids).detach().clone()
+      )
   manager = getattr(env, "termination_manager", None)
   names = getattr(manager, "active_terms", None)
   if names:
-    return {"active_terms": tuple(str(name) for name in names)}
-  return {}
+    result["active_terms"] = tuple(str(name) for name in names)
+  return result
 
 
 def attach_coverage_collector(env: Any, collector: Any) -> None:

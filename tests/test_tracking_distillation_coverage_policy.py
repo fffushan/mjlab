@@ -30,6 +30,8 @@ def test_confirmed_policy_round_trips_with_stable_identity() -> None:
   assert dict(policy.scope)["conditioning_dim"] == 99
   assert dict(policy.scope)["latent_dim"] == 32
   assert dict(policy.scope)["action_dim"] == 31
+  assert "cohort_manifest" not in dict(policy.scope)
+  assert "manifest_sha256" not in dict(policy.scope)
   assert dict(policy.tier_probabilities) == {
     "baseline": 0.6,
     "moderate": 0.3,

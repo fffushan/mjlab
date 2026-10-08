@@ -34,10 +34,12 @@ from mjlab.tasks.tracking.distillation.collector import (
   EvaluationMode,
   EvaluationResult,
   RolloutLatent,
+  concat_replay_batches,
   evaluate_distillation,
 )
 from mjlab.tasks.tracking.distillation.storage import ReplayBufferProtocol
 from mjlab.tasks.tracking.distillation.trainer import (
+  FreshTrainingData,
   TrainingUpdate,
   VaeDistillationTrainer,
 )
@@ -209,6 +211,16 @@ class DistillationRunner:
         "resume segment namespace could not find the fresh collection records"
       )
     fresh_batch = result.fresh_data.batch
+    coverage_batch = result.coverage_batch
+    if self._segment_namespace:
+      coverage_batch = (
+        None
+        if coverage_batch is None
+        else replace(
+          coverage_batch,
+          episode_id=coverage_batch.episode_id + self._segment_namespace,
+        )
+      )
     rebased_batch = replace(
       fresh_batch,
       episode_id=fresh_batch.episode_id + self._segment_namespace,
@@ -216,6 +228,7 @@ class DistillationRunner:
     return replace(
       result,
       fresh_data=replace(result.fresh_data, batch=rebased_batch),
+      coverage_batch=coverage_batch,
     )
 
   def run_iteration(self) -> LifecycleIteration:
@@ -244,6 +257,15 @@ class DistillationRunner:
     self._reset_required = False
     updates: list[TrainingUpdate] = []
     fresh = collection.fresh_data
+    batches = []
+    if fresh is not None:
+      batches.append(fresh.batch)
+    if collection.coverage_batch is not None:
+      batches.append(collection.coverage_batch)
+    combined = concat_replay_batches(batches)
+    if combined is not None:
+      collector_iteration = int(combined.collector_iteration[0].item())
+      fresh = FreshTrainingData(combined, collector_iteration)
     if fresh is not None:
       self.trainer.begin_training(fresh)
     if len(self.replay) > 0:

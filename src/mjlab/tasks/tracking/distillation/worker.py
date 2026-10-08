@@ -236,6 +236,8 @@ class CollectReply:
   boundaries: tuple[Any, ...]
   rows_per_tick: int
   batch: LabeledReplayBatch
+  coverage_batch: LabeledReplayBatch | None = None
+  coverage_report: dict[str, int] = field(default_factory=dict)
   eligible_resets: dict[int, int] = field(default_factory=dict)
   initialization_resets: dict[int, dict[str, int]] = field(default_factory=dict)
   motion_frames: tuple[tuple[int, tuple[int, ...]], ...] = ()
@@ -529,6 +531,12 @@ class _Worker:
     batch = result.fresh_data.batch
     if result.ticks <= 0 or batch.batch_size % result.ticks != 0:
       raise WorkerError("collection returned an unsliceable fresh batch")
+    coverage_batch = getattr(result, "coverage_batch", None)
+    staged_coverage = (
+      None
+      if not isinstance(coverage_batch, LabeledReplayBatch)
+      else _stage_batch(coverage_batch)
+    )
     return CollectReply(
       call_id=request.call_id,
       iteration=request.iteration,
@@ -542,6 +550,8 @@ class _Worker:
       boundaries=tuple(result.boundaries),
       rows_per_tick=batch.batch_size // result.ticks,
       batch=_stage_batch(batch),
+      coverage_batch=staged_coverage,
+      coverage_report=dict(getattr(result, "coverage_report", {})),
       eligible_resets=dict(result.eligible_resets),
       initialization_resets={
         motion: dict(counts) for motion, counts in result.initialization_resets.items()
@@ -934,18 +944,25 @@ class WorkerPool:
       for index in range(len(self.specs))
     ]
     replies = list(self._exchange(requests))
+    typed_replies: list[CollectReply] = []
+    for reply in replies:
+      if not isinstance(reply, CollectReply):
+        raise self._abort(
+          f"worker returned {type(reply).__name__}, not a collect reply"
+        )
+      typed_replies.append(reply)
     if any(
       reply.rows_per_tick != spec.num_envs
-      for reply, spec in zip(replies, self.specs, strict=True)
+      for reply, spec in zip(typed_replies, self.specs, strict=True)
     ):
       raise self._abort(
         "workers returned row blocks that do not match their shard size"
       )
-    ticks = {reply.ticks for reply in replies}
+    ticks = {reply.ticks for reply in typed_replies}
     if len(ticks) != 1:
       raise self._abort(f"workers collected different tick counts: {sorted(ticks)}")
     assert ticks.pop() >= 0
-    return tuple(replies)
+    return tuple(typed_replies)
 
   def evaluate(
     self,
@@ -970,9 +987,14 @@ class WorkerPool:
       for index in range(len(self.specs))
     ]
     replies = self._exchange(requests)
+    typed_replies: list[EvaluateReply] = []
     for reply in replies:
-      assert isinstance(reply, EvaluateReply)
-    return tuple(replies)
+      if not isinstance(reply, EvaluateReply):
+        raise self._abort(
+          f"worker returned {type(reply).__name__}, not an evaluation reply"
+        )
+      typed_replies.append(reply)
+    return tuple(typed_replies)
 
 
 def worker_specs(
@@ -1049,6 +1071,10 @@ def validate_collect_reply(reply: CollectReply) -> None:
   if reply.batch.batch_size != reply.ticks * reply.rows_per_tick:
     raise WorkerError("collect reply main rows do not equal ticks times rows_per_tick")
   branch = reply.branch_batch
+  coverage = reply.coverage_batch
+  if coverage is not None:
+    if coverage.batch_size < 0 or coverage.schema != reply.batch.schema:
+      raise WorkerError("collect reply coverage rows have an invalid schema")
   if branch is None:
     return
   if branch.batch.batch_size != len(branch.metadata.rows):

@@ -85,7 +85,7 @@ class CoverageEnvironmentComponent:
 
   @property
   def live_ready(self) -> bool:
-    return False
+    return self.enabled and self._parity_evidence is not None
 
   def preflight(self) -> None:
     if not self.enabled:
@@ -302,11 +302,17 @@ class CoverageEnvironmentComponent:
   def terminal_captures(self) -> tuple[TerminalCapture, ...]:
     return tuple(self._terminal)
 
-  def clear_terminal_captures(self) -> None:
+  def take_terminal_captures(self) -> tuple[TerminalCapture, ...]:
+    """Return admitted captures and release their bounded state storage."""
+    captures = tuple(self._terminal)
     self._terminal.clear()
     self._terminal_records.clear()
     self._terminal_bytes = 0
     self._terminal_seen = 0
+    return captures
+
+  def clear_terminal_captures(self) -> None:
+    self.take_terminal_captures()
     self.counters.clear()
 
 

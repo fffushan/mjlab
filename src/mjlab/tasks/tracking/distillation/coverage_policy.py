@@ -57,6 +57,7 @@ def _tuple_names(value: object, name: str) -> tuple[str, ...]:
   result = tuple(value)
   if not all(isinstance(item, str) and item for item in result):
     raise CoveragePolicyError(f"{name} must contain non-empty names")
+  result = cast(tuple[str, ...], result)
   if len(set(result)) != len(result):
     raise CoveragePolicyError(f"{name} contains duplicate names")
   return result
@@ -163,9 +164,10 @@ class RootEnvelope:
       "linear_velocity_m_s": {"x", "y", "z"},
       "angular_velocity_rad_s": {"roll", "pitch", "yaw"},
     }
+    mapping = cast(Mapping[str, object], value)
     fields = []
     for key in required:
-      field = value[key]
+      field = mapping[key]
       if not isinstance(field, Mapping) or set(field) != axes[key]:
         raise CoveragePolicyError(f"{name}.{key} axes are malformed")
       fields.append(_mapping_numbers(field, f"{name}.{key}"))
@@ -545,11 +547,6 @@ class CoveragePolicy:
     return cls(
       mode="difficult-state-coverage",
       scope=(
-        ("cohort_manifest", "configs/distillation/x2_tennis_mixed_v3.yaml"),
-        (
-          "manifest_sha256",
-          "4b73aca9450d8186bdf2c12ab375899ec4d1420e7efe9e705aa160fa260b057a",
-        ),
         ("root_body", "pelvis"),
         ("anchor_body", "torso_link"),
         ("reference_dim", 68),
@@ -617,6 +614,7 @@ class CoveragePolicy:
   def from_dict(cls, payload: object) -> CoveragePolicy:
     if not isinstance(payload, Mapping):
       raise CoveragePolicyError("coverage policy must be a mapping")
+    payload = cast(Mapping[str, Any], payload)
     allowed = set(cls().as_dict()) | {"contract_id"}
     unknown = set(payload) - allowed
     if unknown:

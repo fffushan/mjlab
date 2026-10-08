@@ -920,9 +920,16 @@ inspection. It does not construct a simulator or authorize collection::
 
    uv run distill coverage-inspect --policy difficult-state-coverage
 
-The output includes the canonical policy identity and reports live collection as
-``blocked_pending_p2_next_transition_parity`` until that separately authorized
-gate is established. Fixed-state fidelity evaluation is exposed as a CPU API in
+The output includes the canonical policy identity. It reports the MVP collection
+profile as ``mvp_one_step_requires_restore_parity_evidence``. The MVP accepts
+``--coverage-parity-evidence`` only when the report has the matching manifest
+digest and a passing restore-parity result. A bounded cohort launch uses::
+
+   uv run distill train --teacher-ids "('inc000','inc001','inc002','inc003','inc004','inc005','inc006','inc007')" \
+     --coverage-policy difficult-state-coverage \
+     --coverage-parity-evidence logs/diagnostics/vae-coverage-mvp-20261008/restore-parity.json
+
+Multi-step branch continuation remains deferred. Fixed-state fidelity evaluation is exposed as a CPU API in
 ``mjlab.tasks.tracking.distillation.coverage_evaluator``. It splits complete
 source families before scoring and reports normalized teacher-action RMS/p95,
 optional target-position metrics, and motion/source/severity strata. It does

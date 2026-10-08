@@ -36,6 +36,7 @@ from mjlab.tasks.tracking.distillation.adapter import (
   make_multi_teacher_distillation_adapter,
 )
 from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuffer
+from mjlab.tasks.tracking.distillation.branch_state import BranchState
 from mjlab.tasks.tracking.distillation.checkpoint import (
   CHECKPOINT_VERSION,
   COHORT_CHECKPOINT_VERSION,
@@ -123,6 +124,7 @@ _COMMANDS = (
   "play",
   "export",
   "coverage-inspect",
+  "coverage-parity",
 )
 SamplingMode = Literal["start", "uniform"]
 ResetProfile = Literal["standing-start", "standing-window"]
@@ -189,6 +191,7 @@ _COHORT_RESUME_INVARIANT_KEYS = (
   "trainer",
   "replay",
   "model",
+  "coverage",
 )
 """Cohort entries a version-2 resume must reproduce; only the budget grows.
 
@@ -230,6 +233,10 @@ def _print_help(stream) -> None:
   )
   print(
     "  export              Export an audited checkpoint into a v2 VAE bundle.",
+    file=stream,
+  )
+  print(
+    "  coverage-parity     Measure X2 capture/restore policy-input parity.",
     file=stream,
   )
   print(file=stream)
@@ -1086,6 +1093,7 @@ def _build_cohort_runner(
       device=torch.device(device),
       dtype=torch.float32,
       phase_bins=phase_bins,
+      coverage_sampling=setup.coverage_policy is not None,
     )
     identity = cohort_identity_from_adapter(adapter, replay=replay)
     trainer = VaeDistillationTrainer(
@@ -1192,6 +1200,7 @@ def _build_sharded_cohort_runner(
       device=torch.device(device),
       dtype=torch.float32,
       phase_bins=phase_bins,
+      coverage_sampling=setup.coverage_policy is not None,
     )
     # The identity describes the run, so it carries the run's slot allocation
     # rather than shard 0's: a shard's rows (and its seeded per-row clip
@@ -1268,6 +1277,8 @@ def _cohort_resolved_config(
   runner: DistillationRunner,
   resume: Path | None,
   checkpoint_every: int,
+  coverage_policy: CoveragePolicy | None,
+  coverage_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
   """Complete resolved M4 configuration recorded in every cohort checkpoint.
 
@@ -1292,6 +1303,14 @@ def _cohort_resolved_config(
     "mapping_digest": identity.mapping_digest,
     "phase_policy": identity.slots.phase_policy,
     "reset_policy": dict(reset_policy_dict),
+    "coverage": {
+      "mode": "off" if coverage_policy is None else coverage_policy.mode,
+      "policy_identity": (
+        None if coverage_policy is None else coverage_policy.identity
+      ),
+      "execution_profile": ("legacy" if coverage_policy is None else "mvp-one-step"),
+      "parity_evidence": dict(coverage_evidence),
+    },
     "task": base_task,
     "task_id": task_id,
     "runtime": {
@@ -1320,6 +1339,7 @@ def _cohort_resolved_config(
       "quotas": list(quota.quotas),
       "motion_ids": list(replay.motion_ids),
       "phase_bins": replay.phase_bins,
+      "coverage_sampling": replay.coverage_sampling,
     },
     "model": {
       "settings": trainer.model.settings.to_metadata(),
@@ -1397,6 +1417,26 @@ def _boundaries_report(collection, mode: ReportBoundaries):
   return _boundary_summary(collection)
 
 
+def _coverage_summary(iterations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+  """Summarize the one-step coverage rows collected by the lifecycle."""
+  totals: dict[str, int] = {}
+  for report in iterations:
+    collection = report.get("collection")
+    if not isinstance(collection, Mapping):
+      continue
+    coverage = collection.get("coverage")
+    if not isinstance(coverage, Mapping):
+      continue
+    for name, value in coverage.items():
+      if isinstance(value, int) and not isinstance(value, bool):
+        totals[str(name)] = totals.get(str(name), 0) + value
+  return {
+    "execution_profile": "mvp-one-step",
+    "rows": totals.get("replay_inserted", 0),
+    "counters": totals,
+  }
+
+
 def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
   collection = iteration.collection
   return {
@@ -1413,6 +1453,10 @@ def _iteration_report(iteration, report_boundaries: ReportBoundaries) -> dict:
       "diagnostics": list(collection.diagnostics),
       "boundaries": _boundaries_report(collection, report_boundaries),
       "motion_stats": [stats.as_dict() for stats in collection.motion_stats],
+      "coverage": dict(collection.coverage_report),
+      "coverage_rows": (
+        0 if collection.coverage_batch is None else collection.coverage_batch.batch_size
+      ),
       "fresh_data_samples": (
         None
         if collection.fresh_data is None
@@ -1999,6 +2043,7 @@ def _train_cohort(
   resume: Path | None,
   reset_policy: ResetPolicy,
   coverage_policy: Literal["off", "difficult-state-coverage"] = "off",
+  coverage_parity_evidence: Path | None = None,
 ) -> int:
   """Run the bounded shared-student M4 cohort collect/update lifecycle.
 
@@ -2033,7 +2078,11 @@ def _train_cohort(
       )
     cohort = _resolve(manifest, repo_root)
     resolved_coverage = resolve_coverage_policy(coverage_policy)
-    require_coverage_execution(resolved_coverage)
+    coverage_evidence = require_coverage_execution(
+      resolved_coverage,
+      coverage_parity_evidence,
+      manifest_sha256=cohort.manifest.sha256,
+    )
     setup = CohortSetup(
       manifest=manifest,
       repo_root=repo_root,
@@ -2045,6 +2094,9 @@ def _train_cohort(
       schema_mode=schema_mode,
       numerical_controls=numerical_controls,
       coverage_policy=resolved_coverage,
+      coverage_parity_evidence=(
+        None if not coverage_evidence else str(coverage_parity_evidence)
+      ),
     )
     if worker_devices:
       primary_build = _build_sharded_cohort_runner(
@@ -2126,6 +2178,8 @@ def _train_cohort(
       runner=runner,
       resume=resume,
       checkpoint_every=checkpoint_every,
+      coverage_policy=resolved_coverage,
+      coverage_evidence=coverage_evidence,
     )
     resume_audit = None
     if resume is not None:
@@ -2136,6 +2190,10 @@ def _train_cohort(
       resume_audit = _check_resume_compatibility(
         state, resolved_config, invariant_keys=_COHORT_RESUME_INVARIANT_KEYS
       )
+      if resolved_coverage is not None and "coverage" in resume_audit["unverified"]:
+        raise DistillationError(
+          "coverage resume requires a checkpoint with MVP coverage metadata"
+        )
     if output_dir is None:
       output_dir = _default_train_output_dir(task_id)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2185,6 +2243,13 @@ def _train_cohort(
       "resolved_config": resolved_config,
       "resume": resume_audit,
       "replay": runner.replay.report().as_dict(),
+      "coverage": {
+        "policy": None if resolved_coverage is None else resolved_coverage.as_dict(),
+        "policy_identity": (
+          None if resolved_coverage is None else resolved_coverage.identity
+        ),
+        **_coverage_summary(iteration_reports),
+      },
       "cohort": {
         "teacher_ids": list(identity.teacher_ids),
         "cohort_digest": identity.digest(),
@@ -2262,6 +2327,8 @@ def _train(
   standing_start_frame_zero_fraction: float = 0.5,
   output_dir: Path | None = None,
   resume: Path | None = None,
+  coverage_policy: Literal["off", "difficult-state-coverage"] = "off",
+  coverage_parity_evidence: Path | None = None,
 ) -> int:
   """Run a bounded native single-teacher or shared-student cohort lifecycle.
 
@@ -2375,6 +2442,19 @@ def _train(
     resolved_worker_devices = _resolve_worker_devices(worker_devices, num_envs=num_envs)
   except ValueError as exc:
     return _fail(exc)
+  if not teacher_ids and coverage_policy != "off":
+    return _fail(
+      ValueError(
+        "--coverage-policy applies only to the cohort path; use --teacher-ids "
+        "with difficult-state-coverage"
+      )
+    )
+  if not teacher_ids and coverage_parity_evidence is not None:
+    return _fail(
+      ValueError(
+        "--coverage-parity-evidence applies only to the cohort path; use --teacher-ids"
+      )
+    )
   if teacher_ids:
     return _train_cohort(
       manifest=manifest,
@@ -2407,6 +2487,8 @@ def _train(
       output_dir=output_dir,
       resume=resume,
       reset_policy=resolved_reset_policy,
+      coverage_policy=coverage_policy,
+      coverage_parity_evidence=coverage_parity_evidence,
     )
   return _train_single(
     manifest=manifest,
@@ -3547,6 +3629,95 @@ def _validate_teachers(
   return 0 if result["passed"] else 1
 
 
+def _coverage_parity(
+  manifest: Path = Path(
+    "configs/distillation/x2_tennis_increased_perturbation_a_v1.yaml"
+  ),
+  repo_root: Path = Path("."),
+  teacher_ids: tuple[str, ...] = (),
+  task_id: str | None = None,
+  device: str = "cpu",
+  num_envs: int = 2,
+  seed: int = 0,
+  report: Path = Path("logs/diagnostics/vae-coverage-restore-parity/REPORT.json"),
+) -> int:
+  """Measure policy-input parity after restoring one X2 row into another."""
+  adapter = None
+  payload: dict[str, Any] = {
+    "kind": "x2-vae-coverage-restore-parity-v1",
+    "status": "fail",
+    "manifest": str(manifest),
+    "teacher_ids": list(teacher_ids),
+    "device": device,
+    "num_envs": num_envs,
+    "seed": seed,
+  }
+  try:
+    if not teacher_ids:
+      raise ValueError("--teacher-ids is required for coverage parity")
+    if num_envs < 2:
+      raise ValueError("coverage parity needs at least two environments")
+    cohort = _resolve(manifest, repo_root)
+    adapter = make_multi_teacher_distillation_adapter(
+      cohort,
+      tuple(teacher_ids),
+      phase_policy="uniform",
+      task_id=task_id,
+      num_envs=num_envs,
+      device=device,
+      seed=seed,
+    )
+    adapter.reset(seed=seed)
+    source = BranchState.capture(adapter.env, env_index=0)
+    source.restore(adapter.env, env_index=1)
+    restored = BranchState.capture(adapter.env, env_index=1)
+    fields = (
+      "teacher_actor_view",
+      "student_reference",
+      "student_conditioning",
+      "previous_action",
+    )
+    max_errors: dict[str, float] = {}
+    for name in fields:
+      left = source.fields[name]
+      right = restored.fields[name]
+      if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+        raise ValueError(f"policy field {name} is not a tensor")
+      if left.shape != right.shape:
+        raise ValueError(f"policy field {name} shape changed after restore")
+      max_errors[name] = float((left - right).abs().max().item())
+    source.assert_policy_view(restored)
+    payload.update(
+      {
+        "status": "pass",
+        "manifest_sha256": cohort.manifest.sha256,
+        "schema": {
+          "reference_dim": adapter.schema.reference_dim,
+          "conditioning_dim": adapter.schema.conditioning_dim,
+          "latent_dim": adapter.schema.latent_dim,
+          "action_dim": adapter.schema.action_dim,
+        },
+        "source_row": 0,
+        "destination_row": 1,
+        "policy_input_max_abs_error": max_errors,
+        "policy_input_exact": all(value == 0.0 for value in max_errors.values()),
+      }
+    )
+  except (DistillationError, ValueError, RuntimeError) as exc:
+    payload["error"] = f"{type(exc).__name__}: {exc}"
+    print(f"[FAIL] {exc}", file=sys.stderr)
+  finally:
+    if adapter is not None:
+      adapter.close()
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+  if payload["status"] != "pass":
+    return 1
+  print(json.dumps(payload, indent=2, sort_keys=True))
+  print(f"[OK] wrote restore-parity evidence {report}", file=sys.stderr)
+  return 0
+
+
 def _coverage_inspect(
   policy: Literal["off", "difficult-state-coverage"] = "off",
   output: Path | None = None,
@@ -3563,7 +3734,8 @@ def _coverage_inspect(
     "policy": resolved.as_dict(),
     "runtime": {
       "enabled": resolved.enabled,
-      "live_collection": "blocked_pending_p2_next_transition_parity",
+      "live_collection": "mvp_one_step_requires_restore_parity_evidence",
+      "branch_continuation": "deferred",
       "physics": "not_run",
       "training": "not_run",
       "hardware": "not_run",
@@ -3595,6 +3767,7 @@ def main() -> None:
     "play": _play,
     "export": _export,
     "coverage-inspect": _coverage_inspect,
+    "coverage-parity": _coverage_parity,
   }
   raise SystemExit(
     tyro.cli(

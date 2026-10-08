@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from mjlab.tasks.tracking.distillation.adapter import (
   DistillationSnapshot,
   DistillationStep,
 )
+from mjlab.tasks.tracking.distillation.branch_state import BranchState
 from mjlab.tasks.tracking.distillation.collector import (
   CollectionConfig,
   CollectionNumericalError,
@@ -132,7 +134,59 @@ def _student() -> ConditionalVAE:
   return ConditionalVAE(DEFAULT_SCHEMA, ModelSettings(hidden_dims=(8, 8)))
 
 
-def test_collector_labels_pre_step_and_records_actual_previous_action() -> None:
+def test_coverage_capture_gets_one_step_teacher_label_and_replay_row() -> None:
+  adapter = FakeAdapter()
+  adapter.schema = DEFAULT_SCHEMA
+  state = BranchState(
+    fields={
+      "teacher_actor_view": torch.zeros(164),
+      "student_reference": torch.zeros(68),
+      "student_conditioning": torch.zeros(99),
+      "previous_action": torch.zeros(31),
+    },
+    manager_state={
+      "command": {
+        "row": {
+          "motion_ids": torch.tensor(4),
+          "_teacher_codes": torch.tensor(0),
+          "time_steps": torch.tensor(7),
+          "segment_ids": torch.tensor(3),
+        }
+      }
+    },
+  )
+  capture = SimpleNamespace(state=state)
+
+  class FakeCoverage:
+    enabled = True
+
+    def __init__(self) -> None:
+      self.pending = [capture]
+
+    def drain_terminal_captures(self):
+      pending, self.pending = self.pending, []
+      return pending
+
+  adapter.env = SimpleNamespace(coverage_collector=FakeCoverage())
+  replay = LabeledReplayBuffer(16, DEFAULT_SCHEMA)
+  collector = DAggerCollector(adapter, FakeTeacher(), _student(), replay)
+
+  result = collector.collect(CollectionConfig(steps=1), reset=True)
+
+  assert result.coverage_batch is not None
+  assert result.coverage_batch.batch_size == 1
+  assert result.coverage_report == {
+    "captures": 1,
+    "teacher_labels": 1,
+    "replay_inserted": 1,
+  }
+  assert len(replay) == 3
+  assert result.coverage_batch.reference_frame.tolist() == [7]
+  assert result.coverage_batch.episode_id.tolist() == [3]
+  torch.testing.assert_close(
+    result.coverage_batch.teacher_action, torch.full((1, 31), 2.0)
+  )
+
   adapter = FakeAdapter()
   replay = LabeledReplayBuffer(16, DEFAULT_SCHEMA)
   collector = DAggerCollector(adapter, FakeTeacher(), _student(), replay)

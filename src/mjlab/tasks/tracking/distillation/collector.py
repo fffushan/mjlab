@@ -225,6 +225,8 @@ class CollectionResult:
   motion_stats: tuple[MotionCollectionStats, ...] = ()
   eligible_resets: dict[int, int] = field(default_factory=dict)
   initialization_resets: dict[int, dict[str, int]] = field(default_factory=dict)
+  coverage_batch: LabeledReplayBatch | None = None
+  coverage_report: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,6 +543,13 @@ def _concat_batches(batches: list[LabeledReplayBatch]) -> LabeledReplayBatch | N
     ),
     **provenance_kwargs,
   )
+
+
+def concat_replay_batches(
+  batches: Sequence[LabeledReplayBatch],
+) -> LabeledReplayBatch | None:
+  """Concatenate non-empty replay batches while preserving their schema."""
+  return _concat_batches([batch for batch in batches if batch.batch_size > 0])
 
 
 def _ids(snapshot: DistillationSnapshot) -> tuple[torch.Tensor, torch.Tensor]:
@@ -931,6 +940,107 @@ def _replay_batch(
   )
 
 
+def _coverage_replay_batch(
+  captures: Sequence[Any],
+  teacher: FrozenTeacher | _TeacherLike | _TeacherBankLike,
+  schema: Any,
+  collector_iteration: int,
+  *,
+  include_provenance: bool = True,
+) -> LabeledReplayBatch:
+  """Turn pre-reset captures into one-step teacher-labelled replay rows."""
+  if not captures:
+    raise ValueError("coverage replay batch needs at least one capture")
+  rows: list[dict[str, torch.Tensor]] = []
+  for capture in captures:
+    fields = capture.state.fields
+    managers = capture.state.manager_state
+    command = managers.get("command") if isinstance(managers, Mapping) else None
+    row = command.get("row") if isinstance(command, Mapping) else None
+    if not isinstance(row, Mapping):
+      raise CollectionNumericalError(
+        "coverage capture has no saved multi-motion command row"
+      )
+    required = ("motion_ids", "_teacher_codes", "time_steps", "segment_ids")
+    if any(name not in row for name in required):
+      raise CollectionNumericalError(
+        "coverage capture command row is missing routing metadata"
+      )
+    reference = fields.get("student_reference")
+    conditioning = fields.get("student_conditioning")
+    teacher_view = fields.get("teacher_actor_view")
+    if not all(
+      isinstance(value, torch.Tensor)
+      for value in (reference, conditioning, teacher_view)
+    ):
+      raise CollectionNumericalError("coverage capture is missing cached policy inputs")
+    reference = reference.reshape(1, -1)
+    conditioning = conditioning.reshape(1, -1)
+    teacher_view = teacher_view.reshape(1, -1)
+    packed = PackedObservationBatch(reference, conditioning, schema)
+    packed.validate()
+    motion_id = row["motion_ids"].reshape(1).to(dtype=torch.int64)
+    teacher_code = row["_teacher_codes"].reshape(1).to(dtype=torch.int64)
+    reference_frame = row["time_steps"].reshape(1).to(dtype=torch.int64)
+    episode_id = row["segment_ids"].reshape(1).to(dtype=torch.int64)
+    if isinstance(teacher, TeacherBank):
+      action = teacher.label(teacher_code, teacher_view)
+    else:
+      single = cast(FrozenTeacher | _TeacherLike, teacher)
+      with torch.no_grad():
+        action = single.label(teacher_view)
+    _finite("coverage teacher label", action)
+    if action.shape != (1, teacher.action_dim):
+      raise CollectionNumericalError("coverage teacher label has an unexpected shape")
+    row_data = {
+      "reference": reference,
+      "conditioning": conditioning,
+      "teacher_action": action.detach().clone(),
+      "motion_id": motion_id,
+      "teacher_id": teacher_code,
+      "reference_frame": reference_frame,
+      "episode_id": episode_id,
+      "collector_iteration": torch.full(
+        (1,), collector_iteration, dtype=torch.int64, device=action.device
+      ),
+    }
+    if include_provenance:
+      row_data.update(
+        {
+          "initialization_kind": torch.zeros_like(motion_id),
+          "segment_initial_reference_frame": reference_frame.clone(),
+          "segment_age": torch.zeros_like(reference_frame),
+        }
+      )
+    rows.append(row_data)
+  observations = PackedObservationBatch(
+    torch.cat([row["reference"] for row in rows], dim=0),
+    torch.cat([row["conditioning"] for row in rows], dim=0),
+    schema,
+  )
+  provenance_kwargs: dict[str, torch.Tensor] = {}
+  if include_provenance:
+    provenance_kwargs = {
+      "initialization_kind": torch.cat(
+        [row["initialization_kind"] for row in rows], dim=0
+      ),
+      "segment_initial_reference_frame": torch.cat(
+        [row["segment_initial_reference_frame"] for row in rows], dim=0
+      ),
+      "segment_age": torch.cat([row["segment_age"] for row in rows], dim=0),
+    }
+  return LabeledReplayBatch(
+    observations=observations,
+    teacher_action=torch.cat([row["teacher_action"] for row in rows], dim=0),
+    motion_id=torch.cat([row["motion_id"] for row in rows], dim=0),
+    teacher_id=torch.cat([row["teacher_id"] for row in rows], dim=0),
+    reference_frame=torch.cat([row["reference_frame"] for row in rows], dim=0),
+    episode_id=torch.cat([row["episode_id"] for row in rows], dim=0),
+    collector_iteration=torch.cat([row["collector_iteration"] for row in rows], dim=0),
+    **provenance_kwargs,
+  )
+
+
 class DAggerCollector:
   """Collect valid pre-step labels from one adapter into raw replay.
 
@@ -959,6 +1069,11 @@ class DAggerCollector:
     self._requires_reset = False
     self._rng_initialized = False
     self._invalidation_cause: str | None = None
+
+  @property
+  def coverage(self) -> Any | None:
+    """Return the opt-in environment coverage collector, when present."""
+    return getattr(getattr(self.adapter, "env", None), "coverage_collector", None)
 
   def generator_state(self) -> torch.Tensor:
     """Return the persistent collection RNG state for lifecycle checkpoints."""
@@ -1084,6 +1199,8 @@ class DAggerCollector:
       )
     disagreements: list[float] = []
     fresh_batches: list[LabeledReplayBatch] = []
+    coverage_batches: list[LabeledReplayBatch] = []
+    coverage_report: dict[str, int] = {}
     records: dict[int, _MotionRecord] = {}
 
     if config.steps == 0:
@@ -1175,12 +1292,48 @@ class DAggerCollector:
         raise
       if boundary is not None:
         boundaries.append(boundary)
+      coverage_source = self.coverage
+      if coverage_source is not None and getattr(coverage_source, "enabled", False):
+        drain = getattr(coverage_source, "drain_terminal_captures", None)
+        if not callable(drain):
+          raise CollectionNumericalError(
+            "enabled coverage collector has no MVP capture drain"
+          )
+        captures = tuple(drain())
+        coverage_report["captures"] = coverage_report.get("captures", 0) + len(captures)
+        if captures:
+          try:
+            coverage_batch = _coverage_replay_batch(
+              captures,
+              self.teacher,
+              cast(Any, self.adapter).schema,
+              config.collector_iteration,
+              include_provenance=(
+                True
+                if self.replay is None
+                else bool(getattr(self.replay, "_provenance_enabled", False))
+              ),
+            )
+          except Exception as exc:
+            self._invalidate_on_failure(exc)
+            raise
+          coverage_batches.append(coverage_batch)
+          if self.replay is not None:
+            self.replay.insert(coverage_batch)
+          rows = coverage_batch.batch_size
+          coverage_report["teacher_labels"] = (
+            coverage_report.get("teacher_labels", 0) + rows
+          )
+          coverage_report["replay_inserted"] = (
+            coverage_report.get("replay_inserted", 0) + rows
+          )
       snapshot = next_snapshot
       self._snapshot = snapshot
       self._requires_reset = False
       ticks += 1
     self._snapshot = snapshot
     fresh_batch = _concat_batches(fresh_batches)
+    coverage_batch = _concat_batches(coverage_batches)
     fresh_data = (
       None
       if fresh_batch is None
@@ -1198,6 +1351,8 @@ class DAggerCollector:
       _build_motion_stats(records),
       eligible_resets,
       initialization_resets,
+      coverage_batch=coverage_batch,
+      coverage_report=coverage_report,
     )
 
 
@@ -1861,5 +2016,6 @@ __all__ = [
   "SegmentBoundary",
   "TeacherRoutingError",
   "collect_dagger",
+  "concat_replay_batches",
   "evaluate_distillation",
 ]

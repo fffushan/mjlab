@@ -52,14 +52,18 @@ Added
   family-disjoint fixed-state difficult-state fidelity evaluator. It reports
   teacher-label action RMS/p95 and optional target-position metrics without
   constructing physics, updating normalizers, launching training, or including
-  the held-out hardware fixture. Live collection remains fail-closed.
+  the held-out hardware fixture. The enabled MVP collection path requires a
+  passing restore-parity evidence file; multi-step branch continuation remains
+  deferred.
 
-- Integrated the difficult-state coverage lanes into one tree. The merge
-  provenance is ``MERGE-MANIFEST.md`` and the acceptance record is
-  ``ACCEPTANCE-20261007.md``. Added ``CohortSetup.coverage_policy`` and the
-  ``--coverage-policy {off,difficult-state-coverage}`` option on ``distill train``.
-  An enabled policy still stops at the execution gate until live collection
-  evidence is accepted.
+- Added the MVP difficult-state coverage execution path. ``distill train`` now
+  accepts ``--coverage-policy difficult-state-coverage`` and a matching
+  ``--coverage-parity-evidence`` report. The path captures physical terminal
+  states before reset, obtains one frozen-teacher label from cached 164-D actor
+  inputs, inserts the resulting 68/99/31 row into ordinary replay, reports
+  capture/label/insertion counters, and preserves the unchanged VAE objective.
+  Branch continuation, runtime coverage perturbations and protected replay
+  quotas remain deferred.
 
 Changed
 ^^^^^^^

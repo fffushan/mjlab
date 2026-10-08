@@ -1,10 +1,10 @@
 # P0 — X2 VAE difficult-state coverage contracts
 
-Date: 2026-10-01. Status: **P0 source audit/contracts complete; user confirmed
-numerical settings and authorized P1–P6 implementation by Luna/high subagents.
-P2 restore support and live physics remain unvalidated.** The P0 audit itself
-performed no source implementation, physics, training, remote connection,
-controller operation or commit.
+Date: 2026-10-01. Status: **full P0 branch contract remains unvalidated; an MVP
+one-step capture/label/replay path is now implemented and bounded simulator-tested.**
+The MVP has passing X2 policy-input restore-parity evidence for the selected
+``inc000``–``inc007`` cohort. It does not validate branch continuation, runtime
+coverage perturbations, protected replay, closed-loop quality or hardware.
 
 - Parent plan: [implementation phases](beyondmimic_vae_difficult_state_coverage_implementation.md).
 - Declarative proposal: [P0 contract YAML](beyondmimic_vae_difficult_state_coverage_p0_contract.yaml).

@@ -1,10 +1,11 @@
 # X2 VAE difficult-state coverage — implementation plan
 
-Status: **implementation authorized, not yet validated**. On 2026-10-01 the user
-confirmed P0 settings and requested P1–P6 implementation by `gpt-5.6-luna:high`
-subagents, with parent supervision every 15 minutes. Production training,
-remote/GPU jobs, live physics smoke, deployment and commits remain separate
-approval gates. The original planning request launched none of those operations.
+Status: **full P1–P6 implementation is not complete; the bounded MVP path is implemented and validated in the primary checkout**. The MVP captures physical terminal states before reset, labels them once with the frozen teacher, inserts them into ordinary replay, and keeps the existing VAE objective. It requires a passing restore-parity report. Multi-step teacher branches, runtime coverage perturbations and protected replay remain deferred.
+
+MVP evidence: ``logs/diagnostics/vae-coverage-mvp-20261008/`` contains the
+restore-parity report and bounded training/resume smoke artifacts. The smoke is
+simulator and lifecycle evidence only. It is not policy-quality, closed-loop,
+hardware or deployment evidence.
 
 Repository: `/home/agiuser/projects/mjlab`, branch `fxy/test/tracking-exp`.
 Observed planning baseline: `8dcd46dde7ca5dddd246245d4c3b15b19fdafc92`, clean tracked

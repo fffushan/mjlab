@@ -49,14 +49,24 @@ def test_require_coverage_execution_allows_the_disabled_path() -> None:
   require_coverage_execution(None)
 
 
-def test_require_coverage_execution_fails_closed_when_enabled() -> None:
+def test_require_coverage_execution_requires_parity_evidence() -> None:
   policy = resolve_coverage_policy("difficult-state-coverage")
-  with pytest.raises(NotImplementedError) as excinfo:
+  with pytest.raises(ValueError, match="coverage-parity-evidence") as excinfo:
     require_coverage_execution(policy)
-  message = str(excinfo.value)
-  # The refusal must say what is missing, and that nothing ran.
-  assert "no execution path" in message
-  assert "execution_authorized: false" in message
+  assert "restore-parity" in str(excinfo.value)
+
+
+def test_require_coverage_execution_accepts_passing_parity_evidence(tmp_path) -> None:
+  policy = resolve_coverage_policy("difficult-state-coverage")
+  evidence = tmp_path / "parity.json"
+  evidence.write_text(
+    '{"kind":"x2-vae-coverage-restore-parity-v1",'
+    '"status":"pass","manifest_sha256":"manifest"}'
+  )
+  result = require_coverage_execution(policy, evidence, manifest_sha256="manifest")
+  assert result["kind"] == "x2-vae-coverage-restore-parity-v1"
+  assert result["status"] == "pass"
+  assert len(result["sha256"]) == 64
 
 
 def test_cohort_setup_defaults_to_no_coverage_policy() -> None:

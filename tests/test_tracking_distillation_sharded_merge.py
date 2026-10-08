@@ -92,6 +92,8 @@ def _reply(
   boundaries: tuple[SegmentBoundary, ...] = (),
   diagnostics: tuple[str, ...] = (),
   batch: LabeledReplayBatch | None = None,
+  coverage_batch: LabeledReplayBatch | None = None,
+  coverage_report: dict[str, int] | None = None,
 ) -> CollectReply:
   rows = ticks * rows_per_tick
   return CollectReply(
@@ -107,10 +109,48 @@ def _reply(
     boundaries=boundaries,
     rows_per_tick=rows_per_tick,
     batch=_batch(rows, worker_index) if batch is None else batch,
+    coverage_batch=coverage_batch,
+    coverage_report={} if coverage_report is None else coverage_report,
   )
 
 
-def test_rows_merge_tick_major_with_workers_ascending_within_a_tick() -> None:
+def test_coverage_rows_merge_and_namespace_worker_segments() -> None:
+  def coverage(worker_index: int) -> LabeledReplayBatch:
+    return LabeledReplayBatch(
+      observations=PackedObservationBatch(
+        reference=torch.zeros(1, DEFAULT_SCHEMA.reference_dim),
+        conditioning=torch.zeros(1, DEFAULT_SCHEMA.conditioning_dim),
+        schema=DEFAULT_SCHEMA,
+      ),
+      teacher_action=torch.zeros(1, DEFAULT_SCHEMA.action_dim),
+      motion_id=torch.zeros(1, dtype=torch.long),
+      teacher_id=torch.zeros(1, dtype=torch.long),
+      reference_frame=torch.tensor([worker_index], dtype=torch.long),
+      episode_id=torch.tensor([worker_index], dtype=torch.long),
+      collector_iteration=torch.zeros(1, dtype=torch.long),
+    )
+
+  result = merge_collection_replies(
+    [
+      _reply(
+        worker_index=0,
+        coverage_batch=coverage(0),
+        coverage_report={"captures": 1, "replay_inserted": 1},
+      ),
+      _reply(
+        worker_index=1,
+        coverage_batch=coverage(1),
+        coverage_report={"captures": 2, "replay_inserted": 2},
+      ),
+    ],
+    iteration=4,
+    device=torch.device("cpu"),
+  )
+
+  assert result.coverage_batch is not None
+  assert result.coverage_batch.episode_id.tolist() == [0, WORKER_SEGMENT_STRIDE + 1]
+  assert result.coverage_report == {"captures": 3, "replay_inserted": 3}
+
   """Tick k from every worker precedes tick k+1.
 
   This is the FIFO ordering a full replay evicts by.  Sorting by worker

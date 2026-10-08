@@ -2,11 +2,13 @@
 # No collector implementation or resource allocation is authorized by this file.
 version: 1
 contract_id: x2-vae-difficult-state-coverage-p0-v1
-status: user_confirmed_settings_implementation_authorized
+status: user_confirmed_settings_mvp_one_step_implemented
 settings_confirmed_by_user: true
-# This document is still design data; it cannot authorize a training launch.
+# Full P0 branch execution remains closed. The MVP one-step path requires a
+# separate passing restore-parity report and does not authorize branches,
+# runtime perturbations or protected replay quotas.
 execution_authorized: false
-implementation_status: not_implemented
+implementation_status: mvp_one_step_capture_label_replay
 
 # The collection-barrier seed-queue policy is fixed here and must not change on
 # resume.  User decision, 2026-10-07: DRAIN AND CLEAR.
@@ -23,8 +25,10 @@ barrier_seed_queue_policy: drain_and_clear_with_counts
 barrier_seed_queue_user_decision: "2026-10-07"
 
 scope:
-  cohort_manifest: configs/distillation/x2_tennis_mixed_v3.yaml
-  manifest_sha256: 4b73aca9450d8186bdf2c12ab375899ec4d1420e7efe9e705aa160fa260b057a
+  # The selected cohort is a run identity, not part of the immutable physical
+  # coverage policy. The train report records both values.
+  cohort_manifest: runtime_selected_by_train_command
+  manifest_sha256: runtime_selected_manifest_sha256
   initial_test_member: tennis_001
   support: fixed_topology_x2_builtin_position_actuators
   root_body: pelvis
