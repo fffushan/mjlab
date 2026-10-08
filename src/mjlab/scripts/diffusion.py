@@ -179,22 +179,23 @@ def _ou_pair_block_reason(clean_result: Any) -> str | None:
 
 
 def _validate_trial_pairs(trials: tuple[Any, ...]) -> str | None:
-  """Require a complete clean phase before matching OU partners."""
+  """Require each OU trial to follow its own clean partner.
+
+  The former global phase check protected a process-wide snapshot map.  The
+  collector now checks each pair fingerprint and qualification at admission,
+  so unrelated clean and OU pairs may interleave.
+  """
   clean: dict[str, Any] = {}
   seen_ou: set[str] = set()
-  saw_ou = False
   for spec in trials:
     phase = getattr(spec, "phase", None)
     pair_id = getattr(spec, "pair_id", "")
     initial_state_id = getattr(spec, "initial_state_id", "")
     if phase == "clean":
-      if saw_ou:
-        return "the complete clean phase must precede every OU trial"
       if not pair_id or not initial_state_id or pair_id in clean:
         return "clean trials require unique pair and initial-state identities"
       clean[pair_id] = spec
     elif phase == "ou":
-      saw_ou = True
       if not pair_id or not initial_state_id:
         return "OU trials require a clean pair and initial-state identity"
       partner = clean.get(pair_id)
@@ -207,7 +208,7 @@ def _validate_trial_pairs(trials: tuple[Any, ...]) -> str | None:
       seen_ou.add(pair_id)
     else:
       return "trial phase must be clean or ou"
-  if seen_ou and set(clean) != seen_ou:
+  if set(clean) != seen_ou:
     return "complete clean/OU pair matrix is required before collection"
   return None
 
@@ -742,6 +743,45 @@ def _command_collect(args: argparse.Namespace) -> int:
   if pair_error is not None:
     print(pair_error, file=sys.stderr)
     return 2
+  if bool((bundle.runtime_provenance or {}).get("batched", False)):
+    batch = bundle.collector.collect_batched(
+      bundle.trials,
+      slots=args.max_envs,
+    )
+    transitions = sum(result.qualification.steps for result in batch.results)
+    ou_skipped = len(batch.skipped_ou_pairs)
+    ou_attempted = sum(result.spec.phase == "ou" for result in batch.results)
+    batched_results = [
+      {
+        "run_id": result.spec.run_id,
+        "motion_id": result.spec.motion_id,
+        "phase": result.spec.phase,
+        "qualified": result.qualification.qualified,
+        "label": result.qualification.label,
+        "reason": result.qualification.reason,
+        "rows": len(result.rows),
+        "accepted_rows": len(result.accepted_rows),
+        "verification_rows": len(result.verification_rows),
+        "stopped_reason": result.stopped_reason,
+        "store_files": list(result.store_files),
+      }
+      for result in batch.results
+    ]
+    payload = {
+      "contract_sha256": contract.contract_sha256,
+      "trials_attempted": len(batched_results),
+      "control_transitions": transitions,
+      "ou_trials_attempted": ou_attempted,
+      "ou_trials_skipped": ou_skipped,
+      "partial": False,
+      "stop_reason": None,
+      "results": batched_results,
+      "batched_store_files": list(batch.store_files),
+      "note": "pilot collection only; this command does not authorize bulk collection or training",
+    }
+    _json_write(args.report, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
   results: list[dict[str, Any]] = []
   transitions = 0
   clean_results: dict[str, Any] = {}

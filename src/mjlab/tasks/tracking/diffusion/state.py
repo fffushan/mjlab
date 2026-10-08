@@ -208,6 +208,29 @@ class WorldState:
   def count(self) -> int:
     return self.root_position.shape[0] if self.root_position.ndim == 2 else 1
 
+  def select(self, indices: np.ndarray | Iterable[int]) -> "WorldState":
+    """Return a copied row subset while preserving the batch axis."""
+    ids = np.asarray(tuple(indices), dtype=np.int64).reshape(-1)
+    if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.count):
+      raise StateValidationError("state selection indices are outside the batch")
+    if self.root_position.ndim != 2:
+      if ids.size != 1 or ids[0] != 0:
+        raise StateValidationError("a single state only supports selecting row zero")
+      return self
+    return type(self)(
+      *(
+        np.asarray(getattr(self, field))[ids].copy()
+        for field in (
+          "root_position",
+          "root_quaternion_wxyz",
+          "root_linear_velocity",
+          "root_angular_velocity",
+          "body_positions",
+          "body_linear_velocities",
+        )
+      )
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class WorldFrameContext:
