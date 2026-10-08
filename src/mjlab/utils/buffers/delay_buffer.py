@@ -239,17 +239,120 @@ class DelayBuffer:
     """
     self._buffer.backfill(data, batch_ids)
 
+  def capture_state(
+    self, batch_ids: torch.Tensor | Sequence[int] | None = None
+  ) -> dict[str, object]:
+    """Capture selected rows and scheduler configuration without alias loss."""
+    ids = (
+      torch.arange(self.batch_size, device=self.device)
+      if batch_ids is None
+      else torch.as_tensor(batch_ids, dtype=torch.long, device=self.device)
+    )
+    if (
+      ids.ndim != 1
+      or ids.numel() == 0
+      or ids.unique().numel() != ids.numel()
+      or bool((ids < 0).any())
+      or bool((ids >= self.batch_size).any())
+    ):
+      raise ValueError("delay capture row IDs are malformed")
+    captured = self._buffer.capture_state(ids)
+    captured["current_lags"] = self._current_lags.index_select(0, ids).detach().clone()
+    captured["step_count"] = self._step_count.index_select(0, ids).detach().clone()
+    captured["phase_offsets"] = (
+      self._phase_offsets.index_select(0, ids).detach().clone()
+    )
+    captured.update(
+      {
+        "min_lag": self.min_lag,
+        "max_lag": self.max_lag,
+        "source_batch_size": self.batch_size,
+        "per_env": self.per_env,
+        "hold_prob": self.hold_prob,
+        "update_period": self.update_period,
+        "per_env_phase": self.per_env_phase,
+        "generator_device": None
+        if self.generator is None
+        else str(getattr(self.generator, "device", "cpu")),
+        "generator_state": None
+        if self.generator is None
+        else self.generator.get_state().clone(),
+      }
+    )
+    return captured
+
+  def restore_state(
+    self, state: dict[str, object], batch_ids: torch.Tensor | None = None
+  ) -> None:
+    """Validate the full delay layout, then restore history and scheduler state."""
+    for name in (
+      "min_lag",
+      "max_lag",
+      "per_env",
+      "hold_prob",
+      "update_period",
+      "per_env_phase",
+    ):
+      if state.get(name) != getattr(self, name):
+        raise ValueError(f"delay-buffer layout mismatch for {name}")
+    rows = state.get("source_row_ids")
+    if not isinstance(rows, torch.Tensor):
+      raise ValueError("delay source row IDs are missing")
+    ids = (
+      torch.arange(self.batch_size, device=self.device)
+      if batch_ids is None
+      else torch.as_tensor(batch_ids, dtype=torch.long, device=self.device)
+    )
+    if (
+      ids.ndim != 1
+      or ids.numel() != rows.numel()
+      or ids.unique().numel() != ids.numel()
+      or bool((ids < 0).any())
+      or bool((ids >= self.batch_size).any())
+    ):
+      raise ValueError("delay destination row mapping is malformed")
+    values: dict[str, torch.Tensor] = {}
+    for name in ("current_lags", "step_count", "phase_offsets"):
+      value = state.get(name)
+      if (
+        not isinstance(value, torch.Tensor)
+        or value.shape != (rows.numel(),)
+        or value.dtype != torch.long
+      ):
+        raise ValueError(f"delay-buffer {name} has wrong shape or dtype")
+      values[name] = value
+    if bool((values["current_lags"] < self.min_lag).any()) or bool(
+      (values["current_lags"] > self.max_lag).any()
+    ):
+      raise ValueError("delay-buffer lags are out of range")
+    buffer_state = dict(state)
+    generator_state = state.get("generator_state")
+    generator_tensor: torch.Tensor | None = None
+    if self.generator is None:
+      if generator_state is not None:
+        raise ValueError("delay-buffer checkpoint contains an unexpected generator")
+    else:
+      if not isinstance(generator_state, torch.Tensor):
+        raise ValueError("delay-buffer generator state is missing")
+      generator_tensor = generator_state
+      if state.get("generator_device") != str(getattr(self.generator, "device", "cpu")):
+        raise ValueError("delay-buffer generator device mismatch")
+      try:
+        self.generator.clone_state().set_state(generator_tensor.detach().clone())
+      except (RuntimeError, TypeError) as exc:
+        raise ValueError("delay-buffer generator state is invalid") from exc
+    self._buffer.restore_state(buffer_state, ids)
+    self._current_lags[ids] = values["current_lags"].to(self.device)
+    self._step_count[ids] = values["step_count"].to(self.device)
+    self._phase_offsets[ids] = values["phase_offsets"].to(self.device)
+    if self.generator is not None:
+      assert generator_tensor is not None
+      self.generator.set_state(generator_tensor.detach().clone())
+
   def compute(self) -> torch.Tensor:
-    """Compute delayed observation for current step.
-
-    Advances the lag update schedule, then returns the delayed observation.
-
-    Returns:
-      Delayed observation with shape (batch_size, ...).
-    """
+    """Compute delayed observation and advance its lag schedule."""
     if not self.is_initialized:
       raise RuntimeError("Buffer not initialized. Call append() first.")
-
     self._update_lags()
     return self.peek()
 

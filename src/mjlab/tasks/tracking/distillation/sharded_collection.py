@@ -49,8 +49,10 @@ from mjlab.tasks.tracking.distillation.worker import (
   CollectReply,
   EvaluateReply,
   WorkerEnvironmentDescription,
+  WorkerError,
   WorkerPool,
   WorkerPoolError,
+  validate_collect_reply,
 )
 
 
@@ -240,6 +242,15 @@ def _require_mergeable(replies: Sequence[CollectReply]) -> tuple[int, int]:
         f"worker {index} returned {reply.batch.batch_size} rows, which is not "
         f"{ticks} ticks of {rows_per_tick} rows"
       )
+    # Branch rows are variable size: a bounded branch work unit has its own
+    # row count, so ticks * rows_per_tick cannot describe them.  Validate every
+    # reply here, before the parent touches its replay or its normalizers.
+    try:
+      validate_collect_reply(reply)
+    except WorkerError as exc:
+      raise ShardedCollectionError(
+        f"worker {index} returned an unusable collect reply: {exc}"
+      ) from exc
   return ticks, rows_per_tick
 
 
@@ -670,3 +681,86 @@ class ShardedCollection:
 
   def close(self) -> None:
     self.pool.close()
+
+
+def merge_branch_rows(
+  replies: Sequence[CollectReply], *, namespace_prefix: str = "branch"
+) -> Any | None:
+  """Concatenate every shard's branch rows into one enabled batch.
+
+  Order is defined here, not implied.  Workers appear in ascending order, and
+  within one reply the rows keep the metadata order that the collector produced:
+  terminal rows, then first-failure rows, then teacher-branch rows.  Two shards can
+  derive the same local row, family or branch identifier from the same clip, so each
+  reply is namespaced before the concatenation.  The merged store is then unique
+  across workers and across a resume.
+
+  The function returns ``None`` when no shard produced branch rows.  A malformed
+  payload fails in ``_require_mergeable`` before this function runs.
+  """
+  from mjlab.tasks.tracking.distillation.coverage_metadata import (
+    CoverageBatchMetadata,
+    namespace_coverage_rows,
+  )
+  from mjlab.tasks.tracking.distillation.coverage_storage import CoverageReplayBatch
+
+  present = [
+    (index, reply) for index, reply in enumerate(replies) if reply.branch_batch
+  ]
+  if not present:
+    return None
+  prefix = str(namespace_prefix).strip()
+  if not prefix or "/" in prefix:
+    raise ShardedCollectionError("a branch namespace must be a token without a slash")
+
+  def accessor(name: str) -> Callable[[LabeledReplayBatch], torch.Tensor]:
+    if name.startswith("observations."):
+      field = name.split(".", 1)[1]
+      return lambda batch: getattr(batch.observations, field)
+    return lambda batch: getattr(batch, name)
+
+  def merged(name: str) -> torch.Tensor:
+    blocks = [
+      accessor(name)(reply.branch_batch.batch).contiguous() for _, reply in present
+    ]
+    return torch.cat(blocks, dim=0)
+
+  provenance = [reply.branch_batch.batch.has_provenance for _, reply in present]
+  if any(provenance) and not all(provenance):
+    raise ShardedCollectionError(
+      "workers disagree about whether branch rows carry standing-start provenance; "
+      "merging them would invent a reference history"
+    )
+  rows = []
+  for index, reply in present:
+    rows.extend(
+      namespace_coverage_rows(
+        reply.branch_batch.metadata.rows, namespace=f"{prefix}-w{index}"
+      )
+    )
+  first = present[0][1].branch_batch.batch
+  observations = replace(
+    first.observations,
+    reference=merged("observations.reference"),
+    conditioning=merged("observations.conditioning"),
+  )
+  batch = replace(
+    first,
+    observations=observations,
+    teacher_action=merged("teacher_action"),
+    motion_id=merged("motion_id"),
+    teacher_id=merged("teacher_id"),
+    reference_frame=merged("reference_frame"),
+    episode_id=merged("episode_id"),
+    collector_iteration=merged("collector_iteration"),
+  )
+  if all(provenance):
+    batch = replace(
+      batch,
+      initialization_kind=merged("initialization_kind"),
+      segment_initial_reference_frame=merged("segment_initial_reference_frame"),
+      segment_age=merged("segment_age"),
+    )
+  return CoverageReplayBatch(
+    batch, CoverageBatchMetadata(rows=tuple(rows), batch_id="")
+  )

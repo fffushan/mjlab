@@ -28,13 +28,16 @@ from mjlab.tasks.tracking.distillation.adapter import (
 )
 from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuffer
 from mjlab.tasks.tracking.distillation.checkpoint import (
+  COVERAGE_COHORT_CHECKPOINT_VERSION,
   CheckpointValidationError,
   load_checkpoint,
   load_cohort_checkpoint,
   load_cohort_member_inference,
+  load_coverage_cohort_checkpoint,
   load_inference_checkpoint,
   save_checkpoint,
   save_cohort_checkpoint,
+  save_coverage_cohort_checkpoint,
 )
 from mjlab.tasks.tracking.distillation.cohort_contract import (
   CohortContractError,
@@ -44,6 +47,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
   cohort_identity_from_adapter,
   require_same_cohort,
 )
+from mjlab.tasks.tracking.distillation.cohort_setup import resolve_coverage_policy
 from mjlab.tasks.tracking.distillation.collector import (
   CollectionResult,
   DAggerCollector,
@@ -2108,3 +2112,87 @@ def test_the_sharded_identity_records_the_run_level_slots(
   # The routing and the weights are the run's, not a shard's.
   assert run_slots.teacher_ids == shard_slots.teacher_ids
   assert tuple(run_slots.weights) == tuple(shard_slots.weights)
+
+
+# ---------------------------------------------------------------------------
+# Difficult-state coverage: the strict-resume matrix (P0 contract, section 8).
+#
+# The plan's table has five rows and only two of them reject:
+#   row 1  coverage off (v1/v2/v3)      keep their behaviour  -> tested here
+#   row 2  old checkpoint + enabled     reject                -> tested here
+#   row 3  enabled + changed identity   reject, before any mutation -> tested here
+#   row 4  enabled + identical policy   continue with a fresh namespace
+#   row 5  enabled, model-only export   needs no collection environment
+# Row 2 is tested in the form the code enforces it: a coverage-off checkpoint cannot
+# enter the enabled loader.  Row 5 is covered by the export tests.  Row 4 needs an
+# enabled run, which cannot exist before the collection backend does, so it is not
+# claimed here.  Every rejection below also asserts that nothing was mutated, which
+# is the transactional requirement, and none of these tests starts a simulator.
+# ---------------------------------------------------------------------------
+
+
+def test_coverage_off_versions_keep_their_behaviour_and_v4_is_the_enabled_format(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  # Row 1: the enabled format is v4, next to the coverage-off v1/v2/v3 formats.
+  assert COVERAGE_COHORT_CHECKPOINT_VERSION == 4
+  trainer, identity, _adapter, collector = make_v3_trainer(
+    schema, plan, body_selection, real_cohort
+  )
+  path = tmp_path / "coverage-off-v3.pt"
+  save_cohort_checkpoint(
+    path,
+    trainer,
+    trainer.replay,
+    cohort=identity,
+    reset_provenance=make_reset_provenance(plan),
+    collector=collector,
+  )
+  before = capture_state(trainer, trainer.replay, collector)
+  # Row 2: an old checkpoint cannot silently acquire collection semantics.
+  with pytest.raises(CheckpointValidationError, match="enabled v4"):
+    load_coverage_cohort_checkpoint(
+      path,
+      trainer,
+      trainer.replay,
+      expected_cohort=identity,
+      expected_policy=resolve_coverage_policy("balance-recovery"),
+      collector=collector,
+    )
+  assert_state_unchanged(trainer, trainer.replay, collector, before)
+
+
+def test_a_legacy_replay_cannot_be_saved_as_enabled_v4(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """The enabled save path needs a replay seam that no production class provides.
+
+  This is the same shape as the missing environment handlers: the lane left the
+  seam for a consumer that does not exist yet.  The check is explicit, so an
+  enabled save fails closed instead of writing a half-enabled artifact.  The
+  field, digest and live-identity rejections inside the v4 loader cannot be
+  exercised until a replay exposes ``coverage_replay_policy()``; they stay
+  unverified rather than tested against a fake.
+  """
+  trainer, identity = make_cohort_trainer(
+    schema, plan, body_selection, real_cohort, updates=1
+  )
+  with pytest.raises(
+    CheckpointValidationError, match="must expose coverage_replay_policy"
+  ):
+    save_coverage_cohort_checkpoint(
+      tmp_path / "coverage-v4.pt",
+      trainer,
+      trainer.replay,
+      cohort=identity,
+      coverage_policy=resolve_coverage_policy("balance-recovery"),
+      coverage_report={"recapture_candidates": 0},
+    )

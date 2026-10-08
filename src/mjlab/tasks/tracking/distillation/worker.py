@@ -29,7 +29,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 import torch
 
@@ -58,6 +58,9 @@ from mjlab.tasks.tracking.distillation.multi_motion import PhasePolicy
 from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBatch
 from mjlab.tasks.tracking.distillation.teachers import TeacherBank
+
+if TYPE_CHECKING:
+  from mjlab.tasks.tracking.distillation.coverage_storage import CoverageReplayBatch
 
 DEFAULT_REQUEST_TIMEOUT_S = 900.0
 """Upper bound on one request before the pool aborts.
@@ -236,6 +239,10 @@ class CollectReply:
   eligible_resets: dict[int, int] = field(default_factory=dict)
   initialization_resets: dict[int, dict[str, int]] = field(default_factory=dict)
   motion_frames: tuple[tuple[int, tuple[int, ...]], ...] = ()
+  # Enabled coverage replies carry variable-size branch rows here.  Main rows
+  # stay tick major in ``batch``; branch rows cannot be described by
+  # ``rows_per_tick`` because a bounded branch work unit has its own row count.
+  branch_batch: CoverageReplayBatch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1028,3 +1035,24 @@ __all__ = [
   "worker_specs",
   "watch_parent",
 ]
+
+
+def validate_collect_reply(reply: CollectReply) -> None:
+  """Check a reply's shape before the parent merges it.
+
+  Main rows are tick major, so the parent slices them with ``rows_per_tick``.
+  Branch rows are variable size and cannot be described that way.  A malformed
+  reply must fail here, before any parent replay or normalizer mutation.
+  """
+  if reply.ticks < 0 or reply.rows_per_tick <= 0:
+    raise WorkerError("collect reply has invalid tick or per-tick row counts")
+  if reply.batch.batch_size != reply.ticks * reply.rows_per_tick:
+    raise WorkerError("collect reply main rows do not equal ticks times rows_per_tick")
+  branch = reply.branch_batch
+  if branch is None:
+    return
+  if branch.batch.batch_size != len(branch.metadata.rows):
+    raise WorkerError("collect reply branch rows do not match their metadata")
+  # A missing branch batch id is not representable: CoverageBatchMetadata derives
+  # its own id from the rows it holds and refuses an id they do not produce, so the
+  # count check above is the one that matters here.

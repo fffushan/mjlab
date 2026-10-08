@@ -208,6 +208,122 @@ class CircularBuffer:
     self._buffer[:, batch_ids] = data[batch_ids].unsqueeze(0)
     self._num_pushes[batch_ids] = 1
 
+  def capture_state(
+    self, batch_ids: torch.Tensor | Sequence[int] | None = None
+  ) -> dict[str, object]:
+    """Capture selected rows in chronological order, never the whole batch."""
+    if batch_ids is None:
+      ids = torch.arange(self._batch_size, device=self._device)
+    else:
+      ids = torch.as_tensor(batch_ids, dtype=torch.long, device=self._device)
+    if (
+      ids.ndim != 1
+      or ids.numel() == 0
+      or bool((ids < 0).any())
+      or bool((ids >= self._batch_size).any())
+      or ids.unique().numel() != ids.numel()
+    ):
+      raise ValueError("capture batch_ids must be unique in-range row IDs")
+    chronological = (
+      None
+      if self._buffer is None
+      else self.buffer.index_select(0, ids).detach().clone()
+    )
+    if chronological is not None:
+      if chronological.device != torch.device(self._device):
+        raise ValueError("captured history device mismatch")
+    return {
+      "max_len": self._max_len,
+      "source_batch_size": self._batch_size,
+      "source_row_ids": ids.detach().clone(),
+      "dtype": None if chronological is None else str(chronological.dtype),
+      "device": self._device,
+      "pointer": self._pointer,
+      "current_length": self._num_pushes.index_select(0, ids).detach().clone(),
+      "chronological": chronological,
+    }
+
+  def restore_state(
+    self, state: dict[str, object], batch_ids: torch.Tensor | None = None
+  ) -> None:
+    """Restore selected rows at the destination pointer after full validation."""
+    if state.get("max_len") != self._max_len:
+      raise ValueError("circular-buffer max_len mismatch")
+    source_size = state.get("source_batch_size", state.get("batch_size"))
+    if not isinstance(source_size, int):
+      raise ValueError("circular-buffer source batch size is missing")
+    rows = state.get("source_row_ids")
+    if not isinstance(rows, torch.Tensor) or rows.ndim != 1 or rows.numel() == 0:
+      raise ValueError("circular-buffer source row IDs are malformed")
+    if (
+      rows.dtype != torch.long
+      or bool((rows < 0).any())
+      or bool((rows >= source_size).any())
+    ):
+      raise ValueError("circular-buffer source row IDs are invalid")
+    if rows.unique().numel() != rows.numel():
+      raise ValueError("circular-buffer source row IDs are duplicated")
+    if batch_ids is None:
+      if rows.numel() != self._batch_size:
+        raise ValueError(
+          "destination row mapping is required for different batch sizes"
+        )
+      ids = torch.arange(self._batch_size, device=self._device)
+    else:
+      ids = torch.as_tensor(batch_ids, dtype=torch.long, device=self._device)
+    if (
+      ids.ndim != 1
+      or ids.numel() != rows.numel()
+      or bool((ids < 0).any())
+      or bool((ids >= self._batch_size).any())
+      or ids.unique().numel() != ids.numel()
+    ):
+      raise ValueError("destination row mapping is malformed")
+    chronological = state.get("chronological")
+    lengths = state.get("current_length")
+    if chronological is None:
+      if not isinstance(lengths, torch.Tensor) or lengths.shape != (rows.numel(),):
+        raise ValueError("circular-buffer current lengths are malformed")
+      if bool((lengths < 0).any()) or bool((lengths > self._max_len).any()):
+        raise ValueError("circular-buffer current lengths are out of range")
+      self.reset(ids)
+      return
+    if (
+      not isinstance(chronological, torch.Tensor)
+      or chronological.ndim < 2
+      or chronological.shape[:2] != (rows.numel(), self._max_len)
+    ):
+      raise ValueError("circular-buffer chronological history has wrong shape")
+    if (
+      str(chronological.dtype) != state.get("dtype")
+      or state.get("device") != self._device
+    ):
+      raise ValueError("circular-buffer dtype/device mismatch")
+    if (
+      not isinstance(lengths, torch.Tensor)
+      or lengths.shape != (rows.numel(),)
+      or lengths.dtype != torch.long
+    ):
+      raise ValueError("circular-buffer current lengths are malformed")
+    if bool((lengths < 0).any()):
+      raise ValueError("circular-buffer current lengths are out of range")
+    if self._buffer is not None and self._buffer.shape[2:] != chronological.shape[2:]:
+      raise ValueError("circular-buffer trailing shape mismatch")
+    destination = self._pointer
+    if self._buffer is None:
+      self._buffer = torch.zeros(
+        (self._max_len, self._batch_size, *chronological.shape[2:]),
+        dtype=chronological.dtype,
+        device=self._device,
+      )
+      destination = self._max_len - 1
+      self._pointer = destination
+    order = (
+      torch.arange(self._max_len, device=self._device) + destination + 1
+    ) % self._max_len
+    self._buffer[order[:, None], ids] = chronological.to(self._device).transpose(0, 1)
+    self._num_pushes[ids] = lengths
+
   def append(self, data: torch.Tensor) -> None:
     """Append a new frame for all batch elements.
 

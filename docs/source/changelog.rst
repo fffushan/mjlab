@@ -48,6 +48,19 @@ Added
   semantic-identity gates. The active schema and 135-state/32-latent/167-token
   dimensional checks remain enforced.
 
+- Added an offline ``distill coverage-inspect`` contract/status surface and a
+  family-disjoint fixed-state difficult-state fidelity evaluator. It reports
+  teacher-label action RMS/p95 and optional target-position metrics without
+  constructing physics, updating normalizers, launching training, or including
+  the held-out hardware fixture. Live collection remains fail-closed.
+
+- Integrated the difficult-state coverage lanes into one tree. The merge
+  provenance is ``MERGE-MANIFEST.md`` and the acceptance record is
+  ``ACCEPTANCE-20261007.md``. Added ``CohortSetup.coverage_policy`` and the
+  ``--coverage-policy {off,balance-recovery}`` option on ``distill train``.
+  An enabled policy still stops at the execution gate until live collection
+  evidence is accepted.
+
 Changed
 ^^^^^^^
 

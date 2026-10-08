@@ -31,6 +31,7 @@ from mjlab.tasks.tracking.distillation.config import (
   load_manifest,
   resolve_cohort,
 )
+from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
 from mjlab.tasks.tracking.distillation.multi_motion import PhasePolicy
 from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
@@ -112,6 +113,7 @@ class CohortSetup:
   base_seed: int
   schema_mode: str = "gravity"
   numerical_controls: bool = False
+  coverage_policy: CoveragePolicy | None = None
 
   def resolve(self) -> CohortContract:
     """Load and validate the cohort manifest this setup names."""
@@ -155,3 +157,29 @@ class CohortSetup:
       DEFAULT_MODEL_SETTINGS,
       numerical_controls=self.numerical_controls,
     ).to(device)
+
+
+COVERAGE_POLICY_CHOICES = ("off", "balance-recovery")
+
+
+def resolve_coverage_policy(choice: str) -> CoveragePolicy | None:
+  """Resolve a CLI choice to a coverage policy, or return None for off."""
+  if choice not in COVERAGE_POLICY_CHOICES:
+    raise ValueError(
+      f"unknown coverage policy {choice!r}; expected one of {COVERAGE_POLICY_CHOICES}"
+    )
+  if choice == "off":
+    return None
+  return CoveragePolicy.balance_recovery()
+
+
+def require_coverage_execution(policy: CoveragePolicy | None) -> None:
+  """Fail closed while live coverage collection remains gated."""
+  if policy is None:
+    return
+  raise NotImplementedError(
+    "coverage collection has no execution path in this tree. The dry-run "
+    "inspection command reports the resolved policy, and no run may enable "
+    "collection until the live producer and collection gates are accepted. "
+    "Live collection stays blocked; the contract records execution_authorized: false."
+  )
