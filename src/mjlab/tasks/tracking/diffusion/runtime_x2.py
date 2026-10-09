@@ -1059,16 +1059,20 @@ class X2DiffusionRuntime:
     self._active = None
 
 
-def _action_contract_for(cohort: Any, teacher_id: str) -> ActionContract:
-  teacher = cohort.teacher(teacher_id)
+def _action_contract_from_onnx(path: str | Path) -> ActionContract:
+  """Read the normalized-action and actuator contract from one ONNX asset."""
   try:
     import onnx
-  except ImportError as exc:  # pragma: no cover - recovery loading needs it too
+  except ImportError as exc:  # pragma: no cover - runtime dependency
     raise RuntimeX2Error(f"reading artifact metadata requires onnx: {exc}") from exc
-  metadata = {
-    entry.key: entry.value for entry in onnx.load(str(teacher.onnx.path)).metadata_props
-  }
+  metadata = {entry.key: entry.value for entry in onnx.load(str(path)).metadata_props}
   return ActionContract.from_metadata(metadata)
+
+
+def _action_contract_for(cohort: Any, teacher_id: str) -> ActionContract:
+  """Read the VAE action contract from the selected teacher's ONNX asset."""
+  teacher = cohort.teacher(teacher_id)
+  return _action_contract_from_onnx(teacher.onnx.path)
 
 
 def build_x2_runtime(request: Any) -> Any:
@@ -1148,8 +1152,11 @@ def build_x2_runtime(request: Any) -> Any:
     cohort_manifest_sha256=manifest_sha256,
     contract=selected_contract,
   )
+  ppo_action_contract = _action_contract_from_onnx(
+    repo_root / selected_contract.recovery_onnx
+  )
   ppo = FrozenPpoRecoveryPolicy.from_onnx(
-    repo_root / selected_contract.recovery_onnx, action_contract
+    repo_root / selected_contract.recovery_onnx, ppo_action_contract
   )
 
   runtime: Any
@@ -1176,7 +1183,7 @@ def build_x2_runtime(request: Any) -> Any:
     vae,
     ppo,
     vae_actions=action_contract,
-    ppo_actions=action_contract,
+    ppo_actions=ppo_action_contract,
     qualification=qualification,
     store=request.store,
   )
