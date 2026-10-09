@@ -4,6 +4,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Difficult-state coverage is now **enabled by default on the cohort path**.
+  ``distill train --teacher-ids ...`` selects ``difficult-state-coverage`` when
+  ``--coverage-policy`` is omitted, while a single-teacher run resolves to
+  ``off`` because it cannot carry the policy. An explicit value always wins, so
+  ``--coverage-policy off`` still disables coverage and reproduces or resumes a
+  coverage-off run. The fail-closed restore-parity gate is unchanged: a cohort
+  launch without ``--coverage-parity-evidence`` is refused before any
+  environment is constructed, and the refusal names the remedy.
+
 - Added command-local reuse of validated motion-reference indices. Reuse ends
   when motion/frame tensors are replaced or their version counters change;
   inference tensors use the validating uncached path. Public library queries
@@ -85,6 +94,10 @@ Added
 
 Changed
 ^^^^^^^
+
+- The queue dispatcher now allows all eight GPUs by default. The optional
+  ``ALLOW_GPUS`` and ``EXCLUDE_GPUS`` environment variables still support
+  per-server allocation and device-specific exclusions.
 
 - Changed VAE distillation defaults to a 16384-row microbatch and two
   accumulation steps, preserving a 32768-row effective batch. Explicit batch

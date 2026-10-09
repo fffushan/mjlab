@@ -2,7 +2,7 @@
 set -uo pipefail
 QUEUE_DIR="${QUEUE_DIR:-/home/fushan/mjlab/queue}"
 cd /home/fushan/mjlab
-echo "dispatcher: $(tmux has-session -t queue-dispatch 2>/dev/null && echo ALIVE || echo 'not running')   max_concurrent=${MAX_CONCURRENT:-8}   allow_gpus=${ALLOW_GPUS:-0,1,2,3}"
+echo "dispatcher: $(tmux has-session -t queue-dispatch 2>/dev/null && echo ALIVE || echo 'not running')   max_concurrent=${MAX_CONCURRENT:-8}   allow_gpus=${ALLOW_GPUS:-0,1,2,3,4,5,6,7}"
 printf '%-16s %-8s %-22s %-4s %s\n' JOB STATE SESSION GPU PROGRESS
 while IFS=$'\t' read -r id session command; do
   case "$id" in ''|'#'*) continue;; esac

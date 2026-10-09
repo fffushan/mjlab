@@ -65,7 +65,7 @@ Usage: $SCRIPT_NAME [OPTIONS] 'ssh -p PORT user@host'
   --remove ID   Remove a non-running job row. Running jobs are refused.
   --stop        Run the remote queue stop.sh (running jobs keep going).
   --restart     Restart only the dispatcher; running jobs keep going.
-  --allow-gpus LIST    Dispatcher GPU allowlist for --restart (default 0,1,2,3).
+  --allow-gpus LIST    Dispatcher GPU allowlist for --restart (default 0,1,2,3,4,5,6,7).
   --exclude-gpus LIST  Extra dispatcher exclusion list for --restart (default none).
   --tail N      Also print the last N lines of the remote queue.log.
   --dispatch    Also print tmux/process status for the dispatcher.
@@ -300,7 +300,7 @@ case "${MODE:-status}" in
     ALLOW_GPUS="$RESTART_ALLOW" EXCLUDE_GPUS="$RESTART_EXCLUDE" \
       tmux new-session -d -s queue-dispatch \
       "ALLOW_GPUS=$RESTART_ALLOW EXCLUDE_GPUS=$RESTART_EXCLUDE bash $QUEUE/dispatch.sh"
-    echo "dispatcher restarted (allow_gpus=${RESTART_ALLOW:-0,1,2,3}; exclude_gpus=${RESTART_EXCLUDE:-none}; running jobs untouched)"
+    echo "dispatcher restarted (allow_gpus=${RESTART_ALLOW:-0,1,2,3,4,5,6,7}; exclude_gpus=${RESTART_EXCLUDE:-none}; running jobs untouched)"
     ;;
   stop)
     if [ -x "$QUEUE/stop.sh" ]; then

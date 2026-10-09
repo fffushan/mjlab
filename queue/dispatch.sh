@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # GPU queue dispatcher: runs pending jobs from jobs.tsv on free GPUs, at most
 # MAX_CONCURRENT at a time and never more than ONE job per GPU.
-# Only GPUs in ALLOW_GPUS (default 0,1,2,3) are used; cards 4-7 are reserved for
-# other users, so the allowlist caps the queue whatever MAX_CONCURRENT says.
+# Only GPUs in ALLOW_GPUS (default 0,1,2,3,4,5,6,7) are used; the allowlist
+# caps the queue whatever MAX_CONCURRENT says.
 # Never evicts a running job; only uses GPUs with no compute process.
 set -uo pipefail
 cd /home/fushan/mjlab
@@ -16,7 +16,7 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-8}"
 MEM_FREE_MIB="${MEM_FREE_MIB:-1000}"
 # GPUs the dispatcher may use. This allowlist is the hard cap: it holds even if
 # a caller sets EXCLUDE_GPUS=none or raises MAX_CONCURRENT.
-ALLOW_GPUS="${ALLOW_GPUS:-0,1,2,3}"
+ALLOW_GPUS="${ALLOW_GPUS:-0,1,2,3,4,5,6,7}"
 # GPUs to never use even when they are allowed (e.g. a device with degraded DMA:
 # see queue.log notes). Empty by default.
 EXCLUDE_GPUS="${EXCLUDE_GPUS:-}"
