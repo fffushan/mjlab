@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from mjlab.tasks.tracking.diffusion.noising import sample_levels
+from mjlab.tasks.tracking.diffusion.trainer import _history_dropout_mask
 from mjlab.tasks.tracking.diffusion.training_config import (
   TrainingConfig,
   TrainingConfigError,
@@ -36,8 +37,43 @@ def test_default_config_is_uniform_with_plain_loss() -> None:
   assert config.level_sampling == "uniform"
   assert config.state_loss_weight == 1.0
   assert config.latent_loss_weight == 1.0
+  assert config.history_state_dropout_probability == 0.0
   assert config.checkpoint_every is None
   config.validate()
+
+
+def test_history_dropout_mask_is_one_decision_per_window() -> None:
+  generator = torch.Generator().manual_seed(17)
+  mask = _history_dropout_mask(
+    10_000,
+    0.2,
+    generator=generator,
+    device=torch.device("cpu"),
+  )
+  assert mask.shape == (10_000,)
+  assert mask.dtype == torch.bool
+  assert float(mask.float().mean()) == pytest.approx(0.2, abs=0.02)
+  assert torch.equal(
+    mask,
+    _history_dropout_mask(
+      10_000,
+      0.2,
+      generator=torch.Generator().manual_seed(17),
+      device=torch.device("cpu"),
+    ),
+  )
+
+
+def test_history_dropout_probability_extremes_do_not_draw() -> None:
+  generator = torch.Generator().manual_seed(19)
+  before = generator.get_state()
+  assert not _history_dropout_mask(
+    4, 0.0, generator=generator, device=torch.device("cpu")
+  ).any()
+  assert torch.equal(before, generator.get_state())
+  assert _history_dropout_mask(
+    4, 1.0, generator=torch.Generator().manual_seed(19), device=torch.device("cpu")
+  ).all()
 
 
 def test_uniform_mode_matches_randint_draw_for_draw() -> None:
@@ -119,6 +155,8 @@ def test_unknown_mode_is_rejected() -> None:
     ("level_logit_std", -1.0),
     ("state_loss_weight", -0.5),
     ("latent_loss_weight", float("nan")),
+    ("history_state_dropout_probability", -0.1),
+    ("history_state_dropout_probability", 1.1),
     ("checkpoint_every", 0),
   ],
 )
@@ -159,17 +197,19 @@ eval: {split: validation, seed: 0}
   plain.write_text(base, encoding="utf-8")
   plain_config = TrainingConfig.from_yaml(plain)
   assert plain_config.level_sampling == "uniform"
+  assert plain_config.history_state_dropout_probability == 0.0
   assert plain_config.checkpoint_every is None
 
   ablated = tmp_path / "ablated.yaml"
   ablated.write_text(
     base + "ablation: {level_sampling: low_noise, latent_loss_weight: 0.5, "
-    "checkpoint_every: 4000}\n",
+    "history_state_dropout_probability: 0.2, checkpoint_every: 4000}\n",
     encoding="utf-8",
   )
   ablated_config = TrainingConfig.from_yaml(ablated)
   assert ablated_config.level_sampling == "low_noise"
   assert ablated_config.latent_loss_weight == 0.5
+  assert ablated_config.history_state_dropout_probability == 0.2
   assert ablated_config.checkpoint_every == 4000
   assert ablated_config.sha256() != plain_config.sha256()
 

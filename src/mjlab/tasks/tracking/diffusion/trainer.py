@@ -161,6 +161,33 @@ def _finite_tensor(value: Tensor, name: str) -> None:
     raise TrainerError(f"{name} contains NaN or Inf")
 
 
+def _history_dropout_mask(
+  batch_size: int,
+  probability: float,
+  *,
+  generator: torch.Generator,
+  device: torch.device,
+) -> Tensor:
+  """Sample one history-pair dropout decision per training window."""
+  if batch_size < 0:
+    raise TrainerError("history dropout batch size must be non-negative")
+  if not 0.0 <= probability <= 1.0 or not math.isfinite(probability):
+    raise TrainerError("history dropout probability must be finite and in [0, 1]")
+  if probability == 0.0:
+    return torch.zeros(batch_size, dtype=torch.bool, device=device)
+  if probability == 1.0:
+    return torch.ones(batch_size, dtype=torch.bool, device=device)
+  return (
+    torch.rand(
+      (batch_size,),
+      generator=generator,
+      device=device,
+      dtype=torch.float32,
+    )
+    < probability
+  )
+
+
 class _FiniteGuard:
   """Collect finiteness flags and read them in one synchronisation.
 
@@ -412,6 +439,9 @@ class DiffusionTrainer:
     self.sampler_generator = torch.Generator(device="cpu").manual_seed(
       self.config.seed + 2
     )
+    self.history_dropout_generator = _generator(self.device, self.config.seed + 3)
+    self._history_dropout_windows = 0
+    self._history_total_windows = 0
     self.identity = _dataset_identity(self.train_dataset)
     self.config_hash = self.config.sha256()
     self._alpha_bars = self.schedule.alpha_bars_torch(
@@ -536,6 +566,11 @@ class DiffusionTrainer:
       else None,
       "noise_generator": self.noise_generator.get_state(),
       "sampler_generator": self.sampler_generator.get_state(),
+      "history_dropout_generator": self.history_dropout_generator.get_state(),
+      "history_dropout_counters": {
+        "windows": self._history_dropout_windows,
+        "total": self._history_total_windows,
+      },
     }
 
   def _restore_rng_state(self, state: Any) -> None:
@@ -549,6 +584,16 @@ class DiffusionTrainer:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
       self.noise_generator.set_state(state["noise_generator"])
       self.sampler_generator.set_state(state["sampler_generator"])
+      if "history_dropout_generator" in state:
+        self.history_dropout_generator.set_state(state["history_dropout_generator"])
+      elif self.config.history_state_dropout_probability != 0.0:
+        raise TrainerError(
+          "checkpoint lacks history dropout RNG state for a non-zero dropout run"
+        )
+      counters = state.get("history_dropout_counters")
+      if isinstance(counters, Mapping):
+        self._history_dropout_windows = int(counters.get("windows", 0))
+        self._history_total_windows = int(counters.get("total", 0))
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
       raise TrainerError("resume RNG state cannot be restored") from exc
 
@@ -609,7 +654,7 @@ class DiffusionTrainer:
 
   def _forward_loss(
     self, clean: Tensor
-  ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+  ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     clean = clean.to(device=self.device, dtype=torch.float32)
     _finite_tensor(clean, "clean tokens")
     batch = clean.shape[0]
@@ -629,6 +674,30 @@ class DiffusionTrainer:
       shift_gamma=self.config.level_shift_gamma,
       logit_std=self.config.level_logit_std,
     ).to(self.device)
+    history_dropout = _history_dropout_mask(
+      batch,
+      self.config.history_state_dropout_probability,
+      generator=self.history_dropout_generator,
+      device=self.device,
+    )
+    if self.config.history_state_dropout_probability != 0.0:
+      history_rows = history_dropout[:, None].expand(-1, self.contract.current_index)
+      k_state = k_state.clone()
+      k_latent = k_latent.clone()
+      k_state[:, : self.contract.current_index] = torch.where(
+        history_rows,
+        torch.full_like(
+          k_state[:, : self.contract.current_index], self.schedule.training_k
+        ),
+        k_state[:, : self.contract.current_index],
+      )
+      k_latent[:, : self.contract.current_index] = torch.where(
+        history_rows,
+        torch.full_like(
+          k_latent[:, : self.contract.current_index], self.schedule.training_k
+        ),
+        k_latent[:, : self.contract.current_index],
+      )
     noised = add_independent_noise(
       clean[..., : self.contract.projected_state_dimension],
       clean[..., self.contract.projected_state_dimension :],
@@ -669,7 +738,7 @@ class DiffusionTrainer:
         state_weight * state_squared.sum() + latent_weight * latent_squared.sum()
       ) / denominator
     _finite_tensor(loss, "loss")
-    return loss, prediction.float(), target, k_state, k_latent
+    return loss, prediction.float(), target, k_state, k_latent, history_dropout
 
   def _optimizer_update(
     self, pending: Sequence[Mapping[str, float]], *, update_index: int
@@ -765,6 +834,8 @@ class DiffusionTrainer:
         loader = self._loader(epoch)
         pending: list[Mapping[str, float]] = []
         epoch_updates: list[Mapping[str, float]] = []
+        epoch_dropout_windows = 0
+        epoch_total_windows = 0
         self.optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(loader):
           if self.global_step >= self._resolved_updates:
@@ -772,7 +843,20 @@ class DiffusionTrainer:
             break
           self._profiler.on_step_start(self.global_step)
           clean = _as_tokens(batch)
-          loss, prediction, target, k_state, k_latent = self._forward_loss(clean)
+          (
+            loss,
+            prediction,
+            target,
+            k_state,
+            k_latent,
+            history_dropout,
+          ) = self._forward_loss(clean)
+          dropout_windows = int(history_dropout.sum().item())
+          total_windows = int(history_dropout.numel())
+          self._history_dropout_windows += dropout_windows
+          self._history_total_windows += total_windows
+          epoch_dropout_windows += dropout_windows
+          epoch_total_windows += total_windows
           metrics = _metrics(
             prediction,
             target,
@@ -780,6 +864,9 @@ class DiffusionTrainer:
             k_latent,
             self._unknown_mask,
             single_read=self._perf.metrics_single_read,
+          )
+          metrics["history_state_dropout_fraction"] = (
+            float(dropout_windows) / float(total_windows) if total_windows else 0.0
           )
           pending.append(metrics)
           loss.backward()
@@ -821,6 +908,14 @@ class DiffusionTrainer:
           "epoch": epochs_completed,
           "global_step": self.global_step,
           "train_loss": self._last_train_loss,
+          "history_state_dropout_probability": self.config.history_state_dropout_probability,
+          "history_state_dropout_windows": epoch_dropout_windows,
+          "history_state_total_windows": epoch_total_windows,
+          "history_state_dropout_fraction": (
+            float(epoch_dropout_windows) / float(epoch_total_windows)
+            if epoch_total_windows
+            else 0.0
+          ),
           **_average_metrics(epoch_updates),
         }
         validation_loss: float | None = None
@@ -873,6 +968,14 @@ class DiffusionTrainer:
       "dataset_identity": self.identity,
       "resolved_updates": self._resolved_updates,
       "effective_batch_size": self.config.effective_batch_size,
+      "history_state_dropout_probability": self.config.history_state_dropout_probability,
+      "history_state_dropout_windows": self._history_dropout_windows,
+      "history_state_total_windows": self._history_total_windows,
+      "history_state_dropout_fraction": (
+        float(self._history_dropout_windows) / float(self._history_total_windows)
+        if self._history_total_windows
+        else 0.0
+      ),
       "resume_reproducibility": {
         "measured": False,
         "residual": None,

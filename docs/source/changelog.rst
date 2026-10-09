@@ -4,6 +4,15 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added an opt-in VGK8 diffusion history dropout ablation. The training arm
+  drops both state and latent values in the eight history rows with a configured
+  probability, using independent ``K=1000`` diffusion noise. The default is
+  zero. The D1 contract, dataset identity, token caches and model shape remain
+  unchanged. The offline evaluator accepts
+  ``--history-condition-dropout-probability`` for matched missing-history
+  stress evaluation. This evidence does not claim closed-loop, hardware or
+  deployment readiness.
+
 - Difficult-state coverage is now **enabled by default on the cohort path**.
   ``distill train --teacher-ids ...`` selects ``difficult-state-coverage`` when
   ``--coverage-policy`` is omitted, while a single-teacher run resolves to

@@ -64,6 +64,8 @@ class GenerationReport:
   beats_trivial_copy: bool
   beats_zero_latent: bool
   diagnostics_path: Path
+  history_condition_dropout_probability: float = 0.0
+  history_condition_dropout_windows: int = 0
 
   def as_dict(self) -> dict[str, object]:
     """Return a JSON-compatible representation of the generation report."""
@@ -76,6 +78,8 @@ class GenerationReport:
       "beats_trivial_copy": self.beats_trivial_copy,
       "beats_zero_latent": self.beats_zero_latent,
       "diagnostics_path": str(self.diagnostics_path),
+      "history_condition_dropout_probability": self.history_condition_dropout_probability,
+      "history_condition_dropout_windows": self.history_condition_dropout_windows,
     }
 
 
@@ -163,6 +167,23 @@ class _Moments:
 def _cpu_generator(seed: int) -> torch.Generator:
   """Create a CPU generator for stable initial-noise streams on every device."""
   return torch.Generator(device="cpu").manual_seed(int(seed))
+
+
+def _history_condition_dropout_flags(
+  count: int, probability: float, *, seed: int
+) -> np.ndarray:
+  """Select complete history pairs to hide during offline stress evaluation."""
+  if count < 0:
+    raise ValueError("history condition window count must be non-negative")
+  if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+    raise ValueError(
+      "history_condition_dropout_probability must be finite and in [0, 1]"
+    )
+  if probability == 0.0:
+    return np.zeros(count, dtype=bool)
+  if probability == 1.0:
+    return np.ones(count, dtype=bool)
+  return np.random.default_rng(int(seed)).random(count) < probability
 
 
 def _as_record_tokens(
@@ -595,6 +616,7 @@ def evaluate_generation(
   split: str | None = None,
   sampler_kind: str = "ddim",
   start_level: int = 1000,
+  history_condition_dropout_probability: float = 0.0,
   reverse_diagnostics_path: str | Path | None = None,
   pathwise_transition_diagnostics_path: str | Path | None = None,
 ) -> GenerationReport:
@@ -628,6 +650,15 @@ def evaluate_generation(
       raise ValueError("projection contract identity differs from evaluation contract")
   selected = tuple(records if max_windows is None else records[:max_windows])
   target_count = len(selected)
+  history_dropout_flags = _history_condition_dropout_flags(
+    target_count,
+    float(history_condition_dropout_probability),
+    seed=int(seed) + 2,
+  )
+  if history_dropout_flags.any() and pathwise_transition_diagnostics_path is not None:
+    raise ValueError(
+      "pathwise transition diagnostics do not support per-window history dropout"
+    )
   destination = (
     Path(diagnostics_path) if diagnostics_path is not None else Path("<not-written>")
   )
@@ -646,6 +677,10 @@ def evaluate_generation(
       beats_trivial_copy=False,
       beats_zero_latent=False,
       diagnostics_path=destination,
+      history_condition_dropout_probability=float(
+        history_condition_dropout_probability
+      ),
+      history_condition_dropout_windows=0,
     )
     _write_generation_diagnostics(destination, report)
     return report
@@ -702,11 +737,19 @@ def evaluate_generation(
         clean = torch.from_numpy(selected_tokens[start:stop]).to(
           device=torch_device, dtype=torch.float32
         )
+        if history_dropout_flags.any():
+          batch_mask_cpu = mask_cpu.unsqueeze(0).expand(stop - start, -1, -1).clone()
+          dropped = torch.from_numpy(history_dropout_flags[start:stop])
+          if bool(dropped.any()):
+            batch_mask_cpu[dropped, : contract.current_index, :] = False
+          batch_mask = batch_mask_cpu.to(torch_device)
+        else:
+          batch_mask = mask
         if reverse_accumulator is not None:
           generated, traces, _ = sample_trajectory_trace(
             model,
             schedule=schedule,
-            conditions=SamplerConditions(clean, mask),
+            conditions=SamplerConditions(clean, batch_mask),
             config=sampler_config,
             generator=sampler_generator,
           )
@@ -724,11 +767,11 @@ def evaluate_generation(
             reference = apply_clean_mask(
               torch.sqrt(alpha) * clean + torch.sqrt(1.0 - alpha) * reference_noise,
               clean,
-              mask,
+              batch_mask,
             )
             reference_x0 = model(reference, trace.step_ids)
             target = clean.detach().cpu().numpy().astype(np.float64)
-            unknown = (~mask).detach().cpu().numpy().astype(bool)
+            unknown = (~batch_mask).detach().cpu().numpy().astype(bool)
             unknown = np.broadcast_to(unknown, target.shape).copy()
             for label, prediction in (
               ("correctly_noised", reference_x0),
@@ -749,14 +792,14 @@ def evaluate_generation(
           generated, _ = sample_trajectory_ddpm(
             model,
             schedule=schedule,
-            conditions=SamplerConditions(clean, mask),
+            conditions=SamplerConditions(clean, batch_mask),
             generator=ddpm_generator,
           )
         else:
           generated, _ = sample_trajectory(
             model,
             schedule=schedule,
-            conditions=SamplerConditions(clean, mask),
+            conditions=SamplerConditions(clean, batch_mask),
             config=sampler_config,
             generator=sampler_generator,
           )
@@ -766,12 +809,12 @@ def evaluate_generation(
           device="cpu",
           dtype=clean.dtype,
         ).to(torch_device)
-        prior = apply_clean_mask(prior_noise, clean, mask)
+        prior = apply_clean_mask(prior_noise, clean, batch_mask)
         baselines = _baseline_tokens(clean)
         target = clean.detach().cpu().numpy().astype(np.float64)
         generated_np = generated.detach().cpu().numpy().astype(np.float64)
         prior_np = prior.detach().cpu().numpy().astype(np.float64)
-        unknown = (~mask).detach().cpu().numpy().astype(bool)
+        unknown = (~batch_mask).detach().cpu().numpy().astype(bool)
         unknown = np.broadcast_to(unknown, target.shape).copy()
         predictions: dict[str, tuple[np.ndarray, str | None]] = {
           "model": (generated_np, None),
@@ -914,6 +957,8 @@ def evaluate_generation(
     beats_trivial_copy=beats_trivial_copy,
     beats_zero_latent=beats_zero_latent,
     diagnostics_path=destination,
+    history_condition_dropout_probability=float(history_condition_dropout_probability),
+    history_condition_dropout_windows=int(history_dropout_flags.sum()),
   )
   _write_generation_diagnostics(destination, report)
   return report

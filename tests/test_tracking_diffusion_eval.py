@@ -219,6 +219,40 @@ def test_generation_report_scores_unknown_entries_and_writes_diagnostics(
   assert any("phase" in key for key in report.metrics)
 
 
+def test_generation_can_drop_both_history_state_and_latent_conditions() -> None:
+  class RecordingDenoiser(EchoDenoiser):
+    def __init__(self) -> None:
+      super().__init__()
+      self.inputs: list[Tensor] = []
+      self.step_ids: list[Tensor] = []
+
+    def forward(self, noisy_tokens: Tensor, step_ids: Tensor) -> Tensor:
+      self.inputs.append(noisy_tokens.clone())
+      self.step_ids.append(step_ids.clone())
+      return super().forward(noisy_tokens, step_ids)
+
+  contract = DiffusionContract()
+  model = RecordingDenoiser()
+  report = evaluate_generation(
+    model,
+    schedule=DiffusionSchedule.build(),
+    grid=build_inference_grid(DiffusionSchedule.build(), contract=contract),
+    records=[_record("clean"), _record("ou")],
+    projection=IdentityProjection(),  # type: ignore[arg-type]
+    contract=contract,
+    seed=29,
+    device="cpu",
+    history_condition_dropout_probability=1.0,
+  )
+  assert report.history_condition_dropout_probability == 1.0
+  assert report.history_condition_dropout_windows == 2
+  first_ids = model.step_ids[0]
+  assert torch.equal(first_ids[:, :8, 0], torch.full((2, 8), 1000))
+  assert torch.equal(first_ids[:, :8, 1], torch.full((2, 8), 1000))
+  assert torch.equal(first_ids[:, 8, 0], torch.zeros(2, dtype=torch.long))
+  assert torch.equal(first_ids[:, 8, 1], torch.full((2,), 1000))
+
+
 def test_generation_uses_raw_state_mask_for_real_projection_shape() -> None:
   contract = DiffusionContract()
   projection = ProjectionBundle.create(

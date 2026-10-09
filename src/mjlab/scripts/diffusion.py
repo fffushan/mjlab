@@ -1298,6 +1298,7 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
       split=args.split,
       sampler_kind=args.sampler,
       start_level=args.start_level,
+      history_condition_dropout_probability=args.history_condition_dropout_probability,
       reverse_diagnostics_path=reverse_diagnostics_path,
       pathwise_transition_diagnostics_path=pathwise_transition_path,
     )
@@ -1588,6 +1589,15 @@ def build_parser() -> argparse.ArgumentParser:
     "--pathwise-output",
     type=Path,
     help="output path for the opt-in pathwise transition report",
+  )
+  evaluate.add_argument(
+    "--history-condition-dropout-probability",
+    type=float,
+    default=0.0,
+    help=(
+      "hide both state and latent history rows with this probability during "
+      "offline generation stress evaluation"
+    ),
   )
   evaluate.add_argument("--seed", type=int)
   evaluate.add_argument("--json", type=Path)

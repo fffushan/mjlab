@@ -65,6 +65,7 @@ class TrainingConfig:
   level_logit_std: float = 1.0
   state_loss_weight: float = 1.0
   latent_loss_weight: float = 1.0
+  history_state_dropout_probability: float = 0.0
   checkpoint_every: int | None = None
 
   def validate(
@@ -179,6 +180,14 @@ class TrainingConfig:
         raise TrainingConfigError(f"{name} must be non-negative")
     if float(self.state_loss_weight) == 0.0 and float(self.latent_loss_weight) == 0.0:
       raise TrainingConfigError("at least one loss weight must be positive")
+    if (
+      not isinstance(self.history_state_dropout_probability, (int, float))
+      or not math.isfinite(float(self.history_state_dropout_probability))
+      or not 0.0 <= float(self.history_state_dropout_probability) <= 1.0
+    ):
+      raise TrainingConfigError(
+        "history_state_dropout_probability must be finite and in [0, 1]"
+      )
     if self.checkpoint_every is not None and (
       isinstance(self.checkpoint_every, bool)
       or not isinstance(self.checkpoint_every, int)
@@ -281,6 +290,7 @@ class TrainingConfig:
       "level_logit_std",
       "state_loss_weight",
       "latent_loss_weight",
+      "history_state_dropout_probability",
       "checkpoint_every",
     }
     for name in sorted(ablation_fields):

@@ -28,7 +28,43 @@ from mjlab.tasks.tracking.diffusion.training_config import (
 )
 
 
-def test_metrics_report_unknown_entries_not_clean_conditioning() -> None:
+def test_history_dropout_masks_both_history_slices_at_training_level(
+  tmp_path: Path,
+) -> None:
+  config = _config(
+    history_state_dropout_probability=1.0,
+    mixed_precision="fp32",
+  )
+  trainer = _trainer(tmp_path, config=config)
+  clean = torch.randn((3, 41, 167), generator=torch.Generator().manual_seed(23))
+  loss, _prediction, target, k_state, k_latent, dropped = trainer._forward_loss(clean)
+  assert torch.isfinite(loss)
+  assert dropped.tolist() == [True, True, True]
+  assert torch.equal(k_state[:, :8], torch.full((3, 8), 1000, dtype=torch.long))
+  assert torch.equal(k_latent[:, :8], torch.full((3, 8), 1000, dtype=torch.long))
+  torch.testing.assert_close(target, clean)
+
+
+def test_history_dropout_counters_are_reported_and_checkpointed(tmp_path: Path) -> None:
+  config = _config(
+    epochs=1,
+    max_updates=2,
+    history_state_dropout_probability=1.0,
+  )
+  trainer = _trainer(tmp_path, config=config)
+  result = trainer.train()
+  report = json.loads((tmp_path / "train-report.json").read_text())
+  assert report["history_state_dropout_probability"] == 1.0
+  assert (
+    report["history_state_dropout_windows"] == report["history_state_total_windows"]
+  )
+  assert report["history_state_dropout_fraction"] == 1.0
+  payload = torch.load(
+    result.checkpoint_paths["last"], map_location="cpu", weights_only=False
+  )
+  assert "history_dropout_generator" in payload["rng_state"]
+  assert "history_dropout_counters" in payload["rng_state"]
+
   prediction = torch.zeros((1, 41, 167))
   target = torch.zeros_like(prediction)
   prediction[:, 9:, :135] = 2.0
@@ -288,7 +324,7 @@ def test_resume_rejects_mismatched_dataset_identity(tmp_path) -> None:
 def test_resume_rejects_mismatched_contract_and_projection_identity(tmp_path) -> None:
   first_dir = tmp_path / "first"
   result = _trainer(first_dir).train()
-  changed_contract = replace(DiffusionContract(), contract_sha256="d" * 64)
+  changed_contract = replace(DiffusionContract(), vae_sha256="d" * 64)
   with pytest.raises(TrainerError, match="contract identity"):
     _trainer(
       tmp_path / "contract-resume",
