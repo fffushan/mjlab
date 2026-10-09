@@ -797,10 +797,22 @@ class FrozenPpoRecoveryPolicy:
     if artifact_metadata is not None:
       action_contract.verify_metadata(artifact_metadata, require_actuator_metadata=True)
     action_contract.verify_metadata(actual_metadata, require_actuator_metadata=True)
+    static_batch = shape[0] if isinstance(shape[0], int) else None
+
+    def inference(observation: np.ndarray) -> np.ndarray:
+      values = np.asarray(observation, dtype=np.float32)
+      if static_batch == 1 and values.shape[0] != 1:
+        # Some frozen recovery graphs export a fixed [1, 102] input.  Preserve
+        # batched collection by making one exact ONNX call per active recovery
+        # row instead of passing an invalid larger batch to the graph.
+        return np.concatenate(
+          [np.asarray(session.run([output], {name: row[None]})[0]) for row in values],
+          axis=0,
+        )
+      return np.asarray(session.run([output], {name: values})[0])
+
     policy = cls(
-      lambda observation: np.asarray(
-        session.run([output], {name: observation.astype(np.float32)})[0]
-      ),
+      inference,
       action_contract,
       observation_builder,
       actual_metadata,
