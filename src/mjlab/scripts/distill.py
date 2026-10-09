@@ -566,6 +566,23 @@ def _schedule_config(
   }
 
 
+def _resolve_coverage_choice(
+  choice: Literal["off", "difficult-state-coverage"] | None,
+  teacher_ids: tuple[str, ...],
+) -> Literal["off", "difficult-state-coverage"]:
+  """Resolve the coverage policy, defaulting to enabled on the cohort path.
+
+  Difficult-state coverage is **on by default** for a shared-student cohort run.
+  A single-teacher run cannot carry it, so an omitted choice there means ``off``
+  rather than a refusal, which keeps ``distill train`` without ``--teacher-ids``
+  working unchanged.  An explicit value always wins, so ``--coverage-policy off``
+  still disables coverage and can reproduce or resume a coverage-off run.
+  """
+  if choice is not None:
+    return choice
+  return "difficult-state-coverage" if teacher_ids else "off"
+
+
 def _resolve_worker_devices(
   worker_devices: tuple[str, ...] | None, *, num_envs: int
 ) -> tuple[str, ...]:
@@ -2360,7 +2377,7 @@ def _train(
   standing_start_frame_zero_fraction: float = 0.5,
   output_dir: Path | None = None,
   resume: Path | None = None,
-  coverage_policy: Literal["off", "difficult-state-coverage"] = "off",
+  coverage_policy: Literal["off", "difficult-state-coverage"] | None = None,
   coverage_parity_evidence: Path | None = None,
 ) -> int:
   """Run a bounded native single-teacher or shared-student cohort lifecycle.
@@ -2415,6 +2432,18 @@ def _train(
   therefore a resume invariant.  A list that repeats a device, exceeds eight
   entries, or does not divide ``num_envs`` evenly is refused before any
   environment is constructed, as is any use on the single-teacher path.
+
+  ``coverage_policy`` selects the difficult-state coverage policy and is
+  **enabled by default on the cohort path**: an omitted value resolves to
+  ``difficult-state-coverage`` whenever ``--teacher-ids`` is supplied, and to
+  ``off`` for a single-teacher run, which cannot carry it.  An explicit value
+  always wins, so ``--coverage-policy off`` disables coverage and reproduces or
+  resumes a coverage-off run.  Enabling coverage requires
+  ``--coverage-parity-evidence`` pointing at a passing restore-parity report for
+  the selected cohort; the run is refused before any environment is constructed
+  when that evidence is missing or belongs to another manifest or teacher set.
+  Produce it with ``distill coverage-parity``.  The resolved choice is recorded
+  in the resolved configuration and is therefore a resume invariant.
 
   ``max_iterations`` is the total lifetime iteration budget, including when
   ``resume`` is supplied.  Resume restores replay, normalizers, optimizer, and
@@ -2509,11 +2538,15 @@ def _train(
     resolved_worker_devices = _resolve_worker_devices(worker_devices, num_envs=num_envs)
   except ValueError as exc:
     return _fail(exc)
-  if not teacher_ids and coverage_policy != "off":
+  resolved_coverage_choice = _resolve_coverage_choice(
+    coverage_policy, tuple(teacher_ids)
+  )
+  if not teacher_ids and resolved_coverage_choice != "off":
     return _fail(
       ValueError(
         "--coverage-policy applies only to the cohort path; use --teacher-ids "
-        "with difficult-state-coverage"
+        "with difficult-state-coverage, or pass --coverage-policy off for a "
+        "single-teacher run"
       )
     )
   if not teacher_ids and coverage_parity_evidence is not None:
@@ -2554,7 +2587,7 @@ def _train(
       output_dir=output_dir,
       resume=resume,
       reset_policy=resolved_reset_policy,
-      coverage_policy=coverage_policy,
+      coverage_policy=resolved_coverage_choice,
       coverage_parity_evidence=coverage_parity_evidence,
       sample_budget=sample_budget,
     )

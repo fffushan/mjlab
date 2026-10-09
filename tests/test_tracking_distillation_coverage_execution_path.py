@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import tyro
 
-from mjlab.scripts.distill import _train_cohort
+from mjlab.scripts.distill import _resolve_coverage_choice, _train, _train_cohort
 from mjlab.tasks.tracking.distillation.cohort_setup import (
   COVERAGE_POLICY_CHOICES,
   CohortSetup,
@@ -117,6 +117,43 @@ def test_train_cohort_declares_the_coverage_policy_flag() -> None:
   parameters = inspect.signature(_train_cohort).parameters
   assert "coverage_policy" in parameters
   assert parameters["coverage_policy"].default == "off"
+
+
+def test_public_train_leaves_the_coverage_choice_unset() -> None:
+  # None means "unset": the cohort path enables coverage, the single-teacher path
+  # cannot carry it.  An explicit value always wins.
+  parameters = inspect.signature(_train).parameters
+  assert parameters["coverage_policy"].default is None
+
+
+def test_unset_coverage_is_enabled_on_the_cohort_path() -> None:
+  assert _resolve_coverage_choice(None, ("tennis_000", "tennis_001")) == (
+    "difficult-state-coverage"
+  )
+
+
+def test_unset_coverage_is_off_on_the_single_teacher_path() -> None:
+  # A single-teacher run cannot carry coverage, so an omitted choice means off
+  # rather than a refusal: `distill train` without --teacher-ids keeps working.
+  assert _resolve_coverage_choice(None, ()) == "off"
+
+
+def test_explicit_coverage_choice_always_wins() -> None:
+  assert _resolve_coverage_choice("off", ("tennis_000",)) == "off"
+  assert _resolve_coverage_choice("off", ()) == "off"
+  assert _resolve_coverage_choice("difficult-state-coverage", ("tennis_000",)) == (
+    "difficult-state-coverage"
+  )
+
+
+def test_enabled_coverage_without_evidence_names_the_remedy() -> None:
+  policy = resolve_coverage_policy("difficult-state-coverage")
+  with pytest.raises(ValueError) as excinfo:
+    require_coverage_execution(policy, None, manifest_sha256="0" * 64)
+  message = str(excinfo.value)
+  assert "--coverage-parity-evidence" in message
+  assert "distill coverage-parity" in message
+  assert "--coverage-policy off" in message
 
 
 def test_cli_accepts_and_types_the_flag() -> None:

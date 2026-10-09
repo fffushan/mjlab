@@ -1016,11 +1016,29 @@ inspection. It does not construct a simulator or authorize collection::
 The output includes the canonical policy identity. It reports the MVP collection
 profile as ``mvp_one_step_requires_restore_parity_evidence``. The MVP accepts
 ``--coverage-parity-evidence`` only when the report has the matching manifest
-digest and a passing restore-parity result. A bounded cohort launch uses::
+digest and a passing restore-parity result.
+
+**Difficult-state coverage is enabled by default on the cohort path.** An omitted
+``--coverage-policy`` resolves to ``difficult-state-coverage`` whenever
+``--teacher-ids`` is supplied, and to ``off`` for a single-teacher run, which
+cannot carry it. An explicit value always wins, so ``--coverage-policy off``
+disables coverage and reproduces or resumes a coverage-off run. Because coverage
+is on by default, a cohort launch must supply parity evidence for its own
+cohort; a launch without it is refused before any environment is constructed,
+and the refusal names the remedy. Generate the evidence with
+``distill coverage-parity`` for the exact manifest and teacher set::
+
+   uv run distill coverage-parity \
+     --manifest configs/distillation/x2_tennis_increased_perturbation_a_v1.yaml \
+     --teacher-ids "('inc000','inc001','inc002','inc003','inc004','inc005','inc006','inc007')" \
+     --report logs/diagnostics/vae-coverage-mvp-20261008/restore-parity.json
+
+A bounded cohort launch then uses::
 
    uv run distill train --teacher-ids "('inc000','inc001','inc002','inc003','inc004','inc005','inc006','inc007')" \
-     --coverage-policy difficult-state-coverage \
      --coverage-parity-evidence logs/diagnostics/vae-coverage-mvp-20261008/restore-parity.json
+
+Pass ``--coverage-policy off`` explicitly to train a cohort without coverage.
 
 Multi-step branch continuation remains deferred. Fixed-state fidelity evaluation is exposed as a CPU API in
 ``mjlab.tasks.tracking.distillation.coverage_evaluator``. It splits complete

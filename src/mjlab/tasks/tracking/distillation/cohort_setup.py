@@ -217,8 +217,11 @@ def require_coverage_execution(
     return {}
   if parity_evidence is None or not str(parity_evidence).strip():
     raise ValueError(
-      "difficult-state coverage requires --coverage-parity-evidence pointing to "
-      "a passing restore-parity report"
+      "difficult-state coverage is enabled and requires "
+      "--coverage-parity-evidence pointing to a passing restore-parity report "
+      "for this cohort; produce it with `distill coverage-parity --manifest "
+      "<manifest> --teacher-ids (<ids>)`, or pass --coverage-policy off to "
+      "train without coverage"
     )
   path = Path(parity_evidence)
   if not path.is_file():

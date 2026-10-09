@@ -147,7 +147,23 @@ def motion_fps(cohort: CohortContract) -> float:
   return float(cohort.teachers[0].reference.fps)
 
 
-def invoke(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> str | int | None:
+def invoke(
+  monkeypatch: pytest.MonkeyPatch,
+  argv: list[str],
+  *,
+  opt_out_of_coverage: bool = True,
+) -> str | int | None:
+  """Run the CLI with ``argv``.
+
+  Difficult-state coverage is enabled by default on the cohort path and requires
+  restore-parity evidence for the selected cohort.  The tests in this module
+  exercise unrelated features (resume invariants, worker layout, transport,
+  budgets, export, playback), so by default they append an explicit
+  ``--coverage-policy off`` instead of supplying evidence.  Pass
+  ``opt_out_of_coverage=False`` to observe the new default.
+  """
+  if opt_out_of_coverage and "train" in argv and "--coverage-policy" not in argv:
+    argv = [*argv, "--coverage-policy", "off"]
   monkeypatch.setattr(sys, "argv", argv)
   with pytest.raises(SystemExit) as exit_info:
     main()
@@ -2468,6 +2484,47 @@ def test_single_teacher_train_refuses_phase_bins(
     assert captured.out == ""
     assert "cohort path" in captured.err
   assert not (tmp_path / "refused" / "checkpoint-final.pt").exists()
+
+
+def test_cohort_train_default_enables_coverage_and_refuses_without_evidence(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+  schema,
+) -> None:
+  """The cohort default is coverage ON, and the evidence gate still fails closed.
+
+  An omitted ``--coverage-policy`` on the cohort path resolves to
+  ``difficult-state-coverage``.  Without restore-parity evidence for the selected
+  cohort the run must be refused before any environment is constructed, and the
+  refusal must name the remedy.
+  """
+  calls: list[dict] = []
+  _install_fake_multi_adapter(monkeypatch, calls, schema, adapters=[])
+  code = invoke(
+    monkeypatch,
+    [
+      "distill",
+      "train",
+      "--manifest",
+      str(MANIFEST),
+      "--repo-root",
+      str(REPO_ROOT),
+      "--teacher-ids",
+      _teacher_ids_arg(TEACHER_IDS),
+      *_TRAIN_ARGV,
+      "--output-dir",
+      str(tmp_path / "default-coverage"),
+    ],
+    opt_out_of_coverage=False,
+  )
+  captured = capsys.readouterr()
+  assert code != 0
+  assert calls == [], "no environment may be constructed without evidence"
+  message = captured.out + captured.err
+  assert "--coverage-parity-evidence" in message
+  assert "distill coverage-parity" in message
+  assert "--coverage-policy off" in message
 
 
 def test_cohort_train_records_single_device_workers(
