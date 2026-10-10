@@ -14,11 +14,19 @@ remote job is used by this tool.
 
 ## Preflight and execution
 
-Every artifact path, expected digest, selected cohort member, seed, start frame,
-output directory, and resource budget is explicit. Omitting `--execute` performs
-all frozen contract/checkpoint/projection/VAE/manifest loader checks and prints a
-JSON preflight without constructing an environment. `--execute` is required to
-construct mjlab simulation.
+The checkpoint path identifies the diffusion run. A required sibling sidecar named
+`checkpoint-best.yaml` supplies the contract, projection bundle, VAE checkpoint,
+manifest, member, seed, and start frame. If the sidecar is missing or malformed,
+preflight fails. The repository root is resolved from the sidecar. The output
+directory derives from the checkpoint run name and must be new.
+
+The viewer defaults to the diffusion branch, `127.0.0.1:8080`, 25 continuation
+steps, and the default CUDA device. Override any sidecar or viewer value when
+using a different artifact cohort.
+
+Without `--execute`, the command performs the contract/schema/model loader
+preflight without constructing an environment. `--execute` constructs mjlab
+simulation and opens the local browser viewer.
 
 The active defaults are immutable: 167 token channels (135 state + 32 raw VAE
 latent), 8 history pairs, 32 future steps, 20 DDIM updates, start level 1000,
@@ -45,27 +53,14 @@ their actual `__file__` locations, with source checkout heads kept separate
 from the explicit artifact-resolution `--repo-root`. Passing a primary checkout
 as the artifact root therefore does not make its source files current evidence.
 
-Example simulator-free preflight (the command still loads the frozen models,
-but never constructs the simulator):
+Example simulator-free preflight (the command loads the checkpoint sidecar
+and frozen models, but never constructs the simulator):
 
 ```sh
 PYTHONPATH="$PWD/src" uv run --no-sync python \
   scripts/experiments/diffusion_d3_closed_loop/evaluate.py \
-  --repo-root "$PWD" \
-  --contract docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml \
-  --contract-sha256 f5237d4327fd7cfd4c065604806555a43f8afa97c0ea17a9e59a3482a6d0caed \
-  --checkpoint /path/to/checkpoint-best.pt \
-  --checkpoint-sha256 252fb3a8ddd8da98f8cd3c8890328bec38aa5107767b13a576e5db8a43b956ae \
-  --projection /path/to/projection.npz \
-  --projection-sha256 e258cf27bdfd7e9e3d81762287f1afd992738e0c5f6c81222e8c1b2c065217fe \
-  --vae-checkpoint /path/to/mixed-10k/checkpoint-final.pt \
-  --vae-checkpoint-sha256 69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117 \
-  --manifest configs/distillation/x2_tennis_mixed.yaml \
-  --manifest-sha256 587550f26345a278f14c350404be11843dca379d708c2a3c418f0aa8340f9b2d \
-  --member tennis_000 \
-  --seed 0 \
-  --start-frame <floor-0.1-times-N-minus-1> \
-  --output-dir logs/diagnostics/diffusion-d3-closed-loop/preflight-example
+  --checkpoint logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt \
+  --device cpu
 ```
 
 The public persistence API is shared by the runner and this CLI:
@@ -202,52 +197,31 @@ extends it. When it elapses the session ends and the launcher closes the
 server, viewer and env; a fall, boundary, terminal flag or runtime error stops
 the run with no automatic restart.
 
-Simulator-free preflight (loads the frozen models, constructs no environment,
-viewer or server):
+Simulator-free preflight (loads the checkpoint sidecar and frozen models, but
+constructs no environment, viewer or server):
 
 ```sh
 PYTHONPATH="$PWD/src" uv run --no-sync python \
   scripts/experiments/diffusion_d3_closed_loop/view.py \
-  --repo-root "$PWD" \
-  --contract docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml \
-  --contract-sha256 f5237d4327fd7cfd4c065604806555a43f8afa97c0ea17a9e59a3482a6d0caed \
-  --checkpoint /home/agiuser/projects/worktrees/mjlab/d3-focused-20261003T185144Z/assets/checkpoint-best.pt \
-  --checkpoint-sha256 252fb3a8ddd8da98f8cd3c8890328bec38aa5107767b13a576e5db8a43b956ae \
-  --projection /home/agiuser/projects/worktrees/mjlab/d3-focused-20261003T185144Z/assets/projection.npz \
-  --projection-sha256 e258cf27bdfd7e9e3d81762287f1afd992738e0c5f6c81222e8c1b2c065217fe \
-  --vae-checkpoint "$PWD/logs/distillation/mixed-10k/checkpoint-final.pt" \
-  --vae-checkpoint-sha256 69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117 \
-  --manifest configs/distillation/x2_tennis_mixed.yaml \
-  --manifest-sha256 587550f26345a278f14c350404be11843dca379d708c2a3c418f0aa8340f9b2d \
-  --member tennis_000 --seed 0 --start-frame 45 \
-  --branch diffusion \
-  --output-dir logs/diagnostics/diffusion-d3-visual/preflight
+  --checkpoint logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt \
+  --device cpu
 ```
 
-Launching the local browser diagnostic (identical artifacts plus `--execute`):
+Launching the local browser diagnostic uses the same command with `--execute`.
 
 ```sh
 PYTHONPATH="$PWD/src" uv run --no-sync python \
   scripts/experiments/diffusion_d3_closed_loop/view.py \
-  --repo-root "$PWD" \
-  --contract docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml \
-  --contract-sha256 f5237d4327fd7cfd4c065604806555a43f8afa97c0ea17a9e59a3482a6d0caed \
-  --checkpoint /home/agiuser/projects/worktrees/mjlab/d3-focused-20261003T185144Z/assets/checkpoint-best.pt \
-  --checkpoint-sha256 252fb3a8ddd8da98f8cd3c8890328bec38aa5107767b13a576e5db8a43b956ae \
-  --projection /home/agiuser/projects/worktrees/mjlab/d3-focused-20261003T185144Z/assets/projection.npz \
-  --projection-sha256 e258cf27bdfd7e9e3d81762287f1afd992738e0c5f6c81222e8c1b2c065217fe \
-  --vae-checkpoint "$PWD/logs/distillation/mixed-10k/checkpoint-final.pt" \
-  --vae-checkpoint-sha256 69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117 \
-  --manifest configs/distillation/x2_tennis_mixed.yaml \
-  --manifest-sha256 587550f26345a278f14c350404be11843dca379d708c2a3c418f0aa8340f9b2d \
-  --member tennis_000 --seed 0 --start-frame 45 \
-  --branch diffusion \
-  --host 127.0.0.1 --port 8080 \
-  --continuation-steps 25 --max-wall-seconds 1200 \
-  --output-dir logs/diagnostics/diffusion-d3-visual/tennis000-seed0 \
+  --checkpoint logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt \
   --execute
-# Open http://localhost:8080 (the server binds 127.0.0.1 only).
 ```
+
+The defaults use the active local VGK8 contract, projection bundle, mixed VAE
+checkpoint, `tennis_000`, seed `0`, start frame `45`, diffusion branch,
+`127.0.0.1:8080`, 25 continuation steps, and a 1200-second wall budget. The
+output directory is derived as
+`logs/diagnostics/diffusion-d3-visual/d2-vgk8-double-20261009`.
+Open `http://localhost:8080` after startup.
 
 The bound server, viewer, runtime and env are closed on exit or on any failure;
 a bounded `viewer-status.json` records the final diagnostic status. This is a

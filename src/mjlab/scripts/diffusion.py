@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Mapping, Sequence, cast
 
 from mjlab.tasks.tracking.diffusion.runtime import CollectionRequest, RuntimeBundle
 
@@ -150,6 +150,121 @@ def _load_factory(spec: str) -> Callable[[CollectionRequest], RuntimeBundle]:
 def _json_write(path: Path, payload: Any) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _yaml_write_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+  """Write a small YAML artifact without exposing a partial file."""
+  try:
+    import yaml
+
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(yaml.safe_dump(dict(payload), sort_keys=False), encoding="utf-8")
+    temporary.replace(path)
+  except (ImportError, OSError, TypeError, ValueError) as exc:
+    raise ValueError(f"could not write YAML artifact {path}: {exc}") from exc
+
+
+def _repository_root(path: Path) -> Path:
+  """Find the checkout root without serializing a machine-local path."""
+  path = path.resolve()
+  for candidate in (path.parent, *path.parents):
+    if (candidate / "src" / "mjlab").is_dir() and (candidate / "configs").is_dir():
+      return candidate
+  raise ValueError(f"could not identify mjlab repository root from {path}")
+
+
+def _repo_relative(path: Path, root: Path) -> str:
+  """Return a repository-relative artifact reference."""
+  path = path.resolve()
+  try:
+    return path.relative_to(root).as_posix()
+  except ValueError as exc:
+    raise ValueError(
+      f"artifact path is outside repository root {root}: {path}"
+    ) from exc
+
+
+def _resolve_repo_path(value: object, root: Path, *, field: str) -> Path:
+  if not isinstance(value, str) or not value:
+    raise ValueError(f"contract field {field!r} must be a non-empty path")
+  path = Path(value)
+  return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def _diffusion_artifact_metadata(
+  *,
+  args: argparse.Namespace,
+  contract: Any,
+  contract_payload: Mapping[str, Any],
+  source: Any,
+  output_dir: Path,
+  config_path: Path,
+  seed: int,
+) -> dict[str, Any]:
+  """Build portable run and checkpoint metadata from resolved training inputs."""
+  root = _repository_root(Path(args.contract))
+  vae_payload = contract_payload.get("vae")
+  if not isinstance(vae_payload, Mapping):
+    raise ValueError("contract must contain a vae mapping for checkpoint metadata")
+  manifest_path = _resolve_repo_path(
+    vae_payload.get("cohort_manifest"), root, field="vae.cohort_manifest"
+  )
+  vae_path = _resolve_repo_path(
+    vae_payload.get("checkpoint", contract.vae_checkpoint),
+    root,
+    field="vae.checkpoint",
+  )
+  projection_path = Path(source.directory).resolve() / "offline" / "projection.npz"
+  if not projection_path.is_file():
+    raise ValueError(f"training projection bundle is missing: {projection_path}")
+  try:
+    import yaml
+
+    manifest_payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+  except (ImportError, OSError, TypeError, ValueError) as exc:
+    raise ValueError(f"could not read VAE cohort manifest {manifest_path}: {exc}") from exc
+  cohort_members: list[str] = []
+  declared_members = vae_payload.get("cohort_ids")
+  if isinstance(declared_members, list):
+    cohort_members = [str(value) for value in declared_members if str(value)]
+  if not cohort_members and isinstance(manifest_payload, Mapping):
+    teachers = manifest_payload.get("teachers")
+    if isinstance(teachers, list):
+      cohort_members = [
+        str(item["id"])
+        for item in teachers
+        if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+      ]
+  if not cohort_members:
+    raise ValueError(f"VAE cohort manifest has no teacher members: {manifest_path}")
+  selected_members = [str(value) for value in args.motion_id if str(value)]
+  default_member = selected_members[0] if selected_members else cohort_members[0]
+  sidecar_root = os.path.relpath(root, output_dir.resolve())
+  artifact_paths = {
+    "contract": _repo_relative(Path(args.contract), root),
+    "projection": _repo_relative(projection_path, root),
+    "vae_checkpoint": _repo_relative(vae_path, root),
+    "manifest": _repo_relative(manifest_path, root),
+    "training_config": _repo_relative(config_path, root),
+  }
+  run_manifest = {
+    "schema": "mjlab-diffusion-run-v1",
+    "paths_relative_to": "repository_root",
+    "artifacts": artifact_paths,
+    "cohort_members": cohort_members,
+    "training": {"seed": seed},
+  }
+  checkpoint_sidecar = {
+    "schema": "mjlab-d3-diffusion-checkpoint-v1",
+    "repo_root": sidecar_root,
+    **artifact_paths,
+    "cohort_members": cohort_members,
+    "member": default_member,
+    "seed": seed,
+    "start_frame": 45,
+    "run_manifest": "run-manifest.yaml",
+  }
+  return {"run_manifest": run_manifest, "checkpoint_sidecar": checkpoint_sidecar}
 
 
 def _trial_fingerprint(spec: Any) -> tuple[Any, ...]:
@@ -983,6 +1098,14 @@ def _command_train(args: argparse.Namespace) -> int:
       raise ValueError("--cache-lock-timeout must be non-negative")
 
     contract = DiffusionContract.from_yaml(args.contract)
+    try:
+      contract_payload = yaml.safe_load(
+        args.contract.read_text(encoding="utf-8")
+      )
+    except (OSError, TypeError, ValueError) as exc:
+      raise ValueError(f"could not read contract metadata: {exc}") from exc
+    if not isinstance(contract_payload, Mapping):
+      raise ValueError("diffusion contract metadata must be a YAML mapping")
     source = DatasetSource.resolve(args.dataset_dir, contract_path=args.contract)
     loaded = source.load()
     schedule = DiffusionSchedule.from_contract(contract)
@@ -993,6 +1116,18 @@ def _command_train(args: argparse.Namespace) -> int:
     )
     output_dir = Path(args.out)
     output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_metadata = _diffusion_artifact_metadata(
+      args=args,
+      contract=contract,
+      contract_payload=contract_payload,
+      source=source,
+      output_dir=output_dir,
+      config_path=args.config,
+      seed=config.seed,
+    )
+    _yaml_write_atomic(
+      output_dir / "run-manifest.yaml", artifact_metadata["run_manifest"]
+    )
 
     source_hash = _source_dataset_hash(source, loaded)
     projection_hash = _projection_identity(loaded.projection)
@@ -1124,6 +1259,7 @@ def _command_train(args: argparse.Namespace) -> int:
       output_dir=output_dir,
       device=device,
       resume=args.resume,
+      checkpoint_sidecar=artifact_metadata["checkpoint_sidecar"],
     )
     result = trainer.train()
     payload = {
@@ -1137,6 +1273,11 @@ def _command_train(args: argparse.Namespace) -> int:
       "metrics_path": str(result.metrics_path),
       "checkpoint_paths": {
         name: str(path) for name, path in result.checkpoint_paths.items()
+      },
+      "run_manifest": str(output_dir / "run-manifest.yaml"),
+      "checkpoint_sidecars": {
+        name: str(path.with_suffix(".yaml"))
+        for name, path in result.checkpoint_paths.items()
       },
       "note": "bounded engineering training; no model-quality claim",
     }

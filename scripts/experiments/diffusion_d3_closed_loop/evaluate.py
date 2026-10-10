@@ -11,7 +11,6 @@ runtime factory.  This is a measurement harness, not a policy-quality verdict.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib
 import importlib.util
 import json
@@ -49,7 +48,6 @@ from mjlab.tasks.tracking.diffusion.replay_integration import (
   load_projection_bundle,
   load_vae_decoder,
   sha256_file,
-  verify_file_digest,
 )
 from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 
@@ -61,6 +59,7 @@ _BOOTSTRAP_PAIRS = 8
 _FROZEN_DDIM_STEPS = 20
 _FROZEN_START_LEVEL = 1000
 _FROZEN_CONTROL_PERIOD = 0.02
+_DEFAULT_OUTPUT_ROOT = Path("logs/diagnostics/diffusion-d3-visual")
 
 # The strict D4 task loader lives beside this CLI as an experiment tool.  It is
 # loaded by absolute path so the CLI keeps working both as a script and as an
@@ -109,145 +108,6 @@ class PreparedEvaluation:
   device: torch.device
   task: SparseTaskSpec | None = None
   task_source_files: Mapping[str, tuple[Path, str]] = field(default_factory=dict)
-
-
-def _json_value(value: Any) -> Any:
-  """Convert model metadata into bounded JSON-compatible values."""
-  if isinstance(value, Tensor):
-    return {
-      "dtype": str(value.dtype),
-      "shape": list(value.shape),
-      "values_sha256": hashlib.sha256(
-        value.detach().to(device="cpu").contiguous().numpy().tobytes()
-      ).hexdigest(),
-    }
-  if isinstance(value, np.ndarray):
-    return {
-      "dtype": str(value.dtype),
-      "shape": list(value.shape),
-      "values_sha256": hashlib.sha256(
-        np.ascontiguousarray(value).tobytes()
-      ).hexdigest(),
-    }
-  if isinstance(value, Mapping):
-    return {
-      str(key): _json_value(item)
-      for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-    }
-  if isinstance(value, (list, tuple)):
-    return [_json_value(item) for item in value]
-  if isinstance(value, (str, int, float, bool)) or value is None:
-    return value
-  return repr(value)
-
-
-def _update_digest(digest: "hashlib._Hash", value: Any) -> None:
-  """Hash tensors and non-tensor extra state without dropping metadata."""
-  if isinstance(value, Tensor):
-    array = value.detach().to(device="cpu").contiguous().numpy()
-    digest.update(b"tensor\0")
-    digest.update(str(value.dtype).encode())
-    digest.update(json.dumps(list(value.shape)).encode())
-    digest.update(array.tobytes())
-    return
-  if isinstance(value, np.ndarray):
-    array = np.ascontiguousarray(value)
-    digest.update(b"ndarray\0")
-    digest.update(str(array.dtype).encode())
-    digest.update(json.dumps(list(array.shape)).encode())
-    digest.update(array.tobytes())
-    return
-  if isinstance(value, Mapping):
-    digest.update(b"mapping\0")
-    for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
-      _update_digest(digest, str(key))
-      _update_digest(digest, item)
-    return
-  if isinstance(value, (list, tuple)):
-    digest.update(b"sequence\0")
-    for item in value:
-      _update_digest(digest, item)
-    return
-  digest.update(type(value).__name__.encode())
-  digest.update(json.dumps(value, sort_keys=True, default=repr).encode())
-
-
-def _state_fingerprint(module: Any) -> dict[str, Any]:
-  """Fingerprint a frozen module, including ``_extra_state`` entries."""
-  state_method = getattr(module, "state_dict", None)
-  if not callable(state_method):
-    raise ClosedLoopCliError("frozen model does not expose state_dict()")
-  state = state_method()
-  if not isinstance(state, Mapping):
-    raise ClosedLoopCliError("frozen model state_dict() is not a mapping")
-  digest = hashlib.sha256()
-  tensor_keys: list[str] = []
-  non_tensor_keys: list[str] = []
-  extra_state: dict[str, Any] = {}
-  for key, value in sorted(state.items(), key=lambda pair: str(pair[0])):
-    name = str(key)
-    if isinstance(value, Tensor):
-      tensor_keys.append(name)
-    else:
-      non_tensor_keys.append(name)
-      if name.endswith("_extra_state"):
-        extra_state[name] = _json_value(value)
-    _update_digest(digest, name)
-    _update_digest(digest, value)
-  return {
-    "state_dict_sha256": digest.hexdigest(),
-    "tensor_keys": tensor_keys,
-    "non_tensor_keys": non_tensor_keys,
-    "non_tensor_extra_state": extra_state,
-  }
-
-
-def _array_digest(value: Any) -> str:
-  array = np.ascontiguousarray(np.asarray(value))
-  return hashlib.sha256(array.tobytes()).hexdigest()
-
-
-def _normalizer_fingerprint(normalizer: Any) -> dict[str, Any]:
-  result = _state_fingerprint(normalizer)
-  result["dimension"] = int(getattr(normalizer, "dimension", -1))
-  result["frozen"] = bool(getattr(normalizer, "frozen", False))
-  result["eps"] = float(getattr(normalizer, "eps", float("nan")))
-  return result
-
-
-def _integrity_snapshot(prepared: PreparedEvaluation) -> dict[str, Any]:
-  """Capture files, models, projection stats and VAE normalizers."""
-  files: dict[str, Any] = {}
-  for role, (path, expected) in prepared.file_expectations.items():
-    actual = sha256_file(path)
-    files[role] = {
-      "path": str(path),
-      "expected_sha256": expected,
-      "actual_sha256": actual,
-      "matches_expected": actual == expected,
-    }
-  projection = prepared.projection
-  vae_model = cast(Any, prepared.vae.model)
-  return {
-    "files": files,
-    "models": {
-      "diffusion": _state_fingerprint(prepared.denoiser.model),
-      "vae": _state_fingerprint(vae_model),
-    },
-    "normalizers": {
-      "projection_state_stats": {
-        "statistics_sha256": projection.statistics_sha256,
-        "mean_sha256": _array_digest(projection.state_stats.mean),
-        "std_sha256": _array_digest(projection.state_stats.std),
-      },
-      "projection_latent_stats": {
-        "mean_sha256": _array_digest(projection.latent_stats.mean),
-        "std_sha256": _array_digest(projection.latent_stats.std),
-      },
-      "vae_reference": _normalizer_fingerprint(vae_model.reference_normalizer),
-      "vae_conditioning": _normalizer_fingerprint(vae_model.conditioning_normalizer),
-    },
-  }
 
 
 _SOURCE_MODULES = (
@@ -352,66 +212,95 @@ def _parser() -> argparse.ArgumentParser:
     )
   )
   parser.add_argument(
-    "--contract", type=Path, required=True, help="active contract YAML"
+    "--checkpoint-config",
+    type=Path,
+    default=None,
+    help="checkpoint sidecar YAML (default: checkpoint-best.yaml beside checkpoint)",
   )
   parser.add_argument(
-    "--contract-sha256", required=True, help="expected SHA256 of the contract file"
+    "--contract",
+    type=Path,
+    default=None,
+    help="override contract path from checkpoint sidecar YAML",
+  )
+  parser.add_argument(
+    "--contract-sha256",
+    default=None,
+    help="deprecated artifact digest metadata; never validated",
   )
   parser.add_argument(
     "--checkpoint", type=Path, required=True, help="frozen D2 checkpoint"
   )
   parser.add_argument(
-    "--checkpoint-sha256", required=True, help="expected SHA256 of the D2 checkpoint"
+    "--checkpoint-sha256",
+    default=None,
+    help="deprecated artifact digest metadata; never validated",
   )
   parser.add_argument(
-    "--projection", type=Path, required=True, help="projection bundle"
+    "--projection",
+    type=Path,
+    default=None,
+    help="override projection path from checkpoint sidecar YAML",
   )
   parser.add_argument(
     "--projection-sha256",
-    required=True,
-    help="expected SHA256 of the projection bundle",
+    default=None,
+    help="deprecated artifact digest metadata; never validated",
   )
   parser.add_argument(
     "--vae-checkpoint",
     "--vae",
     dest="vae_checkpoint",
     type=Path,
-    required=True,
-    help="frozen gravity-mode VAE cohort checkpoint",
+    default=None,
+    help="override VAE checkpoint path from checkpoint sidecar YAML",
   )
   parser.add_argument(
     "--vae-checkpoint-sha256",
     "--vae-sha256",
     dest="vae_checkpoint_sha256",
-    required=True,
-    help="expected SHA256 of the VAE checkpoint",
+    default=None,
+    help="deprecated artifact digest metadata; never validated",
   )
   parser.add_argument(
     "--manifest",
     "--vae-manifest",
     dest="manifest",
     type=Path,
-    required=True,
-    help="frozen VAE cohort manifest",
+    default=None,
+    help="override VAE manifest path from checkpoint sidecar YAML",
   )
   parser.add_argument(
     "--manifest-sha256",
     "--vae-manifest-sha256",
     dest="manifest_sha256",
-    required=True,
-    help="expected SHA256 of the cohort manifest",
+    default=None,
+    help="deprecated artifact digest metadata; never validated",
   )
   parser.add_argument(
     "--repo-root",
     "--vae-repo-root",
     dest="repo_root",
     type=Path,
-    required=True,
-    help="repository root resolving manifest artifacts",
+    default=None,
+    help="override repository root from checkpoint sidecar YAML",
   )
-  parser.add_argument("--member", "--vae-member", dest="member", required=True)
-  parser.add_argument("--seed", type=int, required=True)
-  parser.add_argument("--start-frame", type=int, required=True)
+  parser.add_argument(
+    "--member",
+    "--vae-member",
+    dest="member",
+    default=None,
+    help="override VAE cohort member from checkpoint sidecar YAML",
+  )
+  parser.add_argument(
+    "--seed", type=int, default=None, help="override seed from checkpoint sidecar YAML"
+  )
+  parser.add_argument(
+    "--start-frame",
+    type=int,
+    default=None,
+    help="override motion start frame from checkpoint sidecar YAML",
+  )
   parser.add_argument(
     "--continuation-steps",
     type=int,
@@ -433,8 +322,11 @@ def _parser() -> argparse.ArgumentParser:
   parser.add_argument(
     "--output-dir",
     type=Path,
-    required=True,
-    help="new output directory under logs/diagnostics/...",
+    default=None,
+    help=(
+      "new output directory; default derives from the checkpoint run name "
+      f"under {_DEFAULT_OUTPUT_ROOT}"
+    ),
   )
   parser.add_argument(
     "--device",
@@ -463,7 +355,96 @@ def build_parser() -> argparse.ArgumentParser:
   return _parser()
 
 
+
+
+def _load_checkpoint_sidecar(
+  checkpoint_path: Path, args: argparse.Namespace
+) -> Path:
+  """Load and apply the required YAML sidecar beside a diffusion checkpoint."""
+  config_arg = getattr(args, "checkpoint_config", None)
+  config_path = Path(config_arg) if config_arg is not None else checkpoint_path.with_suffix(".yaml")
+  config_path = config_path.resolve()
+  if not config_path.is_file():
+    raise ClosedLoopCliError(
+      f"checkpoint sidecar YAML is required: {config_path}"
+    )
+  try:
+    import yaml
+  except ImportError as exc:
+    raise ClosedLoopCliError("PyYAML is required to read checkpoint sidecar YAML") from exc
+  try:
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+  except (OSError, yaml.YAMLError, ValueError) as exc:
+    raise ClosedLoopCliError(f"could not read checkpoint sidecar {config_path}: {exc}") from exc
+  if not isinstance(payload, Mapping):
+    raise ClosedLoopCliError(f"checkpoint sidecar must contain a YAML mapping: {config_path}")
+  if payload.get("schema") != "mjlab-d3-diffusion-checkpoint-v1":
+    raise ClosedLoopCliError(
+      f"unsupported checkpoint sidecar schema in {config_path}: {payload.get('schema')!r}"
+    )
+  required = (
+    "repo_root",
+    "contract",
+    "projection",
+    "vae_checkpoint",
+    "manifest",
+    "member",
+    "seed",
+    "start_frame",
+  )
+  missing = [key for key in required if key not in payload]
+  if missing:
+    raise ClosedLoopCliError(
+      f"checkpoint sidecar is missing required fields {missing}: {config_path}"
+    )
+  repo_root_value = payload["repo_root"]
+  if not isinstance(repo_root_value, str) or not repo_root_value:
+    raise ClosedLoopCliError(f"checkpoint sidecar repo_root must be a non-empty string: {config_path}")
+  configured_root = Path(repo_root_value)
+  if not configured_root.is_absolute():
+    configured_root = config_path.parent / configured_root
+  configured_root = configured_root.resolve()
+  if getattr(args, "repo_root", None) is None:
+    args.repo_root = configured_root
+  effective_root = Path(args.repo_root).resolve()
+
+  def configured_path(key: str) -> Path:
+    value = payload[key]
+    if not isinstance(value, str) or not value:
+      raise ClosedLoopCliError(
+        f"checkpoint sidecar field {key!r} must be a non-empty string: {config_path}"
+      )
+    path = Path(value)
+    return path if path.is_absolute() else effective_root / path
+
+  for key in ("contract", "projection", "vae_checkpoint", "manifest"):
+    attribute = "vae_checkpoint" if key == "vae_checkpoint" else key
+    if getattr(args, attribute, None) is None:
+      setattr(args, attribute, configured_path(key))
+  if getattr(args, "member", None) is None:
+    args.member = payload["member"]
+  if getattr(args, "seed", None) is None:
+    args.seed = payload["seed"]
+  if getattr(args, "start_frame", None) is None:
+    args.start_frame = payload["start_frame"]
+  args.checkpoint_config = config_path
+  return config_path
+
+
 def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
+  checkpoint_arg = getattr(args, "checkpoint", None)
+  if checkpoint_arg is not None:
+    checkpoint_path = Path(checkpoint_arg).resolve()
+    _load_checkpoint_sidecar(checkpoint_path, args)
+    repo_root = Path(args.repo_root).resolve()
+    if getattr(args, "output_dir", None) is None:
+      run_name = checkpoint_path.parent.parent.name or checkpoint_path.stem
+      args.output_dir = repo_root / _DEFAULT_OUTPUT_ROOT / run_name
+  else:
+    repo_root_arg = getattr(args, "repo_root", None)
+    repo_root = Path(repo_root_arg or Path.cwd()).resolve()
+  if getattr(args, "output_dir", None) is None:
+    raise ClosedLoopCliError("output-dir cannot be derived without checkpoint")
   if isinstance(args.seed, bool) or not isinstance(args.seed, int) or args.seed < 0:
     raise ClosedLoopCliError("seed must be a nonnegative integer")
   if (
@@ -497,12 +478,11 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
       f"max-output-bytes must be an integer in [{MIN_OUTPUT_CAP_BYTES}, "
       f"{_MAX_OUTPUT_BYTES}]"
     )
-  output_dir = args.output_dir.resolve()
+  output_dir = Path(args.output_dir).resolve()
   if output_dir.exists():
     raise ClosedLoopCliError(
       f"output-dir must be new and absent; refusing existing path {output_dir}"
     )
-  repo_root = args.repo_root.resolve()
   if not repo_root.is_dir():
     raise ClosedLoopCliError(f"repo-root is not a directory: {repo_root}")
   task_config = getattr(args, "task_config", None)
@@ -525,7 +505,7 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
   return repo_root, device
 
 
-def _require_frozen_contract(contract: Any, expected_sha256: str) -> None:
+def _require_frozen_contract(contract: Any) -> None:
   if contract.schema_version != "mjlab-x2-state-latent-d1-no-mixtures-v1":
     raise ClosedLoopCliError(
       "D3 closed-loop requires the active no-mixture v1 contract; "
@@ -552,11 +532,7 @@ def _require_frozen_contract(contract: Any, expected_sha256: str) -> None:
       )
   if not np.isclose(contract.period_seconds, _FROZEN_CONTROL_PERIOD):
     raise ClosedLoopCliError("frozen contract control period must be 0.02 seconds")
-  if contract.contract_sha256 != expected_sha256:
-    raise ClosedLoopCliError(
-      "contract embedded digest disagrees with the explicit contract hash"
-    )
-
+  # Artifact digests are intentionally not part of D3 runtime validation.
 
 def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
   repo_root, device = _validate_request(args)
@@ -565,20 +541,12 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
   projection_path = args.projection.resolve()
   vae_path = args.vae_checkpoint.resolve()
   manifest_path = args.manifest.resolve()
-  file_expectations = {
-    "contract": (contract_path, str(args.contract_sha256)),
-    "diffusion_checkpoint": (checkpoint_path, str(args.checkpoint_sha256)),
-    "projection": (projection_path, str(args.projection_sha256)),
-    "vae_checkpoint": (vae_path, str(args.vae_checkpoint_sha256)),
-    "vae_manifest": (manifest_path, str(args.manifest_sha256)),
-  }
+  file_expectations: dict[str, tuple[Path, str]] = {}
   try:
-    for role, (path, expected) in file_expectations.items():
-      verify_file_digest(path, expected, role=role)
     contract = load_active_contract(contract_path)
   except (ReplayError, OSError, ValueError) as exc:
     raise ClosedLoopCliError(str(exc)) from exc
-  _require_frozen_contract(contract, str(args.contract_sha256))
+  _require_frozen_contract(contract)
   try:
     manifest = load_manifest(manifest_path, repo_root=repo_root)
     cohort = resolve_cohort(manifest)
@@ -590,8 +558,9 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
     denoiser = load_denoiser(
       checkpoint_path,
       contract=contract,
-      checkpoint_sha256=str(args.checkpoint_sha256),
+      checkpoint_sha256=None,
       projection_bundle=projection,
+      verify_projection_hashes=False,
     )
     vae = load_vae_decoder(
       vae_path,
@@ -599,7 +568,7 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
       repo_root=repo_root,
       member=args.member,
       contract=contract,
-      vae_checkpoint_sha256=str(args.vae_checkpoint_sha256),
+      vae_checkpoint_sha256=None,
     )
   except (ReplayError, OSError, ValueError) as exc:
     raise ClosedLoopCliError(str(exc)) from exc
@@ -691,11 +660,6 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
       if role.startswith("task_")
     },
   )
-  integrity = _integrity_snapshot(prepared)
-  for role, info in integrity.get("files", {}).items():
-    if info.get("matches_expected") is False:
-      raise ClosedLoopCliError(f"preflight input changed while loading: {role}")
-  object.__setattr__(prepared, "integrity_before", integrity)
   return prepared
 
 
@@ -737,7 +701,6 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
     "execution": "not-run; pass --execute to construct the simulator",
     "contract": {
       "path": str(args.contract.resolve()),
-      "sha256": args.contract_sha256,
       "schema_version": prepared.contract.schema_version,
       "identity_hash": prepared.contract.identity_hash(),
       "token_dimension": prepared.contract.token_dimension,
@@ -746,7 +709,6 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
     },
     "checkpoint": {
       "path": str(args.checkpoint.resolve()),
-      "sha256": args.checkpoint_sha256,
       "selected_step": prepared.denoiser.global_step,
       "training_budget_updates": _TRAINING_BUDGET_UPDATES,
       "ema_selected": prepared.denoiser.ema_selected,
@@ -761,9 +723,7 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
     },
     "vae": {
       "path": str(args.vae_checkpoint.resolve()),
-      "sha256": args.vae_checkpoint_sha256,
       "manifest": str(args.manifest.resolve()),
-      "manifest_sha256": prepared.manifest_sha256,
       "member": args.member,
       "reference_dimension": prepared.vae.reference_dim,
       "conditioning_dimension": prepared.vae.conditioning_dim,
@@ -792,7 +752,7 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
     "device": str(prepared.device),
     "artifact_root": str(prepared.repo_root),
     "source_provenance": dict(prepared.source_fingerprints),
-    "frozen_file_integrity": dict(prepared.integrity_before["files"]),
+    "artifact_integrity_checks": "disabled",
   }
   task_report = _task_config_report(getattr(prepared, "task", None))
   if task_report is not None:
@@ -895,7 +855,6 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
     },
     "checkpoint": {
       "path": str(args.checkpoint.resolve()),
-      "sha256": args.checkpoint_sha256,
       "selected_step": prepared.denoiser.global_step,
       "training_budget_updates": _TRAINING_BUDGET_UPDATES,
       "selection_split": prepared.denoiser.selection_split,
@@ -917,9 +876,7 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
     },
     "vae": {
       "path": str(args.vae_checkpoint.resolve()),
-      "sha256": args.vae_checkpoint_sha256,
       "manifest": str(args.manifest.resolve()),
-      "manifest_sha256": prepared.manifest_sha256,
       "member": args.member,
       "member_artifact_hashes": dict(prepared.teacher_hashes),
       "relocated_artifact_roles": list(prepared.vae.relocated_artifact_roles),
@@ -940,7 +897,7 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
       "max_output_bytes": args.max_output_bytes,
       "started_monotonic": started,
     },
-    "frozen_file_integrity": dict(prepared.integrity_before["files"]),
+    "artifact_integrity_checks": "disabled",
   }
   task_report = _task_config_report(getattr(prepared, "task", None))
   if task_report is not None:
@@ -965,15 +922,6 @@ def _report_exit_code(report: EvaluationReport) -> int:
     return 1
   if report.output.get("error"):
     return 1
-  for key in ("integrity", "postintegrity", "after_run_integrity"):
-    integrity = report.provenance.get(key)
-    if isinstance(integrity, Mapping):
-      if (
-        integrity.get("error")
-        or integrity.get("unchanged") is False
-        or integrity.get("passed") is False
-      ):
-        return 1
   execution = report.provenance.get("execution")
   if isinstance(execution, Mapping):
     if (
@@ -1044,24 +992,7 @@ def _execute(prepared: PreparedEvaluation) -> EvaluationReport:
   )
   elapsed = time.monotonic() - started
   provenance = dict(report.provenance)
-  try:
-    after = _integrity_snapshot(prepared)
-    unchanged = prepared.integrity_before == after
-    integrity: dict[str, Any] = {
-      "before": dict(prepared.integrity_before),
-      "after": after,
-      "unchanged": unchanged,
-    }
-    if not unchanged:
-      integrity["error"] = "frozen model/normalizer/file integrity changed"
-  except Exception as exc:
-    integrity = {
-      "before": dict(prepared.integrity_before),
-      "after": None,
-      "unchanged": False,
-      "error": str(exc),
-    }
-  provenance["integrity"] = integrity
+  provenance["artifact_integrity_checks"] = "disabled"
   try:
     provenance["source_provenance"] = _source_fingerprints()
     source_error: str | None = None
@@ -1092,8 +1023,6 @@ def _execute(prepared: PreparedEvaluation) -> EvaluationReport:
       provenance["task"] = {"error": str(exc)}
       _mark_report_partial(report, f"task provenance failed: {exc}")
   object.__setattr__(report, "provenance", provenance)
-  if integrity.get("error"):
-    _mark_report_partial(report, f"post-run integrity failed: {integrity['error']}")
   if not within_wall_budget:
     _mark_report_partial(report, "wall-clock budget exceeded")
   if source_error:

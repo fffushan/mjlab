@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -408,6 +409,7 @@ class DiffusionTrainer:
     output_dir: Path,
     device: str | torch.device,
     resume: Path | None = None,
+    checkpoint_sidecar: Mapping[str, Any] | None = None,
   ) -> None:
     if not isinstance(config, TrainingConfig):
       raise TypeError("config must be a TrainingConfig")
@@ -460,6 +462,9 @@ class DiffusionTrainer:
     self.best_metric_split: str | None = None
     self._last_train_loss: float | None = None
     self._resume_state: CheckpointState | None = None
+    self._checkpoint_sidecar = (
+      dict(checkpoint_sidecar) if checkpoint_sidecar is not None else None
+    )
     # First global step at which a periodic checkpoint is due.  Unlike best/last
     # these exist so the validation curve and its optimum stay inspectable.
     every = self.config.checkpoint_every
@@ -798,6 +803,27 @@ class DiffusionTrainer:
     self._last_train_loss = result["loss"]
     return result
 
+  def _write_checkpoint_sidecar(self, path: Path, name: str) -> None:
+    if self._checkpoint_sidecar is None:
+      return
+    try:
+      import yaml
+
+      payload = {
+        **self._checkpoint_sidecar,
+        "checkpoint": name,
+        "global_step": self.global_step,
+      }
+      temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+      temporary.write_text(
+        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+      )
+      temporary.replace(path.with_suffix(".yaml"))
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+      raise TrainerError(
+        f"could not write checkpoint sidecar for {path.name}: {exc}"
+      ) from exc
+
   def _save(self, name: str, *, epoch: int, best_validation_loss: float | None) -> Path:
     path = self.output_dir / name
     save_checkpoint(
@@ -818,6 +844,7 @@ class DiffusionTrainer:
       selection_split=self.best_metric_split,
       fp32_checked=self._fp32_checked,
     )
+    self._write_checkpoint_sidecar(path, name)
     return path
 
   def train(self) -> TrainResult:

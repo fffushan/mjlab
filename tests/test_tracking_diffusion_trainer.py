@@ -164,6 +164,7 @@ def _trainer(
   config: TrainingConfig | None = None,
   contract: DiffusionContract | None = None,
   resume: Path | None = None,
+  checkpoint_sidecar: dict[str, object] | None = None,
 ) -> DiffusionTrainer:
   train = dataset or SyntheticWindows()
   return DiffusionTrainer(
@@ -176,10 +177,42 @@ def _trainer(
     output_dir=output,
     device="cpu",
     resume=resume,
+    checkpoint_sidecar=checkpoint_sidecar,
   )
 
 
-def test_config_defaults_to_validation_and_rejects_test_selection() -> None:
+def test_checkpoint_sidecars_follow_saved_checkpoint_names(tmp_path: Path) -> None:
+  trainer = _trainer(
+    tmp_path,
+    config=_config(epochs=1, max_updates=2),
+    checkpoint_sidecar={
+      "schema": "mjlab-d3-diffusion-checkpoint-v1",
+      "repo_root": "../../../..",
+      "contract": "docs/plans/contract.yaml",
+      "projection": "logs/diffusion/d1/offline/projection.npz",
+      "vae_checkpoint": "logs/distillation/vae/checkpoint-final.pt",
+      "manifest": "configs/distillation/cohort.yaml",
+      "member": "vgk000",
+      "seed": 0,
+      "start_frame": 45,
+    },
+  )
+  result = trainer.train()
+  import yaml
+
+  best = yaml.safe_load(
+    (result.checkpoint_paths["best"].with_suffix(".yaml")).read_text()
+  )
+  last = yaml.safe_load(
+    (result.checkpoint_paths["last"].with_suffix(".yaml")).read_text()
+  )
+  assert best["checkpoint"] == "checkpoint-best.pt"
+  assert last["checkpoint"] == "checkpoint-last.pt"
+  assert best["member"] == "vgk000"
+  assert best["global_step"] == result.global_step
+
+
+
   assert TrainingConfig().eval_split == "validation"
   with pytest.raises(TrainingConfigError, match="test split.*never drive"):
     TrainingConfig(eval_split="test").validate()

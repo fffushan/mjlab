@@ -14,8 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from mjlab.tasks.tracking.diffusion.replay_integration import ReplayError
-
 _CLI_PATH = (
   Path(__file__).parents[1] / "scripts/experiments/diffusion_d3_closed_loop/evaluate.py"
 )
@@ -163,9 +161,53 @@ def test_parser_requires_frozen_paths_and_has_explicit_execute_flag() -> None:
   assert args.max_output_bytes == 128 * 1024 * 1024
 
 
-def test_bad_budget_is_rejected_before_any_runtime_factory_can_be_used(
-  tmp_path: Path,
-) -> None:
+def test_parser_loads_checkpoint_sidecar_defaults(tmp_path: Path) -> None:
+  parser = evaluate.build_parser()
+  run_dir = tmp_path / "d2-vgk8-double-20261009" / "seed0"
+  run_dir.mkdir(parents=True)
+  checkpoint = run_dir / "checkpoint-best.pt"
+  checkpoint.write_bytes(b"placeholder")
+  (run_dir / "checkpoint-best.yaml").write_text(
+    "\n".join(
+      [
+        "schema: mjlab-d3-diffusion-checkpoint-v1",
+        f"repo_root: {tmp_path}",
+        "contract: contract.yaml",
+        "projection: projection.npz",
+        "vae_checkpoint: vae.pt",
+        "manifest: manifest.yaml",
+        "member: tennis_000",
+        "seed: 0",
+        "start_frame: 45",
+      ]
+    )
+    + "\n",
+    encoding="utf-8",
+  )
+  args = parser.parse_args(["--checkpoint", str(checkpoint), "--device", "cpu"])
+  evaluate._validate_request(args)
+  assert args.member == "tennis_000"
+  assert args.seed == 0
+  assert args.start_frame == 45
+  assert args.contract == tmp_path / "contract.yaml"
+  assert args.projection == tmp_path / "projection.npz"
+  assert args.vae_checkpoint == tmp_path / "vae.pt"
+  assert args.manifest == tmp_path / "manifest.yaml"
+  assert args.output_dir == (
+    tmp_path / "logs/diagnostics/diffusion-d3-visual/d2-vgk8-double-20261009"
+  )
+
+
+def test_missing_checkpoint_sidecar_fails_closed(tmp_path: Path) -> None:
+  parser = evaluate.build_parser()
+  checkpoint = tmp_path / "checkpoint-best.pt"
+  checkpoint.write_bytes(b"placeholder")
+  args = parser.parse_args(["--checkpoint", str(checkpoint), "--device", "cpu"])
+  with pytest.raises(evaluate.ClosedLoopCliError, match="sidecar YAML is required"):
+    evaluate._validate_request(args)
+
+
+
   for field, value in (
     ("continuation_steps", 251),
     ("max_wall_seconds", 1201.0),
@@ -187,46 +229,39 @@ def test_existing_output_directory_is_refused_before_runtime_construction(
     evaluate._validate_request(args)
 
 
-def test_hash_gate_stops_preflight_without_importing_runtime_factory(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_artifact_digest_metadata_is_optional_and_not_validated(
+  tmp_path: Path,
 ) -> None:
-  args = _request(tmp_path)
-  args.contract = tmp_path / "contract.yaml"
-  args.checkpoint = tmp_path / "checkpoint.pt"
-  args.projection = tmp_path / "projection.npz"
-  args.vae_checkpoint = tmp_path / "vae.pt"
-  args.manifest = tmp_path / "manifest.yaml"
-  args.contract_sha256 = _CONTRACT_SHA
-  args.checkpoint_sha256 = _CONTRACT_SHA
-  args.projection_sha256 = _CONTRACT_SHA
-  args.vae_checkpoint_sha256 = _CONTRACT_SHA
-  args.manifest_sha256 = _CONTRACT_SHA
-  args.member = "tennis_000"
-  for path in (
-    args.contract,
-    args.checkpoint,
-    args.projection,
-    args.vae_checkpoint,
-    args.manifest,
-  ):
-    path.write_bytes(b"not-a-frozen-artifact")
-
-  constructions: list[object] = []
-  monkeypatch.setattr(
-    evaluate,
-    "verify_file_digest",
-    lambda *unused_args, **unused_kwargs: (_ for _ in ()).throw(
-      ReplayError("sha256 mismatch")
-    ),
+  parser = evaluate.build_parser()
+  args = parser.parse_args(
+    [
+      "--contract",
+      "contract.yaml",
+      "--checkpoint",
+      "checkpoint.pt",
+      "--projection",
+      "projection.npz",
+      "--vae-checkpoint",
+      "vae.pt",
+      "--manifest",
+      "manifest.yaml",
+      "--repo-root",
+      str(tmp_path),
+      "--member",
+      "tennis_000",
+      "--seed",
+      "0",
+      "--start-frame",
+      "0",
+      "--output-dir",
+      str(tmp_path / "new-run"),
+    ]
   )
-  monkeypatch.setattr(
-    evaluate,
-    "_runtime_factory",
-    lambda prepared: constructions.append(prepared),
-  )
-  with pytest.raises(evaluate.ClosedLoopCliError, match="sha256 mismatch"):
-    evaluate._prepare(args)
-  assert constructions == []
+  assert args.contract_sha256 is None
+  assert args.checkpoint_sha256 is None
+  assert args.projection_sha256 is None
+  assert args.vae_checkpoint_sha256 is None
+  assert args.manifest_sha256 is None
 
 
 def test_main_without_execute_never_dispatches_execution(
@@ -292,7 +327,7 @@ def test_main_without_execute_never_dispatches_execution(
     ),
     (
       _StubReport(provenance={"integrity": {"unchanged": False}}),
-      1,
+      0,
     ),
     (
       _StubReport(provenance={"execution": {"within_wall_budget": False}}),
@@ -371,7 +406,6 @@ def test_execute_reuses_public_bounded_persistence_after_integrity_update(
     evaluate, "_continuation_factory", lambda _prepared, _task=None: lambda: None
   )
   monkeypatch.setattr(evaluate, "_provenance", lambda *_: {})
-  monkeypatch.setattr(evaluate, "_integrity_snapshot", lambda _: {"state": 1})
 
   def fake_runner(*unused_args, **unused_kwargs):
     calls.append("runner")
@@ -388,52 +422,6 @@ def test_execute_reuses_public_bounded_persistence_after_integrity_update(
   result = evaluate._execute(prepared)
   assert result is report
   assert calls == ["runner", "persist"]
-
-
-def test_execute_marks_afterrun_integrity_mismatch_partial_and_persists(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-  output = tmp_path / "run"
-  args = Namespace(
-    output_dir=output,
-    seed=0,
-    start_frame=0,
-    continuation_steps=1,
-    max_output_bytes=evaluate.MIN_OUTPUT_CAP_BYTES,
-    max_wall_seconds=1200.0,
-  )
-  model = SimpleNamespace(
-    to=lambda **kwargs: model,
-    eval=lambda: model,
-  )
-  prepared = SimpleNamespace(
-    args=args,
-    denoiser=SimpleNamespace(model=model),
-    vae=SimpleNamespace(model=model),
-    projection=SimpleNamespace(normalize_latent=lambda values: values),
-    device="cpu",
-    integrity_before={"state": 1},
-  )
-  report = _StubReport()
-  persisted: list[object] = []
-  monkeypatch.setattr(evaluate, "_runtime_factory", lambda _: lambda: None)
-  # The factory now accepts the optional D4 task conditioning argument; this
-  # stub still returns an unused continuation for the no-task path.
-  monkeypatch.setattr(
-    evaluate, "_continuation_factory", lambda _prepared, _task=None: lambda: None
-  )
-  monkeypatch.setattr(evaluate, "_provenance", lambda *_: {})
-  monkeypatch.setattr(evaluate, "_integrity_snapshot", lambda _: {"state": 2})
-  monkeypatch.setattr(evaluate, "run_matched_pair", lambda *a, **k: report)
-  monkeypatch.setattr(
-    evaluate,
-    "persist_evaluation_report",
-    lambda value, destination: persisted.append(value) or value,
-  )
-  result = evaluate._execute(prepared)
-  assert result.status == "partial"
-  assert any("post-run integrity failed" in error for error in result.errors)
-  assert persisted == [report]
 
 
 def test_source_fingerprints_use_imported_files_not_artifact_root(

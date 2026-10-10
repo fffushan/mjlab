@@ -71,8 +71,8 @@ def build_parser() -> ArgumentParser:
   parser.add_argument(
     "--branch",
     choices=["baseline", "diffusion"],
-    required=True,
-    help="single diagnostic branch to run (no matched pair is executed)",
+    default="diffusion",
+    help="single diagnostic branch to run (default: diffusion)",
   )
   actions = getattr(parser, "_option_string_actions", {})
   execute_action = actions.get("--execute")
@@ -153,9 +153,6 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
     },
     "vae": {
       "member": args.member,
-      "path": str(args.vae_checkpoint.resolve()),
-      "sha256": args.vae_checkpoint_sha256,
-      "manifest_sha256": prepared.manifest_sha256,
     },
     "checkpoint": {
       "selected_step": prepared.denoiser.global_step,
@@ -164,7 +161,7 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
     },
     "device": str(prepared.device),
     "artifact_root": str(prepared.repo_root),
-    "frozen_file_integrity": dict(prepared.integrity_before["files"]),
+    "artifact_integrity_checks": "disabled",
     "notes": [
       "one branch only; no baseline comparison and no matched acceptance",
       "reference-free continuation follows eight real VAE bootstrap pairs",
