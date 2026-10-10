@@ -4,6 +4,14 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the X2 VGK8 diffusion training pipeline runbook at
+  ``docs/source/x2_diffusion_training.rst``. It documents the D1 collection,
+  inspect/replay, grouped windowing, train-only statistics, token-cache,
+  bounded D2 training, and offline evaluation commands. It records
+  ``max-envs 64`` with one worker and one CPU thread per OpenMP and MKL pool as
+  the best tested collection setting on the managed RTX 4090 server. This is a
+  throughput practice, not a policy-quality or deployment claim.
+
 - Added an opt-in VGK8 diffusion history dropout ablation. The training arm
   drops both state and latent values in the eight history rows with a configured
   probability, using independent ``K=1000`` diffusion noise. The default is
