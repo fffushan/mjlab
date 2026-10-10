@@ -111,6 +111,11 @@ Fixed
   OU noise; only the retained VAE interval of OU trials receives that noise.
   The simulator's manual-reset guard remains enabled.
 
+- Made batched OU restore parity origin-independent. The reset signature now
+  subtracts each row's ``scene.env_origins`` and compares with ``rtol=0`` and
+  ``atol=1e-6``. World-frame trajectory rows remain unchanged, and larger state
+  changes still fail closed.
+
 Changed
 ^^^^^^^
 

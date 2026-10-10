@@ -642,6 +642,8 @@ class X2MotionEnvironment:
 class X2MultiMotionEnvironment:
   """Shared X2 environment exposing the collector's vectorized row protocol."""
 
+  _RESTORE_PARITY_ATOL = 1e-6
+
   def __init__(
     self,
     cohort: Any,
@@ -985,13 +987,25 @@ class X2MultiMotionEnvironment:
   def capture_initial_state_batch(
     self, env_ids: np.ndarray
   ) -> tuple[InitialStateSnapshot, ...]:
+    """Capture reset parity in scene-local coordinates.
+
+    The simulator places environment rows on a world-frame grid.  A clean/OU
+    pair may use different rows, so absolute root positions include different
+    ``scene.env_origins`` even when the physical local state is identical.
+    Normalize only this parity signature.  Stored trajectory states remain in
+    world coordinates.
+    """
     ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    tensor_ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
     data = self.robot.data
+    root_position = (
+      data.root_link_pos_w[tensor_ids] - self.env.scene.env_origins[tensor_ids]
+    )
     result = []
-    for row in ids.tolist():
+    for index, row in enumerate(ids.tolist()):
       values = np.concatenate(
         (
-          data.root_link_pos_w[row].detach().cpu().numpy(),
+          root_position[index].detach().cpu().numpy(),
           data.root_link_quat_w[row].detach().cpu().numpy(),
           data.joint_pos[row].detach().cpu().numpy(),
           data.joint_vel[row].detach().cpu().numpy(),
@@ -1011,7 +1025,12 @@ class X2MultiMotionEnvironment:
   ) -> None:
     actual = self.capture_initial_state_batch(env_ids)
     if len(actual) != len(snapshots) or any(
-      tuple(current.signature) != tuple(expected.signature)
+      not np.allclose(
+        np.asarray(current.signature),
+        np.asarray(expected.signature),
+        rtol=0.0,
+        atol=self._RESTORE_PARITY_ATOL,
+      )
       for current, expected in zip(actual, snapshots, strict=True)
     ):
       raise AdapterError("OU rows could not reproduce their clean partner states")
