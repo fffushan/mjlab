@@ -391,6 +391,85 @@ The optional ``--history-condition-dropout-probability`` flag is an offline
 stress condition. It is not a replacement for a checkpoint trained with the
 same dropout policy and is not a closed-loop evaluation.
 
+D3 closed-loop simulation
+--------------------------
+
+D3 simulation is the first closed-loop stage. It constructs one X2 MuJoCo
+simulation and executes the frozen VAE bootstrap followed by the diffusion
+continuation. It is simulation evidence only. It is not hardware evidence and
+does not qualify real-time control, stability, deployment, or physical quality.
+
+Use ``view.py`` for the browser-based diagnostic. It runs one selected branch.
+The default branch is ``diffusion``. The viewer starts paused and provides
+``Play``, ``Pause``, ``Step``, and ``Reset Environment`` controls. A reset clears
+policy history and performs a new eight-step VAE bootstrap. It does not mutate
+the reference motion or permit a reference after handover.
+
+The training command writes a portable sidecar beside every checkpoint. For the
+best checkpoint, the file is:
+
+.. code-block:: text
+
+   checkpoint-best.pt
+   checkpoint-best.yaml
+
+The sidecar contains repository-relative references to the contract, projection
+bundle, VAE checkpoint, VAE cohort manifest, cohort members, seed, and default
+start frame. The training run also writes ``run-manifest.yaml`` before training.
+The sidecar contains no server-local absolute path. The fetch step must copy the
+sidecar and all referenced artifacts to the local repository layout.
+
+The runner refuses a missing or malformed sidecar. SHA-256 command arguments are
+not required. The runner still performs contract, dimension, schema, VAE, and
+runtime compatibility checks. A sidecar does not replace those checks.
+
+Run a simulator-free preflight first:
+
+.. code-block:: bash
+
+   export CHECKPOINT=$RUN/checkpoint-best.pt
+   PYTHONPATH="$ROOT/src" uv run --no-sync python \
+     "$ROOT/scripts/experiments/diffusion_d3_closed_loop/view.py" \
+     --checkpoint "$CHECKPOINT" \
+     --device cpu
+
+Launch the local browser viewer after the preflight passes:
+
+.. code-block:: bash
+
+   PYTHONPATH="$ROOT/src" uv run --no-sync python \
+     "$ROOT/scripts/experiments/diffusion_d3_closed_loop/view.py" \
+     --checkpoint "$CHECKPOINT" \
+     --execute
+
+The default viewer address is ``http://127.0.0.1:8080``. The default session
+uses 25 continuation steps and a 1200-second wall budget. The output directory
+is derived from the checkpoint run name. It must not already exist. Pass
+``--output-dir`` to select a different new directory.
+
+The three VGK8 best checkpoints use the same D3 pattern:
+
+.. list-table:: VGK8 D2 best checkpoints
+   :header-rows: 1
+
+   * - Training arm
+     - Checkpoint
+     - Default member
+   * - No history dropout
+     - ``logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt``
+     - ``vgk000``
+   * - 20 percent history dropout
+     - ``logs/diffusion/d2-vgk8-history-dropout20-20261009/seed0/checkpoint-best.pt``
+     - ``vgk000``
+   * - 50 percent history dropout
+     - ``logs/diffusion/d2-vgk8-history-dropout50-20261009/seed0/checkpoint-best.pt``
+     - ``vgk000``
+
+A GUI run is one branch and one selected cohort member. It does not perform the
+matched baseline-versus-diffusion acceptance comparison. Use ``evaluate.py``
+when a bounded matched pair is required. Keep the GUI output, preflight output,
+and any stop reason with the checkpoint sidecar.
+
 Gates and evidence boundaries
 -----------------------------
 
