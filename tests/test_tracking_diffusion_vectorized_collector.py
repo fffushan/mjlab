@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 from tracking_diffusion_fixtures import make_state
@@ -76,9 +78,7 @@ class _ScalarEnv:
   def post_step_evidence(self, result: int) -> PostStepBundle:
     boundary = self.phase == "vae" and result == 2
     return PostStepBundle(
-      StepEvidence(
-        True, terminated=boundary, reference_boundary=boundary, clip_ended=boundary
-      ),
+      StepEvidence(True, reference_boundary=boundary, clip_ended=boundary),
       float(result),
       self.observe_vae(),
     )
@@ -210,12 +210,16 @@ def test_batched_rows_are_bit_identical_to_single_row_rows() -> None:
   )
   clean = TrialSpec("run", "a", 7, 3, pair_id="pair", initial_state_id="state")
   ou = TrialSpec("run", "a", 7, 3, "ou", pair_id="pair", initial_state_id="state")
-  scalar.collect(clean)
+  scalar_clean = scalar.collect(clean)
   single = scalar.collect(ou)
 
   batch_vae, batch_ppo = _policies()
   batch = DiffusionCollector(_BatchEnv(), batch_vae, batch_ppo, qualification=config)
   result = batch.collect_batched((clean, ou), slots=1)
+  batch_clean = next(item for item in result.results if item.spec.phase == "clean")
+  for left, right in zip(scalar_clean.rows, batch_clean.rows, strict=True):
+    np.testing.assert_array_equal(left.executed_action, right.executed_action)
+    np.testing.assert_array_equal(right.ou_noise, np.zeros(31))
   batched = next(item for item in result.results if item.spec.phase == "ou")
   assert len(single.rows) == len(batched.rows)
   for left, right in zip(single.rows, batched.rows, strict=True):
@@ -267,6 +271,58 @@ def test_batched_store_receives_one_write_for_multiple_trials(tmp_path) -> None:
   assert result.store_files == ("shard-000000.npz",)
   assert len(calls[0]) == sum(len(item.rows) for item in result.results)
   assert all(row.group_key == "a" for row in calls[0])
+
+
+def test_multi_slot_terminal_reset_and_idle_tail_do_not_block_other_rows() -> None:
+  class _StrictBatchEnv(_BatchEnv):
+    num_envs = 4
+
+    def __init__(self):
+      super().__init__()
+      self.pending = np.zeros(4, dtype=bool)
+      self.active_masks = []
+      self.resets = []
+
+    def set_active_env_ids(self, ids):
+      self.active = np.zeros(4, dtype=bool)
+      self.active[ids] = True
+      self.active_masks.append(self.active.copy())
+
+    def step_batch(self, action):
+      assert not self.pending.any(), "terminal row was not reset"
+      result = super().step_batch(action)
+      if self.active[2] and self.rows[2].step_count == 1:
+        self.pending[2] = True
+      # Without the idle-row mask, row 3 would terminate and block this batch.
+      if self.active[3] and self.rows[3].step_count >= 1:
+        self.pending[3] = True
+      return result
+
+    def post_step_evidence_batch(self, ids):
+      bundle = super().post_step_evidence_batch(ids)
+      return replace(
+        bundle, evidence=replace(bundle.evidence, terminated=self.pending[ids])
+      )
+
+    def reset_after_trial_batch(self, ids):
+      self.resets.extend(ids.tolist())
+      self.pending[ids] = False
+      super().reset_after_trial_batch(ids)
+
+  env = _StrictBatchEnv()
+  vae, ppo = _policies()
+  collector = DiffusionCollector(
+    env, vae, ppo, qualification=QualificationConfig(control_steps=4, retained_steps=2)
+  )
+  specs = tuple(TrialSpec(f"run{i}", "a", 7, 3) for i in range(3))
+  results = collector.collect_batched(specs, slots=4).results
+  assert [len(result.rows) for result in results] == [4, 4, 1]
+  assert results[2].qualification.reason == "early_termination"
+  assert results[0].qualification.qualified
+  assert results[1].qualification.qualified
+  assert not env.pending.any()
+  assert sorted(env.resets) == [0, 1, 2]
+  assert all(not mask[3] for mask in env.active_masks)
 
 
 def test_batch_policy_methods_accept_selected_subsets() -> None:

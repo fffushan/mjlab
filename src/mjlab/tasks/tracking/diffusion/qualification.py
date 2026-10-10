@@ -553,13 +553,12 @@ class BatchedQualificationTracker:
         ("end_effector_z_error", self.config.end_effector_z_error_m),
       ):
         values = getattr(observation, name, None)
-        if not np.any(ppo):
-          if values is None:
-            tracking_rejection |= ~ppo
-          else:
-            tracking_rejection |= (~ppo) & (
-              np.abs(np.asarray(values, dtype=np.float64)) > limit
-            )
+        if values is None:
+          tracking_rejection |= ~ppo
+        else:
+          tracking_rejection |= (~ppo) & (
+            np.abs(np.asarray(values, dtype=np.float64)) > limit
+          )
     else:
       physical_fall |= ppo
       tracking_rejection |= ~ppo
@@ -575,14 +574,17 @@ class BatchedQualificationTracker:
       (ppo & (reference_boundary | clip_ended), "invalid_ppo_reference_boundary"),
     ):
       self._set_failure(selected[mask], reason)
-    valid_boundary = (~ppo) & (reference_boundary | clip_ended)
+    valid_boundary = (
+      (~ppo) & (reference_boundary | clip_ended) & ~(terminated | truncated)
+    )
     boundary_ids = selected[valid_boundary & ~self.saw_handoff[selected]]
     self.saw_handoff[boundary_ids] = True
     self.handoff_step[boundary_ids] = self.steps[boundary_ids]
     interrupted = (terminated | truncated) & ~valid_boundary
-    self.interrupted[
-      selected[interrupted] & (self.failure_codes[selected[interrupted]] == 0)
-    ] = True
+    # Apply the Boolean mask BEFORE selecting global integer row identities.
+    # Bitwise-AND of an ID and a Boolean maps even IDs to 0 and odd IDs to 1.
+    interrupted_ids = selected[interrupted & (self.failure_codes[selected] == 0)]
+    self.interrupted[interrupted_ids] = True
     return StepEvidenceBatch(
       terminal_available,
       terminated,

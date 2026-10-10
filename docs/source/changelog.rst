@@ -101,6 +101,16 @@ Added
   Full physics snapshot restoration remains reserved for the deferred branch
   path.
 
+Fixed
+^^^^^
+
+- Fixed D1 batched X2 collection lifecycle. Idle slots no longer set pending
+  reset flags, and early termination marks the correct environment IDs.
+  VAE reference guards remain active in mixed VAE/recovery batches. Recovery
+  holds the handoff reference without a wrap teleport. Clean trials receive no
+  OU noise; only the retained VAE interval of OU trials receives that noise.
+  The simulator's manual-reset guard remains enabled.
+
 Changed
 ^^^^^^^
 

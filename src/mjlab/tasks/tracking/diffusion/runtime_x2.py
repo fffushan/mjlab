@@ -694,23 +694,52 @@ class X2MultiMotionEnvironment:
     self._capture_snapshot = _capture_snapshot
     self._slices = _term_slices(cohort)
     self._schema = make_schema(joint_order=cohort.actions.joint_names)
+    self._install_termination_masks()
+    self._install_reference_advance_mask()
+
+  def _install_reference_advance_mask(self) -> None:
+    """Hold recovery frames without invoking the motion wrap/teleport path."""
+    update = self.command._update_command
+
+    def advance(env_ids: torch.Tensor | None = None) -> None:
+      candidates = self._row_ids if env_ids is None else env_ids
+      enabled = torch.as_tensor(
+        self._active_rows & self._vae_phase, dtype=torch.bool, device=self.device
+      )
+      update(candidates[enabled[candidates]])
+
+    self.command._update_command = advance
+
+  def _install_termination_masks(self) -> None:
+    """Keep idle physics rows and recovery references out of termination."""
     self._reference_terms: list[tuple[Any, dict[str, Any]]] = []
+    self._vae_phase = np.ones(self.num_envs, dtype=bool)
+    self._active_rows = np.zeros(self.num_envs, dtype=bool)
     manager = self.env.termination_manager
     for name in _REFERENCE_TERMINATIONS:
       if name not in manager.active_terms:
         raise RuntimeX2Error(f"tracking task is missing termination {name!r}")
-      index = manager.active_terms.index(name)
-      cfg = manager._term_cfgs[index]
+    for name in manager.active_terms:
+      cfg = manager.get_term_cfg(name)
       original, params = cfg.func, dict(cfg.params)
-      self._reference_terms.append((original, params))
+      is_reference = name in _REFERENCE_TERMINATIONS
+      if is_reference:
+        self._reference_terms.append((original, params))
 
-      def masked(env: Any, _original: Any = original, **kwargs: Any) -> Any:
+      def masked(
+        env: Any,
+        _original: Any = original,
+        _reference: bool = is_reference,
+        **kwargs: Any,
+      ) -> Any:
+        enabled = self._active_rows
+        if _reference:
+          enabled = enabled & self._vae_phase
         return _original(env, **kwargs) & torch.as_tensor(
-          self._vae_phase, dtype=torch.bool, device=env.device
+          enabled, dtype=torch.bool, device=env.device
         )
 
       cfg.func = masked
-    self._vae_phase = np.ones(self.num_envs, dtype=bool)
 
   def _refresh(self, ids: torch.Tensor) -> None:
     self.env.scene.write_data_to_sim()
@@ -735,6 +764,9 @@ class X2MultiMotionEnvironment:
       raise RuntimeX2Error("trial slots and specs must align")
     if np.any(slots >= self.num_envs):
       raise RuntimeX2Error("trial batch exceeds shared environment slots")
+    self._active_rows[slots] = True
+    self._phase_ppo[slots] = False
+    self._vae_phase[slots] = True
     ids = torch.as_tensor(slots, dtype=torch.long, device=self.device)
     motion_codes = torch.as_tensor(
       [self.teacher_ids.index(spec.motion_id) for spec in specs],
@@ -892,7 +924,14 @@ class X2MultiMotionEnvironment:
       frames / np.maximum(self.command.row_lengths.detach().cpu().numpy()[ids] - 1, 1),
     )
 
+  def set_active_env_ids(self, env_ids: np.ndarray) -> None:
+    """Declare the trial-owned rows before the next full-batch physics step."""
+    self._active_rows[:] = False
+    self._active_rows[np.asarray(env_ids, dtype=np.int64)] = True
+
   def step_batch(self, action: np.ndarray) -> Any:
+    # Physics still advances idle rows.  Their terminal signals are masked
+    # because no trial owns or consumes the corresponding evidence.
     self._pre_frames = self.command.time_steps.detach().clone()
     tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device)
     self._last_result = self.env.step(tensor)
@@ -908,8 +947,9 @@ class X2MultiMotionEnvironment:
     pre = self._pre_frames.detach().cpu().numpy()[ids]
     post = self._post_frames.detach().cpu().numpy()[ids]
     lengths = self.command.row_lengths.detach().cpu().numpy()[ids]
-    boundary = (pre + 1 >= lengths) | (post >= lengths - 1)
-    teleport = (~boundary) & (post != pre + 1)
+    vae = ~self._phase_ppo[ids]
+    boundary = vae & ((pre + 1 >= lengths) | (post >= lengths - 1))
+    teleport = vae & (~boundary) & (post != pre + 1)
     from mjlab.tasks.tracking.diffusion.adapter import PostStepBundleBatch
     from mjlab.tasks.tracking.diffusion.qualification import StepEvidenceBatch
 

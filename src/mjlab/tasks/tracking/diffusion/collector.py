@@ -619,6 +619,9 @@ class DiffusionCollector:
       slots_now = tuple(sorted(started))
       ids = _ids(slots_now)
       trial_specs = tuple(started[slot] for slot in slots_now)
+      set_active = getattr(self.env, "set_active_env_ids", None)
+      if callable(set_active):
+        set_active(_ids(tuple(sorted(scheduler.active))))
       self.env.reset_batch(trial_specs, env_ids=ids)
       tracker.reset(ids)
       previous[ids] = 0.0
@@ -657,16 +660,26 @@ class DiffusionCollector:
         clean[vae_ids] = clean_values
         latent[vae_ids] = latent_values
         retained = vae_ids[
-          tracker.vae_steps[vae_ids] < self.qualification.retained_steps
+          (tracker.vae_steps[vae_ids] < self.qualification.retained_steps)
+          & np.asarray(
+            [
+              spec is not None and spec.phase == "ou"
+              for spec in (active_specs[int(slot)] for slot in vae_ids)
+            ],
+            dtype=bool,
+          )
         ]
         if retained.size:
-          noise[retained] = ou.sample(retained)
+          noise[retained] = ou.sample(retained.tolist())
       if ppo_ids.size:
         assert ppo_observation is not None
         clean[ppo_ids] = self.ppo.batch_action(ppo_observation, previous[ppo_ids])
       executed = clean + noise
       if not np.isfinite(executed).all():
         raise CollectorError("batched policy produced non-finite actions")
+      set_active = getattr(self.env, "set_active_env_ids", None)
+      if callable(set_active):
+        set_active(active_ids)
       self.env.step_batch(executed)
       bundle = self.env.post_step_evidence_batch(active_ids)
       if bundle.observation is None:
@@ -748,7 +761,7 @@ class DiffusionCollector:
           [boundary[position[slot]] for slot in vae_ids.tolist()], dtype=bool
         )
         vae_failed = tracker.failure_codes[vae_ids] != 0
-        handoff = vae_ids[vae_boundary & ~vae_failed]
+        handoff = vae_ids[vae_boundary & ~vae_failed & ~tracker.interrupted[vae_ids]]
       else:
         handoff = np.empty(0, dtype=np.int64)
       if handoff.size:
