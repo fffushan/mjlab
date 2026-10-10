@@ -18,9 +18,10 @@ The checkpoint path identifies the diffusion run. A required sibling sidecar nam
 `checkpoint-best.yaml` supplies the contract, projection bundle, VAE checkpoint,
 manifest, member, seed, and start frame. If the sidecar is missing or malformed,
 preflight fails. The repository root is resolved from the sidecar. The output
-directory derives from the checkpoint run name and must be new.
-
-The viewer defaults to the diffusion branch, `127.0.0.1:8080`, 25 continuation
+directory derives from the checkpoint run name. Existing output directories are
+accepted. The evaluator and viewer overwrite their output files in that directory.
+Pass ``--output-dir`` to select a different directory.
+The viewer defaults to the diffusion branch, `127.0.0.1:8080`, 5000 continuation
 steps, and the default CUDA device. Override any sidecar or viewer value when
 using a different artifact cohort.
 
@@ -35,8 +36,9 @@ convention (reference 68 / conditioning 99 / raw mean latent 32 / action 31).
 Continuation uses measured runtime conditioning: projected gravity plus the
 cached actor gyro, joint position, joint velocity, and previous applied action.
 
-Hard CLI limits are continuation steps `1..250`, wall budget `(0,1200]` seconds,
-and output cap `4096..128 MiB`; the output directory must not already exist.
+Hard CLI limits are continuation steps `1..5000`, wall budget `(0,1200]` seconds,
+and output cap `4096..128 MiB`; an existing output directory is allowed and its
+output files are overwritten.
 The runner and CLI share the public `MIN_OUTPUT_CAP_BYTES` bound and the same
 bounded persistence function. Each run is persisted as `full`, `compact`, or
 `marker` representation with truthful omitted-row counts and actual byte
@@ -46,7 +48,8 @@ in-memory ticks when they were omitted. A report/inference/runtime failure,
 output error, post-run integrity mismatch, or wall-budget failure exits nonzero.
 A complete paired physical attempt, including a physical fall, remains exit 0.
 The initial smoke budget is exactly 8 bootstrap + 25 evaluation ticks per
-branch.
+branch when ``--continuation-steps 25`` is passed explicitly. The default
+viewer session uses 5000 evaluation ticks per branch.
 
 Source provenance fingerprints the executed CLI and imported module files from
 their actual `__file__` locations, with source checkout heads kept separate
@@ -124,8 +127,8 @@ known semantics.
 `run_pilot.py` runs one frozen, preregistered headless batch through
 `evaluate.py`: `tennis_000`, seeds `0/1/2` x start fractions `0.1/0.5` = six
 matched pairs, eight actual VAE bootstrap transitions per branch, and at most
-`250` post-bootstrap evaluation ticks per branch. Each condition's horizon is
-`min(250, clip_frames - 2 - start_frame - 8)` with
+`5000` post-bootstrap evaluation ticks per branch. Each condition's horizon is
+`min(5000, clip_frames - 2 - start_frame - 8)` with
 `start_frame = floor(start_fraction * (clip_frames - 1))`; the frames and
 horizons are declared before any physics runs, so neither branch attempts a
 final-reference-frame action or clip wrap and the horizon is not tuned from
@@ -190,7 +193,7 @@ reference after handover. The status panel shows the selected branch/member,
 height, bootstrap count, evaluation steps, and the stop/error reason. The final
 stopped pose stays visible until the viewer resets it, the session wall
 budget elapses, or the viewer closes. Playback is bounded by
-`--continuation-steps` (`1..250`). `--max-wall-seconds` is a fixed **whole
+`--continuation-steps` (`1..5000`). `--max-wall-seconds` is a fixed **whole
 session** budget: it starts before device/model load and also counts rendering,
 paused/idle time, inference, stepping and explicit resets, so a user reset never
 extends it. When it elapses the session ends and the launcher closes the
@@ -218,7 +221,7 @@ PYTHONPATH="$PWD/src" uv run --no-sync python \
 
 The defaults use the active local VGK8 contract, projection bundle, mixed VAE
 checkpoint, `tennis_000`, seed `0`, start frame `45`, diffusion branch,
-`127.0.0.1:8080`, 25 continuation steps, and a 1200-second wall budget. The
+`127.0.0.1:8080`, 5000 continuation steps, and a 1200-second wall budget. The
 output directory is derived as
 `logs/diagnostics/diffusion-d3-visual/d2-vgk8-double-20261009`.
 Open `http://localhost:8080` after startup.

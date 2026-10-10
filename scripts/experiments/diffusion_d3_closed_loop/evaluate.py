@@ -51,7 +51,7 @@ from mjlab.tasks.tracking.diffusion.replay_integration import (
 )
 from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 
-_MAX_CONTINUATION_STEPS = 250
+_MAX_CONTINUATION_STEPS = 5000
 _MAX_WALL_SECONDS = 1200.0
 _MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 _TRAINING_BUDGET_UPDATES = 104_000
@@ -304,8 +304,8 @@ def _parser() -> argparse.ArgumentParser:
   parser.add_argument(
     "--continuation-steps",
     type=int,
-    default=25,
-    help="post-bootstrap evaluation ticks per branch (1..250; default: 25)",
+    default=5000,
+    help="post-bootstrap evaluation ticks per branch (1..5000; default: 5000)",
   )
   parser.add_argument(
     "--max-wall-seconds",
@@ -324,8 +324,8 @@ def _parser() -> argparse.ArgumentParser:
     type=Path,
     default=None,
     help=(
-      "new output directory; default derives from the checkpoint run name "
-      f"under {_DEFAULT_OUTPUT_ROOT}"
+      "overwrite existing output directory; default derives from the checkpoint run name "
+      f"under {_DEFAULT_OUTPUT_ROOT}; files are replaced on write"
     ),
   )
   parser.add_argument(
@@ -479,9 +479,9 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
       f"{_MAX_OUTPUT_BYTES}]"
     )
   output_dir = Path(args.output_dir).resolve()
-  if output_dir.exists():
+  if output_dir.exists() and not output_dir.is_dir():
     raise ClosedLoopCliError(
-      f"output-dir must be new and absent; refusing existing path {output_dir}"
+      f"output-dir exists but is not a directory: {output_dir}"
     )
   if not repo_root.is_dir():
     raise ClosedLoopCliError(f"repo-root is not a directory: {repo_root}")

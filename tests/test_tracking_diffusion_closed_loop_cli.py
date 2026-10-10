@@ -157,7 +157,7 @@ def test_parser_requires_frozen_paths_and_has_explicit_execute_flag() -> None:
   )
   assert args.execute is False
   assert args.member == "tennis_000"
-  assert args.continuation_steps == 25
+  assert args.continuation_steps == 5000
   assert args.max_output_bytes == 128 * 1024 * 1024
 
 
@@ -209,7 +209,7 @@ def test_missing_checkpoint_sidecar_fails_closed(tmp_path: Path) -> None:
 
 
   for field, value in (
-    ("continuation_steps", 251),
+    ("continuation_steps", 5001),
     ("max_wall_seconds", 1201.0),
     ("max_output_bytes", evaluate.MIN_OUTPUT_CAP_BYTES - 1),
     ("max_output_bytes", 128 * 1024 * 1024 + 1),
@@ -219,14 +219,15 @@ def test_missing_checkpoint_sidecar_fails_closed(tmp_path: Path) -> None:
       evaluate._validate_request(args)
 
 
-def test_existing_output_directory_is_refused_before_runtime_construction(
+def test_existing_output_directory_is_allowed_for_overwrite(
   tmp_path: Path,
 ) -> None:
   output_dir = tmp_path / "already-there"
   output_dir.mkdir()
   args = _request(tmp_path, output_dir=output_dir)
-  with pytest.raises(evaluate.ClosedLoopCliError, match="must be new"):
-    evaluate._validate_request(args)
+  repo_root, device = evaluate._validate_request(args)
+  assert repo_root == tmp_path.resolve()
+  assert device.type == "cpu"
 
 
 def test_artifact_digest_metadata_is_optional_and_not_validated(

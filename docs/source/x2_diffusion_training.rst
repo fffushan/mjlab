@@ -443,9 +443,10 @@ Launch the local browser viewer after the preflight passes:
      --execute
 
 The default viewer address is ``http://127.0.0.1:8080``. The default session
-uses 25 continuation steps and a 1200-second wall budget. The output directory
-is derived from the checkpoint run name. It must not already exist. Pass
-``--output-dir`` to select a different new directory.
+uses 5000 continuation steps and a 1200-second wall budget. The output directory
+is derived from the checkpoint run name. An existing output directory is allowed;
+the evaluator and viewer overwrite their output files. Pass
+``--output-dir`` to select a different directory.
 
 The three VGK8 best checkpoints use the same D3 pattern:
 
