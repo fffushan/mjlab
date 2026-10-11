@@ -50,7 +50,7 @@ uv run --no-sync pytest \
 ```
 
 Result: **161 passed**, one existing Tyro parser deprecation warning, 47.14 seconds.
-[Captured output](/tmp/vae-sample-budget-final-tests-20261008.log).
+Captured output was written to `/tmp/vae-sample-budget-final-tests-20261008.log`, which no longer exists.
 Monitor `#6` reports `exit=0`.
 
 Tests replace the simulator, not replay, trainer, Adam or checkpoint code.

@@ -41,7 +41,7 @@ Files:
 Final expanded command includes collection statistics, motion command, routing, sharded merge,
 CLI/cohort CLI, motion library, standing trials, provenance and X2 coverage-adapter tests.
 Result: **209 passed**,12 existing ONNX/model-timestep warnings,62.49 seconds.
-[Captured output](/tmp/vae-next-collection-final-tests-20261008.log).
+Captured output was written to `/tmp/vae-next-collection-final-tests-20261008.log`, which no longer exists.
 The first narrower run reports190 passes and is preserved separately.
 
 Tests cover subset reset, frame wrap, timer resample, explicit restore-like copies,

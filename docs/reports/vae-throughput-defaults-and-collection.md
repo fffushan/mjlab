@@ -38,14 +38,14 @@ Files:
 ## Validation evidence
 
 The final six-suite CPU/fake-simulator regression run reports **212 passed**, eight existing ONNX deprecation warnings.
-Duration:93.05 seconds. [Output](/tmp/vae-default-collection-final-tests-20261008.log).
+Duration:93.05 seconds. Output was written to `/tmp/vae-default-collection-final-tests-20261008.log`, which no longer exists.
 No live simulator is built by these suites.
 
 An earlier run was stopped after faulthandler reported a long backward call.
 The CLI test helper had inherited the new16384-row GPU batch.
 The helper now supplies microbatch4 and accumulation3.
 The three affected cadence/resume tests pass in5.60 seconds.
-The original diagnostic remains at [stopped output](/tmp/vae-default-collection-tests-20261008.log).
+The original diagnostic was written to `/tmp/vae-default-collection-tests-20261008.log`, which no longer exists.
 The stop was not reported as a passing run.
 
 A later local CUDA regression **passes** on the RTX5080 Laptop GPU.
