@@ -191,6 +191,63 @@ def test_time_steps_stay_inside_the_reference_clip(tmp_path: Path) -> None:
   assert steps.max() < frames
 
 
+def test_reference_tensor_lookup_follows_exporter_alias_nodes() -> None:
+  """A deduplicated reference constant arrives as an ``Identity`` alias.
+
+  The exporter gives byte-identical constants one initializer plus an ``Identity``
+  node per duplicate, and a static clip's two all-zero velocity arrays are exactly
+  that case.  The reader must resolve the alias, or a valid export looks like one
+  with a missing reference array.
+  """
+  onnx = pytest.importorskip("onnx")
+
+  zeros = np.zeros((4, 3), dtype=np.float32)
+  lin_vel = onnx.numpy_helper.from_array(zeros, name="body_lin_vel_w.1")
+  joint_vel = onnx.numpy_helper.from_array(
+    np.arange(12, dtype=np.float32).reshape(4, 3), name="joint_vel.1"
+  )
+  ang_alias = onnx.helper.make_node(
+    "Identity", inputs=["body_lin_vel_w.1"], outputs=["body_ang_vel_w.1"]
+  )
+  # A second hop proves the resolution is iterative, not single-pass.
+  pos_alias = onnx.helper.make_node(
+    "Identity", inputs=["joint_vel.1"], outputs=["body_pos_w.1"]
+  )
+  # An alias over a graph input has no constant to resolve: it must stay absent.
+  input_alias = onnx.helper.make_node(
+    "Identity", inputs=["obs"], outputs=["body_quat_w.1"]
+  )
+  graph = onnx.helper.make_graph(
+    [ang_alias, pos_alias, input_alias],
+    "alias_tensors",
+    [
+      onnx.helper.make_tensor_value_info("obs", onnx.TensorProto.FLOAT, [1, 3]),
+      onnx.helper.make_tensor_value_info(
+        "body_ang_vel_w", onnx.TensorProto.FLOAT, [1, 3]
+      ),
+    ],
+    [],
+    initializer=[lin_vel, joint_vel],
+  )
+  model = onnx.helper.make_model(graph)
+
+  import tempfile
+
+  with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "alias.onnx"
+    onnx.save(model, str(path))
+    artifact = load_onnx_artifact(path, "generated alias export")
+
+  found = artifact.reference_tensor("body_ang_vel_w")
+  assert found is not None
+  assert np.array_equal(found[1], zeros)
+  chained = artifact.reference_tensor("body_pos_w")
+  assert chained is not None
+  assert chained[0] == "body_pos_w.1"
+  assert np.array_equal(chained[1], np.arange(12).reshape(4, 3))
+  assert artifact.reference_tensor("body_quat_w") is None
+
+
 def test_reference_tensor_lookup_accepts_constant_nodes() -> None:
   """Exports may embed reference data as Constant attributes, not initializers."""
   onnx = pytest.importorskip("onnx")

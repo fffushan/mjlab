@@ -1236,6 +1236,20 @@ def _require_reference_cadence(
     )
 
 
+_MAX_REFERENCE_ALIAS_HOPS = 8
+"""Bound on resolving a reference tensor that the exporter aliased to a constant.
+
+The ONNX exporter deduplicates byte-identical reference constants: one keeps the
+initializer and each duplicate becomes an ``Identity`` node over it.  A static
+reference clip carries two all-zero arrays (``body_lin_vel_w`` and
+``body_ang_vel_w``), so such an export holds no ``body_ang_vel_w`` initializer at
+all and a reader that only inspects initializers and ``Constant`` nodes loses an
+array the graph does expose to ONNX Runtime.  Aliases are resolved by following
+``Identity`` nodes only, and a chain longer than this bound stays unresolved
+rather than being guessed.
+"""
+
+
 def load_onnx_artifact(path: Path, where: str) -> OnnxArtifact:
   """Read an original teacher ONNX export without running it."""
   onnx = require_onnx()
@@ -1268,6 +1282,33 @@ def load_onnx_artifact(path: Path, where: str) -> OnnxArtifact:
     for attribute in node.attribute:
       if attribute.name == "value":
         constants[node.output[0]] = onnx.numpy_helper.to_array(attribute.t)
+
+  # Materialize the exporter's deduplicated reference aliases.  An alias is only
+  # followed when its source is already a known tensor, so an unresolvable or
+  # dangling input stays absent and the caller's fail-closed lookup still refuses
+  # it.
+  aliases = {
+    node.output[0]: node.input[0]
+    for node in graph.node
+    if node.op_type == "Identity"
+    and len(node.input) == 1
+    and len(node.output) == 1
+    and node.output[0] not in initializers
+    and node.output[0] not in constants
+  }
+  for _ in range(_MAX_REFERENCE_ALIAS_HOPS):
+    resolvable = {
+      name: source
+      for name, source in aliases.items()
+      if source in initializers or source in constants
+    }
+    if not resolvable:
+      break
+    for name, source in resolvable.items():
+      constants[name] = (
+        initializers[source] if source in initializers else constants[source]
+      )
+      del aliases[name]
 
   return OnnxArtifact(
     path=path,
