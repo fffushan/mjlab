@@ -59,6 +59,7 @@ def main(
   num_envs: int = 1024,
   episode_length_s: float | None = None,
   device: str | None = None,
+  seed: int = 0,
 ) -> None:
   """Evaluate a trained tracking policy and print metrics.
 
@@ -70,6 +71,9 @@ def main(
     num_envs: Number of parallel environments (= number of evaluation episodes).
     episode_length_s: Episode length in seconds; None = full motion trajectory.
     device: Device to run on; defaults to CUDA if available.
+    seed: Environment seed. A fixed default makes repeat runs and comparisons
+      between checkpoints of the same policy reproducible; with ``None`` the
+      environment draws a random seed and identical runs disagree.
   """
   configure_torch_backends()
   device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -101,6 +105,8 @@ def main(
   env_cfg.events.pop("push_robot", None)
   env_cfg.scene.num_envs = num_envs
   env_cfg.episode_length_s = eval_length_s
+  env_cfg.seed = seed
+  print(f"[INFO] environment seed: {env_cfg.seed}")
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -204,9 +210,9 @@ def main(
   for i, name in enumerate(body_names):
     tag = " <-- ankle" if "ankle" in name else ""
     print(f"    {name:28s}: {per_body[i].item():.4f} m{tag}")
-  if fail_steps:
-    weighted = np.repeat([t for t, _ in fail_steps], [c for _, c in fail_steps]) / 50.0
-    print(f"  failed envs: {len(weighted)}")
+  weighted = np.repeat([t for t, _ in fail_steps], [c for _, c in fail_steps]) / 50.0
+  print(f"  failed envs: {weighted.size}")
+  if weighted.size:
     print(
       f"  failure times (s): min={weighted.min():.1f} "
       f"p25={np.percentile(weighted, 25):.1f} median={np.median(weighted):.1f} "
