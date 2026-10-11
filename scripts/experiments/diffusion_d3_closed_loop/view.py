@@ -117,7 +117,7 @@ def _validate_viewer_options(args: Any) -> None:
 
 def _preflight_report(prepared: Any) -> dict[str, Any]:
   args = prepared.args
-  return {
+  report: dict[str, Any] = {
     "schema": "mjlab-d3-visual-diagnostic-preflight-v1",
     "ok": True,
     "authority": "single-branch-visual-diagnostic",
@@ -168,13 +168,17 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
       "the viewer starts paused and never mutates the reference or physical state",
     ],
   }
+  task_report = evaluate._task_config_report(getattr(prepared, "task", None))
+  if task_report is not None:
+    report["task"] = task_report
+  return report
 
 
 def _display_host(host: str) -> str:
   return "localhost" if host in {"0.0.0.0", "::", ""} else host
 
 
-def _write_status(prepared: Any, playback: Any) -> None:
+def _write_status(prepared: Any, playback: Any, task_conditioning: Any = None) -> None:
   """Best-effort bounded status record; never masks the run result."""
   args = prepared.args
   output_dir = Path(args.output_dir).resolve()
@@ -195,6 +199,8 @@ def _write_status(prepared: Any, playback: Any) -> None:
       },
       "status": playback.status(),
     }
+    if task_conditioning is not None:
+      payload["task"] = task_conditioning.provenance()
     (output_dir / "viewer-status.json").write_text(
       json.dumps(payload, indent=1, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -219,6 +225,9 @@ def _run_viewer(prepared: Any) -> int:
   playback = None
   viewer = None
   server = None
+  task_conditioning = None
+  task_conditioning_closed = False
+  task_conditioning_used = False
   try:
     import viser
 
@@ -229,9 +238,36 @@ def _run_viewer(prepared: Any) -> int:
     vae_model.eval()
 
     runtime = evaluate._runtime_factory(prepared)()
-    continuation_factory = (
-      evaluate._continuation_factory(prepared) if args.branch == "diffusion" else None
-    )
+    continuation_factory = None
+    if args.branch == "diffusion":
+      task_spec = getattr(prepared, "task", None)
+      if task_spec is None:
+        continuation_factory = evaluate._continuation_factory(prepared)
+      else:
+        from mjlab.tasks.tracking.diffusion.conditioned_continuation import (
+          TaskConditioning,
+        )
+
+        task_conditioning = TaskConditioning(
+          task_spec,
+          projection=prepared.projection,
+          contract=prepared.contract,
+        )
+
+        def build_task_continuation() -> Any:
+          nonlocal task_conditioning, task_conditioning_used
+          if task_conditioning_used:
+            task_conditioning.close(stop_reason="viewer_reset")
+            task_conditioning = TaskConditioning(
+              task_spec,
+              projection=prepared.projection,
+              contract=prepared.contract,
+            )
+          task_conditioning_used = True
+          factory = evaluate._continuation_factory(prepared, task_conditioning)
+          return factory()
+
+        continuation_factory = build_task_continuation
     render_env = getattr(runtime, "env", None)
     playback = VisualDiagnosticPlayback(
       runtime=runtime,
@@ -263,12 +299,23 @@ def _run_viewer(prepared: Any) -> int:
       env, policy, playback, viser_server=server, frame_rate=args.frame_rate
     )
     viewer.run()
-    _write_status(prepared, playback)
+    if task_conditioning is not None:
+      task_conditioning.close(stop_reason=playback.stop_reason)
+      task_conditioning_closed = True
+    _write_status(prepared, playback, task_conditioning)
     return 0
   except Exception as exc:
     print(f"D3 visual diagnostic failed: {exc}", file=sys.stderr)
     return 1
   finally:
+    if task_conditioning is not None and not task_conditioning_closed:
+      try:
+        task_conditioning.close(
+          stop_reason=None if playback is None else playback.stop_reason
+        )
+        task_conditioning_closed = True
+      except Exception as exc:  # noqa: BLE001 - cleanup must not mask the run result
+        print(f"[WARN] task conditioning close failed: {exc}", file=sys.stderr)
     if viewer is not None:
       try:
         viewer.close()

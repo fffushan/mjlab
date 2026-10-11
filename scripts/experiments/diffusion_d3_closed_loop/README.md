@@ -226,10 +226,111 @@ output directory is derived as
 `logs/diagnostics/diffusion-d3-visual/d2-vgk8-double-20261009`.
 Open `http://localhost:8080` after startup.
 
+For the D4 hard-keyframe inpaint prepared for `vgk005`, pass the task config to
+`view.py`. The viewer starts paused. The target is absolute tick `38`, so the
+first diffusion tick is `8` and the target is reached after about `30`
+reference-free steps. Use at least `30` continuation steps; `60` leaves room to
+observe the post-target motion.
+
+```sh
+cd /home/agiuser/projects/mjlab
+PYTHONPATH="$PWD/src" uv run --no-sync python \
+  scripts/experiments/diffusion_d3_closed_loop/view.py \
+  --checkpoint logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt \
+  --member vgk005 \
+  --seed 0 \
+  --start-frame 45 \
+  --task-config logs/diagnostics/diffusion-d4-vgk005-start45-target-frame75-tick38.json \
+  --branch diffusion \
+  --device cuda:0 \
+  --continuation-steps 60 \
+  --max-wall-seconds 300 \
+  --output-dir logs/diagnostics/diffusion-d4-visual-vgk005-start45-target75 \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --execute
+```
+
+This is a single-branch visual diagnostic. It is not a matched evaluation and
+it does not claim physical provenance for the direct reference-motion source.
+`viewer-status.json` records the task source, target ledger and stop reason.
+
 The bound server, viewer, runtime and env are closed on exit or on any failure;
 a bounded `viewer-status.json` records the final diagnostic status. This is a
 single-branch visual diagnostic only: it is not physical evidence and it does
 not qualify the matched-pair gate.
+
+## One-shot future-pose inspection
+
+`inspect_sequence.py` generates exactly one complete future-pose sample and
+plays the fitted poses in temporal order. It runs one environment for eight real VAE
+bootstrap transitions, freezes the reference, draws one `41 x 167` window from
+the installed plan and sampler, recovers the `32` predicted future world poses
+with `sequence_poses.py`, fits display-only joint angles with an isolated CPU
+MuJoCo model, and opens one saved-pose Viser viewer. The diffusion action is never
+decoded and no physics step runs after handover. This is a single-sample
+visualization: it is not a matched evaluation and it makes no policy,
+deployment or hardware claim.
+
+Run one command to execute the eight-step bootstrap, denoise once, fit IK,
+and open the looped playback viewer. No separate replay command is required.
+For the prepared D4 task, plan tick `8` places keyframe tick `38` at future pose `30`.
+
+```sh
+cd /home/agiuser/projects/mjlab
+PYTHONPATH="$PWD/src" uv run --no-sync python \
+  scripts/experiments/diffusion_d3_closed_loop/inspect_sequence.py \
+  --checkpoint logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt \
+  --member vgk005 \
+  --seed 0 \
+  --start-frame 45 \
+  --task-config logs/diagnostics/diffusion-d4-vgk005-start45-target-frame75-tick38.json \
+  --output-dir logs/diagnostics/diffusion-d3-future-pose/vgk005-start45 \
+  --device cuda:0 \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --execute
+```
+
+For simulator-free preflight, omit `--execute` and use `--device cpu`.
+Add `--no-view` only when you want headless generation without playback.
+
+`--output-dir` receives `future-poses.npz`, the compiled `ghost-model.mjb` and
+`inspect-status.json`. The default is
+`logs/diagnostics/diffusion-d3-future-pose/<member>-start<frame>-seed<seed>`.
+The current X2 compiled model is about 340 MiB because it embeds the robot meshes.
+The pose NPZ is small. Reusing an output directory overwrites its saved files.
+The pose viewer stays open until `Ctrl+C`.
+Inherited evaluator budget flags do not apply to this one-shot tool.
+Optionally, `--replay DIR` reopens a result from an earlier run. It is not
+needed after the normal command above. It loads no neural model and steps no physics:
+
+```sh
+cd /home/agiuser/projects/mjlab
+PYTHONPATH="$PWD/src" uv run --no-sync python \
+  scripts/experiments/diffusion_d3_closed_loop/inspect_sequence.py \
+  --replay logs/diagnostics/diffusion-d3-future-pose/vgk005-start45 \
+  --execute
+```
+
+The camera starts centered on the fitted poses. `Center view` restores the camera.
+The viewer starts paused at future pose 1, with one solid robot visible.
+
+- `Play` / `Pause`: loop through poses `1..32`, then return to pose 1.
+- `Step`: pause and advance exactly one pose. Pose 32 wraps to pose 1.
+- `Reset`: pause and return to pose 1. It does not reset or run a simulator.
+- `Playback speed`: defaults to `0.25x`. `1x` is nominally 50 poses per second.
+- `Future index`: seek to a pose and pause.
+- `All ghosts`: pause and show the original 32-pose overlay around the measured center.
+- `Ghost opacity` and `Raw body points`: control the overlay display.
+
+Playback uses only saved joint poses and forward kinematics. It runs no physics,
+VAE, denoising, or IK. The status
+panel shows the measured center root position, the absolute plan tick, the
+absolute future tick and the IK residual. The fitted joints are a rendering aid
+derived from the predicted body positions: they are not model predictions and
+they never feed physics or control. A predicted row the display fit cannot
+reach keeps its residual and reports `converged: false`.
 
 ## Opt-in D4 sparse task conditioning
 
@@ -313,8 +414,9 @@ cannot upgrade a source, and a missing, modified or scenario-mismatched
 recording is refused. The digest and declared-record checks prove the recorded
 bytes and their structural qualification; they are not a cryptographic or
 independent authentication that the recording reflects physical execution.
-Under `--execute` a non-verified source is refused, so a manual/synthetic or
-`declared` task can only be used for CPU diagnostics and preflight.
+Under `--execute`, unverified, declared, and verified sources are all accepted;
+the original source qualification remains in the report and does not become a
+physical-evidence claim.
 
 ```sh
 PYTHONPATH="$PWD/src" uv run --no-sync python \

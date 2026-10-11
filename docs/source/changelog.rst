@@ -4,6 +4,25 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added looped playback to the one-shot future-pose viewer. It starts paused
+  on pose 1 and has Play/Pause, Step, Reset and playback-speed controls.
+  Playback changes only the displayed saved pose. It runs no physics,
+  neural inference or IK. Normal ``--execute`` generates the result and opens
+  this playback viewer in one command. The 32-pose ghost overlay remains available.
+
+- Added the one-shot D3 future-pose inspection tool
+  ``scripts/experiments/diffusion_d3_closed_loop/inspect_sequence.py`` and its
+  display-only pose helper
+  ``scripts/experiments/diffusion_d3_closed_loop/sequence_poses.py``. It executes
+  eight real VAE bootstrap transitions, draws one complete window from the
+  installed plan and sampler, recovers the 32 predicted future world poses and
+  fits display-only joint angles with an isolated CPU MuJoCo model, then shows
+  one static Viser scene with minimal controls. ``--replay DIR`` reopens saved
+  poses without a neural artifact or a physics step, and ``--no-view``
+  generates headlessly. The tool never decodes the diffusion action and never
+  steps physics after handover. It is a single-sample visualization and makes no
+  matched-evaluation, policy, deployment or hardware claim.
+
 - Added the X2 VGK8 diffusion training pipeline runbook at
   ``docs/source/x2_diffusion_training.rst``. It documents the D1 collection,
   inspect/replay, grouped windowing, train-only statistics, token-cache,
@@ -111,6 +130,11 @@ Added
 
 Fixed
 ^^^^^
+
+- Fixed the one-shot future-pose camera framing. The static scene keeps world
+  coordinates, and the camera frames the fitted robot bodies instead of the
+  global model extent. A ``Center view`` button restores this camera pose.
+  Saved poses and IK results are unchanged.
 
 - Fixed D1 batched X2 collection lifecycle. Idle slots no longer set pending
   reset flags, and early termination marks the correct environment IDs.
