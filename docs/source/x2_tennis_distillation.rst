@@ -260,6 +260,13 @@ Existing checkpoints keep their saved batch settings. Resume must repeat those
 settings explicitly; equal effective batch alone does not permit a different
 microbatch/accumulation split.
 
+Measured note on this split: on the VAE trainer a larger microbatch with
+accumulation 1 is much faster than accumulation over the same effective batch,
+because the small model makes each accumulated pass launch-bound. The optimizer
+phase fell from 8.40 s to 1.72 s per iteration at an unchanged effective batch
+of 32768. See
+[the optimizer batching note](../plans/beyondmimic_vae_optimizer_batching.md).
+
 Each flag replaces one explicit total. Do not combine ``--envs-per-motion``
 with ``--num-envs``, the draw ratio with ``--updates-per-iteration``, or the
 retention horizon with ``--replay-capacity``. Conflicts fail before environment
