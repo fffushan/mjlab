@@ -10,7 +10,7 @@ Baseline: `fxy/test/tracking-exp`, HEAD `203cb6ff8dcef1c2b080e047e0128c78f740991
 standing-start milestones).
 Related: [M4 implementation and acceptance](beyondmimic_vae_m4_implementation.md),
 [standing-start extension](beyondmimic_vae_standing_start_implementation.md),
-[architecture](beyondmimic_vae_distillation.md),
+[architecture](../design/beyondmimic_vae_distillation.md),
 [usage](../source/x2_tennis_distillation.rst).
 
 Notes:

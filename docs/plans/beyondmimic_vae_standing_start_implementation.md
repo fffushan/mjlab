@@ -8,7 +8,7 @@ Repository: `/home/agiuser/projects/mjlab`.
 Baseline: the accepted, uncommitted M4 working tree on `fxy/test/tracking-exp`,
 HEAD `5cb756eed94b5a2353a1b8b4aa93b65f0f160b7a`.
 Related: [M4 implementation and acceptance](beyondmimic_vae_m4_implementation.md),
-[architecture](beyondmimic_vae_distillation.md), and
+[architecture](../design/beyondmimic_vae_distillation.md), and
 [usage](../source/x2_tennis_distillation.rst). This plan extends the M4 cohort
 path; the M4 acceptance record above it does not mention or depend on it.
 

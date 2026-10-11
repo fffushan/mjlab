@@ -14,7 +14,7 @@ All delegated workers/reviewers: **`lingzhi/gpt-5.6-luna`**.
 Parent owns scope, decisions, 15-minute supervision, runtime resource gates, and
 final independent acceptance. No automatic commit or push of M3.
 
-Related: [architecture](beyondmimic_vae_distillation.md),
+Related: [architecture](../design/beyondmimic_vae_distillation.md),
 [milestones](beyondmimic_vae_implementation.md),
 [M2 contract and acceptance](beyondmimic_vae_m2_implementation.md).
 This document supersedes earlier statements that M3 is not yet authorized; those

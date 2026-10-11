@@ -5,11 +5,11 @@
 > channels (135state+32latent), and D2 offline gates have passed. D3 seam/evaluator/
 > GUI usability is operator-accepted and D4a sparse keyframe/pose guidance is
 > implemented in the opt-in headless mjlab surface; neither is a controller,
-> real-time or hardware qualification. Use the [active contract](beyondmimic_diffusion_d1_no_mixtures_contract.yaml)
-> and [D4a plan](beyondmimic_diffusion_d4_keyframes_pose_guidance.md) rather
+> real-time or hardware qualification. Use the [active contract](../plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml)
+> and [D4a plan](../plans/beyondmimic_diffusion_d4_keyframes_pose_guidance.md) rather
 > than this document's old model-quality/width claims. Export, sustained timing
 > and controller/vendor integration remain D5; minimal hardware qualification is
-> D6. See the [D6 plan](beyondmimic_diffusion_d6_hardware_qualification.md).
+> D6. See the [D6 plan](../plans/beyondmimic_diffusion_d6_hardware_qualification.md).
 
 Audience: a fresh session that will build a **controller** (sim and later real robot)
 that runs the D2 state–latent diffusion generator for the AgiBot X2.

@@ -12,11 +12,11 @@ supplementary S3 and Tables S6/S7).
 
 Related documents:
 
-- [VAE distillation architecture](beyondmimic_vae_distillation.md)
-- [Implementation milestones](beyondmimic_vae_implementation.md)
-- [M4 implementation and acceptance](beyondmimic_vae_m4_implementation.md)
-- [General tracker and latent diffusion discussion](beyondmimic_general_tracker_and_diffusion.md)
-- [Later 50 Hz diffusion reproduction plan and stage-3 source audit](beyondmimic_diffusion_reproduction.md): selects DDPM-style training with DDIM inference, distinguishes sampler semantics, audits startup/history and dataset splitting, and defines the proposed X2 adaptation. The historical stage-2 comparison below is not evidence of stage-3 closed-loop performance.
+- [VAE distillation architecture](../design/beyondmimic_vae_distillation.md)
+- [Implementation milestones](../plans/beyondmimic_vae_implementation.md)
+- [M4 implementation and acceptance](../plans/beyondmimic_vae_m4_implementation.md)
+- [General tracker and latent diffusion discussion](../design/beyondmimic_general_tracker_and_diffusion.md)
+- [Later 50 Hz diffusion reproduction plan and stage-3 source audit](../design/beyondmimic_diffusion_reproduction.md): selects DDPM-style training with DDIM inference, distinguishes sampler semantics, audits startup/history and dataset splitting, and defines the proposed X2 adaptation. The historical stage-2 comparison below is not evidence of stage-3 closed-loop performance.
 
 ## 1. The reviewed repository's structure
 

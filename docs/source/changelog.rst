@@ -440,7 +440,7 @@ Added
 
 - Documented specialist versus general tracking teachers, multimodal control,
   and the role of latent diffusion in
-  ``docs/plans/beyondmimic_general_tracker_and_diffusion.md``. The discussion
+  ``docs/design/beyondmimic_general_tracker_and_diffusion.md``. The discussion
   retains specialist supervision for the current experiment and does not
   authorize new training.
 
@@ -575,7 +575,7 @@ Added
   actuator torque, root state, gains, effort limits and timing, plus provenance and a
   nominal-diagnostic override list. It supports an optional deploy-ONNX parity check on
   identical actor inputs and refuses to overwrite an existing recording. See
-  ``docs/tracking_policy_command_recording.md``.
+  ``docs/reports/tracking_policy_command_recording.md``.
 - Motion-tracking policies can optionally receive a single future reference frame
   through ``MotionCommandCfg.lookahead_s``.
 - The G1 29DOF mode-15 tracking task adds dedicated foot-tracking reward terms

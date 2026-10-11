@@ -235,7 +235,7 @@ Result: **12 files already formatted**.
 The full-repository `ruff format --check .` command does not pass.
 It reports four pre-existing files outside this change:
 
-- `docs/plans/beyondmimic_diffusion_controller_handoff.md`
+- `docs/design/beyondmimic_diffusion_controller_handoff.md`
 - `docs/plans/beyondmimic_diffusion_d2_implementation.md`
 - `src/mjlab/scripts/distill.py`
 - `src/mjlab/tasks/tracking/distillation/vae_config.py`

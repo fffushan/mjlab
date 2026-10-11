@@ -4,7 +4,7 @@ Status: **implemented and parent-accepted on 2026-09-26** after one scoped corre
 Repository: `/home/agiuser/projects/mjlab`.
 Worker model: **`lingzhi/gpt-5.6-luna`**. Parent supervises every 15 minutes and owns acceptance.
 Depends on the accepted [M1 teacher foundation](beyondmimic_vae_implementation.md).
-Architecture context: [VAE distillation design](beyondmimic_vae_distillation.md).
+Architecture context: [VAE distillation design](../design/beyondmimic_vae_distillation.md).
 
 ## 1. Scope and user decision
 

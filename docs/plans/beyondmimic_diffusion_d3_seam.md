@@ -6,7 +6,7 @@ never occurred. The [closed-loop evaluator](beyondmimic_diffusion_d3_closed_loop
 and [operator-accepted GUI](../../logs/diagnostics/diffusion-d3-gui-implementation-20261004/REPORT.md)
 are now implemented in isolated candidates. D3's measured acceptance gates
 (survival, physical errors, and matched VAE-baseline comparisons from the
-[reproduction plan §6](beyondmimic_diffusion_reproduction.md)) remain open and
+[reproduction plan §6](../design/beyondmimic_diffusion_reproduction.md)) remain open and
 require recorded validation using that harness plus explicit experiment authority.
 
 ## Implemented seam

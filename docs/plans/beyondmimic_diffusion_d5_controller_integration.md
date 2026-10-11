@@ -91,7 +91,7 @@ A successful software state is not physical safety or 50 Hz readiness.
 - `diffusion/async_latent_runtime.py`: warmup, tick selection and acknowledgement.
 - `diffusion/planner_executor.py`: one persistent spawned worker and bounded cleanup.
 - `diffusion/scheduler.py`: one active request and one pending latest request.
-- [D5 follow-up](beyondmimic_diffusion_d5_followup.md): outstanding qualification gates.
+- [D5 follow-up](../reports/beyondmimic_diffusion_d5_followup.md): outstanding qualification gates.
 - [Active contract](beyondmimic_diffusion_d1_no_mixtures_contract.yaml).
 
 The historical controller handoff uses 231 projected channels.

@@ -2,7 +2,7 @@
 
 **Audit date:** 2026-09-29 (+08:00)  
 **Repository:** `/home/agiuser/projects/mjlab`, branch `fxy/test/tracking-exp`  
-**Disposition:** **D0 specification/audit complete, with explicit runtime-risk acceptance (2026-09-29). D1/D2 execution is not authorized by this report.** The current decision and gate reconciliation are in section 11; earlier open-gate statements are retained as audit history, not current status. The [frozen contract](beyondmimic_diffusion_d0_contract.yaml) supersedes the draft in section 7.
+**Disposition:** **D0 specification/audit complete, with explicit runtime-risk acceptance (2026-09-29). D1/D2 execution is not authorized by this report.** The current decision and gate reconciliation are in section 11; earlier open-gate statements are retained as audit history, not current status. The [frozen contract](../plans/beyondmimic_diffusion_d0_contract.yaml) supersedes the draft in section 7.
 
 This is a bounded specification/evidence correction. It does not implement a
 production diffusion package, collect data, train, run a simulator, use remote
@@ -351,7 +351,7 @@ closeout supersede that disposition, not the unperformed-test statuses above.
 ## 7. Superseded draft manifest and owner decisions
 
 This draft is retained for provenance only. Use the versioned
-[beyondmimic_diffusion_d0_contract.yaml](beyondmimic_diffusion_d0_contract.yaml)
+[beyondmimic_diffusion_d0_contract.yaml](../plans/beyondmimic_diffusion_d0_contract.yaml)
 for the frozen contract; neither document is an executable runtime configuration.
 
 ```yaml

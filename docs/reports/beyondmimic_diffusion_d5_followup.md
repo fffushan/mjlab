@@ -16,9 +16,9 @@ unchanged. The local GPU runs below are diagnostic evidence only.
 - [Local GPU smoke report](../../logs/diagnostics/diffusion-d5-gpu-local-20261007/REPORT.md)
 - [Cold traced run](../../logs/diagnostics/diffusion-d5-gpu-local-20261007/latency-investigation.json)
 - [Warm decoder run](../../logs/diagnostics/diffusion-d5-gpu-local-20261007/warm-decoder-investigation.json)
-- [D5 runtime plan](beyondmimic_diffusion_d5_runtime_adapter_executor.md)
-- [Milestone gates](beyondmimic_diffusion_reproduction.md#6-milestones-and-acceptance-gates)
-- [Active no-mixture contract](beyondmimic_diffusion_d1_no_mixtures_contract.yaml)
+- [D5 runtime plan](../plans/beyondmimic_diffusion_d5_runtime_adapter_executor.md)
+- [Milestone gates](../design/beyondmimic_diffusion_reproduction.md#6-milestones-and-acceptance-gates)
+- [Active no-mixture contract](../plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml)
 
 ## Observed behavior
 

@@ -46,7 +46,7 @@ environment step, and the environment calls ``sim.forward()`` after the
 decimation loop, so it is the actuator force *recomputed at the post-step
 state*, not provably the force integrated during the last physics substep. A
 substep-level trace would require instrumenting the environment step and is
-deliberately out of scope here; see ``docs/tracking_policy_command_recording.md``.
+deliberately out of scope here; see ``docs/reports/tracking_policy_command_recording.md``.
 
 Nominal diagnostic, not a training-distribution sample
 ------------------------------------------------------

@@ -1,6 +1,6 @@
 # BeyondMimic VAE: implementation plan
 
-Architecture: [beyondmimic_vae_distillation.md](beyondmimic_vae_distillation.md).
+Architecture: [beyondmimic_vae_distillation.md](../design/beyondmimic_vae_distillation.md).
 Repository: `/home/agiuser/projects/mjlab`.
 Current status: **M1–M4 are complete; M4's multi-teacher pipeline and a valid three-teacher student baseline are accepted**, with strict policy-quality optimization explicitly deferred. See [M4 acceptance and evidence](beyondmimic_vae_m4_implementation.md#11-parent-acceptance-record--2026-09-27). M5 is the next process stage: reproduction/export/sim2sim validation. Hardware remains separately authorized, and flexible teacher cohorts remain a later proposed extension. Earlier milestone sections below retain their historical acceptance boundaries.
 

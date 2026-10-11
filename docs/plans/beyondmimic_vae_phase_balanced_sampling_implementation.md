@@ -57,9 +57,9 @@ first or implement on top of it.
 
 Related documents:
 
-- [VAE distillation architecture](beyondmimic_vae_distillation.md)
+- [VAE distillation architecture](../design/beyondmimic_vae_distillation.md)
 - [M4 implementation and acceptance](beyondmimic_vae_m4_implementation.md)
-- [Reproduction review motivating this change](beyondmimic_reproduction_review.md)
+- [Reproduction review motivating this change](../reports/beyondmimic_reproduction_review.md)
 - [Usage](../source/x2_tennis_distillation.rst)
 
 Motivation (from the reproduction review): the reviewed BeyondMimic

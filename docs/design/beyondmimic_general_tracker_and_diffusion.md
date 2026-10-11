@@ -8,8 +8,8 @@ BeyondMimic distillation work.** A general teacher remains a future option.
 Related documents:
 
 - [VAE distillation architecture](beyondmimic_vae_distillation.md)
-- [Implementation milestones](beyondmimic_vae_implementation.md)
-- [M2 latent-core implementation and acceptance](beyondmimic_vae_m2_implementation.md)
+- [Implementation milestones](../plans/beyondmimic_vae_implementation.md)
+- [M2 latent-core implementation and acceptance](../plans/beyondmimic_vae_m2_implementation.md)
 
 ## 1. The question
 

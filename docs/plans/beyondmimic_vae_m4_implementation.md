@@ -15,7 +15,7 @@ Implementation model: **`ds-oc/deepseek-flash`**, native async subagents.
 Parent owns planning, supervision every **20 minutes**, resource approval,
 review/finding disposition, and final acceptance. No automatic commit or push.
 
-Related: [architecture](beyondmimic_vae_distillation.md),
+Related: [architecture](../design/beyondmimic_vae_distillation.md),
 [milestones](beyondmimic_vae_implementation.md),
 [M3 contracts](beyondmimic_vae_m3_implementation.md), and
 [usage](../source/x2_tennis_distillation.rst).

@@ -32,7 +32,7 @@ Authoritative inputs, in precedence order:
    not change it. Every numeric constant below is read from it or derived from its
    frozen construction; where this plan restates a derived number it records the
    exact value so tests can pin it.
-2. The [reproduction plan](beyondmimic_diffusion_reproduction.md), especially §4.3
+2. The [reproduction plan](../design/beyondmimic_diffusion_reproduction.md), especially §4.3
    (normalization/emphasis), §5.1 (DDPM training vs DDIM inference), §5.2 (startup),
    §5.3 (guidance, deferred), §6 (the D2 row) and §7 (placement).
 3. The [D1 implementation record](beyondmimic_diffusion_d1_implementation.md) for

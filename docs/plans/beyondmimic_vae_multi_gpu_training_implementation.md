@@ -11,10 +11,10 @@ Branch: `fxy/test/tracking-exp`. Planning baseline: `8de96dc10`.
 
 Related documents:
 
-- [VAE distillation architecture](beyondmimic_vae_distillation.md)
+- [VAE distillation architecture](../design/beyondmimic_vae_distillation.md)
 - [M4 implementation and acceptance](beyondmimic_vae_m4_implementation.md)
 - [Phase-balanced sampling plan](beyondmimic_vae_phase_balanced_sampling_implementation.md)
-- [Reproduction review](beyondmimic_reproduction_review.md)
+- [Reproduction review](../reports/beyondmimic_reproduction_review.md)
 
 ## 1. Goal, authority, and non-goals
 

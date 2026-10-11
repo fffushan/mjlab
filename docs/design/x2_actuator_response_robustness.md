@@ -84,7 +84,7 @@ The evidence supports reduced vibration in those trials.
 It does not prove improved overall position tracking.
 It shows why damping and response timing need separate metrics from average position error.
 
-Source: [waist comparison](/home/agiuser/data/20261008T124731Z_tune-kd-001/analysis/comparison_tuned_vs_original.md).
+Source: [waist comparison](../../../../data/20261008T124731Z_tune-kd-001/analysis/comparison_tuned_vs_original.md).
 
 ### 3.3 Current actuator randomization
 
@@ -256,7 +256,7 @@ Neither method replaces the other.
 Audit the student collection distribution as well as teacher training.
 A robust teacher does not automatically make the distilled student robust.
 Collection must preserve randomized dynamics, delay history, and the information required for teacher labels.
-See the [coverage contract](beyondmimic_vae_difficult_state_coverage_p0.md).
+See the [coverage contract](../plans/beyondmimic_vae_difficult_state_coverage_p0.md).
 
 Evaluate fixed actuator models separately from aggregate randomized performance.
 Average success can hide failures at the edges of the distribution.

@@ -11,7 +11,7 @@ schema packing, conditional VAE inference/loss, and bounded raw replay, then a
 bounded native single-teacher collector, trainer, checkpoint lifecycle, and
 ``distill train``/``distill evaluate`` commands, and finally **one shared
 student trained over both teachers's clips in one simulator**. The design
-proposal lives in ``docs/plans/beyondmimic_vae_distillation.md`` and the
+proposal lives in ``docs/design/beyondmimic_vae_distillation.md`` and the
 milestone contracts live in ``docs/plans/beyondmimic_vae_implementation.md`` and
 ``docs/plans/beyondmimic_vae_m2_implementation.md``; the current authority
 document for M4 is ``docs/plans/beyondmimic_vae_m4_implementation.md``.
@@ -265,7 +265,7 @@ accumulation 1 is much faster than accumulation over the same effective batch,
 because the small model makes each accumulated pass launch-bound. The optimizer
 phase fell from 8.40 s to 1.72 s per iteration at an unchanged effective batch
 of 32768. See
-[the optimizer batching note](../plans/beyondmimic_vae_optimizer_batching.md).
+[the optimizer batching note](../reports/beyondmimic_vae_optimizer_batching.md).
 
 Each flag replaces one explicit total. Do not combine ``--envs-per-motion``
 with ``--num-envs``, the draw ratio with ``--updates-per-iteration``, or the

@@ -19,8 +19,8 @@ full dataset remain separate from code, mock tests and review.
 
 - [Frozen D0 contract](beyondmimic_diffusion_d0_contract.yaml), SHA256
   `42694cdd3acd72afd2d234a85ca29e9c7a646d64df831021c8dd43e55f3f73e7`.
-- [D0 closeout](beyondmimic_diffusion_d0_validation.md#11-d0-closeout--2026-09-29)
-  and [overall plan](beyondmimic_diffusion_reproduction.md).
+- [D0 closeout](../reports/beyondmimic_diffusion_d0_validation.md#11-d0-closeout--2026-09-29)
+  and [overall plan](../design/beyondmimic_diffusion_reproduction.md).
 - Implement collection, qualification, shard storage, window construction,
   grouped splits, train-only statistics/projection, replay and CLI validation.
   Do not implement the D2 denoiser/trainer, change the frozen VAE or PPO policies,
