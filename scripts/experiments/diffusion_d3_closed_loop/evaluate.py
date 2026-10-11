@@ -600,9 +600,9 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
   task: SparseTaskSpec | None = None
   if getattr(args, "task_config", None) is not None:
     # Strict task validation happens here, before any runtime or environment is
-    # constructed; a malformed, unverifiable or scenario-mismatched task file can
-    # never reach the simulator.  Under --execute an unverified source is also
-    # refused, so only a re-read recording can drive a physical attempt.
+    # constructed.  Malformed or scenario-mismatched task files cannot reach
+    # the simulator.  Source qualification is retained as provenance, but it is
+    # not an execution gate; direct/manual task targets are allowed by request.
     loader = _task_loader()
     try:
       task = cast(
@@ -613,7 +613,7 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
           expected_scenario=loader.ScenarioExpectation(
             member=args.member, seed=args.seed, start_frame=args.start_frame
           ),
-          require_verified=bool(args.execute),
+          require_verified=False,
         ),
       )
     except (ValueError, OSError) as exc:

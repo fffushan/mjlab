@@ -624,7 +624,6 @@ def _patch_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
     joint_order=tuple(f"joint-{index}" for index in range(31)),
   )
   teacher = SimpleNamespace(reference=SimpleNamespace(frames=100, fps=50.0), hashes={})
-  monkeypatch.setattr(evaluate, "verify_file_digest", lambda *a, **k: None)
   monkeypatch.setattr(evaluate, "load_active_contract", lambda path: contract)
   monkeypatch.setattr(evaluate, "_require_frozen_contract", lambda *a, **k: None)
   monkeypatch.setattr(
@@ -639,7 +638,6 @@ def _patch_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setattr(evaluate, "load_denoiser", lambda *a, **k: denoiser)
   monkeypatch.setattr(evaluate, "load_vae_decoder", lambda *a, **k: vae)
   monkeypatch.setattr(evaluate, "_source_fingerprints", lambda: {"modules": {}})
-  monkeypatch.setattr(evaluate, "_integrity_snapshot", lambda prepared: {"files": {}})
 
 
 def test_malformed_task_config_is_rejected_before_any_runtime_or_model_use(
@@ -1044,7 +1042,8 @@ def test_provenance_and_preflight_include_task_only_when_configured(
   provenance = evaluate._provenance(without, 0.0)
   assert "task" not in provenance
 
-  # A manual/synthetic config is diagnostic-only: it loads without --execute.
+  # A manual/synthetic config loads with and without --execute.  Its source
+  # qualification remains unverified in the returned provenance.
   with_task = evaluate._prepare(
     _prepare_args(
       tmp_path,
@@ -1057,18 +1056,24 @@ def test_provenance_and_preflight_include_task_only_when_configured(
   assert "task" in evaluate._provenance(with_task, 0.0)
 
 
-def test_unverified_task_source_is_refused_under_execute(
+def test_unverified_task_source_is_allowed_under_execute(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
   _patch_prepare(monkeypatch)
+  monkeypatch.setattr(
+    evaluate,
+    "_validate_request",
+    lambda args: (tmp_path, torch.device("cpu")),
+  )
   args = _prepare_args(
     tmp_path,
     output_dir=tmp_path / "run",
     task_config=EXAMPLE_DIR / "synthetic_combined.example.json",
     execute=True,
   )
-  with pytest.raises(evaluate.ClosedLoopCliError, match="verified recording source"):
-    evaluate._prepare(args)
+  prepared = evaluate._prepare(args)
+  assert prepared.task is not None
+  assert prepared.task.source.qualification == "unverified"
 
 
 # --------------------------------------------------------------------------

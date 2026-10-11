@@ -602,14 +602,13 @@ Changed
   the declared label: it re-reads the recording and summary bytes, re-checks their
   digests, rows, recorded contract identity and member/seed/start-frame scenario,
   and re-extracts every target state at its tick before accepting the task. A
-  hand-written ``preparation_tool:`` prefix can no longer upgrade a source, an
-  unverified or merely declared source is refused under ``--execute``, and the
-  task file plus its bound recording files join the run's before/after integrity
-  expectations. The preparation tool gained ``--recording-dir`` for actual D3
-  closed-loop runs (the archived ``diffusion-d3-recorded-comparison-*`` layout),
-  keeps raw NPZ shards as an honestly ``declared`` weaker layout, and validates
-  its payload with the strict loader before an atomic write. Task configs and
-  recording files are read through a bounded regular-file reader.
+  hand-written ``preparation_tool:`` prefix can no longer upgrade a source. Source
+  qualification remains in task provenance but is no longer an ``--execute`` gate.
+  The preparation tool gained ``--recording-dir`` for actual D3 closed-loop runs
+  (the archived ``diffusion-d3-recorded-comparison-*`` layout), keeps raw NPZ
+  shards as an honestly ``declared`` weaker layout, and validates its payload with
+  the strict loader before an atomic write. Task configs and recording files are
+  read through a bounded regular-file reader.
 
 - The opt-in D4 sparse task surface now enforces pure modes (hard keyframes only
   in ``keyframe``, soft pose goals only in ``poseguided``, both in ``combined``)

@@ -16,7 +16,8 @@ layouts are accepted, exclusively:
 * ``--source-shard`` reads a raw D1 NPZ shard written by the frozen collector,
   optionally bound to its store manifest.  That layout carries weaker recorded
   provenance, so its output is honestly declared ``declared`` rather than
-  ``verified`` and cannot be used under ``--execute``.
+  ``verified``.  The loader preserves that qualification in the run report,
+  but it does not block execution.
 
 Qualification is checked, not assumed: the payload is validated by the strict
 task loader -- including a re-read of the recording bytes, the target states and
@@ -24,8 +25,8 @@ the scenario -- before it is written atomically to a new path.  A scenario
 mismatch is refused: no transform is implemented here.
 
 ``--diagnostic`` instead writes a clearly labeled ``synthetic_fixture`` /
-``unverified`` config for pipeline diagnostics.  It can never claim qualified
-physical provenance, and the loader rejects such a claim as well.
+``unverified`` config.  It can never claim qualified physical provenance; the
+qualification remains visible in the task report even when the run is executed.
 """
 
 from __future__ import annotations
