@@ -253,6 +253,68 @@ def test_bounded_window_index_never_falls_back_to_full_store_scan(
   )
 
 
+def test_token_worker_does_not_validate_the_whole_store(tmp_path, monkeypatch) -> None:
+  """A token worker reads its own shards and hash-checks only those.
+
+  Opening the worker store used to hash every shard of the dataset, once per
+  worker.  The manifest-only open removes that cost; each shard the worker
+  reads is still hash-checked, so correctness is unchanged.
+  """
+  from mjlab.tasks.tracking.diffusion import storage as storage_module
+
+  source = _synthetic_source(
+    tmp_path,
+    {"group-a": "train", "group-b": "train"},
+    {"group-a": 59, "group-b": 67},
+    shard_rows=5,
+  )
+  loaded = source.load()
+  refs = loaded.refs("train")
+  cache = tmp_path / "tokens.npy"
+  np.save(
+    cache,
+    np.zeros(
+      (len(refs), loaded.contract.window_steps, loaded.contract.token_dimension),
+      dtype=np.float32,
+    ),
+  )
+  payloads = builder.plan_token_cache_workers(
+    store=loaded.store,
+    refs=refs,
+    directory=source.directory,
+    contract_path=source.contract_path,
+    split="train",
+    destination=cache,
+    dtype=np.float32,
+    jobs=2,
+  )
+
+  validations: list[int] = []
+  original_validate = AppendOnlyShardStore._validate_manifest
+
+  def counting_validate(self):
+    validations.append(1)
+    return original_validate(self)
+
+  hashes: list[str] = []
+  original_hash = storage_module.sha256_file
+
+  def counting_hash(path):
+    hashes.append(str(path))
+    return original_hash(path)
+
+  monkeypatch.setattr(AppendOnlyShardStore, "_validate_manifest", counting_validate)
+  monkeypatch.setattr(storage_module, "sha256_file", counting_hash)
+
+  written: set[int] = set()
+  for payload in payloads:
+    written.update(builder._fill_token_cache_range(payload))
+
+  assert validations == []
+  assert hashes
+  assert written == set(range(len(refs)))
+
+
 def test_coverage_validation_rejects_missing_and_duplicate_positions(tmp_path) -> None:
   source = _synthetic_source(
     tmp_path,

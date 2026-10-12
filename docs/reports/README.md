@@ -30,6 +30,10 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `tracking_policy_command_recording.md` | tool note | recording native tracking policy commands and reading the stages | current tool |
 | `tracking_footstep_experiments.md` | experiment log | G1 29DOF mode-15 footstep tracking experiments | 2026-09-11 record; not revalidated |
 | `ACCEPTANCE-20261007.md` | acceptance | difficult-state coverage integration acceptance | supersedes the removed `PARENT-ACCEPTANCE.md` |
+| `beyondmimic_diffusion_d1_throughput_integration.md` | validation | D1 collection and dataset throughput integration | implemented; speed not measured |
+| `beyondmimic_diffusion_d1_throughput_acceptance.md` | validation | Parent D1 optimization acceptance and evidence limits | 222 CPU tests pass; CUDA/NAS unmeasured |
+| `beyondmimic_diffusion_d1_server_benchmark.md` | experiment | Matched GPU3 D1 collection and preparation benchmark | merge3.14x/stats4.85x; cache-jobs8 slower |
+| `beyondmimic_diffusion_d1_defaults.md` | validation | Enabled D1 defaults and local commit gates | 227 CPU passes; cache worker1 |
 | `MERGE-MANIFEST.md` | provenance | lane provenance for the coverage integration tree | historical |
 | `mvp-source-report.md` | note | fixed-state coverage evaluator scope | historical |
 

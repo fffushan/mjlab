@@ -8,6 +8,7 @@ from tracking_diffusion_fixtures import make_state
 
 from mjlab.tasks.tracking.diffusion import (
   ActionContract,
+  CollectionResult,
   DiffusionCollector,
   FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
@@ -269,7 +270,10 @@ def test_batched_store_receives_one_write_for_multiple_trials(tmp_path) -> None:
   result = collector.collect_batched(specs, slots=1)
   assert len(calls) == 1
   assert result.store_files == ("shard-000000.npz",)
-  assert len(calls[0]) == sum(len(item.rows) for item in result.results)
+  assert all(isinstance(item, CollectionResult) for item in result.results)
+  assert len(calls[0]) == sum(
+    len(item.rows) for item in result.results if isinstance(item, CollectionResult)
+  )
   assert all(row.group_key == "a" for row in calls[0])
 
 
@@ -316,7 +320,10 @@ def test_multi_slot_terminal_reset_and_idle_tail_do_not_block_other_rows() -> No
   )
   specs = tuple(TrialSpec(f"run{i}", "a", 7, 3) for i in range(3))
   results = collector.collect_batched(specs, slots=4).results
-  assert [len(result.rows) for result in results] == [4, 4, 1]
+  assert all(isinstance(result, CollectionResult) for result in results)
+  assert [
+    len(result.rows) for result in results if isinstance(result, CollectionResult)
+  ] == [4, 4, 1]
   assert results[2].qualification.reason == "early_termination"
   assert results[0].qualification.qualified
   assert results[1].qualification.qualified

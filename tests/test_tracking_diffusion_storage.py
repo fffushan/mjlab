@@ -137,6 +137,54 @@ def test_ppo_row_has_no_latent() -> None:
     dataclasses.replace(row, controller="ppo")
 
 
+def test_shard_scan_opt_out_defers_integrity_checks_to_reads(tmp_path) -> None:
+  """``validate_shards=False`` skips only the constructor's whole-store scan.
+
+  A partitioned reader opens one store object per worker and reads only its own
+  shards, so the default scan hashes the whole store once per worker.  Opting out
+  must not weaken any read: an unread corrupt shard stays undetected, and a shard
+  that is read is still rejected exactly as the default rejects it.
+  """
+  store = AppendOnlyShardStore(tmp_path, max_rows_per_shard=2)
+  store.append([make_row(i) for i in range(4)])
+  assert store.shard_count == 2
+  shard = tmp_path / "shard-000000.npz"
+  shard.write_bytes(shard.read_bytes() + b"corruption")
+
+  with pytest.raises(StorageError, match="corrupt or missing shard"):
+    AppendOnlyShardStore(tmp_path)
+
+  deferred = AppendOnlyShardStore(tmp_path, validate_shards=False)
+  assert (deferred.row_count, deferred.shard_count) == (4, 2)
+  with pytest.raises(StorageError, match="corrupt shard hash"):
+    tuple(deferred.iter_rows_range(0, 1))
+  # The intact shard of the same store still reads under the same object.
+  assert [row.tick for row in deferred.iter_rows_range(1, 2)] == [2, 3]
+
+
+def test_shard_scan_opt_out_still_checks_manifest_and_row_counts(tmp_path) -> None:
+  """The manifest metadata and the per-read count checks stay enforced."""
+  store = AppendOnlyShardStore(tmp_path, max_rows_per_shard=4)
+  store.append([make_row(i) for i in range(4)])
+  manifest_path = tmp_path / "manifest.json"
+  original = json.loads(manifest_path.read_text())
+
+  repeated = json.loads(json.dumps(original))
+  repeated["shards"].append(dict(repeated["shards"][0]))
+  manifest_path.write_text(json.dumps(repeated))
+  with pytest.raises(StorageError, match="shard file more than once"):
+    AppendOnlyShardStore(tmp_path, validate_shards=False)
+
+  # A forged row count passes the metadata check but fails on the read that
+  # materialises the shard's arrays.
+  forged = json.loads(json.dumps(original))
+  forged["shards"][0]["rows"] = 2
+  manifest_path.write_text(json.dumps(forged))
+  deferred = AppendOnlyShardStore(tmp_path, validate_shards=False)
+  with pytest.raises(StorageError, match="invalid shape"):
+    tuple(deferred.iter_rows_range(0, 1))
+
+
 def test_append_does_not_rescan_prior_shards(tmp_path) -> None:
   """``append`` must be incremental, not O(whole store) per call.
 

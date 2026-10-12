@@ -196,8 +196,12 @@ class TrainingConfig:
       raise TrainingConfigError("checkpoint_every must be a positive integer")
 
   def as_dict(self) -> dict[str, object]:
-    """Return the resolved scalar fields in stable serialization order."""
-    self.validate()
+    """Serialize valid fields without authorizing training execution.
+
+    Execution entry points separately enforce explicit long-run permission.
+    Hashing or recording an approved large budget must not reject its value.
+    """
+    self.validate(allow_long_run=True)
     return {key: value for key, value in asdict(self).items()}
 
   def sha256(self) -> str:
@@ -300,7 +304,9 @@ class TrainingConfig:
       config = cls(**values)
     except (TypeError, ValueError) as exc:
       raise TrainingConfigError(f"invalid training fields: {exc}") from exc
-    config.validate()
+    # Loading configuration data is not execution authorization. The CLI and
+    # trainer enforce long-run permission before starting work.
+    config.validate(allow_long_run=True)
     return config
 
   @classmethod

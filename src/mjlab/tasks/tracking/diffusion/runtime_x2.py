@@ -42,6 +42,8 @@ from .adapter import (
   PostStepBundle,
   PpoObservation,
   VaeObservation,
+  VaeObservationTensorBatch,
+  resolve_inference_device,
 )
 from .collector import DiffusionCollector, TrialSpec
 from .contract import DEFAULT_CONTRACT
@@ -220,6 +222,26 @@ def build_bulk_trials(
     worker=worker,
     workers=workers,
   )
+
+
+def resolve_policy_device(value: str, *, simulation_device: str) -> str:
+  """Resolve ``MJLAB_D1_POLICY_DEVICE`` to one concrete inference device.
+
+  ``cpu`` (the default) keeps the frozen CPU policy path.  ``simulation``
+  follows the simulator device, so a device-native policy needs no transfer.
+  ``cuda[:N]`` names an explicit GPU.  The choice is validated here, before any
+  checkpoint or environment is constructed, and the resolved value is recorded
+  in the runtime provenance.
+  """
+  text = value.strip().lower()
+  if text == "simulation":
+    text = simulation_device
+  try:
+    return resolve_inference_device(text or "cpu")
+  except AdapterError as exc:
+    raise RuntimeX2Error(
+      f"MJLAB_D1_POLICY_DEVICE={value!r} is not a usable policy device: {exc}"
+    ) from exc
 
 
 def resolve_worker_offset(value: str, worker: int, workers: int) -> int:
@@ -652,6 +674,7 @@ class X2MultiMotionEnvironment:
     num_envs: int,
     device: str,
     seed: int,
+    policy_device: str | torch.device | None = None,
   ) -> None:
     from mjlab.tasks.tracking.distillation.environment import (
       build_multi_motion_environment,
@@ -672,6 +695,12 @@ class X2MultiMotionEnvironment:
     self.env.cfg.auto_reset = False
     self.num_envs = int(self.env.num_envs)
     self.device = self.env.device
+    # Device-native observations are placed where the frozen VAE lives.  The
+    # default follows the simulator, which is the no-transfer choice; the
+    # runtime factory passes the explicitly validated policy device instead.
+    self.policy_device = torch.device(
+      device if policy_device is None else policy_device
+    )
     self.period_seconds = float(self.env.step_dt)
     self._row_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
     self.command: Any = self.env.command_manager.get_term("motion")
@@ -888,6 +917,44 @@ class X2MultiMotionEnvironment:
       **metrics,
     )
 
+  def observe_vae_tensor_batch(self, env_ids: np.ndarray) -> Any:
+    """Return device-native VAE inputs plus CPU row evidence for the rows.
+
+    One snapshot capture supplies both halves.  The packed
+    reference/conditioning tensors are gathered on the simulator device and
+    moved once to :attr:`policy_device` as float32, the dtype the frozen VAE
+    inference path has always consumed, so they never make a host round trip.
+    The row evidence (state, motion id, reference frame and phase) is derived
+    for the collector's rows only; it never carries the packed arrays.  Row
+    order matches ``env_ids``, so a caller may pass noncontiguous slots.
+    """
+    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
+    if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.num_envs):
+      raise RuntimeX2Error("tensor VAE batch ids must be non-empty and in range")
+    if np.unique(ids).size != ids.size:
+      raise RuntimeX2Error("tensor VAE batch ids must not repeat")
+    snapshot = self._snapshot()
+    tensor_ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+    reference = snapshot.packed.reference[tensor_ids].to(
+      dtype=torch.float32, device=self.policy_device
+    )
+    conditioning = snapshot.packed.conditioning[tensor_ids].to(
+      dtype=torch.float32, device=self.policy_device
+    )
+    frames = self.command.time_steps.detach().cpu().numpy()[ids]
+    lengths = self.command.row_lengths.detach().cpu().numpy()[ids]
+    return VaeObservationTensorBatch(
+      reference,
+      conditioning,
+      self._world_state(ids),
+      tuple(
+        self.teacher_ids[int(code)]
+        for code in self.command.motion_ids.detach().cpu().numpy()[ids]
+      ),
+      frames,
+      frames / np.maximum(lengths - 1, 1),
+    )
+
   def _recovery_observation(self, ids: np.ndarray) -> np.ndarray:
     from mjlab.envs import mdp as envs_mdp
 
@@ -937,6 +1004,29 @@ class X2MultiMotionEnvironment:
     self._pre_frames = self.command.time_steps.detach().clone()
     tensor = torch.as_tensor(action, dtype=torch.float32, device=self.device)
     self._last_result = self.env.step(tensor)
+    self._post_frames = self.command.time_steps.detach().clone()
+    return self._last_result
+
+  def step_tensor_batch(self, action: torch.Tensor) -> Any:
+    """Advance physics from a device-native action tensor.
+
+    Mirrors :meth:`step_batch` bookkeeping exactly -- ``_pre_frames``,
+    ``_last_result`` and ``_post_frames`` are all updated -- but accepts the
+    policy action as a tensor and only casts dtype/device when needed, so a
+    simulation-device policy action never passes through NumPy.
+    """
+    if not isinstance(action, torch.Tensor):
+      raise RuntimeX2Error("tensor batch step requires a torch.Tensor action")
+    if action.shape != (self.num_envs, 31):
+      raise RuntimeX2Error(
+        f"tensor batch action must have shape [{self.num_envs}, 31], "
+        f"got {tuple(action.shape)}"
+      )
+    if not torch.isfinite(action).all():
+      raise RuntimeX2Error("tensor batch action must be finite")
+    self._pre_frames = self.command.time_steps.detach().clone()
+    values = action.to(device=self.device, dtype=torch.float32)
+    self._last_result = self.env.step(values)
     self._post_frames = self.command.time_steps.detach().clone()
     return self._last_result
 
@@ -1134,6 +1224,14 @@ def _action_contract_for(cohort: Any, teacher_id: str) -> ActionContract:
   return _action_contract_from_onnx(teacher.onnx.path)
 
 
+def _configure_policy_precision(policy_device: str) -> None:
+  """Pin CUDA frozen-policy inference to the CPU-parity IEEE FP32 mode."""
+  if torch.device(policy_device).type == "cuda":
+    from mjlab.utils.torch import configure_torch_backends
+
+    configure_torch_backends(allow_tf32=False)
+
+
 def build_x2_runtime(request: Any) -> Any:
   """``--runtime-factory`` entry point; returns a verified ``RuntimeBundle``.
 
@@ -1149,6 +1247,11 @@ def build_x2_runtime(request: Any) -> Any:
 
   repo_root = Path(__file__).resolve().parents[5]
   device = os.environ.get("MJLAB_D1_DEVICE", "cuda:0")
+  # Batched collection follows the simulation device by default. Scalar and
+  # explicit CPU requests remain compatible with historical callers.
+  policy_default = "simulation" if request.max_envs > 1 else "cpu"
+  policy_setting = os.environ.get("MJLAB_D1_POLICY_DEVICE", policy_default)
+  policy_device = resolve_policy_device(policy_setting, simulation_device=device)
   # The selected contract owns the pinned artifacts.  The CLI resolves it from
   # ``--contract`` and passes it in the request; the module default is only a
   # fallback for direct library callers.
@@ -1210,6 +1313,7 @@ def build_x2_runtime(request: Any) -> Any:
     cohort_manifest=manifest_path,
     cohort_manifest_sha256=manifest_sha256,
     contract=selected_contract,
+    device=policy_device,
   )
   ppo_action_contract = _action_contract_from_onnx(
     repo_root / selected_contract.recovery_onnx
@@ -1226,6 +1330,7 @@ def build_x2_runtime(request: Any) -> Any:
       num_envs=request.max_envs,
       device=device,
       seed=0,
+      policy_device=policy_device,
     )
     batch_runtime = True
   else:
@@ -1237,6 +1342,10 @@ def build_x2_runtime(request: Any) -> Any:
           f"compiled joint order for {teacher_id} disagrees with the action contract"
         )
     batch_runtime = False
+  # Task registration can enable TF32 globally. Frozen VAE parity with the
+  # historical CPU path requires IEEE FP32; pin it after runtime construction.
+  _configure_policy_precision(policy_device)
+
   collector = DiffusionCollector(
     runtime,
     vae,
@@ -1282,6 +1391,8 @@ def build_x2_runtime(request: Any) -> Any:
       "worker_count": workers,
       "worker_offset": worker_offset,
       "device": device,
+      "policy_device": policy_device,
+      "policy_device_setting": policy_setting,
       "control_hz": int(round(1.0 / qualification.period_seconds)),
       "cohort_manifest": str(manifest_path),
       "cohort_manifest_sha256": manifest_sha256,
@@ -1304,6 +1415,7 @@ __all__ = [
   "BULK_SEED_COUNT",
   "D1_BULK_RUN_ID",
   "D1_RUN_ID",
+  "resolve_policy_device",
   "resolve_rollout_ids",
   "PHASE_FRACTIONS",
   "PILOT_SEEDS",

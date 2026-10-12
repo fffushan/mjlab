@@ -32,6 +32,16 @@ def _array(
   return result
 
 
+_STATE_FIELDS = (
+  "root_position",
+  "root_quaternion_wxyz",
+  "root_linear_velocity",
+  "root_angular_velocity",
+  "body_positions",
+  "body_linear_velocities",
+)
+
+
 def _quat_matrix(quaternion: np.ndarray) -> np.ndarray:
   q = quaternion / np.linalg.norm(quaternion, axis=-1, keepdims=True)
   w, x, y, z = np.moveaxis(q, -1, 0)
@@ -192,17 +202,32 @@ class WorldState:
       raise StateValidationError("cannot stack an empty state sequence")
     return cls(
       *(
-        np.stack([getattr(state, field) for state in values])
-        for field in (
-          "root_position",
-          "root_quaternion_wxyz",
-          "root_linear_velocity",
-          "root_angular_velocity",
-          "body_positions",
-          "body_linear_velocities",
-        )
+        np.stack([getattr(state, field) for state in values]) for field in _STATE_FIELDS
       )
     )
+
+  @classmethod
+  def _from_fields(cls, fields: Iterable[np.ndarray]) -> "WorldState":
+    """Build a state from arrays that a caller already validated."""
+    instance = object.__new__(cls)
+    for name, value in zip(_STATE_FIELDS, fields, strict=True):
+      object.__setattr__(instance, name, value)
+    return instance
+
+  def window(self, start: int, stop: int) -> "WorldState":
+    """Return rows ``[start, stop)`` of a batched state as a slice view.
+
+    :meth:`stack` validates every row of a batch, which is what makes the
+    batched fields trustworthy.  An offline pass over overlapping windows of one
+    segment resolves the same rows again and again, so this method returns a
+    view of already validated rows instead of repeating those per-row checks.
+    """
+    if self.root_position.ndim != 2:
+      raise StateValidationError("window requires a batched state")
+    length = self.root_position.shape[0]
+    if not 0 <= start < stop <= length:
+      raise StateValidationError("window bounds are outside the state batch")
+    return self._from_fields(getattr(self, name)[start:stop] for name in _STATE_FIELDS)
 
   @property
   def count(self) -> int:
@@ -218,17 +243,7 @@ class WorldState:
         raise StateValidationError("a single state only supports selecting row zero")
       return self
     return type(self)(
-      *(
-        np.asarray(getattr(self, field))[ids].copy()
-        for field in (
-          "root_position",
-          "root_quaternion_wxyz",
-          "root_linear_velocity",
-          "root_angular_velocity",
-          "body_positions",
-          "body_linear_velocities",
-        )
-      )
+      *(np.asarray(getattr(self, field))[ids].copy() for field in _STATE_FIELDS)
     )
 
 
@@ -246,28 +261,8 @@ class WorldFrameContext:
 
 def _as_sequence(states: WorldState) -> tuple[np.ndarray, ...]:
   if states.root_position.ndim != 2:
-    return tuple(
-      np.expand_dims(getattr(states, field), 0)
-      for field in (
-        "root_position",
-        "root_quaternion_wxyz",
-        "root_linear_velocity",
-        "root_angular_velocity",
-        "body_positions",
-        "body_linear_velocities",
-      )
-    )
-  return tuple(
-    getattr(states, field)
-    for field in (
-      "root_position",
-      "root_quaternion_wxyz",
-      "root_linear_velocity",
-      "root_angular_velocity",
-      "body_positions",
-      "body_linear_velocities",
-    )
-  )
+    return tuple(np.expand_dims(getattr(states, field), 0) for field in _STATE_FIELDS)
+  return tuple(getattr(states, field) for field in _STATE_FIELDS)
 
 
 def world_to_hybrid(
@@ -312,6 +307,73 @@ def world_to_hybrid(
   return hybrid, context
 
 
+def world_to_hybrid_windows(
+  states: WorldState,
+  starts: np.ndarray,
+  *,
+  center_index: int,
+  length: int,
+) -> np.ndarray:
+  """Pack many equal-length windows of one batched state in a single pass.
+
+  Offline statistics used to call :func:`world_to_hybrid` once per window from a
+  Python loop.  This function applies the same per-window arithmetic to a whole
+  block of ``len(starts)`` windows at once, so the caller issues one vectorized
+  transform per block instead of one scalar call per window.  ``center_index`` is
+  relative to each window, exactly as :func:`world_to_hybrid` treats it, and the
+  result is ``(len(starts), length, state_dimension)`` in float64.  Each row is
+  gathered straight from the validated batch, so the operation is deterministic
+  and its temporary arrays are bounded by ``len(starts) * length``.
+  """
+  if states.root_position.ndim != 2:
+    raise StateValidationError("world_to_hybrid_windows requires a batched state")
+  if length <= 0 or center_index < 0 or center_index >= length:
+    raise StateValidationError("window length and center index are invalid")
+  rows = np.asarray(starts, dtype=np.int64)
+  if rows.ndim != 1:
+    raise StateValidationError("window starts must be one-dimensional")
+  count = rows.size
+  if count == 0:
+    return np.empty((0, length, DEFAULT_CONTRACT.state_dimension), dtype=np.float64)
+  root_p, root_q, root_v, root_w, body_p, body_v = _as_sequence(states)
+  total = root_p.shape[0]
+  if np.any(rows < 0) or np.any(rows + length > total):
+    raise StateValidationError("window starts are outside the state batch")
+  # Row index per (window, step).  Every gather below reuses this one array.
+  offsets = rows[:, None] + np.arange(length, dtype=np.int64)[None, :]
+  root_r = _quat_matrix(root_q)
+  yaw = np.arctan2(root_r[:, 1, 0], root_r[:, 0, 0])
+  body_rt = np.swapaxes(_yaw_matrix(yaw), -1, -2)
+  p = root_p[offsets]
+  v = root_v[offsets]
+  w = root_w[offsets]
+  center_r = _yaw_matrix(yaw[rows + center_index])
+  center_rt = np.swapaxes(center_r, -1, -2)
+  # The centre-relative terms use ``matmul`` and the rotations use ``einsum``, so
+  # each window keeps the operation order of :func:`world_to_hybrid`.
+  root_rel_p = np.matmul(p - p[:, center_index : center_index + 1], center_r)
+  root_rel_v = np.matmul(v - v[:, center_index : center_index + 1], center_r)
+  root_rel_r = np.einsum("wij,wljk->wlik", center_rt, root_r[offsets])
+  root_rel_w = np.matmul(w, center_r)
+  body_rel_p = np.einsum(
+    "wlij,wlkj->wlki", body_rt[offsets], body_p[offsets] - p[:, :, None, :]
+  )
+  body_rel_v = np.einsum(
+    "wlij,wlkj->wlki", body_rt[offsets], body_v[offsets] - v[:, :, None, :]
+  )
+  return np.concatenate(
+    (
+      root_rel_p,
+      _rot6d(root_rel_r),
+      root_rel_v,
+      root_rel_w,
+      body_rel_p.reshape(count, length, -1),
+      body_rel_v.reshape(count, length, -1),
+    ),
+    axis=-1,
+  )
+
+
 def hybrid_to_world(hybrid: np.ndarray, context: WorldFrameContext) -> WorldState:
   """Invert :func:`world_to_hybrid` using retained world planning context."""
   value = np.asarray(hybrid, dtype=np.float64)
@@ -344,4 +406,5 @@ __all__ = [
   "WorldState",
   "hybrid_to_world",
   "world_to_hybrid",
+  "world_to_hybrid_windows",
 ]

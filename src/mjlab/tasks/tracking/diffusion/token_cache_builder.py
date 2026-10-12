@@ -239,7 +239,9 @@ def _fill_token_cache_range(payload: _WorkerPayload) -> WorkerResult:
   store_root = directory / "store"
   if not (store_root / "manifest.json").is_file():
     raise DatasetError(f"dataset store manifest is missing: {store_root}")
-  store = AppendOnlyShardStore(store_root, contract=contract)
+  # A token worker reads only its own segments; each shard it consumes is still
+  # hash-checked on read, so opening does not hash the whole store.
+  store = AppendOnlyShardStore(store_root, contract=contract, validate_shards=False)
   rows_by_segment = _required_rows(store, payload)
   refs = tuple(ref for plan in payload.plans for ref in plan.refs)
   index = _BoundedWindowIndex(store, refs, rows_by_segment, contract)
@@ -373,7 +375,9 @@ def _fill_provenance_range(payload: _WorkerPayload) -> tuple[tuple[int, Any], ..
   store_root = directory / "store"
   if not (store_root / "manifest.json").is_file():
     raise DatasetError(f"dataset store manifest is missing: {store_root}")
-  store = AppendOnlyShardStore(store_root, contract=contract)
+  # A provenance worker reads only its own segments; each shard it consumes is
+  # still hash-checked on read, so opening does not hash the whole store.
+  store = AppendOnlyShardStore(store_root, contract=contract, validate_shards=False)
   rows_by_segment = _required_rows(store, payload)
   refs = tuple(ref for plan in payload.plans for ref in plan.refs)
   index = _BoundedWindowIndex(store, refs, rows_by_segment, contract)

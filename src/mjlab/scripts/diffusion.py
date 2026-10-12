@@ -11,15 +11,16 @@ executable here.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib
 import json
 import os
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence, cast
+from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 
 from mjlab.tasks.tracking.diffusion.runtime import CollectionRequest, RuntimeBundle
 
@@ -158,7 +159,9 @@ def _yaml_write_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     import yaml
 
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(yaml.safe_dump(dict(payload), sort_keys=False), encoding="utf-8")
+    temporary.write_text(
+      yaml.safe_dump(dict(payload), sort_keys=False), encoding="utf-8"
+    )
     temporary.replace(path)
   except (ImportError, OSError, TypeError, ValueError) as exc:
     raise ValueError(f"could not write YAML artifact {path}: {exc}") from exc
@@ -222,7 +225,9 @@ def _diffusion_artifact_metadata(
 
     manifest_payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
   except (ImportError, OSError, TypeError, ValueError) as exc:
-    raise ValueError(f"could not read VAE cohort manifest {manifest_path}: {exc}") from exc
+    raise ValueError(
+      f"could not read VAE cohort manifest {manifest_path}: {exc}"
+    ) from exc
   cohort_members: list[str] = []
   declared_members = vae_payload.get("cohort_ids")
   if isinstance(declared_members, list):
@@ -440,7 +445,7 @@ def _load_collection_config(path: Path) -> dict[str, Any]:
   pilot = payload.get("pilot")
   if isinstance(pilot, dict):
     try:
-      declared_envs = int(pilot.get("max_envs"))
+      declared_envs = int(cast(Any, pilot.get("max_envs")))
     except (TypeError, ValueError) as exc:
       raise ValueError(
         "collection config pilot.max_envs must be a positive integer"
@@ -470,56 +475,129 @@ def _validate_resource_budgets(args: argparse.Namespace) -> str | None:
   return None
 
 
-def _command_inspect(args: argparse.Namespace) -> int:
-  from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
+def _validate_streaming_controls(args: argparse.Namespace) -> str | None:
+  """Refuse an explicit speed option that the collector cannot honour."""
+  if args.max_rows_per_append is not None:
+    if args.max_rows_per_append < 1:
+      return "max_rows_per_append must be one or more"
+    if args.stream_rows is False:
+      return "max_rows_per_append requires --stream-rows"
+  if args.compact_results and args.stream_rows is False:
+    return "compact_results requires --stream-rows"
+  return None
 
+
+def _batched_only_option(args: argparse.Namespace) -> str | None:
+  """Name the first requested batched-only option, or ``None``.
+
+  The X2 runtime factory selects the batched runtime above one environment.
+  A scalar request cannot honour these options, so the CLI refuses them
+  instead of accepting a speed request and silently ignoring it.
+  """
+  for flag, requested in (
+    ("--stream-rows", args.stream_rows),
+    ("--compact-results", args.compact_results),
+    ("--max-rows-per-append", args.max_rows_per_append is not None),
+    ("--tensor-dispatch", args.tensor_dispatch),
+    ("--progress", args.progress is not None),
+  ):
+    if requested:
+      return flag
+  return None
+
+
+def _scalar_control_error(flag: str) -> str:
+  return (
+    f"{flag} is honoured only by the batched runtime; raise --max-envs above 1 "
+    "or drop the option"
+  )
+
+
+@contextlib.contextmanager
+def _policy_device_environment(setting: str | None) -> Iterator[None]:
+  """Scope ``MJLAB_D1_POLICY_DEVICE`` to one runtime-factory call.
+
+  The factory resolves the policy device once, while it constructs the frozen
+  policies.  The override must not outlive that call: a later collection in the
+  same process would otherwise inherit the earlier device instead of the
+  documented ``cpu`` default.
+  """
+  if setting is None:
+    yield
+    return
+  previous = os.environ.get("MJLAB_D1_POLICY_DEVICE")
+  os.environ["MJLAB_D1_POLICY_DEVICE"] = setting
+  try:
+    yield
+  finally:
+    if previous is None:
+      os.environ.pop("MJLAB_D1_POLICY_DEVICE", None)
+    else:
+      os.environ["MJLAB_D1_POLICY_DEVICE"] = previous
+
+
+def _batched_outcome_payload(result: Any) -> dict[str, Any]:
+  """Serialize one batched trial outcome for full rows or compact summaries."""
+  rows = getattr(result, "rows", None)
+  if rows is None:
+    row_count = int(result.row_count)
+    accepted_rows = int(result.accepted_row_count)
+    verification_rows = int(result.verification_row_count)
+  else:
+    row_count = len(rows)
+    accepted_rows = len(result.accepted_rows)
+    verification_rows = len(result.verification_rows)
+  return {
+    "run_id": result.spec.run_id,
+    "motion_id": result.spec.motion_id,
+    "phase": result.spec.phase,
+    "qualified": result.qualification.qualified,
+    "label": result.qualification.label,
+    "reason": result.qualification.reason,
+    "rows": row_count,
+    "accepted_rows": accepted_rows,
+    "verification_rows": verification_rows,
+    "stopped_reason": result.stopped_reason,
+    "store_files": list(result.store_files),
+  }
+
+
+def _progress_callback(path: Path | None) -> Callable[[Any], None] | None:
+  """Append one JSON progress record per event, flushed as it happens."""
+  if path is None:
+    return None
+  path.parent.mkdir(parents=True, exist_ok=True)
+  handle = path.open("a", encoding="utf-8")
+
+  def report(event: Any) -> None:
+    handle.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+    handle.flush()
+
+  return report
+
+
+def _command_inspect(args: argparse.Namespace) -> int:
+  from mjlab.tasks.tracking.diffusion.offline_validation import inspect_store
+
+  if args.jobs < 1:
+    print("inspect: jobs must be one or more", file=sys.stderr)
+    return 2
   contract = _load_contract(args.contract)
-  store = AppendOnlyShardStore(args.store, contract=contract)
-  rows = tuple(store.iter_rows())
-  controllers = {
-    name: sum(row.controller == name for row in rows) for name in ("vae", "ppo")
-  }
-  payload = {
-    "contract_sha256": contract.contract_sha256,
-    "store": str(args.store),
-    "shards": store.shard_count,
-    "rows": store.row_count,
-    "controllers": controllers,
-    "unique_identities": len({row.identity for row in rows}) == len(rows),
-  }
+  payload = inspect_store(args.store, contract=contract, jobs=args.jobs)
   print(json.dumps(payload, indent=2, sort_keys=True))
   return 0
 
 
 def _command_replay(args: argparse.Namespace) -> int:
-  import numpy as np
+  from mjlab.tasks.tracking.diffusion.offline_validation import replay_store
 
-  from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
-
+  if args.jobs < 1:
+    print("replay: jobs must be one or more", file=sys.stderr)
+    return 2
   contract = _load_contract(args.contract)
-  store = AppendOnlyShardStore(args.store, contract=contract)
-  rows = tuple(store.iter_rows())
-  errors: list[str] = []
-  for row in rows:
-    if not np.allclose(
-      row.clean_action + row.ou_noise,
-      row.executed_action,
-      atol=1.0e-5,
-      rtol=1.0e-5,
-    ):
-      errors.append(f"{row.identity}: executed action arithmetic mismatch")
-    if row.controller == "vae" and row.latent is None:
-      errors.append(f"{row.identity}: VAE row has no latent")
-    if row.controller == "ppo" and row.latent is not None:
-      errors.append(f"{row.identity}: PPO row has a latent")
-  payload = {
-    "ok": not errors,
-    "rows": len(rows),
-    "errors": errors,
-    "note": "offline shard replay diagnostics; no simulator was launched",
-  }
+  payload = replay_store(args.store, contract=contract, jobs=args.jobs)
   print(json.dumps(payload, indent=2, sort_keys=True))
-  return 0 if not errors else 1
+  return 0 if payload["ok"] else 1
 
 
 def _load_assignments(path: Path) -> Any:
@@ -529,16 +607,27 @@ def _load_assignments(path: Path) -> Any:
 
 
 def _command_build(args: argparse.Namespace) -> int:
-  from mjlab.tasks.tracking.diffusion.dataset import build_dataset
+  from mjlab.tasks.tracking.diffusion.dataset import (
+    build_window_index,
+    grouped_split,
+  )
   from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
 
+  if args.jobs < 1:
+    print("build: jobs must be one or more", file=sys.stderr)
+    return 2
   contract = _load_contract(args.contract)
   store = AppendOnlyShardStore(args.store, contract=contract)
-  index, assignments = build_dataset(store, contract=contract)
+  assignments = grouped_split(store.iter_rows(), contract=contract)
+  index, method = build_window_index(
+    store, assignments, jobs=args.jobs, contract=contract
+  )
   _json_write(args.assignments, assignments.as_dict())
   payload = {
     "contract_sha256": contract.contract_sha256,
     "assignments": str(args.assignments),
+    "jobs": args.jobs,
+    "method": method,
     "groups": assignments.coverage(),
     "windows": index.coverage(),
     "total_windows": len(index),
@@ -550,20 +639,58 @@ def _command_build(args: argparse.Namespace) -> int:
 
 def _command_stats(args: argparse.Namespace) -> int:
   from mjlab.tasks.tracking.diffusion.dataset import (
+    DatasetError,
     WindowIndex,
     fit_training_statistics,
+    load_window_index,
   )
   from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
 
+  if args.jobs < 1:
+    print("stats: jobs must be one or more", file=sys.stderr)
+    return 2
+  if args.batch_windows is not None and args.batch_windows < 1:
+    print("stats: batch-windows must be one or more", file=sys.stderr)
+    return 2
   contract = _load_contract(args.contract)
   store = AppendOnlyShardStore(args.store, contract=contract)
   assignments = _load_assignments(args.assignments)
-  index = WindowIndex.build(store, assignments, contract=contract)
-  bundle = fit_training_statistics(index, contract=contract)
+  index_path = args.index
+  if index_path is None:
+    candidate = args.assignments.parent / "window_index.npz"
+    if candidate.is_file():
+      index_path = candidate
+  if index_path is not None:
+    # Reuse the persisted, source-bound index instead of rebuilding it.  The
+    # loader refuses an index that does not describe this exact store and
+    # assignment set, so a stale artifact cannot change the dataset definition.
+    try:
+      index = load_window_index(
+        index_path, store=store, assignments=assignments, contract=contract
+      )
+    except (DatasetError, OSError, ValueError) as exc:
+      print(f"stats: refusing the persisted window index: {exc}", file=sys.stderr)
+      return 1
+    index_source = str(index_path)
+  else:
+    index = WindowIndex.build(store, assignments, contract=contract)
+    index_source = "rebuilt"
+  statistics_kwargs = (
+    {} if args.batch_windows is None else {"batch_windows": args.batch_windows}
+  )
+  bundle = fit_training_statistics(
+    index,
+    contract=contract,
+    jobs=args.jobs,
+    **statistics_kwargs,
+  )
   bundle.save(args.bundle)
   payload = {
     "contract_sha256": contract.contract_sha256,
     "bundle": str(args.bundle),
+    "index_source": index_source,
+    "jobs": args.jobs,
+    "batch_windows": args.batch_windows,
     "windows": index.coverage(),
     "train_windows_used": len(index.refs_for("train")),
     "matrix_sha256": bundle.matrix_sha256,
@@ -809,6 +936,16 @@ def _command_collect(args: argparse.Namespace) -> int:
   if budget_error is not None:
     print(budget_error, file=sys.stderr)
     return 2
+  streaming_error = _validate_streaming_controls(args)
+  if streaming_error is not None:
+    print(streaming_error, file=sys.stderr)
+    return 2
+  batched_only = _batched_only_option(args)
+  if batched_only is not None and args.max_envs <= 1:
+    # Refuse before any environment, checkpoint or store work: the scalar
+    # runtime cannot honour a batched publication, progress or tensor option.
+    print(_scalar_control_error(batched_only), file=sys.stderr)
+    return 2
   if args.config is not None:
     try:
       _load_collection_config(args.config)
@@ -841,7 +978,11 @@ def _command_collect(args: argparse.Namespace) -> int:
     args.max_output_mib,
   )
   started = time.monotonic()
-  bundle = _load_factory(args.runtime_factory)(request)
+  # The factory reads the policy-device setting once, when it builds the frozen
+  # policies, so the override is scoped to this call and cannot leak into a
+  # later collection in the same process.
+  with _policy_device_environment(args.policy_device):
+    bundle = _load_factory(args.runtime_factory)(request)
   if not isinstance(bundle, RuntimeBundle):
     raise TypeError("runtime factory must return RuntimeBundle")
   runtime_error = _validate_runtime_bundle(
@@ -849,6 +990,13 @@ def _command_collect(args: argparse.Namespace) -> int:
   )
   if runtime_error is not None:
     print(runtime_error, file=sys.stderr)
+    return 2
+  provenance = bundle.runtime_provenance or {}
+  batch_runtime = bool(provenance.get("batched", False))
+  if batched_only is not None and not batch_runtime:
+    # Backstop for a factory that ignores max_envs: refuse the option instead of
+    # accepting it and running the scalar path without it.
+    print(_scalar_control_error(batched_only), file=sys.stderr)
     return 2
   if len(bundle.trials) == 0:
     raise ValueError("runtime factory returned no trial specifications")
@@ -858,44 +1006,93 @@ def _command_collect(args: argparse.Namespace) -> int:
   if pair_error is not None:
     print(pair_error, file=sys.stderr)
     return 2
-  if bool((bundle.runtime_provenance or {}).get("batched", False)):
+  if batch_runtime:
+    from mjlab.tasks.tracking.diffusion.collection_controls import (
+      CollectionControls,
+      CollectionLimits,
+      limits_from_request,
+    )
+
+    if args.stream_rows is None:
+      args.stream_rows = True
+    if args.compact_results is None:
+      args.compact_results = args.stream_rows
+    if args.tensor_dispatch is None:
+      from mjlab.tasks.tracking.diffusion.collection_controls import (
+        missing_tensor_methods,
+      )
+
+      args.tensor_dispatch = not missing_tensor_methods(
+        getattr(bundle.collector, "env", None),
+        getattr(bundle.collector, "vae", None),
+      )
+    # A supplied progress path stays explicit; the final report always has counts.
+    # Wall-clock and inactivity limits apply to every batched run: the request
+    # always carries a budget, so the report must state whether it bound the run.
+    # The stored-output limit needs streaming publication to be measurable.
+    requested_limits = limits_from_request(request)
+    limits = CollectionLimits(
+      wall_seconds=requested_limits.wall_seconds,
+      inactivity_seconds=requested_limits.inactivity_seconds,
+      max_output_bytes=(
+        requested_limits.max_output_bytes if args.stream_rows else None
+      ),
+    )
+    controls = CollectionControls(
+      limits=limits,
+      stream_rows=args.stream_rows,
+      compact_results=args.compact_results,
+      max_rows_per_append=args.max_rows_per_append,
+      tensor_dispatch=args.tensor_dispatch,
+      progress=_progress_callback(args.progress),
+    )
     batch = bundle.collector.collect_batched(
       bundle.trials,
       slots=args.max_envs,
+      controls=controls,
     )
-    transitions = sum(result.qualification.steps for result in batch.results)
+    transitions = (
+      batch.progress.transitions
+      if batch.progress is not None
+      else sum(result.qualification.steps for result in batch.results)
+    )
     ou_skipped = len(batch.skipped_ou_pairs)
     ou_attempted = sum(result.spec.phase == "ou" for result in batch.results)
-    batched_results = [
-      {
-        "run_id": result.spec.run_id,
-        "motion_id": result.spec.motion_id,
-        "phase": result.spec.phase,
-        "qualified": result.qualification.qualified,
-        "label": result.qualification.label,
-        "reason": result.qualification.reason,
-        "rows": len(result.rows),
-        "accepted_rows": len(result.accepted_rows),
-        "verification_rows": len(result.verification_rows),
-        "stopped_reason": result.stopped_reason,
-        "store_files": list(result.store_files),
-      }
-      for result in batch.results
-    ]
+    batched_results = [_batched_outcome_payload(result) for result in batch.results]
     payload = {
       "contract_sha256": contract.contract_sha256,
       "trials_attempted": len(batched_results),
       "control_transitions": transitions,
       "ou_trials_attempted": ou_attempted,
       "ou_trials_skipped": ou_skipped,
-      "partial": False,
-      "stop_reason": None,
+      "partial": batch.partial,
+      "stop_reason": batch.stop_reason,
+      "unstarted_trials": batch.unstarted_trials,
+      "stored_bytes": batch.stored_bytes,
+      "output_limit_exceeded": batch.output_limit_exceeded,
+      "policy_device": provenance.get("policy_device"),
+      "policy_device_setting": provenance.get("policy_device_setting"),
+      "streaming": {
+        "stream_rows": args.stream_rows,
+        "compact_results": args.compact_results,
+        "max_rows_per_append": args.max_rows_per_append,
+        "tensor_dispatch": args.tensor_dispatch,
+      },
+      "progress": None if batch.progress is None else asdict(batch.progress),
       "results": batched_results,
       "batched_store_files": list(batch.store_files),
       "note": "pilot collection only; this command does not authorize bulk collection or training",
     }
     _json_write(args.report, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
+    if batch.partial:
+      print(
+        "collect: batched run is partial "
+        f"(stop_reason={batch.stop_reason!r}, "
+        f"{batch.unstarted_trials} trials unstarted); do not merge this store",
+        file=sys.stderr,
+      )
+      return 1
     return 0
   results: list[dict[str, Any]] = []
   transitions = 0
@@ -982,6 +1179,8 @@ def _command_collect(args: argparse.Namespace) -> int:
     "ou_trials_skipped": ou_skipped,
     "partial": partial_reason is not None,
     "stop_reason": partial_reason,
+    "policy_device": provenance.get("policy_device"),
+    "policy_device_setting": provenance.get("policy_device_setting"),
     "results": results,
     "note": "pilot collection only; this command does not authorize bulk collection or training",
   }
@@ -1041,7 +1240,6 @@ def _command_train(args: argparse.Namespace) -> int:
     import numpy as np
     import torch
 
-    from mjlab.tasks.tracking.diffusion.checkpoint import CheckpointError
     from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
     from mjlab.tasks.tracking.diffusion.model import (
       DenoiserSettings,
@@ -1099,9 +1297,7 @@ def _command_train(args: argparse.Namespace) -> int:
 
     contract = DiffusionContract.from_yaml(args.contract)
     try:
-      contract_payload = yaml.safe_load(
-        args.contract.read_text(encoding="utf-8")
-      )
+      contract_payload = yaml.safe_load(args.contract.read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError) as exc:
       raise ValueError(f"could not read contract metadata: {exc}") from exc
     if not isinstance(contract_payload, Mapping):
@@ -1260,6 +1456,7 @@ def _command_train(args: argparse.Namespace) -> int:
       device=device,
       resume=args.resume,
       checkpoint_sidecar=artifact_metadata["checkpoint_sidecar"],
+      allow_long_run=args.allow_long_run,
     )
     result = trainer.train()
     payload = {
@@ -1285,7 +1482,7 @@ def _command_train(args: argparse.Namespace) -> int:
       _json_write(args.json, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
-  except (CheckpointError, OSError, RuntimeError, ValueError, TypeError) as exc:
+  except (OSError, RuntimeError, ValueError, TypeError) as exc:
     print(f"train: {exc}", file=sys.stderr)
     return 1
 
@@ -1528,11 +1725,17 @@ def build_parser() -> argparse.ArgumentParser:
   inspect = commands.add_parser("inspect", help="inspect a bounded shard store")
   _common(inspect)
   inspect.add_argument("--store", type=Path, required=True)
+  inspect.add_argument(
+    "--jobs", type=int, default=8, help="bounded shard-validation workers (default: 8)"
+  )
   inspect.set_defaults(handler=_command_inspect)
 
   replay = commands.add_parser("replay", help="run offline row arithmetic diagnostics")
   _common(replay)
   replay.add_argument("--store", type=Path, required=True)
+  replay.add_argument(
+    "--jobs", type=int, default=8, help="bounded replay workers (default: 8)"
+  )
   replay.set_defaults(handler=_command_replay)
 
   build = commands.add_parser("build", help="index eligible windows and grouped splits")
@@ -1540,6 +1743,9 @@ def build_parser() -> argparse.ArgumentParser:
   build.add_argument("--store", type=Path, required=True)
   build.add_argument("--assignments", type=Path, required=True)
   build.add_argument("--report", type=Path, required=True)
+  build.add_argument(
+    "--jobs", type=int, default=8, help="bounded window-index workers (default: 8)"
+  )
   build.set_defaults(handler=_command_build)
 
   stats = commands.add_parser("stats", help="fit train-only projection statistics")
@@ -1548,6 +1754,23 @@ def build_parser() -> argparse.ArgumentParser:
   stats.add_argument("--assignments", type=Path, required=True)
   stats.add_argument("--bundle", type=Path, required=True)
   stats.add_argument("--report", type=Path, required=True)
+  stats.add_argument(
+    "--jobs", type=int, default=8, help="bounded shard-range workers (default: 8)"
+  )
+  stats.add_argument(
+    "--batch-windows",
+    type=int,
+    default=512,
+    help="windows per statistics update (default: 512)",
+  )
+  stats.add_argument(
+    "--index",
+    type=Path,
+    help=(
+      "reuse this persisted window index instead of rebuilding it; the loader "
+      "refuses an index that does not describe the given store and assignments"
+    ),
+  )
   stats.set_defaults(handler=_command_stats)
 
   collect = commands.add_parser(
@@ -1562,11 +1785,52 @@ def build_parser() -> argparse.ArgumentParser:
   collect.add_argument("--output", type=Path, required=True)
   collect.add_argument("--report", type=Path, required=True)
   collect.add_argument("--max-trials", type=int, default=1)
-  collect.add_argument("--max-envs", type=int, default=1)
+  collect.add_argument("--max-envs", type=int, default=256)
   collect.add_argument("--max-gpus", type=int, default=1)
   collect.add_argument("--max-wall-minutes", type=int, default=1)
   collect.add_argument("--monitor-inactivity-seconds", type=int, default=120)
   collect.add_argument("--max-output-mib", type=int, default=512)
+  collect.add_argument(
+    "--stream-rows",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="bounded streaming is on for batched collection; --no-stream-rows opts out",
+  )
+  collect.add_argument(
+    "--compact-results",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="compact batched counts are on with streaming; --no-compact-results opts out",
+  )
+  collect.add_argument(
+    "--max-rows-per-append",
+    type=int,
+    default=None,
+    help="bound one store append in rows; requires --stream-rows",
+  )
+  collect.add_argument(
+    "--tensor-dispatch",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help=(
+      "device-native dispatch is on for compatible batched runtimes; "
+      "--no-tensor-dispatch uses NumPy"
+    ),
+  )
+  collect.add_argument(
+    "--policy-device",
+    type=str,
+    default=None,
+    help=(
+      "VAE device: cpu, simulation, or cuda[:N]; default follows simulation "
+      "for batched X2 collection and stays cpu for scalar collection"
+    ),
+  )
+  collect.add_argument(
+    "--progress",
+    type=Path,
+    help="append one JSON progress record per event to this file",
+  )
   collect.set_defaults(handler=_command_collect)
 
   train = commands.add_parser("train", help="run explicitly bounded D2 training")
@@ -1636,7 +1900,7 @@ def build_parser() -> argparse.ArgumentParser:
   index.add_argument("--dataset-dir", type=Path, required=True)
   index.add_argument("--contract", type=Path, required=True)
   index.add_argument(
-    "--jobs", type=int, default=1, help="worker processes; 1 is sequential"
+    "--jobs", type=int, default=8, help="bounded index workers (default: 8)"
   )
   index.add_argument("--json", type=Path)
   index.set_defaults(handler=_command_build_index)

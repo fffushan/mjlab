@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 import numpy as np
 import torch
@@ -136,6 +136,34 @@ def _metadata_field(metadata: Mapping[str, Any], *names: str) -> Any:
     if name in metadata:
       return metadata[name]
   return None
+
+
+def resolve_inference_device(value: str | torch.device) -> str:
+  """Normalize and validate an explicit policy inference device.
+
+  ``cpu`` keeps the frozen CPU policy path.  ``cuda[:N]`` is accepted only
+  when CUDA is available and the requested index exists, so an unusable device
+  fails before any checkpoint or environment is constructed.
+  """
+  try:
+    device = torch.device(value)
+  except (RuntimeError, TypeError, ValueError) as exc:
+    raise AdapterError(f"invalid policy inference device {value!r}: {exc}") from exc
+  if device.type == "cpu":
+    return "cpu"
+  if device.type != "cuda":
+    raise AdapterError(
+      f"policy inference device must be cpu or cuda[:N], got {value!r}"
+    )
+  if not torch.cuda.is_available():
+    raise AdapterError(
+      f"policy inference device {value!r} needs CUDA, which is unavailable"
+    )
+  if device.index is not None and device.index >= torch.cuda.device_count():
+    raise AdapterError(
+      f"policy inference device {value!r} exceeds {torch.cuda.device_count()} GPUs"
+    )
+  return "cuda" if device.index is None else f"cuda:{device.index}"
 
 
 def _repo_root() -> Path:
@@ -346,6 +374,77 @@ class VaeObservationBatch:
       None if self.gravity_z_error is None else self.gravity_z_error[ids],
       None if self.end_effector_z_error is None else self.end_effector_z_error[ids],
     )
+
+
+@dataclass(frozen=True, slots=True)
+class VaeObservationTensorBatch:
+  """Device-native VAE inputs for one selected row batch.
+
+  The tensors stay on the policy inference device, so the frozen VAE consumes
+  them without the CPU observation round trip.  They carry exactly the packed
+  ``reference``/``conditioning`` content of :class:`VaeObservationBatch`, and
+  row order matches the caller's ``env_ids`` order.
+
+  The optional row evidence (``state``, ``motion_id``, ``reference_frame``,
+  ``reference_phase``) lets the collector record the required row fields from
+  the same snapshot capture without copying the packed reference/conditioning
+  tensors back to the host.  A batch built for inference alone leaves them
+  empty.
+  """
+
+  reference: torch.Tensor
+  conditioning: torch.Tensor
+  state: WorldState | None = None
+  motion_id: tuple[str, ...] = ()
+  reference_frame: np.ndarray | None = None
+  reference_phase: np.ndarray | None = None
+
+  def __post_init__(self) -> None:
+    for name, value, width in (
+      ("reference", self.reference, 68),
+      ("conditioning", self.conditioning, 99),
+    ):
+      if not isinstance(value, torch.Tensor):
+        raise AdapterError(f"tensor {name} must be a torch.Tensor")
+      if value.ndim != 2 or value.shape[1] != width or value.shape[0] == 0:
+        raise AdapterError(f"tensor {name} must have shape [N, {width}] with N > 0")
+      if value.dtype != torch.float32:
+        raise AdapterError(f"tensor {name} must be float32")
+    if self.reference.device != self.conditioning.device:
+      raise AdapterError("tensor reference and conditioning must share a device")
+    if self.reference.shape[0] != self.conditioning.shape[0]:
+      raise AdapterError("tensor reference and conditioning rows must align")
+    if (
+      not torch.isfinite(self.reference).all()
+      or not torch.isfinite(self.conditioning).all()
+    ):
+      raise AdapterError("tensor VAE observation must be finite")
+    if self.state is None:
+      return
+    if self.reference_frame is None or self.reference_phase is None:
+      raise AdapterError("tensor VAE row evidence requires frames and phases")
+    batch = self.reference.shape[0]
+    if self.state.count != batch or len(self.motion_id) != batch:
+      raise AdapterError("tensor VAE row evidence must match the reference rows")
+    frames = np.asarray(self.reference_frame, dtype=np.int64).reshape(-1)
+    phases = np.asarray(self.reference_phase, dtype=np.float64).reshape(-1)
+    if (
+      frames.shape != (batch,)
+      or np.any(frames < 0)
+      or phases.shape != (batch,)
+      or not np.isfinite(phases).all()
+    ):
+      raise AdapterError("tensor VAE row evidence frames must be finite and in range")
+    object.__setattr__(self, "reference_frame", frames.copy())
+    object.__setattr__(self, "reference_phase", phases.copy())
+
+  @property
+  def batch_size(self) -> int:
+    return self.reference.shape[0]
+
+  @property
+  def device(self) -> torch.device:
+    return self.reference.device
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,6 +666,7 @@ class FrozenVaePolicy:
     cohort_manifest: str | Path | None = None,
     cohort_manifest_sha256: str | None = None,
     contract: Any | None = None,
+    device: str | torch.device = "cpu",
   ) -> "FrozenVaePolicy":
     """Load a pinned cohort member through its checked inference loader.
 
@@ -579,6 +679,10 @@ class FrozenVaePolicy:
     default to the frozen three-clip revision.  A caller selecting another
     registered contract revision passes all three explicitly; the loaded
     checkpoint bytes are always compared against the selected contract.
+
+    ``device`` is an explicit runtime input.  It defaults to ``cpu`` so the
+    frozen CPU path is unchanged, and is validated before the checkpoint is
+    read so an unusable inference device fails closed.
     """
     from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
     from mjlab.tasks.tracking.distillation.checkpoint import (
@@ -588,6 +692,7 @@ class FrozenVaePolicy:
     from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 
     selected_contract = contract if contract is not None else DEFAULT_CONTRACT
+    selected_device = resolve_inference_device(device)
     repo_root = _repo_root()
     if cohort_manifest is None:
       manifest_path = repo_root / _MIXED_COHORT_MANIFEST
@@ -613,7 +718,7 @@ class FrozenVaePolicy:
         checkpoint,
         cohort,
         teacher_id,
-        device="cpu",
+        device=selected_device,
       )
     except (CheckpointValidationError, ValueError, OSError) as exc:
       raise AdapterError(
@@ -675,6 +780,10 @@ class FrozenVaePolicy:
     conditioning_tensor = torch.as_tensor(
       _vector("conditioning", conditioning, 99), dtype=torch.float32
     )[None]
+    device = self._model_device()
+    if device is not None:
+      reference_tensor = reference_tensor.to(device)
+      conditioning_tensor = conditioning_tensor.to(device)
     with torch.no_grad():
       mu, _ = self.model.encode(reference_tensor)
       action = self.model.decode(mu, conditioning_tensor)
@@ -692,6 +801,16 @@ class FrozenVaePolicy:
   def action(self, observation: VaeObservation) -> tuple[np.ndarray, np.ndarray]:
     return self.latent_and_action(observation.reference, observation.conditioning)
 
+  def _model_device(self) -> torch.device | None:
+    """The frozen model's parameter device, or ``None`` for a parameterless model."""
+    parameters = getattr(self.model, "parameters", None)
+    if not callable(parameters):
+      return None
+    try:
+      return next(cast(Any, parameters)()).device
+    except StopIteration:
+      return None
+
   def to_device(self, device: str | torch.device) -> "FrozenVaePolicy":
     """Move the frozen model for a batched rollout without changing scalar action."""
     mover = getattr(self.model, "to", None)
@@ -706,14 +825,10 @@ class FrozenVaePolicy:
     """Run one VAE encode/decode call for all supplied rows."""
     reference = torch.as_tensor(observation.reference, dtype=torch.float32)
     conditioning = torch.as_tensor(observation.conditioning, dtype=torch.float32)
-    parameters = getattr(self.model, "parameters", None)
-    if callable(parameters):
-      try:
-        device = next(parameters()).device
-        reference = reference.to(device)
-        conditioning = conditioning.to(device)
-      except StopIteration:
-        pass
+    device = self._model_device()
+    if device is not None:
+      reference = reference.to(device)
+      conditioning = conditioning.to(device)
     with torch.no_grad():
       mu, _ = self.model.encode(reference)
       action = self.model.decode(mu, conditioning)
@@ -727,6 +842,39 @@ class FrozenVaePolicy:
     if not np.isfinite(latent).all() or not np.isfinite(clean).all():
       raise AdapterError("batched VAE produced non-finite values")
     return latent, clean
+
+  def batch_action_tensor(
+    self, observation: VaeObservationTensorBatch
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode and decode one device-native observation batch.
+
+    Returns the posterior mean (never a sampled latent) and the clean decoded
+    action as float32 tensors on the model device.  The model stays frozen and
+    no NumPy conversion is performed, so a device-native observation does not
+    round-trip through the host.  The scalar and NumPy batch paths are
+    unchanged.
+    """
+    if not isinstance(observation, VaeObservationTensorBatch):
+      raise AdapterError("tensor VAE batch must be a VaeObservationTensorBatch")
+    reference = observation.reference
+    conditioning = observation.conditioning
+    device = self._model_device()
+    if device is not None:
+      reference = reference.to(device)
+      conditioning = conditioning.to(device)
+    with torch.no_grad():
+      latent, _ = self.model.encode(reference)
+      action = self.model.decode(latent, conditioning)
+    latent = latent.detach()
+    action = action.detach()
+    if latent.shape != (observation.batch_size, 32) or action.shape != (
+      observation.batch_size,
+      31,
+    ):
+      raise AdapterError("tensor VAE produced an invalid latent or action")
+    if not torch.isfinite(latent).all() or not torch.isfinite(action).all():
+      raise AdapterError("tensor VAE produced non-finite values")
+    return latent, action
 
 
 class RecoveryInference(Protocol):

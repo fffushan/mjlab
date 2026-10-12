@@ -220,12 +220,14 @@ def test_train_statistics_do_not_require_validation_or_test_data(tmp_path) -> No
   np.testing.assert_allclose(bundle.state_stats.mean[0], 0.0, atol=10.0)
 
 
-def test_window_rows_are_resolved_with_one_store_scan(tmp_path) -> None:
+def test_statistics_read_every_shard_once(tmp_path, monkeypatch) -> None:
   """Reading many windows must not re-scan the store once per window.
 
-  ``fit_training_statistics`` resolves every train window; the earlier
-  implementation called ``store.iter_rows()`` per window, which is quadratic in
-  the window count and re-decompressed every shard.
+  ``fit_training_statistics`` resolves every train window from one bounded pass
+  over the shards.  The earlier implementation called ``store.iter_rows()`` per
+  window, which is quadratic in the window count and re-decompressed every
+  shard; a pass that resolved windows one window at a time would read a shard
+  once per window that touches it.
   """
   store = AppendOnlyShardStore(tmp_path, max_rows_per_shard=31)
   rows = [make_row(i, group="family-a", episode="a") for i in range(60)]
@@ -234,15 +236,25 @@ def test_window_rows_are_resolved_with_one_store_scan(tmp_path) -> None:
   index = WindowIndex.build(store, assignments)
   assert len(index) > 1
 
-  scans = 0
-  original = store.iter_rows
+  reads: list[str] = []
+  original = AppendOnlyShardStore._read_shard
 
-  def counting_iter_rows():
-    nonlocal scans
-    scans += 1
-    yield from original()
+  def counting_read_shard(self, item):
+    reads.append(str(item["file"]))
+    return original(self, item)
 
-  store.iter_rows = counting_iter_rows  # type: ignore[method-assign]
+  # Store construction hashes every shard, so count the whole-store validation
+  # separately from the per-shard reads: the fit must not pay it at all.
+  validations: list[int] = []
+  original_validate = AppendOnlyShardStore._validate_manifest
+
+  def counting_validate(self):
+    validations.append(1)
+    return original_validate(self)
+
+  monkeypatch.setattr(AppendOnlyShardStore, "_read_shard", counting_read_shard)
+  monkeypatch.setattr(AppendOnlyShardStore, "_validate_manifest", counting_validate)
   bundle = fit_training_statistics(index)
   assert bundle.matrix_sha256
-  assert scans == 1
+  assert len(reads) == len(set(reads)) == store.shard_count
+  assert validations == []

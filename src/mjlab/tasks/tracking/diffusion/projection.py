@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol, runtime_checkable
@@ -65,8 +67,12 @@ class FeatureStats:
     return {"count": self.count, "mean": self.mean.tolist(), "std": self.std.tolist()}
 
 
-class _Moments:
+class FeatureMomentsAccumulator:
+  """Streaming float64 population moments with an explicit partial result."""
+
   def __init__(self, width: int) -> None:
+    if width <= 0:
+      raise ProjectionError("statistics width must be positive")
     self.count = 0
     self.mean = np.zeros(width, dtype=np.float64)
     self.m2 = np.zeros(width, dtype=np.float64)
@@ -81,14 +87,32 @@ class _Moments:
     batch_mean = values.mean(axis=0, dtype=np.float64)
     centered = values - batch_mean
     batch_m2 = np.sum(centered * centered, axis=0, dtype=np.float64)
+    self.absorb(FeatureMoments(count, batch_mean, batch_m2))
+
+  def absorb(self, partial: FeatureMoments) -> None:
+    """Merge disjoint partial moments into this accumulator.
+
+    The merge is the parallel form of Welford's update, so combining the
+    partials of a range partition in range order is deterministic.
+    """
+    if not isinstance(partial, FeatureMoments):
+      raise ProjectionError("statistics merge accepts partial feature moments")
+    if partial.mean.size != self.mean.size:
+      raise ProjectionError("partial moments width does not match the accumulator")
+    if partial.count == 0:
+      return
+    count, mean, m2 = partial.count, partial.mean, partial.m2
     if self.count == 0:
-      self.count, self.mean, self.m2 = count, batch_mean, batch_m2
+      self.count, self.mean, self.m2 = count, mean.copy(), m2.copy()
       return
     total = self.count + count
-    delta = batch_mean - self.mean
-    self.m2 += batch_m2 + delta * delta * (self.count * count / total)
+    delta = mean - self.mean
+    self.m2 += m2 + delta * delta * (self.count * count / total)
     self.mean += delta * (count / total)
     self.count = total
+
+  def partial(self) -> "FeatureMoments":
+    return FeatureMoments(self.count, self.mean.copy(), self.m2.copy())
 
   def finish(self, floor: float) -> FeatureStats:
     if self.count == 0:
@@ -96,6 +120,30 @@ class _Moments:
     std = np.sqrt(self.m2 / self.count)
     std = np.maximum(std, floor)
     return FeatureStats(self.count, self.mean.copy(), std)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureMoments:
+  """Partial population moments of one feature width.
+
+  Partial moments are the transfer format of a range-partitioned fit: each
+  range accumulates its own moments in float64 and the ranges are combined
+  afterwards.  A partition changes the combination order, so the combined
+  statistics are equal to a single-range fit to floating-point tolerance rather
+  than bit for bit.
+  """
+
+  count: int
+  mean: np.ndarray
+  m2: np.ndarray
+
+  def __post_init__(self) -> None:
+    mean = _finite("partial mean", self.mean)
+    m2 = _finite("partial m2", self.m2)
+    if self.count < 0 or mean.ndim != 1 or mean.shape != m2.shape:
+      raise ProjectionError("invalid partial feature moments")
+    object.__setattr__(self, "mean", mean)
+    object.__setattr__(self, "m2", m2)
 
 
 def fit_feature_stats(
@@ -110,10 +158,30 @@ def fit_feature_stats(
 
   if first.ndim != 2:
     raise ProjectionError("statistics chunks must be two-dimensional")
-  moments = _Moments(first.shape[1])
+  moments = FeatureMomentsAccumulator(first.shape[1])
   moments.update(first)
   for chunk in chunks:
     moments.update(chunk)
+  return moments.finish(std_floor)
+
+
+def combine_feature_moments(
+  partials: Iterable[FeatureMoments], *, std_floor: float = 1e-6
+) -> FeatureStats:
+  """Combine disjoint partial moments in iteration order.
+
+  The iteration order is the reduction order, so the same partition gives the
+  same statistics on every run and on every machine.
+  """
+  moments: FeatureMomentsAccumulator | None = None
+  for partial in partials:
+    if partial.count == 0:
+      continue
+    if moments is None:
+      moments = FeatureMomentsAccumulator(partial.mean.size)
+    moments.absorb(partial)
+  if moments is None:
+    raise ProjectionError("cannot combine statistics from empty partial moments")
   return moments.finish(std_floor)
 
 
@@ -403,18 +471,33 @@ class ProjectionBundle:
     }
 
   def save(self, path: str | Path) -> None:
+    """Write the bundle atomically: stage a temporary, then rename it in place.
+
+    The archive keys, dtypes and compression are unchanged; only the write is
+    staged beside the target, so a crash mid-write leaves no partial
+    ``projection.npz`` behind and a reader never observes a half-written file.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-      path,
-      matrix=self.matrix,
-      pseudoinverse=self.pseudoinverse,
-      state_mean=self.state_stats.mean,
-      state_std=self.state_stats.std,
-      latent_mean=self.latent_stats.mean,
-      latent_std=self.latent_stats.std,
-      metadata=np.asarray(json.dumps(self.as_dict(), sort_keys=True)),
-    )
+    with tempfile.NamedTemporaryFile(
+      dir=path.parent, suffix=".npz", delete=False
+    ) as handle:
+      temporary = Path(handle.name)
+    try:
+      np.savez_compressed(
+        temporary,
+        matrix=self.matrix,
+        pseudoinverse=self.pseudoinverse,
+        state_mean=self.state_stats.mean,
+        state_std=self.state_stats.std,
+        latent_mean=self.latent_stats.mean,
+        latent_std=self.latent_stats.std,
+        metadata=np.asarray(json.dumps(self.as_dict(), sort_keys=True)),
+      )
+      os.replace(temporary, path)
+    finally:
+      if temporary.exists():
+        temporary.unlink()
 
   @classmethod
   def load(
@@ -466,11 +549,14 @@ StateLatentTransformLike = ProjectionBundle | StateLatentTransform
 
 
 __all__ = [
+  "FeatureMoments",
+  "FeatureMomentsAccumulator",
   "FeatureStats",
   "ProjectionBundle",
   "ProjectionError",
   "StateLatentNormalizer",
   "StateLatentTransform",
   "StateLatentTransformLike",
+  "combine_feature_moments",
   "fit_feature_stats",
 ]

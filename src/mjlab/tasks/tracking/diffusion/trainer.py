@@ -410,10 +410,11 @@ class DiffusionTrainer:
     device: str | torch.device,
     resume: Path | None = None,
     checkpoint_sidecar: Mapping[str, Any] | None = None,
+    allow_long_run: bool = False,
   ) -> None:
     if not isinstance(config, TrainingConfig):
       raise TypeError("config must be a TrainingConfig")
-    config.validate()
+    config.validate(allow_long_run=allow_long_run)
     self.config = config
     self.contract = contract
     self.schedule = schedule
@@ -506,7 +507,9 @@ class DiffusionTrainer:
         self._next_periodic = (self.global_step // every + 1) * every
 
     self._updates_per_epoch = self._updates_for_samples(self._epoch_sample_count())
-    self._resolved_updates = self.config.resolved_updates(self._updates_per_epoch)
+    self._resolved_updates = self.config.validate_resolved_updates(
+      self._updates_per_epoch, allow_long_run=allow_long_run
+    )
     if self.global_step > self._resolved_updates:
       raise TrainerError("resume checkpoint is beyond the resolved training budget")
     self._write_run_metadata()
@@ -815,9 +818,7 @@ class DiffusionTrainer:
         "global_step": self.global_step,
       }
       temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-      temporary.write_text(
-        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
-      )
+      temporary.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
       temporary.replace(path.with_suffix(".yaml"))
     except (ImportError, OSError, TypeError, ValueError) as exc:
       raise TrainerError(

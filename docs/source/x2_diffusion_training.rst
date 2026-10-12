@@ -74,32 +74,35 @@ manifest through ``MJLAB_D1_COHORT_MANIFEST``.
 Server best practice
 --------------------
 
-The managed server test used physical GPU 3 on
+The current collection default uses 256 environments, GPU-native VAE inference,
+bounded streaming, and compact counts. Use one collector process per physical
+GPU. Scalar collection remains available with ``--max-envs 1``.
+
+The latest managed-server test used physical GPU 3 on
 ``10.14.64.48:32221``. The process sees that GPU as logical ``cuda:0`` because
 of ``CUDA_VISIBLE_DEVICES``.
 
-The current best tested collection setting is:
+The 2026-10-12 (+08) VGK36 test used 36 references and two seeds per arm.
+Stored-row throughput was 589 rows/s for original CPU64, 669 for GPU64,
+806 for GPU128, and 899 for GPU256. GPU256 was **1.53x** the original rate.
+This is the fastest tested small-run setting, not a full-scale four-GPU optimum.
+The earlier VGK8 CPU-inference sweep favored 64 environments. That result does
+not select the optimum for the new GPU-inference path.
 
-.. code-block:: text
+Defaults for offline validation, indexing, and statistics are ``--jobs 8``.
+Statistics use batches of 512 windows and reuse a source-bound persisted index
+beside the assignments when one exists. Merge copies validated shards by default.
 
-   physical GPU:       3
-   CUDA_VISIBLE_DEVICES=3
-   runtime device:     cuda:0
-   max-envs:           64
-   OMP_NUM_THREADS:    1
-   MKL_NUM_THREADS:    1
-   workers:            1
-   teachers:           vgk000--vgk007
+**Token caches use one worker by default.** On the measured 213,818-row dataset,
+optimized cache preparation took 88.29 s with one worker and 365.48 s with eight.
+One worker was best among the tested counts (1 and 8). Do not call it a
+universal optimum. Token-cache workers run on the CPU; they do not own GPUs.
+Keep one collector per GPU, then prepare token caches with ``--jobs 1`` or
+``--cache-jobs 1``. Do not derive the cache worker count from the GPU count.
 
-The setting was selected from a bounded eight-teacher sweep on 2026-10-10
-(+08). It achieved 101.457 accepted rows per second. The 128- and
-256-environment tests did not improve the result. The 256-environment arm
-achieved 99.736 accepted rows per second.
-
-This is a server-specific engineering default. Re-test it after a source,
-VAE, manifest, GPU, or simulator change. The result is a throughput result,
-not a policy-quality result. Use ``nvidia-smi`` before launch and use a process
-supervisor with an inactivity and wall-time limit for long collection jobs.
+Use ``nvidia-smi`` before launch. Use a monitored process with wall and inactivity
+limits. Keep concurrent training and shared storage effects in timing reports.
+See ``docs/reports/beyondmimic_diffusion_d1_server_benchmark.md`` for full evidence.
 
 Prepare the shell
 -----------------
@@ -174,7 +177,7 @@ bounded 48-trial smoke that uses the best tested setting:
        --output "$STORE" \
        --report "$REPORT" \
        --max-trials 48 \
-       --max-envs 64 \
+       --max-envs 256 \
        --max-gpus 1 \
        --max-wall-minutes 12 \
        --monitor-inactivity-seconds 180 \
@@ -194,19 +197,67 @@ report must have ``partial: false`` and ``stop_reason: null``. A physical fall
 is a trial result. It is not automatically a software failure. An OU pair is
 skipped when its clean partner does not qualify.
 
+Collection publication and limits
+---------------------------------
+
+The batched CLI enables bounded streaming and compact counts by default.
+Compatible runtimes use device-native tensor dispatch. The X2 batched runtime
+loads the VAE on the simulation device and pins IEEE FP32 after construction.
+TF32 failed the tight CPU/CUDA parity test; IEEE FP32 passed rtol/atol ``1e-5``.
+Scalar collection stays CPU-based unless the device is explicitly selected.
+Library ``collect_batched`` callers retain their existing behavior unless they
+supply controls. CLI defaults do not silently change library result types.
+
+Use these overrides when needed:
+
+* ``--no-stream-rows`` restores end-of-schedule publication. Compact counts are
+  then disabled unless explicitly requested, which is refused;
+* ``--no-compact-results`` retains full per-trial rows;
+* ``--max-rows-per-append N`` changes the default 4096-row publication bound;
+* ``--no-tensor-dispatch`` selects NumPy observation/action dispatch; and
+* ``--policy-device cpu|simulation|cuda[:N]`` selects the VAE inference device.
+  An existing ``MJLAB_D1_POLICY_DEVICE`` setting remains an explicit override.
+
+Positive streaming, compact, tensor, append-bound and progress options need a
+batched runtime. Scalar requests with these explicit options are refused.
+Unspecified defaults do not cause scalar refusal. A factory without tensor
+methods keeps NumPy dispatch; explicit tensor requests still fail if unsupported.
+
+``--tensor-dispatch`` with the CPU policy device is a reference and parity
+option, not a speedup: the device encode/decode then runs on the same host the
+NumPy path uses. Tensor dispatch reuses one pre-step snapshot and transfers
+only the required row evidence to the CPU. Post-step CPU observations remain
+required for qualification. Collection tensor batches must include ``state``,
+``motion_id``, ``reference_frame`` and ``reference_phase`` as well as policy
+inputs. Missing row evidence is refused before a physics step.
+Saved-reset IEEE CUDA parity passes. This is not full trajectory equivalence.
+
+The wall-clock, inactivity and stored-output budgets are reported truthfully.
+A batched run that hits a budget writes ``partial: true`` and a
+``stop_reason``, prints the stop reason to standard error, and exits non-zero
+(1). Do not merge such a store. The stored-output limit is measured only with
+``--stream-rows`` and is checked after each published chunk and the final flush.
+A smaller ``--max-rows-per-append`` reduces the publication granularity.
+``--progress PATH`` appends one JSON progress record per
+event, and the final record carries the same stop reason. The report records
+``policy_device`` (the resolved device the runtime used) and
+``policy_device_setting`` (the requested setting) in both the batched and the
+scalar report.
+
 Inspect and replay
 ------------------
 
-Run both checks on every store. These commands do not start a simulator:
+Run both checks on every store. These commands do not start a simulator: they
+validate one shard per worker and return the same JSON payload keys as before.
 
 .. code-block:: bash
 
    uv run --no-sync python -m mjlab.scripts.diffusion inspect \
-     --contract "$CONTRACT" --artifact-root "$ROOT" --store "$STORE" \
+     --contract "$CONTRACT" --artifact-root "$ROOT" --store "$STORE" --jobs 4 \
      > "${STORE%/store}/offline-inspect.json"
 
    uv run --no-sync python -m mjlab.scripts.diffusion replay \
-     --contract "$CONTRACT" --artifact-root "$ROOT" --store "$STORE" \
+     --contract "$CONTRACT" --artifact-root "$ROOT" --store "$STORE" --jobs 4 \
      > "${STORE%/store}/offline-replay.json"
 
 Require these results before preprocessing:
@@ -221,7 +272,12 @@ Merge worker stores
 -------------------
 
 Use ``diffusion_merge`` only after each input store passes inspect and replay.
-The command accepts ``--input`` more than once:
+The command accepts ``--input`` more than once. It refuses an existing output,
+stages the merged store in a sibling directory and publishes it with one atomic
+rename. The default copies validated source shards byte for byte;
+``--legacy-row-merge`` keeps the historical row-level rewrite. The default
+output shard bound follows the largest input shard, so a byte-preserving merge
+never splits a shard.
 
 .. code-block:: bash
 
@@ -238,10 +294,15 @@ The command accepts ``--input`` more than once:
 Inspect and replay the merged store again. Keep the original worker stores and
 all failed attempts. Do not overwrite the original VGK8 dataset.
 
+The ``prepare_dataset.py`` tool below performs the per-input inspect and replay
+and the report gates automatically before it merges, and refuses a partial or
+stopped worker.
+
 Build windows and statistics
 ----------------------------
 
-Build grouped train, validation, and test windows from the merged store:
+Build grouped train, validation, and test windows from the merged store. The
+``--jobs`` count parallels the index build:
 
 .. code-block:: bash
 
@@ -250,9 +311,24 @@ Build grouped train, validation, and test windows from the merged store:
      --artifact-root "$ROOT" \
      --store "$DATASET/store" \
      --assignments "$DATASET/offline/assignments.json" \
-     --report "$DATASET/offline/dataset.json"
+     --report "$DATASET/offline/dataset.json" \
+     --jobs 4
 
-Fit statistics from the training split only:
+Persist the window index once. The command writes the index, reads it back and
+refuses a success exit unless the reloaded index reproduces the built one:
+
+.. code-block:: bash
+
+   uv run --no-sync python -m mjlab.scripts.diffusion build-index \
+     --dataset-dir "$DATASET" \
+     --contract "$CONTRACT" \
+     --jobs 4
+
+Fit statistics from the training split only. Pass ``--index`` to reuse the
+persisted index instead of rebuilding it; the loader refuses an index that does
+not describe the given store and assignments. The ``--jobs`` count uses
+disjoint shard ranges, and ``--batch-windows`` bounds one accumulator update
+(the module default applies when it is omitted):
 
 .. code-block:: bash
 
@@ -262,11 +338,54 @@ Fit statistics from the training split only:
      --store "$DATASET/store" \
      --assignments "$DATASET/offline/assignments.json" \
      --bundle "$DATASET/offline/projection.npz" \
-     --report "$DATASET/offline/stats.json"
+     --report "$DATASET/offline/stats.json" \
+     --index "$DATASET/offline/window_index.npz" \
+     --jobs 4
 
 The split assignment is made before windowing. Clean and OU pair families must
 stay in one split. Validation and test data must not fit the projection or
-normalization statistics.
+normalization statistics. The batched fit accumulates ``--batch-windows``
+windows per accumulator update, so its floating-point reduction order differs
+from the historical per-window fit even at ``--jobs 1``. The statistics are
+therefore equal to the sequential fit to floating-point tolerance, not bit for
+bit, and ``statistics_sha256`` can change for any fit through this path. Treat
+that hash as a new artifact identity, not as a reproduction of the old one:
+
+* keep every historical frozen ``projection.npz`` and its recorded hash; do not
+  overwrite a frozen statistics file with a refit;
+* a checkpoint or evaluation that pins the old statistics hash must use its
+  existing ``projection.npz``, not a fresh fit;
+* a token cache keyed by the old statistics hash is stale. Rebuild it from the
+  projection file the run actually uses, or keep the cache that matches it; and
+* ``--jobs`` above 1 adds a partition on top of the batched reduction, so it
+  changes bits for the same reason.
+
+Prepare a dataset in one pass
+-----------------------------
+
+The ``scripts/experiments/diffusion_d1_throughput/prepare_dataset.py`` entry
+point runs the merge, dataset, statistics and cache phases in order. It uses
+bounded worker counts, prepares the token caches with the existing lifecycle
+controls and never starts training:
+
+.. code-block:: bash
+
+   uv run --no-sync python \
+     "$ROOT/scripts/experiments/diffusion_d1_throughput/prepare_dataset.py" \
+     --contract "$CONTRACT" \
+     --dataset-dir "$DATASET" \
+     --input /path/to/store-worker-0 \
+     --input /path/to/store-worker-1 \
+     --jobs 8 --cache-jobs 1 --max-cache-gib 8 \
+     --report "$DATASET/offline/prepare.json"
+
+Each worker needs its completed collection report (``<run>/report.json``). The
+tool refuses a partial report, a stop reason, a contract mismatch, a row
+accounting mismatch, a duplicate identity, an unreadable store and an existing
+dataset store. The merged store, the window index and the JSON reports are
+staged and published atomically; the projection bundle is written by
+``ProjectionBundle.save``. It prints the training command with
+``--require-prepared-cache`` when it finishes, but it does not run it.
 
 Build and validate token caches
 --------------------------------
@@ -280,7 +399,7 @@ largest expected split. Eight GiB was sufficient for the expanded VGK8 dataset:
      --dataset-dir "$DATASET" \
      --contract "$CONTRACT" \
      --splits train,validation,test \
-     --jobs 4 \
+     --jobs 1 \
      --max-cache-gib 8 \
      --json "$DATASET/offline/token-cache.json"
 
@@ -471,6 +590,36 @@ matched baseline-versus-diffusion acceptance comparison. Use ``evaluate.py``
 when a bounded matched pair is required. Keep the GUI output, preflight output,
 and any stop reason with the checkpoint sidecar.
 
+Throughput benchmark matrix
+---------------------------
+
+The ``scripts/experiments/diffusion_d1_throughput/benchmark_matrix.py`` tool
+generates a matched D1 collection matrix. It varies only the VAE policy device
+(``cpu`` and ``cuda:0``) and the environment count (64, 128 and 256). Every arm
+shares the contract, artifact root, collection config, runtime factory, trial
+budget and streaming flags. The tool writes ``plan.json`` and ``commands.sh`` to
+a new plan directory and refuses to overwrite an output. It never constructs a
+runtime and never runs a benchmark:
+
+.. code-block:: bash
+
+   export STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+   uv run --no-sync python \
+     "$ROOT/scripts/experiments/diffusion_d1_throughput/benchmark_matrix.py" \
+     --contract "$CONTRACT" \
+     --artifact-root "$ROOT" \
+     --config "$COLLECTION_CONFIG" \
+     --stamp "$STAMP" \
+     --plan-dir "$ROOT/logs/diffusion/d1-vgk8-benchmark-$STAMP"
+
+The inputs are read-only references. Each arm writes to its own new output
+directory. The CPU device arm is the matched control, not a speed arm:
+``--tensor-dispatch`` with a CPU policy device is a reference and parity path,
+so it is not expected to be faster than the NumPy path. The 2026-10-12
+benchmark measured CUDA throughput and same-reset IEEE parity; see the report
+above. Re-test after a source, GPU, simulator or cohort change. The generator
+still produces commands only and does not authorize execution.
+
 Gates and evidence boundaries
 -----------------------------
 
@@ -511,6 +660,9 @@ Useful source documents
 
 * D1 contract: ``docs/plans/beyondmimic_diffusion_d1_no_mixtures_vgk8_contract.yaml``
 * D1 implementation: ``docs/plans/beyondmimic_diffusion_d1_implementation.md``
+* D1 throughput plan: ``docs/plans/beyondmimic_diffusion_d1_throughput_implementation.md``
+* Dataset preparation tool: ``scripts/experiments/diffusion_d1_throughput/prepare_dataset.py``
+* Benchmark matrix tool: ``scripts/experiments/diffusion_d1_throughput/benchmark_matrix.py``
 * D2 implementation: ``docs/plans/beyondmimic_diffusion_d2_implementation.md``
 * D3 plan: ``docs/plans/beyondmimic_diffusion_d3_closed_loop_evaluation.md``
 * CLI source: ``src/mjlab/scripts/diffusion.py``

@@ -128,8 +128,36 @@ Added
   Full physics snapshot restoration remains reserved for the deferred branch
   path.
 
+- Added the D1 collection and dataset throughput integration. The statistics fit
+  now reads train-only moments in one segment traversal with a bounded jobs
+  partition; the storage layer adds a byte-preserving validated shard merge and
+  bounded shard-level inspect/replay; the runtime adds a device-native VAE
+  tensor path; and the collector adds bounded streaming publication, progress
+  records and enforced wall, inactivity and output limits. The CLI exposes the
+  worker counts for ``inspect``, ``replay``, ``build`` and ``stats``, and a
+  persisted window index can be reused instead of rebuilt; a foreign index is
+  refused with a message and exit status 1. The new
+  ``scripts/experiments/diffusion_d1_throughput/prepare_dataset.py`` entry point
+  validates worker reports, merges, builds the index once and prepares token
+  caches without starting training; ``benchmark_matrix.py`` generates a matched
+  CPU/GPU VAE and 64/128/256-environment benchmark plan. Managed-server tests
+  measure GPU256 collection at 1.53x original throughput, shard merge at 3.14x,
+  and eight-worker statistics at 4.85x. Eight-worker token caches are 3.90x
+  slower; cache preparation stays at one worker. Collection CLI defaults now
+  use 256 environments, streaming and compact counts, with compatible tensor
+  dispatch. Batched X2 VAE inference follows simulation and pins IEEE FP32 for
+  the validated CPU/CUDA parity. Scalar and explicit CPU/NumPy paths remain.
+  Offline validation/index/statistics default to eight bounded workers and
+  512-window statistics batches. Existing matching window indices are reused.
+
 Fixed
 ^^^^^
+
+- Fixed diffusion long-run permission propagation from the CLI to the trainer.
+  Config serialization no longer rejects a large approved budget. Execution
+  still requires ``--allow-long-run`` above 200,000 optimizer updates.
+  CPU constructor and config round-trip regressions cover the 400,000-update
+  budget without executing a long training run.
 
 - Fixed the one-shot future-pose camera framing. The static scene keeps world
   coordinates, and the camera frames the fitted robot bodies instead of the
@@ -150,6 +178,27 @@ Fixed
 
 Changed
 ^^^^^^^
+
+- Changed the batched D1 collection report to report resource limits truthfully:
+  a run stopped by a wall-clock, inactivity or stored-output budget now writes
+  ``partial: true`` and a ``stop_reason``, warns on standard error and exits
+  non-zero. Streaming publication and compact counts are enabled for batched
+  CLI collection; compatible runtimes use device tensor dispatch. Explicit
+  ``--no-*`` options retain legacy paths. The stored-output limit applies with
+  streaming. A scalar request that carries a batched-only option is refused
+  before any environment is built instead of silently ignoring the option. The
+  collect report now records the resolved ``policy_device`` and the requested
+  ``policy_device_setting``, and ``--policy-device`` is scoped to the runtime
+  factory call instead of leaking into later runs in one process. The batched
+  statistics accumulator changes the floating-point reduction order even at
+  ``--jobs 1``, so ``statistics_sha256`` can change for any fit through the
+  batched path; existing frozen projections and matching token caches are kept,
+  not refitted.
+
+- Changed ``diffusion_merge`` to stage and atomically publish a byte-preserving
+  merge, refuse an existing output and default the output shard bound to the
+  largest input shard. ``--legacy-row-merge`` keeps the historical row-level
+  rewrite.
 
 - The queue dispatcher now allows all eight GPUs by default. The optional
   ``ALLOW_GPUS`` and ``EXCLUDE_GPUS`` environment variables still support

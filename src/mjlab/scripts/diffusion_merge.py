@@ -1,9 +1,22 @@
 """Merge per-worker D1 shard stores into one store.
 
 Parallel collection writes one store per worker (the manifest is a single-writer
-file).  This joins them by streaming every row through the store's own validated
-``append``, so the merged store satisfies the same integrity checks the single
-process would have produced and duplicate identities fail closed.
+file).  The default merge is byte-preserving: each validated source shard is
+hash-checked and copied, so the merged store keeps the source payloads and never
+decodes or recompresses a row.  ``--legacy-row-merge`` keeps the historical
+row-level reference path, which streams every row through the store's own
+validated ``append``.
+
+Both paths refuse an input store that was written under another contract or
+artifact identity, an input manifest that repeats a shard file or names an
+unsafe file, a forged row count, malformed row metadata, a duplicate row identity
+and an input store that changed while it was read.  The byte-preserving path
+refuses an existing output, stages the merged store in a sibling directory and
+publishes it with one atomic rename; the source stores are opened read-only and
+never linked, so they stay byte-identical.
+
+Row accounting is reported in the same JSON payload key names the historical
+command used.
 """
 
 from __future__ import annotations
@@ -24,45 +37,57 @@ def main(argv: list[str] | None = None) -> int:
   )
   parser.add_argument("--input", type=Path, action="append", required=True)
   parser.add_argument("--output", type=Path, required=True)
-  parser.add_argument("--max-rows-per-shard", type=int, default=4096)
-  parser.add_argument("--batch", type=int, default=4096)
+  parser.add_argument(
+    "--max-rows-per-shard",
+    type=int,
+    default=None,
+    help=(
+      "output shard bound; the default is the largest source shard for the "
+      "byte-preserving merge and 4096 for the legacy row merge"
+    ),
+  )
+  parser.add_argument(
+    "--batch",
+    type=int,
+    default=4096,
+    help="rows appended per batch; only used by --legacy-row-merge",
+  )
+  parser.add_argument(
+    "--legacy-row-merge",
+    action="store_true",
+    help="rewrite every row through the store writer instead of copying shards",
+  )
   args = parser.parse_args(argv)
 
   from mjlab.scripts.diffusion import _load_contract
-  from mjlab.tasks.tracking.diffusion.storage import AppendOnlyShardStore
+  from mjlab.tasks.tracking.diffusion.storage import (
+    StorageError,
+    merge_shard_stores,
+    merge_shard_stores_legacy,
+  )
 
   contract = _load_contract(args.contract)
-  output = AppendOnlyShardStore(
-    args.output, contract=contract, max_rows_per_shard=args.max_rows_per_shard
-  )
-  before = output.row_count
-
-  per_input: dict[str, int] = {}
-  for path in args.input:
-    source = AppendOnlyShardStore(path, contract=contract)
-    rows = 0
-    batch: list[object] = []
-    for row in source.iter_rows():
-      batch.append(row)
-      if len(batch) >= args.batch:
-        output.append(batch)  # type: ignore[arg-type]
-        rows += len(batch)
-        batch = []
-    if batch:
-      output.append(batch)  # type: ignore[arg-type]
-      rows += len(batch)
-    per_input[str(path)] = rows
-
-  payload = {
-    "inputs": per_input,
-    "input_rows": sum(per_input.values()),
-    "output": str(args.output),
-    "rows_before": before,
-    "rows_after": output.row_count,
-    "shards": output.shard_count,
-  }
-  if before != 0 or payload["rows_after"] != payload["input_rows"]:
-    raise SystemExit(f"merge row accounting failed: {json.dumps(payload)}")
+  try:
+    if args.legacy_row_merge:
+      report = merge_shard_stores_legacy(
+        args.input,
+        args.output,
+        contract=contract,
+        max_rows_per_shard=(
+          4096 if args.max_rows_per_shard is None else args.max_rows_per_shard
+        ),
+        batch_rows=args.batch,
+      )
+    else:
+      report = merge_shard_stores(
+        args.input,
+        args.output,
+        contract=contract,
+        max_rows_per_shard=args.max_rows_per_shard,
+      )
+  except StorageError as exc:
+    raise SystemExit(str(exc)) from None
+  payload = report.as_payload()
   print(json.dumps(payload, indent=2, sort_keys=True))
   return 0
 
