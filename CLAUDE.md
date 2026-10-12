@@ -54,11 +54,6 @@ uv run python scripts/experiments/vae_teacher_student_replay/evaluate.py \
 See the evaluator README for the required model files, state layout and
 provenance limits.
 
-Always run `make check` before committing. This runs formatting, linting,
-and type checking. Do not commit code that fails type checking.
-
-Before creating a PR, ensure all checks pass with `make test`.
-
 When making user-facing changes, add an entry to `docs/source/changelog.rst`
 under the "Upcoming version (not yet released)" section using
 Added/Changed/Fixed categories. Reference issues with `:issue:\`123\``

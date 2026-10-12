@@ -16,28 +16,28 @@ from pathlib import Path
 import torch
 
 from mjlab.tasks.tracking.diffusion.controller_driver import (
-    build_model_backed_controller_driver,
+  build_model_backed_controller_driver,
 )
 from mjlab.tasks.tracking.diffusion.model_backend import ModelBackendSpec
 
 spec = ModelBackendSpec(
-    contract_path=Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"),
-    diffusion_checkpoint=Path("/path/to/checkpoint-best.pt"),
-    normalization_bundle=Path("/path/to/statistics.npz"),
-    vae_checkpoint=Path("/path/to/vae.pt"),
-    vae_manifest=Path("/path/to/vae-manifest.yaml"),
-    repo_root=Path("."),
-    vae_member="member-0",
-    planner_device="cpu",
-    decoder_device="cpu",
+  contract_path=Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml"),
+  diffusion_checkpoint=Path("/path/to/checkpoint-best.pt"),
+  normalization_bundle=Path("/path/to/statistics.npz"),
+  vae_checkpoint=Path("/path/to/vae.pt"),
+  vae_manifest=Path("/path/to/vae-manifest.yaml"),
+  repo_root=Path("."),
+  vae_member="member-0",
+  planner_device="cpu",
+  decoder_device="cpu",
 )
 
 generator = torch.Generator(device="cpu").manual_seed(7)
 driver = build_model_backed_controller_driver(
-    spec,
-    generator=generator,
-    read_observation=read_observation,
-    execute_action=execute_action,
+  spec,
+  generator=generator,
+  read_observation=read_observation,
+  execute_action=execute_action,
 )
 controller = driver.controller
 controller.load()
@@ -71,13 +71,13 @@ and that the pair is valid for history.
 # decoded for that state. The list is supplied by the caller, not fabricated by
 # the controller.
 for pair in measured_bootstrap_pairs[:8]:
-    accepted = execute_bootstrap(pair)  # external VAE execution, literal bool
-    assert type(accepted) is bool
-    assert controller.acknowledge_bootstrap(
-        pair.state,
-        pair.raw_latent,
-        success=accepted,
-    )
+  accepted = execute_bootstrap(pair)  # external VAE execution, literal bool
+  assert type(accepted) is bool
+  assert controller.acknowledge_bootstrap(
+    pair.state,
+    pair.raw_latent,
+    success=accepted,
+  )
 
 # warmup() reads one fresh current observation. It runs owner-side decoder
 # calls, waits for one real spawned planner result, validates it, and discards
@@ -95,10 +95,10 @@ driver.request_activation()
 # all non-action statuses.
 dispatch = driver.tick()
 if dispatch.execution.value == "accepted":
-    assert dispatch.command is not None
-    assert dispatch.command.action.shape == (31,)
+  assert dispatch.command is not None
+  assert dispatch.command.action.shape == (31,)
 elif dispatch.dispatch.value == "not_dispatched":
-    hold_safe_state()
+  hold_safe_state()
 
 # A reset closes the exact old worker and invalidates old actions. A new load,
 # eight new acknowledged measured pairs, warmup and explicit activation are
@@ -106,11 +106,11 @@ elif dispatch.dispatch.value == "not_dispatched":
 driver.reset()
 controller.load()
 for pair in next_measured_bootstrap_pairs[:8]:
-    assert controller.acknowledge_bootstrap(
-        pair.state,
-        pair.raw_latent,
-        success=execute_bootstrap(pair),
-    )
+  assert controller.acknowledge_bootstrap(
+    pair.state,
+    pair.raw_latent,
+    success=execute_bootstrap(pair),
+  )
 driver.warmup()
 driver.request_activation()
 

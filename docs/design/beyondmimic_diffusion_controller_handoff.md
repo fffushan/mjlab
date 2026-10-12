@@ -141,7 +141,7 @@ The matrices and statistics live in the D1 dataset as `offline/projection.npz`, 
 into a `ProjectionBundle` (`src/mjlab/tasks/tracking/diffusion/projection.py:116`):
 
 ```python
-bundle.project_state(state_135)      # normalize + P        -> 199
+bundle.project_state(state_135)  # normalize + P        -> 199
 bundle.inverse_state(projected_199)  # pinv + denormalize    -> 135
 bundle.normalize_latent(latent_32)
 bundle.denormalize_latent(latent_32)

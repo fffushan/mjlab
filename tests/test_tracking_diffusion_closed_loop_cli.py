@@ -206,8 +206,6 @@ def test_missing_checkpoint_sidecar_fails_closed(tmp_path: Path) -> None:
   with pytest.raises(evaluate.ClosedLoopCliError, match="sidecar YAML is required"):
     evaluate._validate_request(args)
 
-
-
   for field, value in (
     ("continuation_steps", 5001),
     ("max_wall_seconds", 1201.0),

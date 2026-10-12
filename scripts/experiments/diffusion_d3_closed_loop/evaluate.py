@@ -355,29 +355,31 @@ def build_parser() -> argparse.ArgumentParser:
   return _parser()
 
 
-
-
-def _load_checkpoint_sidecar(
-  checkpoint_path: Path, args: argparse.Namespace
-) -> Path:
+def _load_checkpoint_sidecar(checkpoint_path: Path, args: argparse.Namespace) -> Path:
   """Load and apply the required YAML sidecar beside a diffusion checkpoint."""
   config_arg = getattr(args, "checkpoint_config", None)
-  config_path = Path(config_arg) if config_arg is not None else checkpoint_path.with_suffix(".yaml")
+  config_path = (
+    Path(config_arg) if config_arg is not None else checkpoint_path.with_suffix(".yaml")
+  )
   config_path = config_path.resolve()
   if not config_path.is_file():
-    raise ClosedLoopCliError(
-      f"checkpoint sidecar YAML is required: {config_path}"
-    )
+    raise ClosedLoopCliError(f"checkpoint sidecar YAML is required: {config_path}")
   try:
     import yaml
   except ImportError as exc:
-    raise ClosedLoopCliError("PyYAML is required to read checkpoint sidecar YAML") from exc
+    raise ClosedLoopCliError(
+      "PyYAML is required to read checkpoint sidecar YAML"
+    ) from exc
   try:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
   except (OSError, yaml.YAMLError, ValueError) as exc:
-    raise ClosedLoopCliError(f"could not read checkpoint sidecar {config_path}: {exc}") from exc
+    raise ClosedLoopCliError(
+      f"could not read checkpoint sidecar {config_path}: {exc}"
+    ) from exc
   if not isinstance(payload, Mapping):
-    raise ClosedLoopCliError(f"checkpoint sidecar must contain a YAML mapping: {config_path}")
+    raise ClosedLoopCliError(
+      f"checkpoint sidecar must contain a YAML mapping: {config_path}"
+    )
   if payload.get("schema") != "mjlab-d3-diffusion-checkpoint-v1":
     raise ClosedLoopCliError(
       f"unsupported checkpoint sidecar schema in {config_path}: {payload.get('schema')!r}"
@@ -399,7 +401,9 @@ def _load_checkpoint_sidecar(
     )
   repo_root_value = payload["repo_root"]
   if not isinstance(repo_root_value, str) or not repo_root_value:
-    raise ClosedLoopCliError(f"checkpoint sidecar repo_root must be a non-empty string: {config_path}")
+    raise ClosedLoopCliError(
+      f"checkpoint sidecar repo_root must be a non-empty string: {config_path}"
+    )
   configured_root = Path(repo_root_value)
   if not configured_root.is_absolute():
     configured_root = config_path.parent / configured_root
@@ -480,9 +484,7 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
     )
   output_dir = Path(args.output_dir).resolve()
   if output_dir.exists() and not output_dir.is_dir():
-    raise ClosedLoopCliError(
-      f"output-dir exists but is not a directory: {output_dir}"
-    )
+    raise ClosedLoopCliError(f"output-dir exists but is not a directory: {output_dir}")
   if not repo_root.is_dir():
     raise ClosedLoopCliError(f"repo-root is not a directory: {repo_root}")
   task_config = getattr(args, "task_config", None)
@@ -533,6 +535,7 @@ def _require_frozen_contract(contract: Any) -> None:
   if not np.isclose(contract.period_seconds, _FROZEN_CONTROL_PERIOD):
     raise ClosedLoopCliError("frozen contract control period must be 0.02 seconds")
   # Artifact digests are intentionally not part of D3 runtime validation.
+
 
 def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
   repo_root, device = _validate_request(args)

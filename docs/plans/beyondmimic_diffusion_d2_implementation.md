@@ -466,7 +466,7 @@ Requirements:
 ```python
 @dataclass(frozen=True, slots=True)
 class TrainingConfig:
-  epochs: int = 1000                 # cap, never automatic
+  epochs: int = 1000  # cap, never automatic
   max_updates: int | None = None
   effective_batch_size: int = 512
   microbatch_size: int = 128
@@ -476,7 +476,7 @@ class TrainingConfig:
   scheduler: str = "cosine"
   warmup_updates: int = 10000
   max_grad_norm: float = 1.0
-  mixed_precision: str = "bf16"      # after fp32 checks
+  mixed_precision: str = "bf16"  # after fp32 checks
   loss_reduction: str = "token_mean"
   seed: int = 0
   epoch_sample_budget: int | None = None
