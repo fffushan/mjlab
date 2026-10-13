@@ -364,6 +364,18 @@ def test_history_dropout_fraction_is_reported(tmp_path: Path) -> None:
   assert "history_dropout_generator" in state
   assert state["history_dropout_counters"]["windows"] > 0
   assert result.global_step == 2
+  # The epoch row keeps the epoch-boundary values: spreading the averaged
+  # per-update block last used to replace global_step with the epoch mean.
+  epochs = [
+    json.loads(line)
+    for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+    if json.loads(line)["kind"] == "epoch"
+  ]
+  assert len(epochs) == 1
+  assert epochs[0]["epoch"] == 1
+  assert epochs[0]["global_step"] == 2
+  assert epochs[0]["history_state_dropout_fraction"] == 1.0
+  assert epochs[0]["history_state_total_windows"] == 8
 
 
 def test_nan_aborts_without_writing_a_checkpoint(tmp_path: Path) -> None:

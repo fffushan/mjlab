@@ -166,6 +166,63 @@ the source revision that is committed here. The earlier attempt in
 expected 8 updates where one epoch yields 4, so its own final assertion failed after both arms
 had already run.
 
+### Dropout 20 % arm (2026-10-13 17:42 +08)
+
+Operator request: launch a 20 % history-dropout arm against the baseline.
+
+| Item | Value |
+| --- | --- |
+| Run | `logs/flow/flow-vgk36-dropout20-400k-seed0-20261013T094220Z` |
+| tmux session | `flow_vgk36_dropout20`, container GPU 1 |
+| Source | `49f7cd6b4` (includes the dropout change) |
+| Dropout probability | 0.20 |
+| Matched baseline | `flow-vgk36-400k-seed0-20261013T085536Z` on GPU 0 |
+| First update | about 2026-10-13 17:47 (+08), after the same 11.8 GiB cache read |
+
+The run config differs from the baseline config in exactly two lines: the contract path and the dropout
+probability. Both configs live in their run directories and are hashed in the launch manifest.
+
+Verified dropout behaviour on the running job:
+
+| Observation | Value |
+| --- | --- |
+| Configured probability | 0.20 |
+| Per-update fractions (first four updates) | 0.2227, 0.2012, 0.1719, 0.1992 |
+| Epoch 1 | 92,436 of 464,039 windows, fraction **0.19919** |
+| Epoch 2 | 92,873 of 464,039 windows, fraction **0.20013** |
+| Epoch length | 907 optimizer updates, 3626 batches of 128, 464,039 windows |
+
+Both trainers ran at about 7.2 updates/s while sharing the container, and each saturated one CPU core.
+That is inside the rate spread measured for the baseline before the second arm existed, so there is no
+evidence that the two runs slow each other.
+
+Two reporting notes found while checking this run:
+
+1. **The epoch row is built by spreading `**_average_metrics(epoch_updates)` last**, so any key that also
+exists in the per-update metrics is replaced by its epoch mean instead of the explicit value written
+just above it. Verified on the live dropout run: the epoch-1 row reports `global_step` 454 while the
+epoch's last update was step 907, and 454 is exactly the mean of that epoch's update steps; the same
+holds for epoch 2 (1361 = mean of 908..1814). The epoch-level `history_state_dropout_fraction` is also
+the mean of the per-update fractions (0.19919064549585844) rather than the epoch ratio
+(0.1991987742409582); the two agree to six decimals. `epoch`, `train_loss`, the window counters and
+the `eval_model`/`eval_ema` blocks are unaffected.
+   The diffusion trainer builds its epoch row the same way, and the finished D2 runs show the identical
+   pattern (epoch 1 → 454, epoch 2 → 1361, epoch 3 → 2268), so this predates the flow family. Training,
+   checkpoint selection and the authoritative records are unaffected: `train-report.json` and the
+   checkpoint payloads carry the true step (the finished D2 runs record 400,000 updates over 441
+   epochs). The only consumer that reads this field is `tools/diffusion_metrics_to_tensorboard.py`,
+   which uses `row["global_step"]` as the x-coordinate for update **and** epoch scalars. Epoch curves
+   therefore appear about half an epoch too early on the x-axis, with the offset growing per epoch;
+   trends and relative comparisons are preserved. Tools that read `row["epoch"]`, such as
+   `scripts/experiments/diffusion_wave_summary/report.py::read_validation_curve`, are correct.
+   Fixed on 2026-10-13 in the local commit recorded below: the averaged block is spread first in both
+the diffusion and the flow trainer, so an epoch row now keeps the epoch-boundary `global_step` and the
+epoch-wide dropout ratio. Regression checks were added to `tests/test_tracking_diffusion_trainer.py`
+and `tests/test_tracking_flow_matching_trainer.py`. This affects rows written by future runs: the two
+live runs imported the earlier code, so their files keep the older mean-valued epoch rows, which is
+internally consistent for each run. A resume of either run would load the fixed code.
+2. The epoch window counters are correct and reconcile with 907 updates of 512 windows each.
+
 ### NAS baseline training run (in progress)
 
 Authorized by the operator on 2026-10-13 (+08) as the flow arm of a matched comparison against the

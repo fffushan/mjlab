@@ -931,7 +931,12 @@ class DiffusionTrainer:
         if stop:
           break
         epochs_completed = epoch + 1
+        # The per-update rows carry their own ``global_step`` and
+        # ``history_state_dropout_fraction``, so the averaged block is spread
+        # FIRST: spreading it last would replace the explicit epoch-boundary
+        # values with that epoch's mean.
         epoch_metrics: dict[str, Any] = {
+          **_average_metrics(epoch_updates),
           "kind": "epoch",
           "epoch": epochs_completed,
           "global_step": self.global_step,
@@ -944,7 +949,6 @@ class DiffusionTrainer:
             if epoch_total_windows
             else 0.0
           ),
-          **_average_metrics(epoch_updates),
         }
         validation_loss: float | None = None
         eval_split = self.config.eval_split

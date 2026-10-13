@@ -211,8 +211,6 @@ def test_checkpoint_sidecars_follow_saved_checkpoint_names(tmp_path: Path) -> No
   assert best["member"] == "vgk000"
   assert best["global_step"] == result.global_step
 
-
-
   assert TrainingConfig().eval_split == "validation"
   with pytest.raises(TrainingConfigError, match="test split.*never drive"):
     TrainingConfig(eval_split="test").validate()
@@ -301,6 +299,18 @@ def test_accumulation_partial_group_and_epoch_sample_budget(tmp_path) -> None:
   ]
   assert [item["accumulated_microbatches"] for item in updates] == [2.0, 1.0]
   assert all("learning_rate" in item for item in updates)
+  # The epoch row keeps the epoch-boundary step and counts every window,
+  # instead of the mean step and the mean per-update fraction.
+  epochs = [
+    json.loads(line)
+    for line in result.metrics_path.read_text().splitlines()
+    if json.loads(line)["kind"] == "epoch"
+  ]
+  assert len(epochs) == 1
+  assert epochs[0]["epoch"] == 1
+  assert epochs[0]["global_step"] == 2
+  assert epochs[0]["history_state_total_windows"] == 5
+  assert epochs[0]["history_state_dropout_fraction"] == 0.0
   report = json.loads((tmp_path / "train-report.json").read_text())
   assert report["effective_batch_size"] == 4
   assert report["resume_reproducibility"]["measured"] is False

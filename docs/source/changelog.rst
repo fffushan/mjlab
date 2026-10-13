@@ -166,6 +166,15 @@ Added
 Fixed
 ^^^^^
 
+- Fixed the epoch rows of the diffusion and flow-matching ``metrics.jsonl``
+  traces. The averaged per-update block is now spread before the explicit
+  fields, instead of after them, so an epoch row keeps the step at the epoch
+  boundary and the epoch-wide dropout ratio. Previously those fields were
+  silently replaced by the mean of that epoch's per-update values, which made
+  the epoch ``global_step`` read roughly half an epoch early and shifted epoch
+  scalars in conversions to TensorBoard. Training, checkpoint selection and
+  ``train-report.json`` were never affected.
+
 - Fixed diffusion long-run permission propagation from the CLI to the trainer.
   Config serialization no longer rejects a large approved budget. Execution
   still requires ``--allow-long-run`` above 200,000 optimizer updates.
