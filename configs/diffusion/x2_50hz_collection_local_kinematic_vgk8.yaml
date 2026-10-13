@@ -1,0 +1,36 @@
+# Local-kinematic 129-D D1 runtime collection input for the VGK8 cohort.
+# This file remains non-authorizing: the CLI needs --execute and a concrete
+# --runtime-factory.
+# The launch environment must set MJLAB_D1_COHORT_MANIFEST to the VGK8 manifest
+# because the current runtime factory reads that variable.
+schema_version: mjlab-x2-diffusion-d1-collection-v1
+contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_vgk8_contract.yaml
+execution_authorized: false
+runtime_factory: null
+frequency_hz: 50
+physics_timestep_seconds: 0.005
+decimation: 4
+pilot:
+  max_trials: 54
+  max_control_transitions: 13500
+  # The D1 collector used to fail closed unless this was 1, because exactly one
+  # environment identity was carried end-to-end.  That semantic constraint is
+  # removed (2026-10-06): one shared multi-motion environment can hold several
+  # reference clips and many parallel rows.  This pilot value stays 1.
+  max_envs: 1
+  max_gpus: 1
+  max_wall_minutes: 15
+  monitor_inactivity_seconds: 120
+  max_output_mib: 512
+  clean_before_ou: true
+  video: false
+artifacts:
+  vae: logs/distillation/vae-cov-10k-20261008T154401Z/vae-vgk8-cov-on/output/checkpoint-final.pt
+  recovery_onnx: logs/rsl_rl/agibot_x2_velocity/2026-09-26_02-40-45_x2-tennis-recovery-n25/2026-09-26_02-40-45_x2-tennis-recovery-n25.onnx
+qualification:
+  retained_steps: 125
+  control_steps: 250
+  ou_theta: 0.8
+  ou_mu: 0.0
+  ou_sigma: 0.1
+  ou_dt: 1.0

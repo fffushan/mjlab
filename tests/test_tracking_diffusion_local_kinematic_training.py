@@ -48,7 +48,11 @@ from mjlab.tasks.tracking.diffusion.window_dataset import (
 LOCAL_KINEMATIC = Path(
   "docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml"
 )
+LOCAL_KINEMATIC_VGK8 = Path(
+  "docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_vgk8_contract.yaml"
+)
 FULL = Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml")
+FULL_VGK8 = Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_vgk8_contract.yaml")
 
 
 def _windows(count: int, token_dimension: int) -> Dataset:
@@ -123,6 +127,38 @@ def test_dataset_keeps_the_frozen_135_contract_layout() -> None:
   hybrid = np.arange(41 * 135, dtype=np.float64).reshape(41, 135)
   packed = _pack_state_for_contract(hybrid, full)
   np.testing.assert_array_equal(packed, hybrid)
+
+
+def test_vgk8_local_kinematic_contract_pins_its_own_vae_and_identity() -> None:
+  full_vgk8 = DiffusionContract.from_yaml(FULL_VGK8)
+  local_vgk8 = DiffusionContract.from_yaml(LOCAL_KINEMATIC_VGK8)
+  local_three = DiffusionContract.from_yaml(LOCAL_KINEMATIC)
+  assert (local_vgk8.state_dimension, local_vgk8.token_dimension) == (129, 161)
+  assert local_vgk8.state_fields == (
+    "root_rot6d",
+    "root_angular_velocity",
+    "body_positions",
+    "body_linear_velocities",
+  )
+  # The ablation keeps the eight-teacher VAE bytes but is a distinct identity
+  # from the 135-D VGK8 contract and from the three-teacher ablation.
+  assert local_vgk8.vae_sha256 == full_vgk8.vae_sha256
+  assert local_vgk8.vae_checkpoint == full_vgk8.vae_checkpoint
+  assert local_vgk8.identity_hash() not in {
+    full_vgk8.identity_hash(),
+    local_three.identity_hash(),
+  }
+
+
+def test_vgk8_local_kinematic_train_config_matches_its_contract() -> None:
+  config = TrainingConfig.from_yaml(
+    "configs/diffusion/x2_50hz_train_local_kinematic_vgk8.yaml"
+  )
+  assert config.epochs == 1000
+  assert config.effective_batch_size == 512
+  assert config.microbatch_size == 128
+  assert config.mixed_precision == "bf16"
+  assert config.seed == 0
 
   local = DiffusionContract.from_yaml(LOCAL_KINEMATIC)
   settings = DenoiserSettings.from_contract(local)
