@@ -40,6 +40,7 @@ from .handover import (
   build_reference_free_plan,
 )
 from .inpainting import TimedStateKeyframe, inpaint_keyframes
+from .model import ContractDimensions, contract_dimensions
 from .pose_costs import PoseCostWeights, TimedPoseGoal
 from .projection import ProjectionBundle, StateLatentTransformLike
 from .sampler import SamplerConditions, SamplerConfig, sample_trajectory
@@ -91,6 +92,39 @@ def _identity(value: object, name: str) -> str:
   if not isinstance(value, str) or not value.strip():
     raise LatentPlanningError(f"{name} must be a non-empty identity string")
   return value
+
+
+def _require_planning_contract(contract: DiffusionContract) -> ContractDimensions:
+  """Validate the contract whose state width the planning window represents.
+
+  The seam window geometry is frozen (8 measured pairs, the current row and 32
+  future rows at a 32-D latent), but the physical-state and token widths are
+  read from the contract.  The frozen contract declares 135/167; a reduced
+  local-kinematic contract declares 129/161.  A contract that changes the
+  window/latent geometry, keeps a state projection, or declares inconsistent
+  widths is rejected here instead of failing inside the sampler.
+  """
+  if (
+    contract.schema_version != DEFAULT_CONTRACT.schema_version
+    or contract.projection_rows != 0
+  ):
+    raise LatentPlanningError("latent planning requires the active no-mixture contract")
+  try:
+    dimensions = contract_dimensions(contract)
+  except ValueError as exc:
+    raise LatentPlanningError(
+      f"latent planning contract has no usable model layout: {exc}"
+    ) from exc
+  if (
+    dimensions.window_steps != DEFAULT_CONTRACT.window_steps
+    or dimensions.latent_dimension != DEFAULT_CONTRACT.latent_dimension
+  ):
+    raise LatentPlanningError(
+      "latent planning requires the frozen "
+      f"{DEFAULT_CONTRACT.window_steps}-step/"
+      f"{DEFAULT_CONTRACT.latent_dimension}-latent window"
+    )
+  return dimensions
 
 
 def _tuple_vector(value: object, name: str, width: int) -> tuple[float, ...]:
@@ -692,20 +726,21 @@ def _restore_generator(state: Sequence[int], device: str) -> torch.Generator:
 
 def _snapshot_plan(
   plan: ContinuationPlan,
+  *,
+  dimensions: ContractDimensions,
 ) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[bool, ...], ...]]:
-  if plan.clean_tokens.shape != (
-    DEFAULT_CONTRACT.window_steps,
-    DEFAULT_CONTRACT.token_dimension,
-  ):
+  if plan.clean_tokens.shape != (dimensions.window_steps, dimensions.token_dimension):
     raise LatentPlanningError(
-      "conditioning tokens do not match the active 41x167 window"
+      "conditioning tokens do not match the active "
+      f"{dimensions.window_steps}x{dimensions.token_dimension} window"
     )
   if (
     plan.clean_mask.shape != plan.clean_tokens.shape
     or plan.clean_mask.dtype != torch.bool
   ):
     raise LatentPlanningError(
-      "conditioning mask does not match the active 41x167 window"
+      "conditioning mask does not match the active "
+      f"{dimensions.window_steps}x{dimensions.token_dimension} window"
     )
   tokens = plan.clean_tokens.detach().to(device="cpu", dtype=torch.float32).numpy()
   mask = plan.clean_mask.detach().to(device="cpu", dtype=torch.bool).numpy()
@@ -779,10 +814,24 @@ class LatentPlanningPacket:
       raise LatentPlanningError("planning packet task must be a TaskSnapshot or None")
     tokens = np.asarray(self.clean_tokens, dtype=np.float64)
     mask = np.asarray(self.clean_mask, dtype=bool)
-    expected = (DEFAULT_CONTRACT.window_steps, DEFAULT_CONTRACT.token_dimension)
-    if tokens.shape != expected or mask.shape != expected:
+    # The window geometry is fixed (8 measured + current + 32 future) and the
+    # latent width is fixed at 32, but the physical-state width is declared by
+    # the active contract (135 full, 129 reduced).  Validate the packet's own
+    # width here; LatentPlanner checks it against the active contract's token
+    # width, so a mismatched packet is rejected instead of decoded.
+    if (
+      tokens.ndim != 2
+      or tokens.shape[0] != DEFAULT_CONTRACT.window_steps
+      or tokens.shape[1] <= DEFAULT_CONTRACT.latent_dimension
+    ):
       raise LatentPlanningError(
-        "planning packet conditioning must have shape [41, 167]"
+        "planning packet conditioning must have shape "
+        f"[{DEFAULT_CONTRACT.window_steps}, state + "
+        f"{DEFAULT_CONTRACT.latent_dimension}]"
+      )
+    if mask.shape != tokens.shape:
+      raise LatentPlanningError(
+        "planning packet mask must match the conditioning shape"
       )
     if not np.isfinite(tokens).all():
       raise LatentPlanningError("planning packet conditioning is non-finite")
@@ -971,12 +1020,31 @@ class LatentPlanningPacket:
       clean_mask = np.asarray(fields["clean_mask"], dtype=bool)
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
       raise LatentPlanningError("compact planning arrays are invalid") from exc
-    if latents.shape != (8, 32) or not np.isfinite(latents).all():
-      raise LatentPlanningError("compact latents must have shape [8, 32]")
-    if clean_tokens.shape != (41, 167) or not np.isfinite(clean_tokens).all():
-      raise LatentPlanningError("compact tokens must have shape [41, 167]")
-    if clean_mask.shape != (41, 167):
-      raise LatentPlanningError("compact mask must have shape [41, 167]")
+    if (
+      latents.shape
+      != (
+        DEFAULT_CONTRACT.past_steps,
+        DEFAULT_CONTRACT.latent_dimension,
+      )
+      or not np.isfinite(latents).all()
+    ):
+      raise LatentPlanningError(
+        f"compact latents must have shape "
+        f"[{DEFAULT_CONTRACT.past_steps}, {DEFAULT_CONTRACT.latent_dimension}]"
+      )
+    if (
+      clean_tokens.ndim != 2
+      or clean_tokens.shape[0] != DEFAULT_CONTRACT.window_steps
+      or clean_tokens.shape[1] <= DEFAULT_CONTRACT.latent_dimension
+      or not np.isfinite(clean_tokens).all()
+    ):
+      raise LatentPlanningError(
+        "compact tokens must have shape "
+        f"[{DEFAULT_CONTRACT.window_steps}, state + "
+        f"{DEFAULT_CONTRACT.latent_dimension}]"
+      )
+    if clean_mask.shape != clean_tokens.shape:
+      raise LatentPlanningError("compact mask must match the compact tokens")
 
     states = tuple(
       StateSnapshot(
@@ -1071,15 +1139,7 @@ def build_planning_packet(
   if transform is None:
     raise LatentPlanningError("a state/latent normalizer is required")
   projection = transform
-  if (
-    contract.schema_version != DEFAULT_CONTRACT.schema_version
-    or contract.projection_rows != 0
-  ):
-    raise LatentPlanningError("latent planning requires the active no-mixture contract")
-  if contract.identity_hash() != DEFAULT_CONTRACT.identity_hash():
-    raise LatentPlanningError(
-      "latent planning contract identity is not the active identity"
-    )
+  dimensions = _require_planning_contract(contract)
   if (
     abs(_finite_float(period_seconds, "period_seconds") - contract.period_seconds)
     > 1.0e-12
@@ -1135,7 +1195,7 @@ def build_planning_packet(
       projection=cast(ProjectionBundle, projection),
       contract=contract,
     )
-  tokens, mask = _snapshot_plan(base_plan)
+  tokens, mask = _snapshot_plan(base_plan, dimensions=dimensions)
   rng_state, rng_device = _capture_generator(random)
   return LatentPlanningPacket(
     pairs=pairs,
@@ -1325,17 +1385,7 @@ class LatentPlanner:
   ) -> None:
     if not callable(denoiser):
       raise LatentPlanningError("denoiser must be callable")
-    if (
-      contract.schema_version != DEFAULT_CONTRACT.schema_version
-      or contract.projection_rows != 0
-    ):
-      raise LatentPlanningError(
-        "latent planning requires the active no-mixture contract"
-      )
-    if contract.identity_hash() != DEFAULT_CONTRACT.identity_hash():
-      raise LatentPlanningError(
-        "latent planning contract identity is not the active identity"
-      )
+    dimensions = _require_planning_contract(contract)
     if not isinstance(schedule, DiffusionSchedule):
       raise LatentPlanningError("schedule must be a DiffusionSchedule")
     if not isinstance(grid, InferenceGrid) or grid != build_inference_grid(schedule):
@@ -1370,6 +1420,7 @@ class LatentPlanner:
     self.grid = grid
     self.projection = projection
     self.contract = contract
+    self._dimensions = dimensions
     self.device = resolved_device
     self.sampler_config = config
     self.vae_identity = (
@@ -1466,7 +1517,11 @@ class LatentPlanner:
       self.contract.window_steps,
       self.contract.token_dimension,
     ):
-      raise LatentPlanningError("sampler returned an invalid 41x167 token window")
+      raise LatentPlanningError(
+        "sampler returned an invalid "
+        f"{self._dimensions.window_steps}x{self._dimensions.token_dimension} "
+        "token window"
+      )
     normalized = (
       sample[self.contract.current_index :, self.contract.projected_state_dimension :]
       .detach()
@@ -1508,6 +1563,15 @@ class LatentPlanner:
     if packet.contract_identity != self.contract.identity_hash():
       raise LatentPlanningError(
         "planning packet contract identity differs from planner"
+      )
+    if (
+      not packet.clean_tokens
+      or len(packet.clean_tokens[0]) != self._dimensions.token_dimension
+    ):
+      raise LatentPlanningError(
+        "planning packet token width differs from the active contract: "
+        f"{len(packet.clean_tokens[0]) if packet.clean_tokens else 0} != "
+        f"{self._dimensions.token_dimension}"
       )
     if packet.projection_identity != self._projection_identity:
       raise LatentPlanningError(
@@ -1554,7 +1618,9 @@ class LatentPlanner:
         projection=cast(ProjectionBundle, self.projection),
         contract=self.contract,
       )
-    expected_tokens, expected_mask = _snapshot_plan(expected)
+    expected_tokens, expected_mask = _snapshot_plan(
+      expected, dimensions=self._dimensions
+    )
     if expected_tokens != packet.clean_tokens or expected_mask != packet.clean_mask:
       raise LatentPlanningError("planning packet conditioning snapshot is inconsistent")
 

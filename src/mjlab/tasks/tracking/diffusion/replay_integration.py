@@ -34,7 +34,11 @@ from .handover import (
   ContinuationPlan,
   ReferenceFreeContinuation,
 )
-from .model import DenoiserSettings, StateLatentTransformer
+from .model import (
+  DenoiserSettings,
+  StateLatentTransformer,
+  contract_dimensions,
+)
 from .noising import clean_mask as build_clean_mask
 from .projection import (
   ProjectionBundle,
@@ -202,6 +206,12 @@ def load_denoiser(
     raise ReplayError("verify_projection_hashes must be a boolean")
   if not isinstance(verify_contract_identity, bool):
     raise ReplayError("verify_contract_identity must be a boolean")
+  try:
+    dimensions = contract_dimensions(contract)
+  except ValueError as exc:
+    raise ReplayError(
+      f"active diffusion contract has no usable model layout: {exc}"
+    ) from exc
   model = StateLatentTransformer(DenoiserSettings.from_contract(contract))
   try:
     state = load_checkpoint(
@@ -212,7 +222,13 @@ def load_denoiser(
       ),
     )
   except CheckpointError as exc:
-    raise ReplayError(f"frozen denoiser checkpoint rejected: {exc}") from exc
+    # A checkpoint trained for a different state width fails here (contract
+    # identity or tensor shapes).  Name the active layout so a 135-D artifact
+    # supplied for a reduced 129-D contract fails clearly instead of silently.
+    raise ReplayError(
+      f"frozen denoiser checkpoint rejected for the {dimensions.label} active "
+      f"contract: {exc}"
+    ) from exc
   if verify_projection_hashes:
     if isinstance(transforms, StateLatentNormalizer):
       verify_normalization_consistency(state.projection_hashes, transforms)

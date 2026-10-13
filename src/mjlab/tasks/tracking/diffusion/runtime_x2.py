@@ -47,6 +47,7 @@ from .adapter import (
 )
 from .collector import DiffusionCollector, TrialSpec
 from .contract import DEFAULT_CONTRACT
+from .model import ContractDimensions, contract_dimensions
 from .qualification import QualificationConfig, StepEvidence
 from .state import WorldState
 
@@ -1258,6 +1259,16 @@ def build_x2_runtime(request: Any) -> Any:
   selected_contract = getattr(request, "contract", None)
   if selected_contract is None:
     selected_contract = DEFAULT_CONTRACT
+  # The collection runtime records raw world states; the window packer (state.py)
+  # owns the declared state width.  Read that width here so a reduced 129-D
+  # local-kinematic contract is accepted and reported, and an inconsistent one
+  # fails before any environment is built.
+  try:
+    contract_layout: ContractDimensions = contract_dimensions(selected_contract)
+  except ValueError as exc:
+    raise RuntimeX2Error(
+      f"selected collection contract has no usable state layout: {exc}"
+    ) from exc
 
   # Schedule selection is an explicit operational input, never inferred: the
   # frozen contract's pilot schedule must stay the default.
@@ -1400,6 +1411,9 @@ def build_x2_runtime(request: Any) -> Any:
       "rollout_teachers": list(rollout_ids),
       "vae_checkpoint": selected_contract.vae_checkpoint,
       "vae_sha256": selected_contract.vae_sha256,
+      "state_dimension": contract_layout.state_dimension,
+      "token_dimension": contract_layout.token_dimension,
+      "window_steps": contract_layout.window_steps,
       "run_id": run_id,
       "schedule": schedule,
       "seeds": seed_count,

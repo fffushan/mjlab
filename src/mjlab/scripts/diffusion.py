@@ -58,6 +58,7 @@ class PreflightReport:
   contract_sha256: str | None
   artifacts: dict[str, dict[str, Any]]
   errors: tuple[str, ...]
+  layout: dict[str, int] | None = None
 
   def as_dict(self) -> dict[str, Any]:
     return {
@@ -65,6 +66,7 @@ class PreflightReport:
       "contract_sha256": self.contract_sha256,
       "artifacts": self.artifacts,
       "errors": list(self.errors),
+      "layout": self.layout,
     }
 
 
@@ -93,11 +95,28 @@ def run_preflight(
   artifacts: dict[str, dict[str, Any]] = {}
   errors: list[str] = []
   contract_sha: str | None = None
+  layout: dict[str, int] | None = None
   try:
     contract = _load_contract(contract_file)
     contract_sha = contract.contract_sha256
   except Exception as exc:  # report a CLI failure, never hide a bad manifest
     return PreflightReport(False, None, {}, (f"contract: {exc}",))
+  # Report the declared state/latent/token layout so a reduced 129-D
+  # local-kinematic contract is visible, and reject an inconsistent one before
+  # any artifact or model is loaded.
+  from mjlab.tasks.tracking.diffusion.model import contract_dimensions
+
+  try:
+    dimensions = contract_dimensions(contract)
+  except ValueError as exc:
+    errors.append(f"layout: {exc}")
+  else:
+    layout = {
+      "state_dimension": dimensions.state_dimension,
+      "latent_dimension": dimensions.latent_dimension,
+      "token_dimension": dimensions.token_dimension,
+      "window_steps": dimensions.window_steps,
+    }
 
   identities = (
     ("vae", contract.vae_checkpoint, contract.vae_sha256),
@@ -132,7 +151,7 @@ def run_preflight(
       entry["matches"] = False
       errors.append(f"{role}: missing pinned artifact {path}")
     artifacts[role] = entry
-  return PreflightReport(not errors, contract_sha, artifacts, tuple(errors))
+  return PreflightReport(not errors, contract_sha, artifacts, tuple(errors), layout)
 
 
 def _load_factory(spec: str) -> Callable[[CollectionRequest], RuntimeBundle]:

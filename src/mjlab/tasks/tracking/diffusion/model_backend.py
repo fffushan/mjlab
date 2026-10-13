@@ -25,6 +25,7 @@ from torch import Tensor
 from .async_latent_runtime import AsyncLatentRuntime
 from .contract import DiffusionContract
 from .latent_planning import LatentPlanner
+from .model import ContractDimensions, contract_dimensions
 from .planner_executor import BoundedPlannerExecutor
 from .projection import StateLatentTransform
 from .replay_integration import (
@@ -39,6 +40,23 @@ from .scheduler import Plan, PlannerRequest
 
 class ModelBackendError(ValueError):
   """A model-backed D5 input or compatibility check is invalid."""
+
+
+def _require_contract_layout(contract: DiffusionContract) -> ContractDimensions:
+  """Return the active contract's model layout or fail with a clear reason.
+
+  The layout reads the contract's declared state/latent/token widths, so it
+  accepts both the frozen 135-D contract and a reduced 129-D local-kinematic
+  contract.  Nothing in this module fabricates a root-translation channel to
+  pad a reduced state back to 135; a contract whose declared widths are
+  inconsistent is rejected here instead.
+  """
+  try:
+    return contract_dimensions(contract)
+  except ValueError as exc:
+    raise ModelBackendError(
+      f"active diffusion contract has no usable model layout: {exc}"
+    ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +215,7 @@ class ModelPlannerFactory:
   def __call__(self) -> Callable[[PlannerRequest], Plan]:
     self.spec.validate_paths()
     contract = load_active_contract(self.spec.contract_path)
+    _require_contract_layout(contract)
     normalizer = load_normalizer_bundle(
       self.spec.resolved_normalization_bundle,
       contract=contract,
@@ -236,6 +255,7 @@ def load_model_backend(spec: ModelBackendSpec) -> ModelBackend:
     raise ModelBackendError("spec must be a ModelBackendSpec")
   spec.validate_paths()
   contract = load_active_contract(spec.contract_path)
+  _require_contract_layout(contract)
   normalizer = load_normalizer_bundle(
     spec.resolved_normalization_bundle,
     contract=contract,

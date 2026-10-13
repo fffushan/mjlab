@@ -12,6 +12,64 @@ _FROZEN_PARAMETER_COUNT = 20_132_007
 
 
 @dataclass(frozen=True, slots=True)
+class ContractDimensions:
+  """State, latent, token and window widths declared by a diffusion contract.
+
+  The frozen full no-mixture contract declares ``(135, 32, 167, 41)``.  A
+  reduced local-kinematic contract removes the 3-D root position and 3-D root
+  linear velocity slices and declares ``(129, 32, 161, 41)``.  Nothing here
+  assumes either width: the numbers come from the contract, so the model and
+  loader support a reduced contract without a literal 135 or 167.
+  """
+
+  state_dimension: int
+  latent_dimension: int
+  token_dimension: int
+  window_steps: int
+
+  @property
+  def label(self) -> str:
+    """Short ``state-D/token-channel`` description used in failure messages."""
+    return f"{self.state_dimension}-D state/{self.token_dimension}-channel token"
+
+
+def contract_dimensions(contract: Any) -> ContractDimensions:
+  """Read and validate the model layout a contract declares.
+
+  The no-mixture token layout is exactly the physical-state width followed by
+  the latent width.  This reads the declared widths instead of a literal
+  ``167``, so the full 135-D contract and the reduced 129-D local-kinematic
+  contract both resolve.  A contract whose token width is not its state width
+  plus its latent width is rejected, which is the invariant the frozen model
+  has always relied on.
+  """
+  fields = ("state_dimension", "latent_dimension", "token_dimension", "window_steps")
+  try:
+    values = {name: int(getattr(contract, name)) for name in fields}
+  except (AttributeError, TypeError, ValueError) as exc:
+    raise ValueError(
+      f"contract does not declare the model state/latent/token widths: {exc}"
+    ) from exc
+  if min(values.values()) <= 0:
+    raise ValueError("contract state, latent, token and window widths must be positive")
+  dimensions = ContractDimensions(
+    state_dimension=values["state_dimension"],
+    latent_dimension=values["latent_dimension"],
+    token_dimension=values["token_dimension"],
+    window_steps=values["window_steps"],
+  )
+  if dimensions.token_dimension != (
+    dimensions.state_dimension + dimensions.latent_dimension
+  ):
+    raise ValueError(
+      "contract token width must equal its state width plus its latent width: "
+      f"{dimensions.token_dimension} != {dimensions.state_dimension} + "
+      f"{dimensions.latent_dimension}"
+    )
+  return dimensions
+
+
+@dataclass(frozen=True, slots=True)
 class DenoiserSettings:
   """Transformer dimensions for the active no-mixture token contract."""
 
@@ -46,21 +104,20 @@ class DenoiserSettings:
   def from_contract(
     cls, contract: Any, *, training_k: int | None = None
   ) -> "DenoiserSettings":
-    """Construct model settings from the loaded contract's declared width.
+    """Construct model settings from the widths a contract declares.
 
-    The settings follow the contract's token and window dimensions so an
-    opt-in state ablation trains a denoiser whose input and output widths
-    match its own token layout.  The frozen ``DenoiserSettings()`` default is
-    unchanged and still reproduces the pinned parameter count.
+    The frozen full no-mixture contract yields the 167/41 settings.  A reduced
+    local-kinematic contract yields the 161/41 settings.  The frozen D0
+    parameter-count identity in :class:`StateLatentTransformer` still guards the
+    default settings, so the full path keeps its frozen shape and weight count.
     """
     k = 1000 if training_k is None else int(training_k)
     if k < 0:
       raise ValueError("training_k must be non-negative")
-    token_dimension = int(getattr(contract, "token_dimension", 167))
-    sequence_length = int(getattr(contract, "window_steps", 41))
+    dimensions = contract_dimensions(contract)
     return cls(
-      token_dimension=token_dimension,
-      sequence_length=sequence_length,
+      token_dimension=dimensions.token_dimension,
+      sequence_length=dimensions.window_steps,
       embedding_count=k + 1,
       width=512,
       layers=6,
@@ -158,4 +215,9 @@ class StateLatentTransformer(nn.Module):
     return sum(parameter.numel() for parameter in self.parameters())
 
 
-__all__ = ["DenoiserSettings", "StateLatentTransformer"]
+__all__ = [
+  "ContractDimensions",
+  "DenoiserSettings",
+  "StateLatentTransformer",
+  "contract_dimensions",
+]
