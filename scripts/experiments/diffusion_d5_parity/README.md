@@ -55,6 +55,26 @@ The gate accepts its compatible legacy source-bound identity and records both
 identities in the report and ONNX metadata. It does not accept an unrelated
 checkpoint identity.
 
-The default comparison tolerance is FP32 `atol=1e-5` and `rtol=1e-5`. The
-script uses CPU PyTorch and CPU ONNX Runtime. It does not claim that an ONNX
-runtime is selected for `x2_docker`; that is a later integration decision.
+The default comparison tolerance is FP32 `atol=1e-5` and `rtol=1e-5`. An exceeded
+tolerance is recorded as a warning: `status_detail` becomes
+`pass_with_tolerance_warnings`, every exceeded comparison appears in the report's
+`tolerance_warnings` list with its measured `max_abs` and `max_rel`, and one
+`WARNING:` line is printed. The gate was once blocking. It is not blocking now
+because the comparison is between two FP32 implementations of the same graph: a
+checkpoint whose forward pass is not FP32-reproducible at the frozen tolerance
+cannot pass it through any faithful export. Structural checks stay hard
+failures - wrong shape, non-finite values, an unrelated checkpoint identity, a
+missing artifact, a wrong provider, or an unsupported graph.
+
+Before treating a warning as harmless, measure the floor: compare one forward
+pass of the checkpoint in PyTorch float64 against PyTorch float32. If the
+exported graph matches PyTorch about as well as PyTorch matches its own float64
+result, the export is faithful and the deviation is the checkpoint's arithmetic.
+Measured example (2026-10-13): the VGK36 arms differ from PyTorch by 9.05e-5
+while their own float64-to-float32 difference is 8.83e-5, and the accepted
+reference differs by 1.01e-5 against a 5.54e-6 floor.
+
+The script uses CPU PyTorch and CPU ONNX Runtime. It does not claim that an ONNX
+runtime is selected for `x2_docker`; that is a later integration decision. A GPU
+execution provider is a different arithmetic: ONNX Runtime's CUDA provider
+enables TF32 by default, and the D5 TensorRT lane is deliberately TF32.
