@@ -1,0 +1,350 @@
+"""CPU-only flow trainer mechanics, identity and deterministic-resume gates."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+from torch.utils.data import Dataset, TensorDataset
+
+from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
+from mjlab.tasks.tracking.diffusion.training_config import TrainingConfig
+from mjlab.tasks.tracking.flow_matching import (
+  FLOW_CHECKPOINT_FORMAT,
+  FlowTrainer,
+  FlowTrainerError,
+  FlowTrainingConfig,
+  FlowTrainingConfigError,
+  add_linear_noise,
+  sample_independent_levels,
+)
+
+
+class SyntheticWindows(Dataset[Tensor]):
+  """Small well-formed clean token fixtures."""
+
+  def __init__(self, count: int = 5, *, identity: str = "synthetic-v1") -> None:
+    generator = torch.Generator().manual_seed(31)
+    self.tokens = torch.randn((count, 41, 167), generator=generator)
+    self.dataset_identity = {
+      "directory": identity,
+      "assignments_hash": "a" * 64,
+      "split_coverage": {"train": count, "validation": 0, "test": 0},
+      "projection_hashes": {
+        "matrix": "b" * 64,
+        "statistics": "c" * 64,
+      },
+    }
+
+  def __len__(self) -> int:
+    return len(self.tokens)
+
+  def __getitem__(self, index: int) -> Tensor:
+    return self.tokens[index]
+
+
+class TinyDenoiser(nn.Module):
+  """Fast pointwise model for CPU trainer tests."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.linear = nn.Linear(167, 167)
+
+  def forward(self, tokens: Tensor, step_ids: Tensor) -> Tensor:
+    del step_ids
+    return self.linear(tokens)
+
+
+class SettingsDenoiser(TinyDenoiser):
+  """Model whose state dict matches ``TinyDenoiser`` but identity does not."""
+
+  def __init__(self, tag: str) -> None:
+    super().__init__()
+    self.settings = {"tag": tag}
+
+
+class ConstantDenoiser(nn.Module):
+  """Learnable constant used for a deterministic x0 overfit gate."""
+
+  def __init__(self) -> None:
+    super().__init__()
+    self.value = nn.Parameter(torch.zeros((1, 41, 167)))
+
+  def forward(self, tokens: Tensor, step_ids: Tensor) -> Tensor:
+    del step_ids
+    return self.value.expand(tokens.shape[0], -1, -1)
+
+
+class NaNDenoiser(TinyDenoiser):
+  """Model used to prove divergence aborts before any checkpoint write."""
+
+  def forward(self, tokens: Tensor, step_ids: Tensor) -> Tensor:
+    del step_ids
+    return torch.full_like(tokens, float("nan"))
+
+
+def _config(**overrides: object) -> FlowTrainingConfig:
+  values: dict[str, Any] = {
+    "epochs": 2,
+    "max_updates": 2,
+    "effective_batch_size": 4,
+    "microbatch_size": 2,
+    "gradient_accumulation_steps": 2,
+    "mixed_precision": "fp32",
+    "warmup_updates": 1,
+    "eval_split": "validation",
+  }
+  values.update(overrides)
+  return FlowTrainingConfig(training=TrainingConfig(**values))
+
+
+def _trainer(
+  output: Path,
+  *,
+  model: nn.Module | None = None,
+  dataset: Any | None = None,
+  config: FlowTrainingConfig | None = None,
+  contract: Any | None = None,
+  resume: Path | None = None,
+  eval_dataset: Any | None = None,
+) -> FlowTrainer:
+  config = config or _config()
+  # Seed before model construction so two trainers with the same config start
+  # from identical parameters.
+  torch.manual_seed(config.training.seed)
+  train = dataset if dataset is not None else SyntheticWindows()
+  return FlowTrainer(
+    config=config,
+    contract=contract or DiffusionContract(),
+    model=model if model is not None else TinyDenoiser(),
+    train_dataset=train,
+    eval_datasets={
+      "validation": eval_dataset if eval_dataset is not None else SyntheticWindows(2)
+    },
+    output_dir=output,
+    device="cpu",
+    resume=resume,
+  )
+
+
+def _clean(seed: int = 5, batch: int = 3) -> Tensor:
+  return torch.randn((batch, 41, 167), generator=torch.Generator().manual_seed(seed))
+
+
+def test_forward_loss_matches_stage1_primitives_and_plain_x0_mse(
+  tmp_path: Path,
+) -> None:
+  trainer = _trainer(tmp_path)
+  clean = _clean(batch=3)
+  trainer.noise_generator.manual_seed(7)
+  loss, prediction, target, state_levels, latent_levels = trainer._forward_loss(clean)
+
+  reference = torch.Generator().manual_seed(7)
+  levels = sample_independent_levels(
+    (3, 41), process=trainer.process, generator=reference
+  )
+  noised = add_linear_noise(
+    clean[..., :135],
+    clean[..., 135:],
+    state_levels=levels.state,
+    latent_levels=levels.latent,
+    process=trainer.process,
+    generator=reference,
+  )
+  step_ids = torch.stack((noised.state_levels, noised.latent_levels), dim=-1)
+  expected = trainer.model(noised.tokens, step_ids)
+
+  assert torch.equal(state_levels, levels.state)
+  assert torch.equal(latent_levels, levels.latent)
+  assert torch.equal(target, clean)
+  assert torch.allclose(prediction, expected.float())
+  assert loss.item() == pytest.approx(
+    float(F.mse_loss(expected.float().detach(), clean)), rel=0.0, abs=1e-12
+  )
+
+
+def test_all_rows_receive_independent_levels_without_clean_insertion(
+  tmp_path: Path,
+) -> None:
+  trainer = _trainer(tmp_path)
+  trainer.noise_generator.manual_seed(11)
+  clean = _clean(batch=32)
+  _, _, _, state_levels, latent_levels = trainer._forward_loss(clean)
+  assert state_levels.shape == (32, 41)
+  assert latent_levels.shape == (32, 41)
+  assert state_levels.dtype == torch.long
+  assert int(state_levels.min()) >= 0
+  assert int(state_levels.max()) <= 1000
+  # History rows are noised like every other row: many distinct levels appear,
+  # so no row is pinned to a clean-mask level.
+  history = state_levels[:, :8]
+  assert len(history.unique()) > 10
+  assert torch.equal(state_levels, latent_levels) is False
+
+
+def test_tiny_fixed_window_overfits_x0_objective(tmp_path: Path) -> None:
+  target = torch.full((1, 41, 167), 0.25)
+  config = FlowTrainingConfig(
+    training=TrainingConfig(
+      epochs=200,
+      max_updates=100,
+      effective_batch_size=1,
+      microbatch_size=1,
+      gradient_accumulation_steps=1,
+      learning_rate=0.05,
+      warmup_updates=0,
+      mixed_precision="fp32",
+      eval_split="validation",
+    )
+  )
+  trainer = _trainer(
+    tmp_path,
+    model=ConstantDenoiser(),
+    dataset=TensorDataset(target),
+    config=config,
+  )
+  result = trainer.train()
+  assert result.final_train_loss < 1.0e-3
+
+
+def test_train_records_flow_identity_and_writes_no_diffusion_schedule(
+  tmp_path: Path,
+) -> None:
+  config = _config(epochs=1, max_updates=2)
+  trainer = _trainer(tmp_path, config=config)
+  result = trainer.train()
+  report = json.loads((tmp_path / "train-report.json").read_text())
+  assert report["family"] == "x0_linear_flow"
+  assert report["process_identity"] == trainer.process.identity_hash()
+  assert report["history_state_dropout_probability"] == 0.0
+  assert report["data_identity"] == trainer.data_identity
+  payload = torch.load(
+    result.checkpoint_paths["last"], map_location="cpu", weights_only=False
+  )
+  assert payload["format"] == FLOW_CHECKPOINT_FORMAT
+  assert "schedule_identity" not in payload
+  assert payload["process"]["time_encoding"] == "integer_noise_fraction"
+
+
+def test_resume_restores_generators_and_reproduces_the_next_step(
+  tmp_path: Path,
+) -> None:
+  config = _config(epochs=1, max_updates=2)
+  clean = _clean(seed=9, batch=2)
+  first = _trainer(tmp_path / "first", config=config)
+  first.noise_generator.manual_seed(13)
+  first._forward_loss(clean)
+  checkpoint = first._save("checkpoint-probe.pt", epoch=0, best_validation_loss=None)
+  expected_loss, expected_prediction, _, expected_state, expected_latent = (
+    first._forward_loss(clean)
+  )
+  payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+
+  resumed = _trainer(tmp_path / "resumed", config=config, resume=checkpoint)
+  assert torch.equal(
+    resumed.noise_generator.get_state(), payload["rng_state"]["noise_generator"]
+  )
+  assert torch.equal(
+    resumed.sampler_generator.get_state(), payload["rng_state"]["sampler_generator"]
+  )
+  loss, prediction, _, state_levels, latent_levels = resumed._forward_loss(clean)
+  assert torch.equal(loss, expected_loss)
+  assert torch.equal(prediction, expected_prediction)
+  assert torch.equal(state_levels, expected_state)
+  assert torch.equal(latent_levels, expected_latent)
+
+
+def test_resume_rejects_mismatched_identity(tmp_path: Path) -> None:
+  config = _config(epochs=1, max_updates=2)
+  first = _trainer(tmp_path / "first", config=config)
+  checkpoint = first._save("checkpoint-probe.pt", epoch=0, best_validation_loss=None)
+
+  changed_config = _config(epochs=1, max_updates=2, seed=5)
+  with pytest.raises(FlowTrainerError, match="config identity"):
+    _trainer(tmp_path / "config", config=changed_config, resume=checkpoint)
+
+  with pytest.raises(FlowTrainerError, match="process identity"):
+    _trainer(
+      tmp_path / "process",
+      config=FlowTrainingConfig(training=changed_config.training, max_level=500),
+      resume=checkpoint,
+    )
+
+  with pytest.raises(FlowTrainerError, match="data identity"):
+    _trainer(
+      tmp_path / "data",
+      config=config,
+      contract=DiffusionContract(vae_sha256="d" * 64),
+      resume=checkpoint,
+    )
+
+  changed_statistics = SyntheticWindows()
+  changed_statistics.dataset_identity["projection_hashes"] = {
+    "matrix": "e" * 64,
+    "statistics": "f" * 64,
+  }
+  with pytest.raises(FlowTrainerError, match="statistics identity"):
+    _trainer(
+      tmp_path / "statistics",
+      config=config,
+      dataset=changed_statistics,
+      resume=checkpoint,
+    )
+
+  with pytest.raises(FlowTrainerError, match="dataset identity"):
+    _trainer(
+      tmp_path / "dataset",
+      config=config,
+      dataset=SyntheticWindows(identity="other-directory"),
+      resume=checkpoint,
+    )
+
+  with pytest.raises(FlowTrainerError, match="model identity"):
+    _trainer(
+      tmp_path / "model",
+      config=config,
+      model=SettingsDenoiser("other"),
+      resume=checkpoint,
+    )
+
+
+def test_nonzero_history_dropout_is_rejected_by_the_trainer(tmp_path: Path) -> None:
+  config = FlowTrainingConfig(
+    training=TrainingConfig(
+      history_state_dropout_probability=1.0, mixed_precision="fp32"
+    )
+  )
+  with pytest.raises(FlowTrainingConfigError, match="history dropout"):
+    _trainer(tmp_path, config=config)
+
+
+def test_nan_aborts_without_writing_a_checkpoint(tmp_path: Path) -> None:
+  trainer = _trainer(tmp_path, model=NaNDenoiser())
+  with pytest.raises(FlowTrainerError, match="finite|NaN|Inf"):
+    trainer.train()
+  assert not (tmp_path / "checkpoint-last.pt").exists()
+  assert not (tmp_path / "checkpoint-best.pt").exists()
+
+
+def test_evaluate_reports_unknown_and_clean_x0_metrics(tmp_path: Path) -> None:
+  trainer = _trainer(tmp_path, dataset=SyntheticWindows())
+  metrics = trainer.evaluate("validation", parameters="model")
+  assert metrics["windows"] == 2.0
+  for name in (
+    "loss",
+    "total_mse",
+    "state_mse",
+    "latent_mse",
+    "unknown_mse",
+    "unknown_state_mse",
+    "unknown_latent_mse",
+    "clean_state_mse",
+    "clean_latent_mse",
+  ):
+    assert name in metrics
+  assert metrics["unknown_mse"] > 0.0

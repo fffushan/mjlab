@@ -73,6 +73,7 @@ Table of Contents
    source/x2_tennis_recovery
    source/x2_tennis_distillation
    source/x2_diffusion_training
+   source/x2_flow_matching_training
    source/x2_vae_export_contract
    source/x2_gain_provenance
    source/curriculum

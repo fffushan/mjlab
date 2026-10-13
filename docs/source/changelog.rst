@@ -150,6 +150,19 @@ Added
   Offline validation/index/statistics default to eight bounded workers and
   512-window statistics batches. Existing matching window indices are reused.
 
+- Added the opt-in X2 x0 flow-matching family under
+  ``src/mjlab/tasks/tracking/flow_matching/`` and
+  ``src/mjlab/scripts/flow_matching.py``. It uses the linear Gaussian path
+  ``x_s = (1 - s) * x0 + s * e`` with ``s = k / max_level``, independent integer
+  levels per row and per state/latent slice, a plain channel-mean x0 MSE, and an
+  x0 Euler sampler that descends from level 1000 to level 0. It reuses the
+  unchanged ``StateLatentTransformer``, the D1 read-only token caches and the
+  frozen VAE, writes flow-format checkpoints, and never reads or writes a
+  diffusion schedule or checkpoint. History dropout is rejected rather than
+  ignored. The new runbook is ``docs/source/x2_flow_matching_training.rst``. This
+  is software validation on synthetic CPU fixtures; no training run, simulator,
+  controller or hardware use is claimed.
+
 Fixed
 ^^^^^
 

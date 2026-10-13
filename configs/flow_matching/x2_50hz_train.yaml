@@ -1,0 +1,31 @@
+# Non-authorizing flow-matching training input.  The CLI still requires an
+# explicit --max-updates or --epochs budget before it can start.
+#
+# The flow loader reads the shared training fields from `training` and the linear
+# process from `process`; the model dimensions come from the frozen D1 contract
+# through DenoiserSettings.from_contract.  This family has no diffusion noise
+# schedule, so no `noise` section exists here, and history dropout is rejected
+# rather than ignored.  `scheduler: cosine` is the learning-rate schedule only.
+schema_version: mjlab-x2-flow-matching-train-v1
+contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml
+process: {max_level: 1000}
+training:
+  epochs: 1000
+  effective_batch_size: 512
+  microbatch_size: 128
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.001
+  scheduler: cosine
+  warmup_updates: 10000
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  loss_reduction: token_mean
+  seed: 0
+  ema_power: 0.75
+  ema_max_decay: 0.9999
+  clean_weight: 1.0
+  perturbed_weight: 1.0
+  eval_split: validation
+  eval_seed: 0
+  history_state_dropout_probability: 0.0
