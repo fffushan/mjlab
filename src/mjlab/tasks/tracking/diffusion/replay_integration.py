@@ -877,8 +877,11 @@ def main() -> None:
   torch.set_num_threads(args.cpu_threads)
 
   contract = load_active_contract(args.contract)
-  if contract.projection_rows != 0 or contract.token_dimension != 167:
-    raise ReplayError("the active contract must be the no-mixture 167-channel one")
+  if contract.projection_rows != 0:
+    raise ReplayError(
+      "the active contract must be a no-mixture state contract; legacy "
+      "projected contracts are not accepted"
+    )
   verify_file_digest(args.projection, args.projection_sha256, role="projection bundle")
   projection = load_projection_bundle(args.projection, contract=contract)
   denoiser = load_denoiser(

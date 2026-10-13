@@ -23,8 +23,9 @@ denoiser and the frozen X2 VAE decoder:
   caller/adapter obligation.
 
 Token layout stays the active no-mixture contract: 41 steps (8 past + current
-at index 8 + 32 future) by 167 channels (135 normalized physical-state + 32
-normalized VAE latent).  Legacy 231-channel contracts are rejected here.
+at index 8 + 32 future) by the declared token width.  The frozen contract uses
+167 channels (135 normalized physical-state + 32 normalized VAE latent), while
+the opt-in local-kinematic contract uses 161 channels (129 + 32).
 
 This module is deliberately simulator-free and claims no closed-loop, simulator,
 export or hardware evidence; a controller or evaluation harness supplies
@@ -68,7 +69,13 @@ from .sampler import (
   sample_trajectory,
 )
 from .schedule import DiffusionSchedule, InferenceGrid
-from .state import WorldState, world_to_hybrid
+from .state import (
+  HYBRID_STATE,
+  LOCAL_KINEMATIC_STATE,
+  WorldState,
+  hybrid_to_local_kinematic,
+  world_to_hybrid,
+)
 
 # Frozen gravity-mode decoder conditioning width
 # (tasks/tracking/distillation/vae_config.py CONDITIONING_DIMS["gravity"]).
@@ -91,8 +98,8 @@ def _require_no_mixture(contract: DiffusionContract) -> None:
   """Reject any legacy projected (231-channel) contract at the seam."""
   if contract.projection_rows != 0:
     raise HandoverError(
-      "the D3 seam requires the active no-mixture 167-channel contract; "
-      "legacy 231-channel projected contracts are not accepted"
+      "the D3 seam requires a no-mixture contract; legacy projected "
+      f"{contract.token_dimension}-channel contracts are not accepted"
     )
 
 
@@ -235,7 +242,16 @@ def build_reference_free_plan(
     raise HandoverError(f"invalid runtime device {device!r}") from exc
   states = WorldState.stack([*(pair.state for pair in history.pairs), current_state])
   hybrid, _context = world_to_hybrid(states, center_index=contract.current_index)
-  normalized_state = projection.project_state(hybrid)
+  fields = tuple(contract.state_fields)
+  if fields == tuple(HYBRID_STATE.slices):
+    packed_state = hybrid
+  elif fields == tuple(LOCAL_KINEMATIC_STATE.slices):
+    packed_state = hybrid_to_local_kinematic(hybrid)
+  else:
+    raise HandoverError(
+      f"unsupported simulator state layout for contract {contract.schema_version!r}"
+    )
+  normalized_state = projection.project_state(packed_state)
   normalized_latent = projection.normalize_latent(
     np.stack([pair.latent for pair in history.pairs])
   )
@@ -505,7 +521,8 @@ class ReferenceFreeContinuation:
         or not np.isfinite(predicted).all()
       ):
         raise HandoverError(
-          "sampler predicted next hybrid state must be finite with shape [135]"
+          "sampler predicted next state must be finite with shape "
+          f"[{self.contract.state_dimension}]"
         )
       predicted_next_hybrid_state = np.array(predicted[0], copy=True)
     self._last_tick = int(tick)

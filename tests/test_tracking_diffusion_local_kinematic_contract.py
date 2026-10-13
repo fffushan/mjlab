@@ -20,6 +20,10 @@ from tracking_diffusion_fixtures import make_state
 
 from mjlab.scripts import diffusion
 from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
+from mjlab.tasks.tracking.diffusion.handover import (
+  HandoverHistory,
+  build_reference_free_plan,
+)
 from mjlab.tasks.tracking.diffusion.latent_planning import (
   LatentPlanner,
   LatentPlanningError,
@@ -67,6 +71,12 @@ class _ReducedContract:
     self.window_steps = 41
     self.projected_state_dimension = state_dimension
     self.schema_version = DEFAULT_CONTRACT.schema_version
+    self.state_fields = (
+      "root_rot6d",
+      "root_angular_velocity",
+      "body_positions",
+      "body_linear_velocities",
+    )
     self.projection_rows = 0
     self.body_count = 20
     self.past_steps = 8
@@ -224,7 +234,22 @@ def test_backend_contract_layout_accepts_reduced_and_rejects_inconsistent() -> N
     )
 
 
-def test_reduced_planner_rejects_a_167_channel_packet() -> None:
+def test_reduced_handover_builds_a_161_channel_plan() -> None:
+  contract = _ReducedContract()
+  projection = _normalizer(contract)
+  history = HandoverHistory(contract=contract)  # type: ignore[arg-type]
+  for index in range(8):
+    history.push(make_state(index), np.zeros(32))
+  plan = build_reference_free_plan(
+    history,
+    make_state(8),
+    projection=projection,
+    tick=0,
+    contract=contract,  # type: ignore[arg-type]
+  )
+  assert plan.clean_tokens.shape == (41, 161)
+  assert plan.clean_mask.shape == (41, 161)
+
   contract = _ReducedContract()
   schedule = DiffusionSchedule.build()
   planner = LatentPlanner(
