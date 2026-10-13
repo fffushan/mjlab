@@ -30,23 +30,25 @@ def test_default_config_identifies_the_linear_process() -> None:
   assert len(config.sha256()) == 64
 
 
-def test_nonzero_history_dropout_is_rejected() -> None:
+def test_nonzero_history_dropout_is_accepted() -> None:
   config = FlowTrainingConfig(
     training=TrainingConfig(history_state_dropout_probability=0.5)
   )
-  with pytest.raises(FlowTrainingConfigError, match="history dropout"):
-    config.validate()
-
-
-def test_nonzero_history_dropout_is_rejected_from_mapping() -> None:
-  with pytest.raises(FlowTrainingConfigError, match="history dropout"):
+  config.validate()
+  assert (
     FlowTrainingConfig.from_mapping(
-      {"ablation": {"history_state_dropout_probability": 0.25}}
-    )
-  with pytest.raises(FlowTrainingConfigError, match="history dropout"):
-    FlowTrainingConfig(
-      training=TrainingConfig(history_state_dropout_probability=1.0)
-    ).as_dict()
+      config.as_dict()
+    ).training.history_state_dropout_probability
+    == 0.5
+  )
+
+
+def test_flat_ablation_section_is_read_and_mixed_schema_is_rejected() -> None:
+  # A flat payload is read as the training mapping, so dropout survives.
+  flat = FlowTrainingConfig.from_mapping(
+    {"ablation": {"history_state_dropout_probability": 0.25}}
+  )
+  assert flat.training.history_state_dropout_probability == 0.25
   # A top-level ablation section is never read once training is nested, so the
   # mixed schema is rejected instead of silently ignoring the dropout.
   with pytest.raises(FlowTrainingConfigError, match="ablation"):

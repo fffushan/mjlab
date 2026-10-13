@@ -4,8 +4,10 @@
 # The flow loader reads the shared training fields from `training` and the linear
 # process from `process`; the model dimensions come from the frozen D1 contract
 # through DenoiserSettings.from_contract.  This family has no diffusion noise
-# schedule, so no `noise` section exists here, and history dropout is rejected
-# rather than ignored.  `scheduler: cosine` is the learning-rate schedule only.
+# schedule, so no `noise` section exists here.  `scheduler: cosine` is the
+# learning-rate schedule only.  `history_state_dropout_probability` is supported
+# and means the same as in the diffusion family: a whole window's history pair is
+# raised to pure Gaussian so the model cannot read the true history.
 schema_version: mjlab-x2-flow-matching-train-v1
 contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml
 process: {max_level: 1000}

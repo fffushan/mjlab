@@ -11,7 +11,7 @@ The mathematical contract is fixed: integer levels ``k`` in
 ``[0, process.max_level]``, noise fraction ``s = k / max_level``, noising
 ``x_s = (1 - s) * x0 + s * e`` with independent Gaussian ``e``, an ``x0``
 network output, and the Euler update ``x_r = (r / s) * x_s + (1 - r / s) * x0_hat``
-for ``r < s``.  There is no history dropout in this family.
+for ``r < s``.  History dropout is supported and uses the diffusion meaning.
 """
 
 from .checkpoint import (

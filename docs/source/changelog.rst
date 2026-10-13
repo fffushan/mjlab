@@ -158,8 +158,8 @@ Added
   x0 Euler sampler that descends from level 1000 to level 0. It reuses the
   unchanged ``StateLatentTransformer``, the D1 read-only token caches and the
   frozen VAE, writes flow-format checkpoints, and never reads or writes a
-  diffusion schedule or checkpoint. History dropout is rejected rather than
-  ignored. The new runbook is ``docs/source/x2_flow_matching_training.rst``. This
+  diffusion schedule or checkpoint. History dropout is supported and matches
+  the diffusion meaning. The new runbook is ``docs/source/x2_flow_matching_training.rst``. This
   is software validation on synthetic CPU fixtures; no training run, simulator,
   controller or hardware use is claimed.
 

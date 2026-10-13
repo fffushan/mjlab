@@ -6,8 +6,10 @@ The only flow-specific field is ``max_level``, which fixes the linear Gaussian
 process identity that flow checkpoints record.
 
 The flow family is stricter than the shared surface because its mathematical
-contract is fixed: history dropout, non-uniform level sampling and block-weighted
-losses are rejected instead of silently ignored.  The ``scheduler="cosine"``
+contract is fixed: non-uniform level sampling and block-weighted losses are
+rejected instead of silently ignored.  ``history_state_dropout_probability`` is
+supported and means the same thing as in the diffusion family: the history pair
+of a whole window is raised to pure Gaussian noise.  The ``scheduler="cosine"``
 field inherited from the shared surface is a learning-rate schedule, not a noise
 schedule; this module never constructs or records a diffusion noise schedule.
 """
@@ -75,12 +77,6 @@ class FlowTrainingConfig:
       )
     except TrainingConfigError as exc:
       raise FlowTrainingConfigError(str(exc)) from exc
-    if float(self.training.history_state_dropout_probability) != 0.0:
-      raise FlowTrainingConfigError(
-        "the flow family forbids history dropout; "
-        "history_state_dropout_probability must be exactly 0.0, got "
-        f"{self.training.history_state_dropout_probability}"
-      )
     if self.training.level_sampling != "uniform":
       raise FlowTrainingConfigError(
         "the flow family samples independent uniform integer levels; "

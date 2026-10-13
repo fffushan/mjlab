@@ -21,9 +21,16 @@ Gaussian ``e`` and form the linear path:
 
 Level 0 is exactly clean. Level ``max_level`` is exactly Gaussian. The network
 predicts ``x0_hat``. Training draws independent levels for every row and for the
-state and latent slices, including the history rows. There is no history dropout
-in this family: a nonzero ``history_state_dropout_probability`` is rejected, not
-ignored.
+state and latent slices, including the history rows.
+
+``history_state_dropout_probability`` is optional and matches the diffusion
+family. When it is non-zero, a whole window's history pair (the first ``8`` rows
+of the state and latent slices) is raised to level ``max_level``, which is pure
+Gaussian, so that window cannot read its true history. The decision is one draw
+per window. The default is ``0.0``, and the example config sets it explicitly.
+Evaluation never applies the mask, so held-out losses stay comparable across
+dropout settings. The run reports ``history_state_dropout_fraction`` per epoch
+and in ``train-report.json``.
 
 Sampling descends from level ``max_level`` to level 0 with the Euler update:
 

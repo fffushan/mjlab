@@ -3,10 +3,18 @@
 The trainer consumes the Stage 1 primitives directly: it draws independent
 integer state and latent levels for every row (including history), forms
 ``x_s = (1 - s) * x0 + s * e`` and fits the frozen Transformer with plain
-channel-mean x0 MSE.  There is no clean-mask insertion and no history dropout:
-history rows are noised and predicted like every other row, which preserves the
-baseline conditioning strategy.  Level 0 samples are exactly clean and carry a
-reconstruction term.
+channel-mean x0 MSE.  There is no clean-mask insertion: history rows are noised
+and predicted like every other row, which preserves the baseline conditioning
+strategy.  Level 0 samples are exactly clean and carry a reconstruction term.
+
+``history_state_dropout_probability`` optionally drops the history pair of a
+whole window, exactly as the diffusion trainer does: the first
+``current_index`` rows of the state and latent levels are raised to
+``process.max_level``, which is pure Gaussian in the linear path, so the model
+can no longer read the true history for that window.  The default is 0.0.  The
+dropout decision is one draw per window from a dedicated generator whose state
+and counters are stored in the checkpoint, and evaluation never applies the
+mask, so held-out losses stay comparable across dropout settings.
 
 Optimizer, precision, EMA and gradient-accumulation behavior reuse the diffusion
 infrastructure: :class:`~mjlab.tasks.tracking.diffusion.trainer.ExponentialMovingAverage`,
@@ -40,6 +48,7 @@ from ..diffusion.trainer import (
   _dataset_identity,
   _dataset_weights,
   _generator,
+  _history_dropout_mask,
   _set_seed,
 )
 from ..diffusion.training_config import warmup_cosine_learning_rate
@@ -172,6 +181,9 @@ class FlowTrainer:
     self.sampler_generator = torch.Generator(device="cpu").manual_seed(
       self.training.seed + 2
     )
+    self.history_dropout_generator = _generator(self.device, self.training.seed + 3)
+    self._history_dropout_windows = 0
+    self._history_total_windows = 0
     self.identity = _dataset_identity(self.train_dataset)
     self.config_hash = config.sha256()
     self.process_identity = self.process.identity_hash()
@@ -293,6 +305,11 @@ class FlowTrainer:
       else None,
       "noise_generator": self.noise_generator.get_state(),
       "sampler_generator": self.sampler_generator.get_state(),
+      "history_dropout_generator": self.history_dropout_generator.get_state(),
+      "history_dropout_counters": {
+        "windows": self._history_dropout_windows,
+        "total": self._history_total_windows,
+      },
     }
 
   def _restore_rng_state(self, state: Any) -> None:
@@ -306,7 +323,19 @@ class FlowTrainer:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
       self.noise_generator.set_state(state["noise_generator"])
       self.sampler_generator.set_state(state["sampler_generator"])
+      if "history_dropout_generator" in state:
+        self.history_dropout_generator.set_state(state["history_dropout_generator"])
+      elif float(self.training.history_state_dropout_probability) != 0.0:
+        raise FlowTrainerError(
+          "checkpoint lacks history dropout RNG state for a non-zero dropout run"
+        )
+      counters = state.get("history_dropout_counters")
+      if isinstance(counters, Mapping):
+        self._history_dropout_windows = int(counters.get("windows", 0))
+        self._history_total_windows = int(counters.get("total", 0))
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+      if isinstance(exc, FlowTrainerError):
+        raise
       raise FlowTrainerError("resume RNG state cannot be restored") from exc
 
   def _sampler(self) -> Sampler[int] | None:
@@ -350,8 +379,14 @@ class FlowTrainer:
 
   def _forward_loss(
     self, clean: Tensor
-  ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Noise every row independently and fit plain channel-mean x0 MSE."""
+  ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Noise every row independently and fit plain channel-mean x0 MSE.
+
+    With a non-zero ``history_state_dropout_probability`` the history pair of a
+    whole window is raised to ``max_level``, which is pure Gaussian in the
+    linear path, so that window cannot read its true history.  The diffusion
+    trainer applies the same rule to the same rows.
+    """
     clean = clean.to(device=self.device, dtype=torch.float32)
     _finite_tensor(clean, "clean tokens")
     batch = clean.shape[0]
@@ -362,6 +397,27 @@ class FlowTrainer:
     )
     state_levels = levels.state.to(self.device)
     latent_levels = levels.latent.to(self.device)
+    history_dropout = _history_dropout_mask(
+      batch,
+      float(self.training.history_state_dropout_probability),
+      generator=self.history_dropout_generator,
+      device=self.device,
+    )
+    if float(self.training.history_state_dropout_probability) != 0.0:
+      history_rows = history_dropout[:, None].expand(-1, self.contract.current_index)
+      full_level = self.process.max_level
+      state_levels = state_levels.clone()
+      latent_levels = latent_levels.clone()
+      state_levels[:, : self.contract.current_index] = torch.where(
+        history_rows,
+        torch.full_like(state_levels[:, : self.contract.current_index], full_level),
+        state_levels[:, : self.contract.current_index],
+      )
+      latent_levels[:, : self.contract.current_index] = torch.where(
+        history_rows,
+        torch.full_like(latent_levels[:, : self.contract.current_index], full_level),
+        latent_levels[:, : self.contract.current_index],
+      )
     noised = add_linear_noise(
       clean[..., : self.contract.projected_state_dimension],
       clean[..., self.contract.projected_state_dimension :],
@@ -382,7 +438,14 @@ class FlowTrainer:
     target = clean
     loss = F.mse_loss(prediction.float(), target, reduction="mean")
     _finite_tensor(loss, "loss")
-    return loss, prediction.float(), target, noised.state_levels, noised.latent_levels
+    return (
+      loss,
+      prediction.float(),
+      target,
+      noised.state_levels,
+      noised.latent_levels,
+      history_dropout,
+    )
 
   def _optimizer_update(
     self, pending: Sequence[Mapping[str, float]], *, update_index: int
@@ -457,15 +520,28 @@ class FlowTrainer:
         loader = self._loader()
         pending: list[Mapping[str, float]] = []
         epoch_updates: list[Mapping[str, float]] = []
+        epoch_dropout_windows = 0
+        epoch_total_windows = 0
         self.optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(loader):
           if self.global_step >= self._resolved_updates:
             stop = True
             break
           clean = _as_tokens(batch)
-          loss, prediction, target, state_levels, latent_levels = self._forward_loss(
-            clean
-          )
+          (
+            loss,
+            prediction,
+            target,
+            state_levels,
+            latent_levels,
+            history_dropout,
+          ) = self._forward_loss(clean)
+          dropout_windows = int(history_dropout.sum().item())
+          total_windows = int(history_dropout.numel())
+          self._history_dropout_windows += dropout_windows
+          self._history_total_windows += total_windows
+          epoch_dropout_windows += dropout_windows
+          epoch_total_windows += total_windows
           metrics = _x0_metrics(
             prediction,
             target,
@@ -473,6 +549,9 @@ class FlowTrainer:
             latent_levels,
             self._unknown_mask,
             state_dimension=self.contract.projected_state_dimension,
+          )
+          metrics["history_state_dropout_fraction"] = (
+            float(dropout_windows) / float(total_windows) if total_windows else 0.0
           )
           pending.append(metrics)
           loss.backward()
@@ -510,6 +589,16 @@ class FlowTrainer:
           "epoch": epochs_completed,
           "global_step": self.global_step,
           "train_loss": self._last_train_loss,
+          "history_state_dropout_probability": float(
+            self.training.history_state_dropout_probability
+          ),
+          "history_state_dropout_windows": epoch_dropout_windows,
+          "history_state_total_windows": epoch_total_windows,
+          "history_state_dropout_fraction": (
+            float(epoch_dropout_windows) / float(epoch_total_windows)
+            if epoch_total_windows
+            else 0.0
+          ),
           **_average_metrics(epoch_updates),
         }
         eval_split = self.training.eval_split
@@ -564,7 +653,16 @@ class FlowTrainer:
       "dataset_identity": self.identity,
       "resolved_updates": self._resolved_updates,
       "effective_batch_size": self.training.effective_batch_size,
-      "history_state_dropout_probability": 0.0,
+      "history_state_dropout_probability": float(
+        self.training.history_state_dropout_probability
+      ),
+      "history_state_dropout_windows": self._history_dropout_windows,
+      "history_state_total_windows": self._history_total_windows,
+      "history_state_dropout_fraction": (
+        float(self._history_dropout_windows) / float(self._history_total_windows)
+        if self._history_total_windows
+        else 0.0
+      ),
       "resume_reproducibility": {
         "measured": False,
         "residual": None,

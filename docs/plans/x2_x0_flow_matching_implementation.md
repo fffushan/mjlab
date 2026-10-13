@@ -14,7 +14,7 @@ Status: implemented, reviewed, and parent-validated in the primary checkout. Cha
 - Reuse `StateLatentTransformer` without changing its structure or parameter count.
 - Keep the two 1001-entry integer embedding tables. Sample independent levels per row and per state/latent slice.
 - Predict clean `x0`. Use plain channel-mean x0 MSE, as in the diffusion baseline.
-- History dropout is forbidden for this family. Reject nonzero settings, rather than ignoring them.
+- History dropout is supported and matches the diffusion meaning. A nonzero value raises a whole window's history state and latent levels to pure Gaussian. The default is 0.0.
 - Preserve existing diffusion defaults, checkpoints, CLI behavior, and numerical outputs.
 - Add a separate opt-in flow family. Do not label flow artifacts as diffusion artifacts.
 - Deliver bounded training, resumable checkpoints, and offline generated-token evaluation.
@@ -84,7 +84,8 @@ Required evidence:
 - Known entries remain bit-identical after every sampler call.
 - Noise and level generators are reproducible; resume retains their states.
 - Checkpoint model family, path, objective, data, statistics, and model settings are checked.
-- Flow configuration rejects any nonzero history dropout.
+- Flow configuration accepts history dropout and raises the history pair to pure Gaussian.
+Use 0.0 for the baseline arm.
 - Offline metrics score unknown generated state and latent values, not velocity loss.
 - CLI consumes existing data/statistics/caches without modifying them.
 - Existing diffusion behavior remains unchanged.
@@ -137,6 +138,63 @@ Evidence: `/tmp/mjlab-flow-parent-acceptance-wCIecIa6/`.
 | Flow CLI help | PASS |
 | Reviewed file comparison and SHA-256 verification | **19/19 files match** |
 | `git diff --check` | PASS |
+
+### History dropout arm (2026-10-13 17:15 +08)
+
+Operator request: support history dropout in the flow family exactly as the diffusion family does.
+A nonzero ``history_state_dropout_probability`` now raises the whole window's history state and
+latent levels to ``process.max_level``, which is pure Gaussian on the linear path. The trainer
+imports ``_history_dropout_mask`` from the diffusion trainer, so the two families cannot drift.
+One draw per window comes from a dedicated generator whose state and counters are stored in the
+flow checkpoint; a nonzero-dropout resume fails closed when that state is missing. Per-update,
+per-epoch and summary reports carry ``history_state_dropout_windows``,
+``history_state_total_windows`` and ``history_state_dropout_fraction``. Evaluation never applies
+the mask, so held-out losses stay comparable across dropout settings, as in the diffusion family.
+
+Bounded local GPU check, two arms on 32 real VGK36 training windows, 4 updates each
+(one epoch at a batch budget of 128):
+`logs/flow/flow-dropout-check2-20261013T172500+0800/dropout-check.json`.
+
+| Arm | Probability | First-batch levels | Windows | Fraction | Checkpoint dropout RNG |
+| --- | --- | --- | --- | --- | --- |
+| `dropout0` | 0.0 | no mask; history levels sampled as before | 0 / 128 | 0.0 | present |
+| `dropout100` | 1.0 | every history state and latent row at `max_level` | 128 / 128 | 1.0 | present |
+
+The check is a software check of the mask and the reporting, not a quality result. It ran against
+the source revision that is committed here. The earlier attempt in
+`logs/flow/flow-dropout-check-20261013T172000+0800` produced the same arm values; its harness
+expected 8 updates where one epoch yields 4, so its own final assertion failed after both arms
+had already run.
+
+### NAS baseline training run (in progress)
+
+Authorized by the operator on 2026-10-13 (+08) as the flow arm of a matched comparison against the
+diffusion baseline. Branch `fxy/test/flow-matching-baseline` was pushed to the `nas` remote
+(`ssh://fushan@10.14.64.48:32221/home/fushan/mjlab`) and checked out there at `f7d6aee7f`.
+Two untracked server copies of the VGK36 contract and collection config were byte-identical to the
+branch versions; they were moved to `/home/fushan/remote-checkout-backups/flow-baseline-checkout-20261013T085504Z/`
+before the checkout.
+
+| Item | Value |
+| --- | --- |
+| Run | `logs/flow/flow-vgk36-400k-seed0-20261013T085536Z` |
+| tmux session | `flow_vgk36_400k`, container GPU 0 (RTX 4090) |
+| Dataset | `logs/diffusion/d1-vgk36-double-20261012` (published caches reused read-only) |
+| Budget | 400,000 optimizer updates, seed 0 |
+| Batch | 512 effective = 128 microbatch x 4 accumulation, BF16 |
+| Optimizer | AdamW, lr 1e-4, warmup 10,000, cosine, weight decay 1e-3 |
+| Matched baseline | `d2-vgk36-baseline-400k-seed0-retry1-20261012T092934Z` |
+| Launch | 2026-10-13 16:55:36 (+08) |
+| First update | about 2026-10-13 17:00 (+08), after cache validation read 11.8 GiB |
+| Measured rate | 741 to 1998 updates in 180 s = **6.98 updates/s** (includes epoch validation) |
+| Projected completion | about **16 h**, near 2026-10-14 09:00 (+08) |
+
+Early progress at update 2,081 (2 epochs): train loss 0.4622, evaluation `unknown_mse` 0.4542 for the
+model and 0.5192 for the EMA. These are early values, not acceptance evidence.
+
+The flow and diffusion validation losses are **not** on a comparable scale, because one scores
+x0 reconstruction under independent linear noise and the other scores DDPM clean-token error.
+Any flow-versus-diffusion claim must compare generated-token metrics on the same windows.
 
 ### Local GPU smoke on the real VGK36 dataset
 

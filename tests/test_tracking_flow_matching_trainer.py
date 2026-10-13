@@ -19,7 +19,6 @@ from mjlab.tasks.tracking.flow_matching import (
   FlowTrainer,
   FlowTrainerError,
   FlowTrainingConfig,
-  FlowTrainingConfigError,
   add_linear_noise,
   sample_independent_levels,
 )
@@ -142,7 +141,9 @@ def test_forward_loss_matches_stage1_primitives_and_plain_x0_mse(
   trainer = _trainer(tmp_path)
   clean = _clean(batch=3)
   trainer.noise_generator.manual_seed(7)
-  loss, prediction, target, state_levels, latent_levels = trainer._forward_loss(clean)
+  loss, prediction, target, state_levels, latent_levels, _ = trainer._forward_loss(
+    clean
+  )
 
   reference = torch.Generator().manual_seed(7)
   levels = sample_independent_levels(
@@ -174,7 +175,7 @@ def test_all_rows_receive_independent_levels_without_clean_insertion(
   trainer = _trainer(tmp_path)
   trainer.noise_generator.manual_seed(11)
   clean = _clean(batch=32)
-  _, _, _, state_levels, latent_levels = trainer._forward_loss(clean)
+  _, _, _, state_levels, latent_levels, _ = trainer._forward_loss(clean)
   assert state_levels.shape == (32, 41)
   assert latent_levels.shape == (32, 41)
   assert state_levels.dtype == torch.long
@@ -240,7 +241,7 @@ def test_resume_restores_generators_and_reproduces_the_next_step(
   first.noise_generator.manual_seed(13)
   first._forward_loss(clean)
   checkpoint = first._save("checkpoint-probe.pt", epoch=0, best_validation_loss=None)
-  expected_loss, expected_prediction, _, expected_state, expected_latent = (
+  expected_loss, expected_prediction, _, expected_state, expected_latent, _ = (
     first._forward_loss(clean)
   )
   payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -252,7 +253,7 @@ def test_resume_restores_generators_and_reproduces_the_next_step(
   assert torch.equal(
     resumed.sampler_generator.get_state(), payload["rng_state"]["sampler_generator"]
   )
-  loss, prediction, _, state_levels, latent_levels = resumed._forward_loss(clean)
+  loss, prediction, _, state_levels, latent_levels, _ = resumed._forward_loss(clean)
   assert torch.equal(loss, expected_loss)
   assert torch.equal(prediction, expected_prediction)
   assert torch.equal(state_levels, expected_state)
@@ -313,14 +314,56 @@ def test_resume_rejects_mismatched_identity(tmp_path: Path) -> None:
     )
 
 
-def test_nonzero_history_dropout_is_rejected_by_the_trainer(tmp_path: Path) -> None:
+def test_nonzero_history_dropout_is_supported(tmp_path: Path) -> None:
+  """History dropout is allowed and matches the diffusion meaning."""
   config = FlowTrainingConfig(
     training=TrainingConfig(
       history_state_dropout_probability=1.0, mixed_precision="fp32"
     )
   )
-  with pytest.raises(FlowTrainingConfigError, match="history dropout"):
-    _trainer(tmp_path, config=config)
+  config.validate()
+  assert FlowTrainingConfig.from_mapping(config.as_dict()).training == config.training
+  assert config.training.history_state_dropout_probability == 1.0
+
+  trainer = _trainer(tmp_path, config=config)
+  clean = _clean(batch=3)
+  _, _, _, state_levels, latent_levels, dropout = trainer._forward_loss(clean)
+  # A full dropout raises every history row of both slices to pure Gaussian and
+  # leaves the current and future rows at their sampled levels.
+  assert bool(dropout.all())
+  assert torch.equal(
+    state_levels[:, :8], torch.full_like(state_levels[:, :8], trainer.process.max_level)
+  )
+  assert torch.equal(
+    latent_levels[:, :8],
+    torch.full_like(latent_levels[:, :8], trainer.process.max_level),
+  )
+  assert bool((state_levels[:, 8:] < trainer.process.max_level).any())
+
+
+def test_history_dropout_fraction_is_reported(tmp_path: Path) -> None:
+  config = FlowTrainingConfig(
+    training=TrainingConfig(
+      history_state_dropout_probability=1.0,
+      mixed_precision="fp32",
+      epochs=1,
+      max_updates=2,
+      epoch_sample_budget=8,
+      effective_batch_size=4,
+      microbatch_size=4,
+      gradient_accumulation_steps=1,
+    )
+  )
+  trainer = _trainer(tmp_path, config=config)
+  result = trainer.train()
+  report = json.loads((tmp_path / "train-report.json").read_text())
+  assert report["history_state_dropout_probability"] == 1.0
+  assert report["history_state_dropout_fraction"] == 1.0
+  assert report["history_state_total_windows"] > 0
+  state = trainer._rng_state()
+  assert "history_dropout_generator" in state
+  assert state["history_dropout_counters"]["windows"] > 0
+  assert result.global_step == 2
 
 
 def test_nan_aborts_without_writing_a_checkpoint(tmp_path: Path) -> None:
