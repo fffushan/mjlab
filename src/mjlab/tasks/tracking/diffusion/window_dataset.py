@@ -384,18 +384,23 @@ class WindowRecord:
   ou_noise_norm: float
   pair_id: str
   start_tick: int
+  token_dimension: int | None = None
 
   def __post_init__(self) -> None:
     tokens = np.asarray(self.tokens, dtype=np.float32)
+    expected = (
+      {self.token_dimension} if self.token_dimension is not None else {167, 231}
+    )
     if (
       tokens.ndim != 2
       or tokens.shape[0] != 41
-      or tokens.shape[1] not in {167, 231}
+      or tokens.shape[1] not in expected
       or not np.isfinite(tokens).all()
     ):
       raise DatasetError(
-        "window tokens must be finite with shape (41, 167) for active data "
-        "or (41, 231) for explicit legacy data"
+        "window tokens must be finite with shape (41, W) where W is the "
+        "declared token dimension, or (41, 167)/(41, 231) when no dimension "
+        "is declared"
       )
     _validate_provenance_fields(
       self.split, self.phase, self.ou_noise_norm, self.start_tick
@@ -455,16 +460,20 @@ def _normalise_motion_ids(motion_ids: Sequence[str] | None) -> tuple[str, ...] |
   return values
 
 
-def _record_from_sample(sample: Any, ref: WindowRef, split: str) -> WindowRecord:
+def _record_from_sample(
+  sample: Any, ref: WindowRef, split: str, *, token_dimension: int
+) -> WindowRecord:
   tokens = np.asarray(sample.tokens, dtype=np.float32)
   rows = sample.rows
   if (
     tokens.ndim != 2
     or tokens.shape[0] != 41
-    or tokens.shape[1] not in {167, 231}
+    or tokens.shape[1] != token_dimension
     or not np.isfinite(tokens).all()
   ):
-    raise DatasetError("window materialization produced an invalid token shape")
+    raise DatasetError(
+      f"window materialization produced a token width that is not {token_dimension}"
+    )
   if not rows:
     raise DatasetError("window materialization produced no source rows")
   first = rows[0]
@@ -487,6 +496,7 @@ def _record_from_sample(sample: Any, ref: WindowRef, split: str) -> WindowRecord
     ou_noise_norm=noise_norm,
     pair_id=pair_id,
     start_tick=ref.start_tick,
+    token_dimension=token_dimension,
   )
 
 
@@ -502,7 +512,9 @@ def _iter_window_records(
   selected = 0
   for index, ref in enumerate(loaded.refs(split)):
     sample = view[index]
-    record = _record_from_sample(sample, ref, split)
+    record = _record_from_sample(
+      sample, ref, split, token_dimension=loaded.contract.token_dimension
+    )
     if motion_ids is not None and record.motion_id not in motion_ids:
       continue
     yield record

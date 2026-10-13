@@ -265,7 +265,12 @@ def _fill_token_cache_range(payload: _WorkerPayload) -> WorkerResult:
 
     for plan in payload.plans:
       for position, ref in zip(plan.positions, plan.refs, strict=True):
-        record = _record_from_sample(view._sample(ref), ref, payload.split)
+        record = _record_from_sample(
+          view._sample(ref),
+          ref,
+          payload.split,
+          token_dimension=contract.token_dimension,
+        )
         output[position] = record.tokens.astype(cache_dtype, copy=False)
         written.append(position)
     output.flush()

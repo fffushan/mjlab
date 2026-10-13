@@ -21,6 +21,62 @@ class ContractError(ValueError):
 
 _SCHEMA = "mjlab-x2-state-latent-d1-no-mixtures-v1"
 _LEGACY_SCHEMA = "mjlab-x2-state-latent-d0-v1"
+_LOCAL_KINEMATIC_SCHEMA = "mjlab-x2-state-latent-d1-no-mixtures-local-kinematic-v1"
+_SCHEMAS = frozenset({_SCHEMA, _LEGACY_SCHEMA, _LOCAL_KINEMATIC_SCHEMA})
+
+# The packed physical state is a contiguous concatenation of named slices.  The
+# local-kinematic ablation keeps only the rotation, the angular velocity and the
+# pelvis-relative body positions and velocities.  It omits ``root_position`` and
+# ``root_linear_velocity`` on purpose, so this is not a global absolute-state
+# representation: translation is not modelled and every body term stays
+# pelvis-relative.
+_FULL_STATE_FIELDS = (
+  "root_position",
+  "root_rot6d",
+  "root_linear_velocity",
+  "root_angular_velocity",
+  "body_positions",
+  "body_linear_velocities",
+)
+_LOCAL_KINEMATIC_STATE_FIELDS = (
+  "root_rot6d",
+  "root_angular_velocity",
+  "body_positions",
+  "body_linear_velocities",
+)
+_STATE_FIELDS_BY_SCHEMA: dict[str, tuple[str, ...]] = {
+  _SCHEMA: _FULL_STATE_FIELDS,
+  _LEGACY_SCHEMA: _FULL_STATE_FIELDS,
+  _LOCAL_KINEMATIC_SCHEMA: _LOCAL_KINEMATIC_STATE_FIELDS,
+}
+
+
+def _state_field_widths(body_count: int) -> dict[str, int]:
+  """Return the declared width of every physical state field."""
+  return {
+    "root_position": 3,
+    "root_rot6d": 6,
+    "root_linear_velocity": 3,
+    "root_angular_velocity": 3,
+    "body_positions": 3 * body_count,
+    "body_linear_velocities": 3 * body_count,
+  }
+
+
+def _state_slices(
+  fields: tuple[str, ...], body_count: int
+) -> dict[str, tuple[int, int]]:
+  """Return the dense ``[start, stop)`` span of each state field."""
+  widths = _state_field_widths(body_count)
+  slices: dict[str, tuple[int, int]] = {}
+  cursor = 0
+  for name in fields:
+    stop = cursor + widths[name]
+    slices[name] = (cursor, stop)
+    cursor = stop
+  return slices
+
+
 _VAE_SHA = "69891dffb59af31539388e40041efe30242a2028f2876b746d1f7c5ef44ac117"
 _RECOVERY_SHA = "caf17c38f23ad180829a230a9a3259f14eedd3860dd90a046b8be92d3d047681"
 _XML_SHA = "ae0dcbceda3ef74e029e3bf4a9ea24ea8cc58ab44f1518e635653fc79f928125"
@@ -109,18 +165,25 @@ class DiffusionContract:
   )
 
   def __post_init__(self) -> None:
-    if self.schema_version not in {_SCHEMA, _LEGACY_SCHEMA}:
+    if self.schema_version not in _SCHEMAS:
       raise ContractError(f"unsupported schema_version {self.schema_version!r}")
     if self.current_index != self.past_steps:
       raise ContractError("current_index must equal past_steps")
     if self.window_steps != self.past_steps + 1 + self.future_steps:
       raise ContractError("window dimensions are inconsistent")
-    if (
-      len(self.body_names) != self.body_count
-      or self.state_dimension != 15 + 6 * self.body_count
-    ):
-      raise ContractError("ordered body names and state dimension are inconsistent")
-    if self.schema_version == _SCHEMA:
+    if len(self.body_names) != self.body_count:
+      raise ContractError("ordered body names and body count are inconsistent")
+    widths = _state_field_widths(self.body_count)
+    expected_dimension = sum(
+      widths[name] for name in _STATE_FIELDS_BY_SCHEMA[self.schema_version]
+    )
+    if self.state_dimension != expected_dimension:
+      raise ContractError(
+        f"schema {self.schema_version!r} declares state_dimension "
+        f"{self.state_dimension}; the declared state layout requires "
+        f"{expected_dimension}"
+      )
+    if self.schema_version in {_SCHEMA, _LOCAL_KINEMATIC_SCHEMA}:
       if self.projected_state_dimension != self.state_dimension:
         raise ContractError("no-mixture state width must equal physical state width")
       if self.projection_rows != 0:
@@ -151,6 +214,16 @@ class DiffusionContract:
       self.vae_tracking_rejection_source_sha256,
     )
 
+  @property
+  def state_fields(self) -> tuple[str, ...]:
+    """Return the physical state fields in packed order for this schema."""
+    return _STATE_FIELDS_BY_SCHEMA[self.schema_version]
+
+  @property
+  def state_slices(self) -> dict[str, tuple[int, int]]:
+    """Return the ``[start, stop)`` span of each physical state field."""
+    return _state_slices(self.state_fields, self.body_count)
+
   @classmethod
   def from_mapping(cls, payload: Mapping[str, Any]) -> "DiffusionContract":
     """Build a contract from a decoded D0/D1 mapping.
@@ -159,11 +232,11 @@ class DiffusionContract:
     digests in the paper-reproduction manifest remain descriptive metadata; the
     loader does not require a local checkout to match a registry of file bytes.
     """
-    if not isinstance(payload, Mapping) or payload.get("schema_version") not in {
-      _SCHEMA,
-      _LEGACY_SCHEMA,
-    }:
+    if (
+      not isinstance(payload, Mapping) or payload.get("schema_version") not in _SCHEMAS
+    ):
       raise ContractError("payload is not a supported diffusion schema")
+    schema_version = str(payload["schema_version"])
     state = payload.get("state", {})
     window = payload.get("window", {})
     prep = payload.get("preprocessing", {})
@@ -173,8 +246,12 @@ class DiffusionContract:
       fractions = tuple(float(x) for x in prep["split_fractions"])
       if len(fractions) != 3:
         raise ValueError("split_fractions must contain three values")
+      body_order = tuple(str(x) for x in state["body_order"])
+      _validate_declared_state_slices(
+        state.get("slices"), schema_version=schema_version, body_count=len(body_order)
+      )
       contract = cls(
-        schema_version=str(payload["schema_version"]),
+        schema_version=schema_version,
         control_hz=int(payload["control"]["frequency_hz"]),
         period_seconds=float(payload["control"]["period_seconds"]),
         state_dimension=int(state["raw_dimension"]),
@@ -213,7 +290,7 @@ class DiffusionContract:
         vae_tracking_rejection_source_sha256=str(
           payload["qualification"]["vae_tracking_rejection"]["source_sha256"]
         ),
-        body_names=tuple(str(x) for x in state["body_order"]),
+        body_names=body_order,
       )
     except (KeyError, TypeError, ValueError) as exc:
       raise ContractError(f"malformed D0 payload: {exc}") from exc
@@ -321,6 +398,33 @@ class DiffusionContract:
         or item.sha256 != digest
       ):
         raise ContractError(f"artifact {role!r} does not match the frozen identity")
+
+
+def _validate_declared_state_slices(
+  slices: Any, *, schema_version: str, body_count: int
+) -> None:
+  """Fail closed when a manifest declares a layout the schema does not allow.
+
+  The declared ``state.slices`` span map must reproduce, exactly, the dense
+  layout of the loaded schema.  A manifest that omits it falls back to the
+  canonical layout, which the dataclass validates against the declared
+  dimension.  A manifest that declares a different layout, for example one that
+  silently keeps the removed translation rows, is rejected.
+  """
+  if slices is None:
+    return
+  if not isinstance(slices, Mapping):
+    raise ContractError("state.slices must be a mapping")
+  expected = _state_slices(_STATE_FIELDS_BY_SCHEMA[schema_version], body_count)
+  declared: dict[str, tuple[int, int]] = {}
+  for name, span in slices.items():
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+      raise ContractError(f"state slice {name!r} must be a [start, stop] pair")
+    declared[str(name)] = (int(span[0]), int(span[1]))
+  if declared != expected:
+    raise ContractError(
+      f"declared state slices disagree with the schema layout: {declared} != {expected}"
+    )
 
 
 DEFAULT_CONTRACT = DiffusionContract()

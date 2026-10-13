@@ -4,6 +4,23 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added an opt-in local-kinematic state ablation for X2 diffusion. The new
+  contract
+  ``docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml``
+  removes ``root_position`` [3] and ``root_linear_velocity`` [3] from the
+  135-D hybrid state. It keeps ``root_rot6d`` [6], ``root_angular_velocity``
+  [3], ``body_positions`` [60] and ``body_linear_velocities`` [60]. The raw and
+  projected state is 129-D and the token is 161-D. This is not an absolute
+  state: translation is omitted on purpose and the body terms stay
+  pelvis-relative. The training input
+  ``configs/diffusion/x2_50hz_train_local_kinematic.yaml`` and the collection
+  input ``configs/diffusion/x2_50hz_collection_local_kinematic.yaml`` bind the
+  ablation to that contract. The diffusion trainer, denoiser settings, token
+  records and token cache now follow the contract's declared dimensions, so
+  the 135-D defaults are unchanged and a 135-D normalizer, checkpoint or cache
+  is refused for the 129-D contract. The 135-D contract identity and defaults
+  are unchanged.
+
 - Added looped playback to the one-shot future-pose viewer. It starts paused
   on pose 1 and has Play/Pause, Step, Reset and playback-speed controls.
   Playback changes only the displayed saved pose. It runs no physics,

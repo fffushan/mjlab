@@ -39,9 +39,6 @@ class TrainerError(RuntimeError):
   """The training state is invalid or became non-finite."""
 
 
-_STATE_DIMENSION = DiffusionContract().state_dimension
-
-
 @dataclass(frozen=True, slots=True)
 class TrainResult:
   """Summary and artifact paths from one bounded training invocation."""
@@ -225,7 +222,7 @@ class _FiniteGuard:
     raise TrainerError("a checked tensor contains NaN or Inf")
 
 
-def _as_tokens(batch: Any) -> Tensor:
+def _as_tokens(batch: Any, *, window_steps: int, token_dimension: int) -> Tensor:
   if isinstance(batch, Tensor):
     tokens = batch
   elif isinstance(batch, Mapping):
@@ -238,9 +235,10 @@ def _as_tokens(batch: Any) -> Tensor:
     raise TrainerError("dataset must return tokens or (tokens, weight, index)")
   if not isinstance(tokens, Tensor):
     tokens = torch.as_tensor(tokens)
-  if tokens.ndim != 3 or tokens.shape[-2:] != (41, 167):
+  if tokens.ndim != 3 or tokens.shape[-2:] != (window_steps, token_dimension):
     raise TrainerError(
-      f"dataset tokens must have shape [B, 41, 167], got {tuple(tokens.shape)}"
+      f"dataset tokens must have shape [B, {window_steps}, {token_dimension}], "
+      f"got {tuple(tokens.shape)}"
     )
   if not tokens.is_floating_point():
     tokens = tokens.float()
@@ -345,10 +343,10 @@ def _metrics(
   k_latent: Tensor,
   unknown: Tensor,
   *,
+  state_width: int,
   single_read: bool = False,
 ) -> dict[str, float]:
   squared = (prediction.float() - target.float()).square()
-  state_width = _STATE_DIMENSION
   state = squared[..., :state_width]
   latent = squared[..., state_width:]
   unknown_batched = unknown.to(device=squared.device).expand(squared.shape[0], -1, -1)
@@ -870,7 +868,11 @@ class DiffusionTrainer:
             stop = True
             break
           self._profiler.on_step_start(self.global_step)
-          clean = _as_tokens(batch)
+          clean = _as_tokens(
+            batch,
+            window_steps=self.contract.window_steps,
+            token_dimension=self.contract.token_dimension,
+          )
           (
             loss,
             prediction,
@@ -891,6 +893,7 @@ class DiffusionTrainer:
             k_state,
             k_latent,
             self._unknown_mask,
+            state_width=self.contract.projected_state_dimension,
             single_read=self._perf.metrics_single_read,
           )
           metrics["history_state_dropout_fraction"] = (
@@ -1050,13 +1053,24 @@ class DiffusionTrainer:
     loader = DataLoader(dataset, batch_size=self.config.microbatch_size, num_workers=0)
     with torch.no_grad():
       for batch in loader:
-        clean = _as_tokens(batch)
+        clean = _as_tokens(
+          batch,
+          window_steps=self.contract.window_steps,
+          token_dimension=self.contract.token_dimension,
+        )
         loss, prediction, target, k_state, k_latent = self._forward_eval(
           clean, generator
         )
         _finite_tensor(loss, "evaluation loss")
         aggregate.append(
-          _metrics(prediction, target, k_state, k_latent, self._unknown_mask)
+          _metrics(
+            prediction,
+            target,
+            k_state,
+            k_latent,
+            self._unknown_mask,
+            state_width=self.contract.projected_state_dimension,
+          )
         )
     self.model.load_state_dict(backup, strict=True)
     self.model.train(mode_before)

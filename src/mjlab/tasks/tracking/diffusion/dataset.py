@@ -496,6 +496,11 @@ class WindowDataset:
     rows = self.index._rows(ref)
     states = WorldState.stack(row.state for row in rows)
     hybrid, _ = world_to_hybrid(states, center_index=self.index.contract.current_index)
+    if hybrid.shape[-1] != self.index.contract.state_dimension:
+      raise DatasetError(
+        f"hybrid state width {hybrid.shape[-1]} does not match the declared "
+        f"state_dimension {self.index.contract.state_dimension}"
+      )
     latent = np.stack([row.latent for row in rows])
     projected = self.statistics.project_state(hybrid)
     normalized_latent = self.statistics.normalize_latent(latent)
@@ -601,6 +606,11 @@ def _fit_range_statistics(
       hybrid = world_to_hybrid_windows(
         state, chunk, center_index=contract.current_index, length=width
       )
+      if hybrid.shape[-1] != contract.state_dimension:
+        raise DatasetError(
+          f"hybrid state width {hybrid.shape[-1]} does not match the declared "
+          f"state_dimension {contract.state_dimension}"
+        )
       latent_block = latent[chunk[:, None] + offsets]
       state_moments.update(hybrid.reshape(-1, contract.state_dimension))
       latent_moments.update(latent_block.reshape(-1, contract.latent_dimension))

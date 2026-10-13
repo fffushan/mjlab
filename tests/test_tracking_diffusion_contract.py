@@ -5,6 +5,78 @@ import yaml
 
 from mjlab.tasks.tracking.diffusion import ContractError, DiffusionContract
 
+LOCAL_KINEMATIC_CONTRACT = Path(
+  "docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml"
+)
+FULL_CONTRACT = Path("docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml")
+
+
+def test_local_kinematic_contract_declares_129_state_and_161_token() -> None:
+  contract = DiffusionContract.from_yaml(LOCAL_KINEMATIC_CONTRACT)
+  assert (
+    contract.schema_version == "mjlab-x2-state-latent-d1-no-mixtures-local-kinematic-v1"
+  )
+  assert contract.state_dimension == 129
+  assert contract.projected_state_dimension == 129
+  assert contract.token_dimension == 161
+  assert contract.latent_dimension == 32
+  assert contract.projection_rows == 0
+  assert contract.state_fields == (
+    "root_rot6d",
+    "root_angular_velocity",
+    "body_positions",
+    "body_linear_velocities",
+  )
+  assert contract.state_slices == {
+    "root_rot6d": (0, 6),
+    "root_angular_velocity": (6, 9),
+    "body_positions": (9, 69),
+    "body_linear_velocities": (69, 129),
+  }
+
+
+def test_local_kinematic_identity_differs_from_the_unchanged_full_contract() -> None:
+  local = DiffusionContract.from_yaml(LOCAL_KINEMATIC_CONTRACT)
+  full = DiffusionContract.from_yaml(FULL_CONTRACT)
+  assert local.identity_hash() != full.identity_hash()
+  # The 135-D no-mixture defaults are unchanged byte-for-byte.
+  assert full.state_dimension == 135
+  assert full.token_dimension == 167
+  assert full.identity_hash() == DiffusionContract().identity_hash()
+
+
+def test_local_kinematic_rejects_the_full_slice_layout() -> None:
+  payload = yaml.safe_load(LOCAL_KINEMATIC_CONTRACT.read_text())
+  payload["state"]["slices"] = {
+    "root_position": [0, 3],
+    "root_rot6d": [3, 9],
+    "root_linear_velocity": [9, 12],
+    "root_angular_velocity": [12, 15],
+    "body_positions": [15, 75],
+    "body_linear_velocities": [75, 135],
+  }
+  payload["state"]["raw_dimension"] = 135
+  payload["preprocessing"]["projection"]["projected_dimension"] = 135
+  payload["preprocessing"]["projection"]["token_dimension"] = 167
+  with pytest.raises(ContractError, match="slices"):
+    DiffusionContract.from_mapping(payload)
+
+
+def test_local_kinematic_rejects_a_135_dimension_with_a_129_layout() -> None:
+  payload = yaml.safe_load(LOCAL_KINEMATIC_CONTRACT.read_text())
+  payload["state"]["raw_dimension"] = 135
+  payload["preprocessing"]["projection"]["projected_dimension"] = 135
+  payload["preprocessing"]["projection"]["token_dimension"] = 167
+  with pytest.raises(ContractError, match="state_dimension"):
+    DiffusionContract.from_mapping(payload)
+
+
+def test_local_kinematic_rejects_an_unknown_slice_name() -> None:
+  payload = yaml.safe_load(LOCAL_KINEMATIC_CONTRACT.read_text())
+  payload["state"]["slices"]["root_position"] = [0, 3]
+  with pytest.raises(ContractError, match="slices"):
+    DiffusionContract.from_mapping(payload)
+
 
 def test_frozen_yaml_contract_identity_and_dimensions() -> None:
   contract = DiffusionContract.from_yaml(

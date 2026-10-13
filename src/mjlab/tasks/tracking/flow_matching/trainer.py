@@ -527,7 +527,11 @@ class FlowTrainer:
           if self.global_step >= self._resolved_updates:
             stop = True
             break
-          clean = _as_tokens(batch)
+          clean = _as_tokens(
+            batch,
+            window_steps=self.contract.window_steps,
+            token_dimension=self.contract.token_dimension,
+          )
           (
             loss,
             prediction,
@@ -710,7 +714,11 @@ class FlowTrainer:
     )
     with torch.no_grad():
       for batch in loader:
-        clean = _as_tokens(batch)
+        clean = _as_tokens(
+          batch,
+          window_steps=self.contract.window_steps,
+          token_dimension=self.contract.token_dimension,
+        )
         loss, prediction, target, state_levels, latent_levels = self._forward_eval(
           clean, generator
         )

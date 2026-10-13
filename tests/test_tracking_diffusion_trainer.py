@@ -76,6 +76,7 @@ def test_history_dropout_counters_are_reported_and_checkpointed(tmp_path: Path) 
     torch.zeros((1, 41), dtype=torch.long),
     torch.zeros((1, 41), dtype=torch.long),
     unknown,
+    state_width=135,
   )
   assert metrics["unknown_state_mse"] == 4.0
   assert metrics["state_mse"] > metrics["unknown_state_mse"] / 2

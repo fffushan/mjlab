@@ -96,8 +96,8 @@ def _metric_inputs(
 
 def test_single_read_metrics_are_exactly_equal() -> None:
   inputs = _metric_inputs()
-  per_item = _metrics(*inputs)
-  single = _metrics(*inputs, single_read=True)
+  per_item = _metrics(*inputs, state_width=8)
+  single = _metrics(*inputs, state_width=8, single_read=True)
   assert per_item.keys() == single.keys()
   for name in per_item:
     assert per_item[name] == single[name], (
@@ -108,8 +108,10 @@ def test_single_read_metrics_are_exactly_equal() -> None:
 def test_single_read_metrics_agree_with_zero_masks() -> None:
   prediction, target, k_state, k_latent, _ = _metric_inputs(seed=3)
   unknown = torch.zeros_like(target, dtype=torch.bool)
-  per_item = _metrics(prediction, target, k_state, k_latent, unknown)
-  single = _metrics(prediction, target, k_state, k_latent, unknown, single_read=True)
+  per_item = _metrics(prediction, target, k_state, k_latent, unknown, state_width=8)
+  single = _metrics(
+    prediction, target, k_state, k_latent, unknown, state_width=8, single_read=True
+  )
   assert per_item == single
 
 

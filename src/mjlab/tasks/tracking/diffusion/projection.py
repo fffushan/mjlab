@@ -233,7 +233,10 @@ class StateLatentNormalizer:
     if self.contract.token_dimension != (
       self.contract.state_dimension + self.contract.latent_dimension
     ):
-      raise ProjectionError("normalizer contract must have a 135+32 token layout")
+      raise ProjectionError(
+        "normalizer contract token width must equal its state width plus its "
+        "latent width"
+      )
     if self.state_stats.mean.size != self.contract.state_dimension:
       raise ProjectionError("normalizer state statistics width does not match contract")
     if self.latent_stats.mean.size != self.contract.latent_dimension:

@@ -1388,7 +1388,9 @@ def _command_train(args: argparse.Namespace) -> int:
       if records:
         values = torch.from_numpy(np.stack([record.tokens for record in records]))
       else:
-        values = torch.empty((0, 41, 167), dtype=torch.float32)
+        values = torch.empty(
+          (0, contract.window_steps, contract.token_dimension), dtype=torch.float32
+        )
       dataset = _attach_dataset_identity(
         torch.utils.data.TensorDataset(values),
         base_identity=base_identity,

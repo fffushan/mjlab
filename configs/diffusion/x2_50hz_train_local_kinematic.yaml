@@ -1,0 +1,28 @@
+# Local-kinematic state ablation training input.  This is an operational input
+# schema, not the immutable D0 design contract.  It binds the trainer to the
+# 129-D/161-channel contract; the CLI still requires an explicit --max-updates
+# or --epochs budget before it can start.
+#
+# The model, noise, EMA and hyperparameter sections are identical to
+# `x2_50hz_train.yaml`: only the declared contract changes, so the ablation
+# trains the same architecture on a 161-channel token instead of 167.
+schema_version: mjlab-x2-state-latent-train-v1
+contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml
+model: {layers: 6, width: 512, attention_heads: 8, ffn_width: 2048, dropout: 0.0}
+noise: {training_k: 1000, cosine_offset: 0.008, beta_min: 1.0e-5, beta_max: 0.999, updates: 20}
+training:
+  epochs: 1000
+  effective_batch_size: 512
+  microbatch_size: 128
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.001
+  scheduler: cosine
+  warmup_updates: 10000
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  loss_reduction: token_mean
+  seed: 0
+ema: {power: 0.75, max_decay: 0.9999}
+sampling: {clean_weight: 1.0, perturbed_weight: 1.0}
+eval: {split: validation, seed: 0}

@@ -46,14 +46,18 @@ class DenoiserSettings:
   def from_contract(
     cls, contract: Any, *, training_k: int | None = None
   ) -> "DenoiserSettings":
-    """Construct frozen model settings from a D0/D1 contract object."""
+    """Construct model settings from the loaded contract's declared width.
+
+    The settings follow the contract's token and window dimensions so an
+    opt-in state ablation trains a denoiser whose input and output widths
+    match its own token layout.  The frozen ``DenoiserSettings()`` default is
+    unchanged and still reproduces the pinned parameter count.
+    """
     k = 1000 if training_k is None else int(training_k)
     if k < 0:
       raise ValueError("training_k must be non-negative")
     token_dimension = int(getattr(contract, "token_dimension", 167))
     sequence_length = int(getattr(contract, "window_steps", 41))
-    if token_dimension != 167 or sequence_length != 41:
-      raise ValueError("contract dimensions disagree with the frozen D0 model")
     return cls(
       token_dimension=token_dimension,
       sequence_length=sequence_length,
