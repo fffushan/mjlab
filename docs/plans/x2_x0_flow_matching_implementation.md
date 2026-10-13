@@ -196,6 +196,14 @@ The flow and diffusion validation losses are **not** on a comparable scale, beca
 x0 reconstruction under independent linear noise and the other scores DDPM clean-token error.
 Any flow-versus-diffusion claim must compare generated-token metrics on the same windows.
 
+**Source provenance of this run:** the process was launched at `f7d6aee7f` and that commit is
+recorded in the run's `launch-manifest.json`. At 2026-10-13 18:05 (+08) the branch was pushed to
+`d0172a947` (the history-dropout change), which updated the NAS working tree under the live job.
+The running process keeps the modules it imported at startup, so its behaviour did not change; this
+was confirmed by watching the update counter advance across an epoch boundary during and after the
+push. A later resume of this run would load `d0172a947`, which for `probability == 0.0` draws no
+extra randomness and is otherwise only additive in the report fields.
+
 ### Local GPU smoke on the real VGK36 dataset
 
 Operator-authorized on 2026-10-13 (+08) with the local RTX 5080 Laptop GPU and the local dataset
