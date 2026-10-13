@@ -33,6 +33,7 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `beyondmimic_diffusion_d1_throughput_integration.md` | validation | D1 collection and dataset throughput integration | implemented; speed not measured |
 | `beyondmimic_diffusion_d1_throughput_acceptance.md` | validation | Parent D1 optimization acceptance and evidence limits | 222 CPU tests pass; CUDA/NAS unmeasured |
 | `beyondmimic_diffusion_d1_server_benchmark.md` | experiment | Matched GPU3 D1 collection and preparation benchmark | merge3.14x/stats4.85x; cache-jobs8 slower |
+| `beyondmimic_diffusion_d2_history_dropout_series.md` | experiment | D2 history state+latent dropout 0/20/50/100% | 100% costs about11x held-out loss; loss only |
 | `beyondmimic_diffusion_d1_defaults.md` | validation | Enabled D1 defaults and local commit gates | 227 CPU passes; cache worker1 |
 | `MERGE-MANIFEST.md` | provenance | lane provenance for the coverage integration tree | historical |
 | `mvp-source-report.md` | note | fixed-state coverage evaluator scope | historical |
