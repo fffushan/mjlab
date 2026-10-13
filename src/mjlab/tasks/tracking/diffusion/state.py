@@ -1,9 +1,19 @@
-"""World-frame X2 hybrid state construction used by D1 and later runtime code."""
+"""World-frame X2 state construction used by D1 and later runtime code.
+
+Two named packed layouts share the same window-center and per-timestep-root
+frames.  :data:`HYBRID_STATE` is the frozen 135-D contract state, which keeps
+the root position and root linear velocity of every step.
+:data:`LOCAL_KINEMATIC_STATE` is the 129-D state that removes those two
+translation fields, so a generated plan can move the body relative to the root
+but cannot move the root in the world.  The frozen
+:class:`~.contract.DiffusionContract` still declares the 135-D hybrid width; the
+129-D layout is a state-level seam until a contract revision selects it.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import numpy as np
 
@@ -40,6 +50,88 @@ _STATE_FIELDS = (
   "body_positions",
   "body_linear_velocities",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class StateRepresentation:
+  """Named channel layout of one packed diffusion state vector.
+
+  ``slices`` maps a field name to its half-open channel range.  The fields are
+  contiguous and cover ``dimension`` exactly, so a packed vector is the
+  concatenation of the named fields in mapping order.
+  """
+
+  name: str
+  dimension: int
+  slices: Mapping[str, slice]
+
+  def __post_init__(self) -> None:
+    if not self.name or self.dimension <= 0 or not self.slices:
+      raise StateValidationError("state representation is incomplete")
+    start = 0
+    for field, item in self.slices.items():
+      if item.start != start or item.stop <= item.start or item.step is not None:
+        raise StateValidationError(
+          f"state representation field {field!r} is not a contiguous slice"
+        )
+      start = item.stop
+    if start != self.dimension:
+      raise StateValidationError("state representation slices must cover the dimension")
+
+  def field(self, name: str) -> slice:
+    """Return the channel range of ``name``, or fail closed."""
+    try:
+      return self.slices[name]
+    except KeyError as exc:
+      raise StateValidationError(
+        f"representation {self.name!r} has no {name!r} field"
+      ) from exc
+
+
+# The two root translation fields.  They are the only fields that the
+# local-kinematic layout removes from the hybrid layout.
+_TRANSLATION_FIELDS = ("root_position", "root_linear_velocity")
+
+HYBRID_STATE = StateRepresentation(
+  name="mjlab-x2-diffusion-state-hybrid-135-v1",
+  dimension=DEFAULT_CONTRACT.state_dimension,
+  slices={
+    "root_position": slice(0, 3),
+    "root_rot6d": slice(3, 9),
+    "root_linear_velocity": slice(9, 12),
+    "root_angular_velocity": slice(12, 15),
+    "body_positions": slice(15, 75),
+    "body_linear_velocities": slice(75, 135),
+  },
+)
+
+
+def _without_fields(
+  representation: StateRepresentation, removed: tuple[str, ...]
+) -> dict[str, slice]:
+  """Rebuild contiguous slices after removing fields, keeping field order."""
+  slices: dict[str, slice] = {}
+  start = 0
+  for name, item in representation.slices.items():
+    if name in removed:
+      continue
+    width = item.stop - item.start
+    slices[name] = slice(start, start + width)
+    start += width
+  return slices
+
+
+LOCAL_KINEMATIC_STATE = StateRepresentation(
+  name="mjlab-x2-diffusion-state-local-kinematic-129-v1",
+  dimension=HYBRID_STATE.dimension
+  - sum(
+    HYBRID_STATE.field(name).stop - HYBRID_STATE.field(name).start
+    for name in _TRANSLATION_FIELDS
+  ),
+  slices=_without_fields(HYBRID_STATE, _TRANSLATION_FIELDS),
+)
+
+_LOCAL_KINEMATIC_FIELDS = tuple(LOCAL_KINEMATIC_STATE.slices)
 
 
 def _quat_matrix(quaternion: np.ndarray) -> np.ndarray:
@@ -374,6 +466,109 @@ def world_to_hybrid_windows(
   )
 
 
+def _state_vector(name: str, value: np.ndarray, width: int) -> np.ndarray:
+  result = np.asarray(value, dtype=np.float64)
+  if result.ndim == 0 or result.shape[-1] != width:
+    raise StateValidationError(f"{name} must have shape [..., {width}]")
+  return result
+
+
+def hybrid_to_local_kinematic(hybrid: np.ndarray) -> np.ndarray:
+  """Drop the root translation fields from a 135-D hybrid state.
+
+  The input keeps the frozen :func:`world_to_hybrid` frame semantics: the root
+  rot6d and angular velocity are relative to the window-center yaw frame, and
+  the body positions and linear velocities are relative to the same-timestep
+  root yaw frame.  The result uses the :data:`LOCAL_KINEMATIC_STATE` layout and
+  keeps every retained channel unchanged.  Only the window-center-relative root
+  position and root linear velocity are removed.
+  """
+  value = _state_vector("hybrid state", hybrid, HYBRID_STATE.dimension)
+  return np.concatenate(
+    [value[..., HYBRID_STATE.field(name)] for name in _LOCAL_KINEMATIC_FIELDS],
+    axis=-1,
+  )
+
+
+def local_kinematic_to_hybrid(
+  local: np.ndarray,
+  *,
+  root_position: np.ndarray,
+  root_linear_velocity: np.ndarray,
+) -> np.ndarray:
+  """Insert the root translation fields into a 129-D local-kinematic state.
+
+  ``root_position`` and ``root_linear_velocity`` are the values that the hybrid
+  layout stores in its first and third fields: world root values measured
+  relative to the window center and rotated into the window-center yaw frame.
+  A local-kinematic state alone does not determine them.
+  """
+  value = _state_vector("local-kinematic state", local, LOCAL_KINEMATIC_STATE.dimension)
+  inserted = {
+    "root_position": _state_vector("root_position", root_position, 3),
+    "root_linear_velocity": _state_vector(
+      "root_linear_velocity", root_linear_velocity, 3
+    ),
+  }
+  return np.concatenate(
+    [
+      inserted[name]
+      if name in inserted
+      else value[..., LOCAL_KINEMATIC_STATE.field(name)]
+      for name in HYBRID_STATE.slices
+    ],
+    axis=-1,
+  )
+
+
+def world_to_local_kinematic(
+  states: WorldState, *, center_index: int
+) -> tuple[np.ndarray, WorldFrameContext]:
+  """Pack a trajectory into the 129-D local-kinematic state.
+
+  This is :func:`world_to_hybrid` followed by
+  :func:`hybrid_to_local_kinematic`, so every retained channel keeps the frame
+  of the 135-D hybrid state.  The returned context still holds the world root
+  positions and linear velocities that :func:`local_kinematic_to_world` needs.
+  """
+  hybrid, context = world_to_hybrid(states, center_index=center_index)
+  return hybrid_to_local_kinematic(hybrid), context
+
+
+def local_kinematic_to_world(
+  local: np.ndarray, context: WorldFrameContext
+) -> WorldState:
+  """Invert :func:`world_to_local_kinematic` with retained world frame context.
+
+  A local-kinematic state does not encode the root world position or the root
+  world linear velocity.  The inverse reads them from ``context.root_positions``
+  and ``context.root_linear_velocities`` and rotates the center-relative
+  difference into the window-center yaw frame before
+  :func:`local_kinematic_to_hybrid`.  Generation code that feeds a predicted
+  129-D state here must supply the intended root trajectory in the context.
+  """
+  value = _state_vector("local-kinematic state", local, LOCAL_KINEMATIC_STATE.dimension)
+  if value.ndim != 2:
+    raise StateValidationError("local-kinematic state must have shape [T, 129]")
+  n = value.shape[0]
+  if context.root_positions.shape != (n, 3) or context.root_linear_velocities.shape != (
+    n,
+    3,
+  ):
+    raise StateValidationError("world context does not match local-kinematic length")
+  center_r = _yaw_matrix(np.asarray(context.center_yaw))
+  root_position = (context.root_positions - context.center_position) @ center_r
+  root_linear_velocity = (
+    context.root_linear_velocities - context.center_linear_velocity
+  ) @ center_r
+  hybrid = local_kinematic_to_hybrid(
+    value,
+    root_position=root_position,
+    root_linear_velocity=root_linear_velocity,
+  )
+  return hybrid_to_world(hybrid, context)
+
+
 def hybrid_to_world(hybrid: np.ndarray, context: WorldFrameContext) -> WorldState:
   """Invert :func:`world_to_hybrid` using retained world planning context."""
   value = np.asarray(hybrid, dtype=np.float64)
@@ -401,10 +596,17 @@ def hybrid_to_world(hybrid: np.ndarray, context: WorldFrameContext) -> WorldStat
 
 
 __all__ = [
+  "HYBRID_STATE",
+  "LOCAL_KINEMATIC_STATE",
+  "StateRepresentation",
   "StateValidationError",
   "WorldFrameContext",
   "WorldState",
+  "hybrid_to_local_kinematic",
   "hybrid_to_world",
+  "local_kinematic_to_hybrid",
+  "local_kinematic_to_world",
   "world_to_hybrid",
   "world_to_hybrid_windows",
+  "world_to_local_kinematic",
 ]
