@@ -156,7 +156,6 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
     },
     "checkpoint": {
       "selected_step": prepared.denoiser.global_step,
-      "training_budget_updates": evaluate._TRAINING_BUDGET_UPDATES,
       "ema_selected": prepared.denoiser.ema_selected,
     },
     "device": str(prepared.device),

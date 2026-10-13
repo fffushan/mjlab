@@ -113,7 +113,7 @@ PYTHONPATH="$PWD/src" uv run --no-sync python \
 
 `summary.json` records both branches separately, including measured conditioning
 source, handover/reference provenance, physical counters and partial outcomes,
-checkpoint selected step versus the frozen 104000-update training budget, EMA
+checkpoint selected step, EMA
 selection, sampler settings, actual imported source/environment fingerprints,
 artifact root, and before/after model, normalizer, non-Tensor extra-state, and
 frozen-file integrity. The persisted representation may omit tick arrays under

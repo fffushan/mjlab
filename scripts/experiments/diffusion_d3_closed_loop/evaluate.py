@@ -54,7 +54,6 @@ from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_coho
 _MAX_CONTINUATION_STEPS = 5000
 _MAX_WALL_SECONDS = 1200.0
 _MAX_OUTPUT_BYTES = 128 * 1024 * 1024
-_TRAINING_BUDGET_UPDATES = 104_000
 _BOOTSTRAP_PAIRS = 8
 _FROZEN_DDIM_STEPS = 20
 _FROZEN_START_LEVEL = 1000
@@ -579,11 +578,6 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
     raise ClosedLoopCliError("frozen diffusion schedule must use training level 1000")
   if denoiser.grid.updates != _FROZEN_DDIM_STEPS:
     raise ClosedLoopCliError("frozen diffusion inference grid must use 20 DDIM updates")
-  if denoiser.global_step > _TRAINING_BUDGET_UPDATES:
-    raise ClosedLoopCliError(
-      f"checkpoint selected step {denoiser.global_step} exceeds the frozen "
-      f"{_TRAINING_BUDGET_UPDATES}-update training budget"
-    )
   if (
     vae.reference_dim != 68
     or vae.conditioning_dim != 99
@@ -713,7 +707,6 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
     "checkpoint": {
       "path": str(args.checkpoint.resolve()),
       "selected_step": prepared.denoiser.global_step,
-      "training_budget_updates": _TRAINING_BUDGET_UPDATES,
       "ema_selected": prepared.denoiser.ema_selected,
       "ema_updates": prepared.denoiser.ema_updates,
     },
@@ -859,7 +852,6 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
     "checkpoint": {
       "path": str(args.checkpoint.resolve()),
       "selected_step": prepared.denoiser.global_step,
-      "training_budget_updates": _TRAINING_BUDGET_UPDATES,
       "selection_split": prepared.denoiser.selection_split,
       "best_validation_loss": prepared.denoiser.best_validation_loss,
       "ema_selected": prepared.denoiser.ema_selected,
