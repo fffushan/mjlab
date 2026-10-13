@@ -3,9 +3,9 @@
 # The CLI still requires --execute and a concrete --runtime-factory; this file
 # alone never launches a simulator.
 #
-# Collection also needs the state lane to build the 129-D hybrid state.  Until
-# that lands, `prepare`/`train` fail closed when the packed hybrid width does
-# not match the declared state_dimension.
+# Collection stores world-frame rows.  Dataset preparation converts each
+# simulator hybrid window to the declared 129-D local-kinematic layout before
+# fitting statistics and building tokens.
 schema_version: mjlab-x2-diffusion-d1-collection-v1
 contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml
 execution_authorized: false

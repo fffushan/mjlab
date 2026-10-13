@@ -63,6 +63,43 @@ def _record(phase: str) -> WindowRecord:
   )
 
 
+def _local_record() -> WindowRecord:
+  generator = np.random.default_rng(14)
+  return WindowRecord(
+    tokens=generator.normal(size=(41, 161)).astype(np.float32),
+    split="test",
+    group_key="group-local",
+    motion_id="tennis_000",
+    phase="clean",
+    ou_noise_norm=0.0,
+    pair_id="pair-local",
+    start_tick=0,
+    token_dimension=161,
+  )
+
+
+def test_local_kinematic_evaluation_uses_the_declared_161_token_width(
+  tmp_path: Path,
+) -> None:
+  contract = DiffusionContract.from_yaml(
+    "docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml"
+  )
+  schedule = DiffusionSchedule.build()
+  report = evaluate_generation(
+    EchoDenoiser(),
+    schedule=schedule,
+    grid=build_inference_grid(schedule, contract=contract),
+    records=[_local_record()],
+    projection=IdentityProjection(),  # type: ignore[arg-type]
+    contract=contract,
+    seed=7,
+    device="cpu",
+    diagnostics_path=tmp_path / "local.json",
+  )
+  assert report.windows == 1
+  assert (tmp_path / "local.json").is_file()
+
+
 class EchoDenoiser(nn.Module):
   """Small deterministic denoiser that keeps the sampler path inexpensive."""
 

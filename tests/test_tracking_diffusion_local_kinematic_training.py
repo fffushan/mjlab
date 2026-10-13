@@ -23,13 +23,17 @@ from mjlab.tasks.tracking.diffusion.checkpoint import (
   load_checkpoint,
   save_checkpoint,
 )
-from mjlab.tasks.tracking.diffusion.dataset import DatasetError
+from mjlab.tasks.tracking.diffusion.dataset import (
+  DatasetError,
+  _pack_state_for_contract,
+)
 from mjlab.tasks.tracking.diffusion.model import DenoiserSettings
 from mjlab.tasks.tracking.diffusion.projection import (
   FeatureStats,
   ProjectionError,
   StateLatentNormalizer,
 )
+from mjlab.tasks.tracking.diffusion.state import hybrid_to_local_kinematic
 from mjlab.tasks.tracking.diffusion.trainer import (
   DiffusionTrainer,
   TrainerError,
@@ -106,7 +110,20 @@ def _trainer(
   )
 
 
-def test_denoiser_settings_follow_the_declared_token_dimension() -> None:
+def test_dataset_packs_simulator_hybrid_state_for_the_129_contract() -> None:
+  local = DiffusionContract.from_yaml(LOCAL_KINEMATIC)
+  hybrid = np.arange(2 * 41 * 135, dtype=np.float64).reshape(2, 41, 135)
+  packed = _pack_state_for_contract(hybrid, local)
+  assert packed.shape == (2, 41, 129)
+  np.testing.assert_array_equal(packed, hybrid_to_local_kinematic(hybrid))
+
+
+def test_dataset_keeps_the_frozen_135_contract_layout() -> None:
+  full = DiffusionContract.from_yaml(FULL)
+  hybrid = np.arange(41 * 135, dtype=np.float64).reshape(41, 135)
+  packed = _pack_state_for_contract(hybrid, full)
+  np.testing.assert_array_equal(packed, hybrid)
+
   local = DiffusionContract.from_yaml(LOCAL_KINEMATIC)
   settings = DenoiserSettings.from_contract(local)
   assert settings.token_dimension == 161

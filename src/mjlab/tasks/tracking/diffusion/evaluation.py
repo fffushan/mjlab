@@ -206,16 +206,17 @@ def _add_error_metrics(
   physical_prediction: tuple[np.ndarray, np.ndarray] | None = None,
   physical_target: tuple[np.ndarray, np.ndarray] | None = None,
   physical_prefix: str | None = None,
+  state_dimension: int = _STATE_WIDTH,
 ) -> None:
   """Accumulate normalized and optionally physical state/latent MSE values."""
   squared = np.square(prediction - target, dtype=np.float64)
-  state_mask = mask[..., :_STATE_WIDTH]
-  latent_mask = mask[..., _STATE_WIDTH:]
+  state_mask = mask[..., :state_dimension]
+  latent_mask = mask[..., state_dimension:]
   accumulator.add(
-    f"{prefix}_unknown_state_mse", squared[..., :_STATE_WIDTH][state_mask]
+    f"{prefix}_unknown_state_mse", squared[..., :state_dimension][state_mask]
   )
   accumulator.add(
-    f"{prefix}_unknown_latent_mse", squared[..., _STATE_WIDTH:][latent_mask]
+    f"{prefix}_unknown_latent_mse", squared[..., state_dimension:][latent_mask]
   )
   accumulator.add(f"{prefix}_unknown_token_mse", squared[mask])
   if physical_prediction is None or physical_target is None or physical_prefix is None:
@@ -238,20 +239,22 @@ def _add_error_metrics(
   )
 
 
-def _baseline_tokens(clean: Tensor) -> dict[str, Tensor]:
+def _baseline_tokens(
+  clean: Tensor, *, state_dimension: int = _STATE_WIDTH
+) -> dict[str, Tensor]:
   """Construct the four specified baselines from the same conditioned windows."""
   current = clean[:, 8]
   copy_state = clean.clone()
-  copy_state[:, 9:, :_STATE_WIDTH] = current[:, None, :_STATE_WIDTH]
+  copy_state[:, 9:, :state_dimension] = current[:, None, :state_dimension]
 
   copy_latent = clean.clone()
   # The current latent (token 8) is unknown under D0.  Use the last known
   # historical latent instead of leaking the held-out target into this baseline.
-  history_latent = clean[:, 7, _STATE_WIDTH:]
-  copy_latent[:, 8:, _STATE_WIDTH:] = history_latent[:, None, :]
+  history_latent = clean[:, 7, state_dimension:]
+  copy_latent[:, 8:, state_dimension:] = history_latent[:, None, :]
 
   zero_latent = clean.clone()
-  zero_latent[:, 8:, _STATE_WIDTH:] = 0.0
+  zero_latent[:, 8:, state_dimension:] = 0.0
   return {
     "copy_current_state": copy_state,
     "copy_current_latent": copy_latent,
@@ -260,11 +263,14 @@ def _baseline_tokens(clean: Tensor) -> dict[str, Tensor]:
 
 
 def _physical_tokens(
-  projection: ProjectionBundle, tokens: np.ndarray
+  projection: ProjectionBundle,
+  tokens: np.ndarray,
+  *,
+  state_dimension: int = _STATE_WIDTH,
 ) -> tuple[np.ndarray, np.ndarray]:
   """Recover unnormalized physical state and latent arrays from token arrays."""
-  state = projection.inverse_state(tokens[..., :_STATE_WIDTH])
-  latent = projection.denormalize_latent(tokens[..., _STATE_WIDTH:])
+  state = projection.inverse_state(tokens[..., :state_dimension])
+  latent = projection.denormalize_latent(tokens[..., state_dimension:])
   return state, latent
 
 
@@ -276,11 +282,16 @@ def _add_phase_metrics(
   unknown: np.ndarray,
   phase_mask: np.ndarray,
   projection: ProjectionBundle,
+  state_dimension: int = _STATE_WIDTH,
 ) -> None:
   """Add per-phase metrics while retaining the exact unknown-entry mask."""
   selected = unknown & phase_mask[:, None, None]
-  physical_prediction = _physical_tokens(projection, prediction)
-  physical_target = _physical_tokens(projection, target)
+  physical_prediction = _physical_tokens(
+    projection, prediction, state_dimension=state_dimension
+  )
+  physical_target = _physical_tokens(
+    projection, target, state_dimension=state_dimension
+  )
   _add_error_metrics(
     accumulator,
     f"{name}_phase",
@@ -290,6 +301,7 @@ def _add_phase_metrics(
     physical_prediction=physical_prediction,
     physical_target=physical_target,
     physical_prefix=f"{name}_physical_phase",
+    state_dimension=state_dimension,
   )
 
 
@@ -300,10 +312,15 @@ def _add_horizon_metrics(
   target: np.ndarray,
   unknown: np.ndarray,
   projection: ProjectionBundle,
+  state_dimension: int = _STATE_WIDTH,
 ) -> None:
   """Add future-horizon bucket metrics for one prediction or baseline."""
-  physical_prediction = _physical_tokens(projection, prediction)
-  physical_target = _physical_tokens(projection, target)
+  physical_prediction = _physical_tokens(
+    projection, prediction, state_dimension=state_dimension
+  )
+  physical_target = _physical_tokens(
+    projection, target, state_dimension=state_dimension
+  )
   for bucket, start, stop in _HORIZON_BUCKETS:
     selected = np.zeros_like(unknown)
     selected[:, start:stop] = unknown[:, start:stop]
@@ -316,6 +333,7 @@ def _add_horizon_metrics(
       physical_prediction=physical_prediction,
       physical_target=physical_target,
       physical_prefix=f"{name}_physical_horizon_{bucket}",
+      state_dimension=state_dimension,
     )
 
 
@@ -351,26 +369,37 @@ def _pathwise_error_values(
   target: np.ndarray,
   unknown: np.ndarray,
   projection: ProjectionBundle,
+  *,
+  state_dimension: int = _STATE_WIDTH,
 ) -> dict[str, np.ndarray]:
   """Return one masked MSE per leading window for each feature group."""
   groups: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "normalized_state": (
-      prediction[..., :_STATE_WIDTH],
-      target[..., :_STATE_WIDTH],
+      prediction[..., :state_dimension],
+      target[..., :state_dimension],
     ),
-    "normalized_latent": (prediction[..., _STATE_WIDTH:], target[..., _STATE_WIDTH:]),
+    "normalized_latent": (
+      prediction[..., state_dimension:],
+      target[..., state_dimension:],
+    ),
   }
   selections = {
-    "normalized_state": unknown[..., :_STATE_WIDTH],
-    "normalized_latent": unknown[..., _STATE_WIDTH:],
+    "normalized_state": unknown[..., :state_dimension],
+    "normalized_latent": unknown[..., state_dimension:],
   }
   output = {
     name: _window_mse(value, reference, selections[name])
     for name, (value, reference) in groups.items()
   }
-  physical_prediction = _physical_tokens(projection, prediction)
-  physical_target = _physical_tokens(projection, target)
-  physical_state_unknown = np.any(unknown[..., :_STATE_WIDTH], axis=-1, keepdims=True)
+  physical_prediction = _physical_tokens(
+    projection, prediction, state_dimension=state_dimension
+  )
+  physical_target = _physical_tokens(
+    projection, target, state_dimension=state_dimension
+  )
+  physical_state_unknown = np.any(
+    unknown[..., :state_dimension], axis=-1, keepdims=True
+  )
   output["physical_recovered_state"] = _window_mse(
     physical_prediction[0],
     physical_target[0],
@@ -379,7 +408,7 @@ def _pathwise_error_values(
   output["physical_recovered_latent"] = _window_mse(
     physical_prediction[1],
     physical_target[1],
-    unknown[..., _STATE_WIDTH:],
+    unknown[..., state_dimension:],
   )
   return output
 
@@ -414,6 +443,8 @@ def evaluate_pathwise_transition_diagnostic(
   if grid != build_inference_grid(schedule):
     raise ValueError("pathwise transition diagnostic requires the frozen 20-level grid")
   torch_device = torch.device(device)
+  state_dimension = contract.projected_state_dimension
+  token_dimension = contract.token_dimension
   if torch_device.type == "cuda" and not torch.cuda.is_available():
     raise RuntimeError("CUDA device requested for pathwise diagnostic but unavailable")
   if hasattr(model, "to"):
@@ -424,8 +455,8 @@ def evaluate_pathwise_transition_diagnostic(
     token_dimension=contract.token_dimension,
     device=torch_device,
   )
-  fixed_state = mask[..., :_STATE_WIDTH].all(dim=-1)
-  fixed_latent = mask[..., _STATE_WIDTH:].all(dim=-1)
+  fixed_state = mask[..., :state_dimension].all(dim=-1)
+  fixed_latent = mask[..., state_dimension:].all(dim=-1)
   alpha_bars = schedule.alpha_bars_torch(device=torch_device, dtype=torch.float32)
   transition_values: list[dict[str, Any]] = [
     {
@@ -452,7 +483,12 @@ def evaluate_pathwise_transition_diagnostic(
       for start in range(0, len(selected), 32):
         stop = min(len(selected), start + 32)
         tokens = np.stack(
-          [_as_record_tokens(record) for record in selected[start:stop]]
+          [
+            _as_record_tokens(
+              record, expected_shape=(contract.window_steps, token_dimension)
+            )
+            for record in selected[start:stop]
+          ]
         )
         clean = torch.from_numpy(tokens).to(device=torch_device, dtype=torch.float32)
         batch_unknown = np.broadcast_to(
@@ -535,7 +571,11 @@ def evaluate_pathwise_transition_diagnostic(
           assert isinstance(value_store, dict)
           for name, (prediction, target) in arrays.items():
             values = _pathwise_error_values(
-              prediction, target, batch_unknown, projection
+              prediction,
+              target,
+              batch_unknown,
+              projection,
+              state_dimension=state_dimension,
             )
             group_store = value_store[name]
             assert isinstance(group_store, dict)
@@ -648,6 +688,8 @@ def evaluate_generation(
   if projection_contract is not None and hasattr(projection_contract, "identity_hash"):
     if projection_contract.identity_hash() != contract.identity_hash():
       raise ValueError("projection contract identity differs from evaluation contract")
+  state_dimension = contract.projected_state_dimension
+  token_dimension = contract.token_dimension
   selected = tuple(records if max_windows is None else records[:max_windows])
   target_count = len(selected)
   history_dropout_flags = _history_condition_dropout_flags(
@@ -685,7 +727,12 @@ def evaluate_generation(
     _write_generation_diagnostics(destination, report)
     return report
 
-  selected_tokens = np.stack([_as_record_tokens(record) for record in selected])
+  selected_tokens = np.stack(
+    [
+      _as_record_tokens(record, expected_shape=(contract.window_steps, token_dimension))
+      for record in selected
+    ]
+  )
   split_values = {str(getattr(record, "split", "")) for record in selected}
   split = split or (next(iter(split_values)) if len(split_values) == 1 else "mixed")
   torch_device = torch.device(device)
@@ -784,9 +831,14 @@ def evaluate_generation(
                 prediction_np,
                 target,
                 unknown,
-                physical_prediction=_physical_tokens(projection, prediction_np),
-                physical_target=_physical_tokens(projection, target),
+                physical_prediction=_physical_tokens(
+                  projection, prediction_np, state_dimension=state_dimension
+                ),
+                physical_target=_physical_tokens(
+                  projection, target, state_dimension=state_dimension
+                ),
                 physical_prefix=f"{label}_physical_step_{source}",
+                state_dimension=state_dimension,
               )
         elif sampler_kind == "ddpm":
           generated, _ = sample_trajectory_ddpm(
@@ -810,7 +862,7 @@ def evaluate_generation(
           dtype=clean.dtype,
         ).to(torch_device)
         prior = apply_clean_mask(prior_noise, clean, batch_mask)
-        baselines = _baseline_tokens(clean)
+        baselines = _baseline_tokens(clean, state_dimension=state_dimension)
         target = clean.detach().cpu().numpy().astype(np.float64)
         generated_np = generated.detach().cpu().numpy().astype(np.float64)
         prior_np = prior.detach().cpu().numpy().astype(np.float64)
@@ -825,13 +877,17 @@ def evaluate_generation(
           predictions[name] = (value.detach().cpu().numpy().astype(np.float64), scope)
 
         for name, (prediction, scope) in predictions.items():
-          physical_prediction = _physical_tokens(projection, prediction)
-          physical_target = _physical_tokens(projection, target)
+          physical_prediction = _physical_tokens(
+            projection, prediction, state_dimension=state_dimension
+          )
+          physical_target = _physical_tokens(
+            projection, target, state_dimension=state_dimension
+          )
           selected_unknown = unknown.copy()
           if scope == "state":
-            selected_unknown[..., _STATE_WIDTH:] = False
+            selected_unknown[..., state_dimension:] = False
           elif scope == "latent":
-            selected_unknown[..., :_STATE_WIDTH] = False
+            selected_unknown[..., :state_dimension] = False
           _add_error_metrics(
             accumulator,
             f"{name}_normalized",
@@ -841,6 +897,7 @@ def evaluate_generation(
             physical_prediction=physical_prediction,
             physical_target=physical_target,
             physical_prefix=f"{name}_physical",
+            state_dimension=state_dimension,
           )
           _add_horizon_metrics(
             accumulator,
@@ -849,6 +906,7 @@ def evaluate_generation(
             target,
             selected_unknown,
             projection,
+            state_dimension=state_dimension,
           )
           phase_values = [
             str(getattr(record, "phase", "") or "unknown")
@@ -864,6 +922,7 @@ def evaluate_generation(
               selected_unknown,
               phase_mask,
               projection,
+              state_dimension=state_dimension,
             )
 
   finally:

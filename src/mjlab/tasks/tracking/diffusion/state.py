@@ -7,7 +7,7 @@ the root position and root linear velocity of every step.
 translation fields, so a generated plan can move the body relative to the root
 but cannot move the root in the world.  The frozen
 :class:`~.contract.DiffusionContract` still declares the 135-D hybrid width; the
-129-D layout is a state-level seam until a contract revision selects it.
+129-D layout is selected by its opt-in local-kinematic diffusion contract.
 """
 
 from __future__ import annotations

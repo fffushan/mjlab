@@ -389,7 +389,7 @@ class WindowRecord:
   def __post_init__(self) -> None:
     tokens = np.asarray(self.tokens, dtype=np.float32)
     expected = (
-      {self.token_dimension} if self.token_dimension is not None else {167, 231}
+      {self.token_dimension} if self.token_dimension is not None else {161, 167, 231}
     )
     if (
       tokens.ndim != 2
@@ -399,8 +399,8 @@ class WindowRecord:
     ):
       raise DatasetError(
         "window tokens must be finite with shape (41, W) where W is the "
-        "declared token dimension, or (41, 167)/(41, 231) when no dimension "
-        "is declared"
+        "declared token dimension, or (41, 161)/(41, 167)/(41, 231) when no "
+        "dimension is declared"
       )
     _validate_provenance_fields(
       self.split, self.phase, self.ou_noise_norm, self.start_tick

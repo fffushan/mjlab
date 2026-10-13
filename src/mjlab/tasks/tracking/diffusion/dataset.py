@@ -18,7 +18,14 @@ from .projection import (
   ProjectionError,
   combine_feature_moments,
 )
-from .state import WorldState, world_to_hybrid, world_to_hybrid_windows
+from .state import (
+  HYBRID_STATE,
+  LOCAL_KINEMATIC_STATE,
+  WorldState,
+  hybrid_to_local_kinematic,
+  world_to_hybrid,
+  world_to_hybrid_windows,
+)
 from .storage import (
   AppendOnlyShardStore,
   StorageError,
@@ -478,6 +485,28 @@ class WindowIndex:
     return len(self.refs)
 
 
+def _pack_state_for_contract(
+  hybrid: np.ndarray, contract: DiffusionContract
+) -> np.ndarray:
+  """Convert the simulator hybrid state into the contract's state layout."""
+  fields = tuple(contract.state_fields)
+  if fields == tuple(HYBRID_STATE.slices):
+    packed = hybrid
+  elif fields == tuple(LOCAL_KINEMATIC_STATE.slices):
+    packed = hybrid_to_local_kinematic(hybrid)
+  else:
+    raise DatasetError(
+      "unsupported state layout for simulator packing: "
+      f"schema={contract.schema_version!r}, fields={fields!r}"
+    )
+  if packed.shape[-1] != contract.state_dimension:
+    raise DatasetError(
+      f"packed state width {packed.shape[-1]} does not match the declared "
+      f"state_dimension {contract.state_dimension}"
+    )
+  return packed
+
+
 class WindowDataset:
   """A split view whose windows and projected tokens are materialized lazily."""
 
@@ -496,13 +525,9 @@ class WindowDataset:
     rows = self.index._rows(ref)
     states = WorldState.stack(row.state for row in rows)
     hybrid, _ = world_to_hybrid(states, center_index=self.index.contract.current_index)
-    if hybrid.shape[-1] != self.index.contract.state_dimension:
-      raise DatasetError(
-        f"hybrid state width {hybrid.shape[-1]} does not match the declared "
-        f"state_dimension {self.index.contract.state_dimension}"
-      )
+    packed_state = _pack_state_for_contract(hybrid, self.index.contract)
     latent = np.stack([row.latent for row in rows])
-    projected = self.statistics.project_state(hybrid)
+    projected = self.statistics.project_state(packed_state)
     normalized_latent = self.statistics.normalize_latent(latent)
     tokens = np.concatenate((projected, normalized_latent), axis=-1)
     return WindowSample(
@@ -606,13 +631,9 @@ def _fit_range_statistics(
       hybrid = world_to_hybrid_windows(
         state, chunk, center_index=contract.current_index, length=width
       )
-      if hybrid.shape[-1] != contract.state_dimension:
-        raise DatasetError(
-          f"hybrid state width {hybrid.shape[-1]} does not match the declared "
-          f"state_dimension {contract.state_dimension}"
-        )
+      packed_state = _pack_state_for_contract(hybrid, contract)
       latent_block = latent[chunk[:, None] + offsets]
-      state_moments.update(hybrid.reshape(-1, contract.state_dimension))
+      state_moments.update(packed_state.reshape(-1, contract.state_dimension))
       latent_moments.update(latent_block.reshape(-1, contract.latent_dimension))
   return RangeStatistics(
     tuple(windows), state_moments.partial(), latent_moments.partial()
