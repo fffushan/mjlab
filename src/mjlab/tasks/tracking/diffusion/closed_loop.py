@@ -30,8 +30,15 @@ import torch
 from torch import Tensor
 
 from .closed_loop_types import ClosedLoopRuntime, D3Observation, D3Transition
+from .contract import (
+  FROZEN_SCHEMA,
+  LEGACY_SCHEMA,
+  LOCAL_KINEMATIC_SCHEMA,
+  SUPPORTED_SCHEMAS,
+  DiffusionContract,
+)
 from .handover import ContinuationStep, ReferenceFreeContinuation
-from .state import WorldState, world_to_hybrid
+from .state import WorldState, world_to_hybrid, world_to_local_kinematic
 
 _STATE_FIELDS = (
   "root_position",
@@ -41,7 +48,6 @@ _STATE_FIELDS = (
   "body_positions",
   "body_linear_velocities",
 )
-_STATE_WIDTH = 135
 _LATENT_WIDTH = 32
 _ACTION_WIDTH = 31
 _REFERENCE_WIDTH = 68
@@ -52,6 +58,24 @@ _DEFAULT_FALL_DEGREES = 70.0
 _DEFAULT_OUTPUT_CAP = 128 * 1024 * 1024
 _MIN_OUTPUT_CAP_BYTES = 4096
 MIN_OUTPUT_CAP_BYTES = _MIN_OUTPUT_CAP_BYTES
+# World-to-state mappings keyed by contract schema.  The state layout is a
+# property of the schema, so an unknown schema fails closed instead of silently
+# reusing another representation's frame semantics.
+_STATE_MAPPERS: dict[str, Any] = {
+  FROZEN_SCHEMA: world_to_hybrid,
+  LEGACY_SCHEMA: world_to_hybrid,
+  LOCAL_KINEMATIC_SCHEMA: world_to_local_kinematic,
+}
+# Report block labels are historical names for the physical state fields.  A
+# contract that omits a field simply omits that block.
+_PREDICTION_BLOCK_LABELS: dict[str, str] = {
+  "root_position": "root_position",
+  "root_rot6d": "root_rot6d",
+  "root_linear_velocity": "root_linear_velocity",
+  "root_angular_velocity": "root_angular_velocity",
+  "body_positions": "body_position",
+  "body_linear_velocities": "body_velocity",
+}
 # Raw matched-array tolerance for the D3 initialization/bootstrap gate and the
 # handover state check.  This is the user-selected teacher-tracking error scale
 # (1e-3), not a universal length unit and not an unguided reference-tracking
@@ -673,29 +697,49 @@ def _metric(value: np.ndarray) -> dict[str, float]:
   }
 
 
+def _state_mapper(contract: DiffusionContract) -> Any:
+  """Return the world-to-state mapping for the active contract schema."""
+  try:
+    return _STATE_MAPPERS[contract.schema_version]
+  except KeyError as exc:
+    raise ClosedLoopEvaluationError(
+      "no world-to-state mapping for contract schema "
+      f"{contract.schema_version!r}; supported {list(SUPPORTED_SCHEMAS)}"
+    ) from exc
+
+
 def _prediction_metrics(
-  predicted_next_hybrid_state: np.ndarray | None,
+  predicted_next_state: np.ndarray | None,
   pre_state: WorldState,
   post_state: WorldState,
+  *,
+  contract: DiffusionContract,
 ) -> dict[str, Any] | None:
-  if predicted_next_hybrid_state is None:
+  """Metric payload for the sampler's one-step-ahead physical state forecast.
+
+  ``predicted_next_state`` is the active contract's physical state vector, not a
+  fixed 135-D hybrid vector.  The width, the world-to-state mapping and the block
+  layout all come from the input contract, so a reduced contract reports only the
+  blocks it actually carries.  The two JSON keys that name a hybrid state are
+  historical and are kept for report compatibility.
+  """
+  if predicted_next_state is None:
     return None
-  predicted = _finite_array(
-    "predicted next hybrid state", predicted_next_hybrid_state, (_STATE_WIDTH,)
+  width = int(contract.state_dimension)
+  predicted = _finite_array("predicted next state", predicted_next_state, (width,))
+  actual, _context = _state_mapper(contract)(
+    WorldState.stack([pre_state, post_state]), center_index=0
   )
-  actual, _ = world_to_hybrid(WorldState.stack([pre_state, post_state]), center_index=0)
   difference = predicted - actual[1]
   blocks = {
-    "root_position": difference[0:3],
-    "root_rot6d": difference[3:9],
-    "root_linear_velocity": difference[9:12],
-    "root_angular_velocity": difference[12:15],
-    "body_position": difference[15:75],
-    "body_velocity": difference[75:135],
+    _PREDICTION_BLOCK_LABELS[name]: difference[start:stop]
+    for name, (start, stop) in contract.state_slices.items()
   }
   return {
     "available": True,
     "center": "pre_action_state",
+    "state_schema": contract.schema_version,
+    "state_dimension": width,
     "actual_next_hybrid_state": actual[1].tolist(),
     "predicted_next_hybrid_state": predicted.tolist(),
     "blocks": {name: _metric(value) for name, value in blocks.items()},
@@ -1208,7 +1252,12 @@ def _score_diffusion(
       prediction = (
         None
         if post is None or step is None
-        else _prediction_metrics(step.predicted_next_hybrid_state, pre, post.state)
+        else _prediction_metrics(
+          step.predicted_next_hybrid_state,
+          pre,
+          post.state,
+          contract=continuation.contract,
+        )
       )
       _mark_prediction_source(prediction, task_record)
     except Exception as exc:

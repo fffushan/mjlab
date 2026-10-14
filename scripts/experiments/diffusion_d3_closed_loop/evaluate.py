@@ -38,6 +38,10 @@ from mjlab.tasks.tracking.diffusion.conditioned_continuation import (
   TaskConditioning,
   build_conditioned_continuation,
 )
+from mjlab.tasks.tracking.diffusion.contract import (
+  FROZEN_SCHEMA,
+  SUPPORTED_SCHEMAS,
+)
 from mjlab.tasks.tracking.diffusion.handover import ReferenceFreeContinuation
 from mjlab.tasks.tracking.diffusion.replay_integration import (
   LoadedDenoiser,
@@ -57,8 +61,25 @@ _MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 _BOOTSTRAP_PAIRS = 8
 _FROZEN_DDIM_STEPS = 20
 _FROZEN_START_LEVEL = 1000
-_FROZEN_CONTROL_PERIOD = 0.02
+_CONTROL_PERIOD = 0.02
 _DEFAULT_OUTPUT_ROOT = Path("logs/diagnostics/diffusion-d3-visual")
+
+# Representation-independent invariants: the runtime, VAE and asset geometry
+# that this harness can drive.  The physical state, projected-state and token
+# widths are deliberately absent from this mapping.  Those widths are the input
+# contract, and ``DiffusionContract`` already fails closed when they disagree
+# with its declared state layout or with each other.
+_REQUIRED_CONTRACT_VALUES: Mapping[str, int] = {
+  "control_hz": 50,
+  "body_count": 20,
+  "latent_dimension": 32,
+  "action_dimension": 31,
+  "past_steps": 8,
+  "current_index": 8,
+  "future_steps": 32,
+  "window_steps": 41,
+  "projection_rows": 0,
+}
 
 # The strict D4 task loader lives beside this CLI as an experiment tool.  It is
 # loaded by absolute path so the CLI keeps working both as a script and as an
@@ -506,34 +527,53 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
   return repo_root, device
 
 
-def _require_frozen_contract(contract: Any) -> None:
-  if contract.schema_version != "mjlab-x2-state-latent-d1-no-mixtures-v1":
+def _require_supported_contract(contract: Any) -> None:
+  """Fail closed unless the input contract is one this harness can drive.
+
+  The active contract is the input of this command: it selects the physical
+  state layout, and therefore the physical-state, projected-state and token
+  widths.  Nothing in this file pins a representation width.  This gate adds
+  only the two things a contract cannot express on its own:
+
+  * the schema must be one this build understands, so a schema that is unknown
+    to the diffusion contract module is refused instead of half-supported;
+  * the control rate and the runtime/VAE/asset geometry must match.
+
+  A reduced contract such as the local-kinematic ablation therefore passes this
+  gate.  ``_require_matched_acceptance_contract`` keeps the paired acceptance
+  claim on the frozen contract.
+  """
+  if contract.schema_version not in SUPPORTED_SCHEMAS:
     raise ClosedLoopCliError(
-      "D3 closed-loop requires the active no-mixture v1 contract; "
-      f"got {contract.schema_version!r}"
+      "D3 closed-loop requires a contract schema this build understands; "
+      f"supported {list(SUPPORTED_SCHEMAS)}, got {contract.schema_version!r}"
     )
-  expected = {
-    "control_hz": 50,
-    "state_dimension": 135,
-    "body_count": 20,
-    "latent_dimension": 32,
-    "action_dimension": 31,
-    "past_steps": 8,
-    "current_index": 8,
-    "future_steps": 32,
-    "window_steps": 41,
-    "projected_state_dimension": 135,
-    "token_dimension": 167,
-    "projection_rows": 0,
-  }
-  for name, value in expected.items():
+  for name, value in _REQUIRED_CONTRACT_VALUES.items():
     if getattr(contract, name) != value:
       raise ClosedLoopCliError(
-        f"frozen contract field {name} must be {value!r}, got {getattr(contract, name)!r}"
+        f"contract field {name} must be {value!r}, got {getattr(contract, name)!r}"
       )
-  if not np.isclose(contract.period_seconds, _FROZEN_CONTROL_PERIOD):
-    raise ClosedLoopCliError("frozen contract control period must be 0.02 seconds")
-  # Artifact digests are intentionally not part of D3 runtime validation.
+  if not np.isclose(contract.period_seconds, _CONTROL_PERIOD):
+    raise ClosedLoopCliError(
+      f"contract control period must be {_CONTROL_PERIOD} seconds"
+    )
+
+
+def _require_matched_acceptance_contract(contract: Any) -> None:
+  """Keep the paired VAE/diffusion acceptance claim on the frozen contract.
+
+  The matched 1e-3 acceptance tolerance is published against the frozen
+  representation.  A reduced contract is available to the single-branch visual
+  diagnostic, which reports ``matched_acceptance: false`` and makes no paired
+  claim, so it is refused here rather than silently reusing a tolerance that was
+  never validated for it.
+  """
+  if contract.schema_version != FROZEN_SCHEMA:
+    raise ClosedLoopCliError(
+      "matched VAE/diffusion acceptance requires the frozen contract "
+      f"{FROZEN_SCHEMA!r}; got {contract.schema_version!r}. "
+      "Use the single-branch visual diagnostic for another contract."
+    )
 
 
 def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
@@ -548,7 +588,7 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
     contract = load_active_contract(contract_path)
   except (ReplayError, OSError, ValueError) as exc:
     raise ClosedLoopCliError(str(exc)) from exc
-  _require_frozen_contract(contract)
+  _require_supported_contract(contract)
   try:
     manifest = load_manifest(manifest_path, repo_root=repo_root)
     cohort = resolve_cohort(manifest)
@@ -700,7 +740,17 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
       "path": str(args.contract.resolve()),
       "schema_version": prepared.contract.schema_version,
       "identity_hash": prepared.contract.identity_hash(),
+      "frozen_contract": prepared.contract.schema_version == FROZEN_SCHEMA,
+      "state_dimension": prepared.contract.state_dimension,
+      "projected_state_dimension": prepared.contract.projected_state_dimension,
+      "latent_dimension": prepared.contract.latent_dimension,
       "token_dimension": prepared.contract.token_dimension,
+      "body_count": prepared.contract.body_count,
+      "omitted_state_fields": [
+        name
+        for name in ("root_position", "root_rot6d", "root_linear_velocity")
+        if name not in prepared.contract.state_fields
+      ],
       "past_steps": prepared.contract.past_steps,
       "future_steps": prepared.contract.future_steps,
     },
@@ -840,7 +890,7 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
       "start_frame": args.start_frame,
       "clip_frames": prepared.clip_frames,
       "clip_fps": prepared.clip_fps,
-      "control_period_seconds": _FROZEN_CONTROL_PERIOD,
+      "control_period_seconds": _CONTROL_PERIOD,
     },
     "conditioning": {
       "source": "real mjlab runtime projected_gravity_b plus cached actor base_ang_vel/joint_pos/joint_vel/previous_applied_action",
@@ -951,6 +1001,7 @@ def _stdout_payload(report: EvaluationReport, output_dir: Path) -> dict[str, Any
 
 
 def _execute(prepared: PreparedEvaluation) -> EvaluationReport:
+  _require_matched_acceptance_contract(prepared.contract)
   args = prepared.args
   prepared.denoiser.model.to(device=prepared.device)
   prepared.denoiser.model.eval()
@@ -977,7 +1028,7 @@ def _execute(prepared: PreparedEvaluation) -> EvaluationReport:
       max_steps=args.continuation_steps,
       max_sim_time_s=None,
       bootstrap_pairs=_BOOTSTRAP_PAIRS,
-      period_seconds=_FROZEN_CONTROL_PERIOD,
+      period_seconds=_CONTROL_PERIOD,
       output_cap_bytes=args.max_output_bytes,
     ),
     device=prepared.device,

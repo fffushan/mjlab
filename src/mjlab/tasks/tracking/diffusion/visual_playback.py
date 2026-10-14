@@ -11,9 +11,10 @@ What it deliberately does NOT do:
 
 * it never instantiates a second branch or a paired comparison, so it cannot
   and does not claim the 1e-3 matched-acceptance gate;
-* it never relaxes, renormalizes or relabels the frozen contract (167 token
-  channels, 20 DDIM updates, start level 1000, ``eta=0``, zero guidance, FP32,
-  raw mean-latent decode);
+* it never relaxes, renormalizes or relabels the input contract.  The state,
+  projected-state and token widths come from that contract, while the sampler
+  settings (20 DDIM updates, start level 1000, ``eta=0``), zero guidance, FP32 and
+  the raw mean-latent decode stay pinned;
 * it never reads the motion reference after handover and never resamples the
   command during reference-free continuation.
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -12,15 +12,21 @@ import torch
 from tracking_diffusion_fixtures import make_state
 
 from mjlab.tasks.tracking.diffusion.closed_loop import (
+  _STATE_MAPPERS,
   MIN_OUTPUT_CAP_BYTES,
   ClosedLoopEvaluationError,
   EvaluationBudget,
   EvaluationReport,
+  _prediction_metrics,
   persist_evaluation_report,
   run_matched_pair,
 )
 from mjlab.tasks.tracking.diffusion.closed_loop_types import D3Observation, D3Transition
-from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
+from mjlab.tasks.tracking.diffusion.contract import (
+  DEFAULT_CONTRACT,
+  LOCAL_KINEMATIC_SCHEMA,
+  SUPPORTED_SCHEMAS,
+)
 from mjlab.tasks.tracking.diffusion.handover import (
   ContinuationStep,
   ReferenceFreeContinuation,
@@ -30,7 +36,11 @@ from mjlab.tasks.tracking.diffusion.projection import (
   fit_feature_stats,
 )
 from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule, InferenceGrid
-from mjlab.tasks.tracking.diffusion.state import WorldState, world_to_hybrid
+from mjlab.tasks.tracking.diffusion.state import (
+  WorldState,
+  world_to_hybrid,
+  world_to_local_kinematic,
+)
 
 
 @dataclass
@@ -141,6 +151,9 @@ class _FakeContinuation:
   def __init__(self) -> None:
     self.records: list[tuple[WorldState, np.ndarray]] = []
     self.step_calls = 0
+    # The closed-loop runner reads the state layout from the continuation, which
+    # in production is a ReferenceFreeContinuation carrying the input contract.
+    self.contract = DEFAULT_CONTRACT
 
   def record_executed(self, state: WorldState, latent: np.ndarray) -> None:
     self.records.append((state, np.array(latent, copy=True)))
@@ -626,3 +639,62 @@ def test_output_cap_below_public_minimum_is_rejected_before_runtime() -> None:
       budget=EvaluationBudget(output_cap_bytes=MIN_OUTPUT_CAP_BYTES - 1),
     )
   assert calls == 0
+
+
+def _local_kinematic_contract() -> object:
+  """A reduced contract whose widths follow from its schema, not from a pin."""
+  return replace(
+    DEFAULT_CONTRACT,
+    schema_version=LOCAL_KINEMATIC_SCHEMA,
+    state_dimension=129,
+    projected_state_dimension=129,
+    token_dimension=161,
+  )
+
+
+def test_every_supported_schema_has_a_world_to_state_mapper() -> None:
+  """Adding a schema to the contract module must not silently reuse a frame."""
+  assert set(_STATE_MAPPERS) == set(SUPPORTED_SCHEMAS)
+
+
+def test_prediction_metrics_follow_the_contract_layout() -> None:
+  pre = make_state(3)
+  post = make_state(4)
+  stacked = WorldState.stack([pre, post])
+  full, _ = world_to_hybrid(stacked, center_index=0)
+  reduced_vector, _ = world_to_local_kinematic(stacked, center_index=0)
+
+  full_metrics = _prediction_metrics(full[1], pre, post, contract=DEFAULT_CONTRACT)
+  reduced_metrics = _prediction_metrics(
+    reduced_vector[1], pre, post, contract=_local_kinematic_contract()
+  )
+
+  assert full_metrics is not None and reduced_metrics is not None
+  assert set(full_metrics["blocks"]) == {
+    "root_position",
+    "root_rot6d",
+    "root_linear_velocity",
+    "root_angular_velocity",
+    "body_position",
+    "body_velocity",
+  }
+  assert set(reduced_metrics["blocks"]) == {
+    "root_rot6d",
+    "root_angular_velocity",
+    "body_position",
+    "body_velocity",
+  }
+  assert reduced_metrics["state_dimension"] == 129
+  assert reduced_metrics["state_schema"] == LOCAL_KINEMATIC_SCHEMA
+  # An exact forecast of the contract state gives zero error in every block.
+  for payload in (full_metrics, reduced_metrics):
+    assert all(block["max_abs"] == 0.0 for block in payload["blocks"].values())
+    assert len(payload["predicted_next_hybrid_state"]) == payload["state_dimension"]
+
+
+def test_prediction_metrics_refuses_a_width_that_disagrees_with_the_contract() -> None:
+  pre = make_state(3)
+  post = make_state(4)
+  full, _ = world_to_hybrid(WorldState.stack([pre, post]), center_index=0)
+  with pytest.raises(ClosedLoopEvaluationError, match="predicted next state"):
+    _prediction_metrics(full[1], pre, post, contract=_local_kinematic_contract())

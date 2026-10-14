@@ -24,6 +24,13 @@ _LEGACY_SCHEMA = "mjlab-x2-state-latent-d0-v1"
 _LOCAL_KINEMATIC_SCHEMA = "mjlab-x2-state-latent-d1-no-mixtures-local-kinematic-v1"
 _SCHEMAS = frozenset({_SCHEMA, _LEGACY_SCHEMA, _LOCAL_KINEMATIC_SCHEMA})
 
+FROZEN_SCHEMA = _SCHEMA
+"""The frozen full no-mixture D1 schema (135-D state, 167-D token)."""
+LEGACY_SCHEMA = _LEGACY_SCHEMA
+"""The legacy D0 schema; it shares the frozen physical state layout."""
+LOCAL_KINEMATIC_SCHEMA = _LOCAL_KINEMATIC_SCHEMA
+"""The opt-in reduced local-kinematic D1 schema (129-D state, 161-D token)."""
+
 # The packed physical state is a contiguous concatenation of named slices.  The
 # local-kinematic ablation keeps only the rotation, the angular velocity and the
 # pelvis-relative body positions and velocities.  It omits ``root_position`` and
@@ -49,6 +56,14 @@ _STATE_FIELDS_BY_SCHEMA: dict[str, tuple[str, ...]] = {
   _LEGACY_SCHEMA: _FULL_STATE_FIELDS,
   _LOCAL_KINEMATIC_SCHEMA: _LOCAL_KINEMATIC_STATE_FIELDS,
 }
+
+SUPPORTED_SCHEMAS: tuple[str, ...] = tuple(_STATE_FIELDS_BY_SCHEMA)
+"""Every schema whose physical state layout this build understands.
+
+Consumers that read widths from a contract must fail closed on a schema outside
+this tuple, so that adding a schema here is the single deliberate act that
+widens what every consumer accepts.
+"""
 
 
 def _state_field_widths(body_count: int) -> dict[str, int]:
@@ -429,4 +444,13 @@ def _validate_declared_state_slices(
 
 DEFAULT_CONTRACT = DiffusionContract()
 
-__all__ = ["ArtifactIdentity", "ContractError", "DEFAULT_CONTRACT", "DiffusionContract"]
+__all__ = [
+  "ArtifactIdentity",
+  "ContractError",
+  "DEFAULT_CONTRACT",
+  "DiffusionContract",
+  "FROZEN_SCHEMA",
+  "LEGACY_SCHEMA",
+  "LOCAL_KINEMATIC_SCHEMA",
+  "SUPPORTED_SCHEMAS",
+]

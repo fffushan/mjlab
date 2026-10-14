@@ -8,11 +8,18 @@ from __future__ import annotations
 
 import sys
 from argparse import Namespace
+from dataclasses import replace
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from mjlab.tasks.tracking.diffusion.contract import (
+  DEFAULT_CONTRACT,
+  LOCAL_KINEMATIC_SCHEMA,
+  ContractError,
+)
 
 _CLI_PATH = (
   Path(__file__).parents[1] / "scripts/experiments/diffusion_d3_closed_loop/evaluate.py"
@@ -390,6 +397,7 @@ def test_execute_reuses_public_bounded_persistence_after_integrity_update(
   )
   prepared = SimpleNamespace(
     args=args,
+    contract=DEFAULT_CONTRACT,
     denoiser=SimpleNamespace(model=model),
     vae=SimpleNamespace(model=model),
     projection=SimpleNamespace(normalize_latent=lambda values: values),
@@ -441,3 +449,45 @@ def test_source_fingerprints_use_imported_files_not_artifact_root(
     for entry in provenance["modules"].values()
   )
   assert provenance["source_checkouts"]
+
+
+def _local_kinematic_contract() -> object:
+  """A reduced contract whose widths follow from its schema, not from a pin."""
+  return replace(
+    DEFAULT_CONTRACT,
+    schema_version=LOCAL_KINEMATIC_SCHEMA,
+    state_dimension=129,
+    projected_state_dimension=129,
+    token_dimension=161,
+  )
+
+
+def test_contract_gate_reads_widths_from_the_input_contract() -> None:
+  """The gate accepts every supported schema instead of one frozen identity."""
+  for contract in (DEFAULT_CONTRACT, _local_kinematic_contract()):
+    evaluate._require_supported_contract(contract)
+
+
+def test_contract_gate_refuses_a_schema_this_build_does_not_understand() -> None:
+  """A duck-typed contract cannot smuggle in a schema this build cannot map."""
+  stand_in = SimpleNamespace(schema_version="mjlab-x2-state-latent-d9-v1")
+  with pytest.raises(evaluate.ClosedLoopCliError, match="schema this build"):
+    evaluate._require_supported_contract(stand_in)
+
+
+def test_the_contract_module_itself_refuses_an_unknown_schema() -> None:
+  """Defense in depth: the real dataclass cannot carry an unmappable schema."""
+  with pytest.raises(ContractError, match="unsupported schema_version"):
+    replace(DEFAULT_CONTRACT, schema_version="mjlab-x2-state-latent-d9-v1")
+
+
+def test_contract_gate_keeps_the_runtime_geometry() -> None:
+  with pytest.raises(evaluate.ClosedLoopCliError, match="control_hz"):
+    evaluate._require_supported_contract(replace(DEFAULT_CONTRACT, control_hz=30))
+
+
+def test_matched_acceptance_still_requires_the_frozen_contract() -> None:
+  """The paired 1e-3 claim stays on the contract that published it."""
+  evaluate._require_matched_acceptance_contract(DEFAULT_CONTRACT)
+  with pytest.raises(evaluate.ClosedLoopCliError, match="frozen contract"):
+    evaluate._require_matched_acceptance_contract(_local_kinematic_contract())

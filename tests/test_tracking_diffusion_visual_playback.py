@@ -27,6 +27,7 @@ from mjlab.tasks.tracking.diffusion.closed_loop_types import (
   D3Observation,
   D3Transition,
 )
+from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
 from mjlab.tasks.tracking.diffusion.state import WorldState
 from mjlab.tasks.tracking.diffusion.visual_playback import (
   D3DiagnosticEnv,
@@ -662,10 +663,12 @@ def _fake_prepared(tmp_path: Path) -> SimpleNamespace:
     seed=0,
     vae_checkpoint=tmp_path / "vae.pt",
     vae_checkpoint_sha256="a" * 64,
+    contract=tmp_path / "contract.yaml",
     output_dir=tmp_path / "run",
   )
   return SimpleNamespace(
     args=args,
+    contract=DEFAULT_CONTRACT,
     clip_frames=100,
     clip_fps=50.0,
     manifest_sha256="b" * 64,

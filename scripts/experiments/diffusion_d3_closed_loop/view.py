@@ -115,6 +115,23 @@ def _validate_viewer_options(args: Any) -> None:
     raise evaluate.ClosedLoopCliError("frame-rate must be finite and positive")
 
 
+def _contract_report(prepared: Any) -> dict[str, Any]:
+  """State the active representation, which is read from the input contract."""
+  contract = prepared.contract
+  return {
+    "path": str(prepared.args.contract.resolve()),
+    "schema_version": contract.schema_version,
+    "identity_hash": contract.identity_hash(),
+    "frozen_contract": contract.schema_version == evaluate.FROZEN_SCHEMA,
+    "state_dimension": contract.state_dimension,
+    "projected_state_dimension": contract.projected_state_dimension,
+    "latent_dimension": contract.latent_dimension,
+    "token_dimension": contract.token_dimension,
+    "body_count": contract.body_count,
+    "state_fields": list(contract.state_fields),
+  }
+
+
 def _preflight_report(prepared: Any) -> dict[str, Any]:
   args = prepared.args
   report: dict[str, Any] = {
@@ -127,6 +144,7 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
       "not-run; pass --execute to construct one environment and open the viewer"
     ),
     "branch": args.branch,
+    "contract": _contract_report(prepared),
     "viewer": {
       "backend": "viser",
       "host": args.host,
@@ -188,6 +206,7 @@ def _write_status(prepared: Any, playback: Any, task_conditioning: Any = None) -
       "diagnostic_only": True,
       "matched_acceptance": False,
       "branch": args.branch,
+      "contract": _contract_report(prepared),
       "member": args.member,
       "seed": args.seed,
       "start_frame": args.start_frame,

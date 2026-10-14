@@ -625,7 +625,7 @@ def _patch_prepare(monkeypatch: pytest.MonkeyPatch) -> None:
   )
   teacher = SimpleNamespace(reference=SimpleNamespace(frames=100, fps=50.0), hashes={})
   monkeypatch.setattr(evaluate, "load_active_contract", lambda path: contract)
-  monkeypatch.setattr(evaluate, "_require_frozen_contract", lambda *a, **k: None)
+  monkeypatch.setattr(evaluate, "_require_supported_contract", lambda *a, **k: None)
   monkeypatch.setattr(
     evaluate, "load_manifest", lambda path, repo_root: SimpleNamespace(sha256="e" * 64)
   )
