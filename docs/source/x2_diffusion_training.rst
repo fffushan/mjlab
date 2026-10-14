@@ -595,6 +595,199 @@ matched baseline-versus-diffusion acceptance comparison. Use ``evaluate.py``
 when a bounded matched pair is required. Keep the GUI output, preflight output,
 and any stop reason with the checkpoint sidecar.
 
+Parallel headless D3 sweep
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``view.py`` runs one environment. Use ``evaluate_parallel.py`` to run the same
+``--branch diffusion`` arm headless on many environment rows at once and to
+count falls. The command reproduces the viewer arm: it resets every row to the
+sidecar member and start frame, drives exactly eight measured VAE bootstrap
+pairs per row, freezes the reference for the whole batch, and then runs the
+frozen 20-step DDIM continuation per tick with one batched sampler call.
+
+Run the sweep for every cohort member at 256 rows:
+
+.. code-block:: bash
+
+   export CHECKPOINT=logs/diffusion/d2-vgk8-history-dropout20-20261009/seed0/checkpoint-best.pt
+   uv run python scripts/experiments/diffusion_d3_closed_loop/evaluate_parallel.py \
+     --checkpoint "$CHECKPOINT" \
+     --members all \
+     --num-envs 256 \
+     --execute
+
+Without ``--execute`` the command prints a simulator-free preflight report.
+The default run length is the remaining clip: ``clip_frames - 2 - start_frame -
+8`` continuation ticks, so the episode covers the configured motion from the
+configured start frame to its end. ``--steps`` overrides that length.
+``--members`` accepts a comma list, ``all``, or ``configured`` (the sidecar
+member). ``--fall-degrees`` defaults to 70.0, the viewer value.
+
+Evidence is written per member under
+``logs/diagnostics/diffusion-d3-parallel/parallel-<stamp>/``. Each member file
+holds the row count, the step budget, the fall count and rate, the first-fall
+tick per fallen row, the stop-reason counts, the per-row maximum tilt, and the
+runtime provenance.
+
+Stop reasons per row
+^^^^^^^^^^^^^^^^^^^^
+
+A row stops on the first of these events, in the viewer's order:
+
+- ``physical_fall``: the root tilt exceeds ``--fall-degrees``;
+- ``reset`` or ``teleport``: the runtime observed a reset or a reference
+  discontinuity;
+- ``terminated`` or ``timeout``: the task termination or the time-out flag;
+- ``tick_discontinuity``, ``segment_change``, or ``period_discontinuity``: a
+  batch-wide continuity break;
+- ``reference_leakage``: a reference appeared after handover;
+- ``step_budget``: the row completed its own step budget.
+
+A row that stops keeps simulating, because the private environment sets
+``auto_reset = False``. The driver sends a zero action to a stopped row and
+counts only its first fall.
+
+Fidelity check against the single-row path
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``--parity`` runs the real single-row runtime and ``VisualDiagnosticPlayback``
+for the same member, start frame, and seed, and it also runs a small batched
+batch that records row zero. It reports the maximum applied-action difference
+per tick, the tick-zero conditioning and reference differences, and the stop
+reason of both paths.
+
+The parity batch is small on purpose. ``--parity-rows`` defaults to 8 and is
+limited to 12. The task draws a per-row reset perturbation (RSI root pose,
+velocity, and joint positions) and stratifies that draw once the batch is
+large: measurements here show row zero of a 1-row, 2-row, 4-row, 6-row, 8-row,
+or 12-row environment receives one realization, while row zero of a 16-row,
+64-row, or 256-row environment receives a different one. Above the boundary a
+row-zero comparison would compare two different realizations, not two code
+paths, so the command refuses that request.
+
+Two properties make the comparison meaningful below the boundary. First,
+``sample_trajectory`` draws its noise in one ``torch.randn`` call of the whole
+batch shape, so row zero of a wider batch consumes the first slice of the
+stream. Second, on CUDA that slice equals a one-row draw at the same seed; on
+CPU it does not, because the CPU normal generator does not preserve the prefix.
+Run the parity check on the default device.
+
+The raw world-position signature is not the test. It includes each row's
+environment origin, which differs by a constant in a wider batch. The
+origin-independent conditioning (99 channels) and reference (68 channels)
+vectors are the test, and the record states whether they matched at tick zero.
+
+What a row is, and what it is not
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Every row shares one member and one start frame. The rows differ through the
+task's own per-row reset perturbation, through its per-row push events, and
+through their own sampler noise. The command adds no initial-state perturbation
+of its own. Do not present the row count as a number of independent initial
+conditions, and do not present the result as a stability, deployment, or
+hardware claim.
+
+Comparing several checkpoints
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``run_model_ladder.sh`` to run the same sweep for many checkpoints and
+``summarize_models.py`` to print one comparison table. One wave is one
+checkpoint. Inside a wave every motion gets its own process on its own GPU, so
+a wave on the eight-card server takes about the time of one motion, 90 to
+115 seconds. With a single GPU the script runs the motions in sequence.
+
+.. code-block:: bash
+
+   bash scripts/experiments/diffusion_d3_closed_loop/run_model_ladder.sh \
+     --python /home/fushan/mjlab/.venv/bin/python \
+     --gpus 0,1,2,3,4,5,6,7 \
+     --output-root logs/diagnostics/diffusion-d3-models \
+     vgk8-baseline-best:logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt \
+     vgk8-baseline-last:logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-last.pt
+
+Relevant options are ``--motions`` (default ``vgk000`` to ``vgk007``),
+``--num-envs`` (default 256), ``--steps`` to override the tick budget,
+``--extra`` for extra driver arguments, and ``--dry-run``. The script exits
+non-zero if any motion fails and prints the one-line member summary of every
+motion.
+
+Then print the table:
+
+.. code-block:: bash
+
+   .venv/bin/python scripts/experiments/diffusion_d3_closed_loop/summarize_models.py \
+     --extra-label vgk8-dropout20-best=logs/diagnostics/diffusion-d3-parallel-server
+
+The tool reads every label directory under the evidence root and reports the
+fall count per motion, the total, the rate, and the per-motion tick budget. It
+marks an incomplete wave, so a partial sweep cannot pass for a finished one. Use
+``--extra-label name=path`` for evidence outside the root.
+
+Checkpoint sidecars
+^^^^^^^^^^^^^^^^^^^
+
+The evaluator requires a sidecar YAML beside every checkpoint. Some older runs
+never wrote one. Backfill it from the run's own artifacts, and copy the minimal
+schema:
+
+.. code-block:: yaml
+
+   schema: mjlab-d3-diffusion-checkpoint-v1
+   repo_root: ../../../..
+   contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_vgk8_contract.yaml
+   projection: logs/diffusion/d1-vgk8-double-20261009/offline/projection.npz
+   vae_checkpoint: logs/distillation/vae-cov-10k-20261008T154401Z/vae-vgk8-cov-on/output/checkpoint-final.pt
+   manifest: configs/distillation/x2_tennis_vendor_gains_dr_waist_kd4_v1.yaml
+   member: vgk000
+   seed: 0
+   start_frame: 45
+
+``repo_root`` is relative to the sidecar's own directory. Do not invent
+``global_step``: write it only where the run states it. Mark the file as
+backfilled in a comment, and require the preflight to pass for every checkpoint
+before you spend GPU time. The preflight cross-checks the contract identity, the
+projection statistics, and the VAE checkpoint, so a wrong path fails loudly.
+
+Reduced contracts on the server
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The shared server checkout's D3 gate predates the contract-driven change: it
+calls ``_require_frozen_contract`` and refuses the 129-D local-kinematic
+contract. Do not overwrite the shared tree. Use the ``lk129`` worktree instead,
+where the 129-D library support exists, copy in the gate commit's files, and put
+that worktree on ``PYTHONPATH`` while the artifacts stay in the shared checkout:
+
+.. code-block:: bash
+
+   export PYTHONPATH=/home/fushan/mjlab-lk129/src
+   cd /home/fushan/mjlab
+   bash /home/fushan/mjlab-lk129/scripts/experiments/diffusion_d3_closed_loop/run_model_ladder.sh \
+     --python /home/fushan/mjlab/.venv/bin/python \
+     --output-root logs/diagnostics/diffusion-d3-models \
+     vgk8-localkin129-best:logs/diffusion/d2-vgk8-localkin-1000ep-seed0-20261013T183840Z/checkpoint-best.pt
+
+Running the driver from the worktree also selects that worktree's
+``evaluate.py``, because the driver imports it as a sibling.
+
+Reading the result
+^^^^^^^^^^^^^^^^^^
+
+Report the tick budget beside every rate. The budget differs by motion, from 257
+to 398 continuation ticks, so a longer motion gives a policy more time to fall.
+Read the per-motion cells, not only the totals.
+
+A checkpoint comparison is descriptive unless the arms match. The measured
+families differ in training data, in contract width, and in update budget, so a
+rate difference between families does not attribute cause. State the arms in the
+same table as the numbers.
+
+A measured result on this tool (2026-10-14): every ``checkpoint-last.pt`` fell
+far more often than its ``checkpoint-best.pt``, by a factor of 1.7 to 5.0, while
+the validation loss moved only 1.37x to 1.42x. The two 36-teacher ``last``
+checkpoints fell on 98.7 % and 99.5 % of 2048 rows each. Select the best
+checkpoint for any downstream use, and treat the end of training as unusable for
+these recipes.
+
 D5 ONNX export and the controller lane
 --------------------------------------
 
