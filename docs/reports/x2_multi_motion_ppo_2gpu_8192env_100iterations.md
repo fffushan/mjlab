@@ -148,11 +148,12 @@ Final checkpoint SHA-256: `785a7ed9bbb286b86a2d00ab0cbcacbc4d09b6e7fd4f18290727f
 
 ## 6. Next action and open items
 
-Two decisions need operator authority:
+Commit `5adc954ae` records this work on branch `fxy/test/flow-matching-baseline`.
+The NAS checkout `/home/fushan/mjlab` now carries that commit, and its working tree is clean.
+Every deployed file matched the commit byte for byte, so `source-backup/` is a rollback path only.
+The container `10.14.64.37:31505` and the NAS checkout share one directory and now show the same commit.
 
-1. The remote checkout now holds the multi-motion source as uncommitted files.
-   Confirm whether to keep the deployment or restore `source-backup/`.
-2. Do not extend this test or start a larger run without an approved budget.
+One decision needs operator authority: do not extend this test or start a larger run without an approved budget.
 
 Useful next measurements, in order of value:
 
