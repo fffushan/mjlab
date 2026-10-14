@@ -37,6 +37,7 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `beyondmimic_diffusion_d1_defaults.md` | validation | Enabled D1 defaults and local commit gates | 227 CPU passes; cache worker1 |
 | `MERGE-MANIFEST.md` | provenance | lane provenance for the coverage integration tree | historical |
 | `mvp-source-report.md` | note | fixed-state coverage evaluator scope | historical |
+| `x2_multi_motion_ppo_8gpu_nccl_hang_diagnosis.md` | diagnosis | 8-rank multi-motion PPO NCCL hang | not reproduced; cause unknown; one 900-iteration run clean |
 
 Two Simplified Chinese documents moved out of this directory to the shared research landing
 page: `research/mjlab/vae-current-issues.zh-CN.md` and
