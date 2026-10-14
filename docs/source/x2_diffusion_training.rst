@@ -792,6 +792,50 @@ the configuration:
          name: cuda
          device_id: 0
 
+Reference motions for the guided (``a+8``) arm
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A bundle can declare reference motions. The guided arm then constrains the
+future state rows ``f+16`` and ``f+30`` from the selected reference during
+denoising. Attach one table per cohort member and repeat the flag for each:
+
+.. code-block:: bash
+
+   python3 "$X2/tools/diffusion_d5/build_bundle.py" ... \
+     --guidance-reference vgk000="$ACCEPTED/references/vgk000.json" \
+     --guidance-reference vgk001="$ACCEPTED/references/vgk001.json"
+
+The tool validates the cohort-member binding, copies each table to
+``references/<ID>.json``, and writes the descriptor entry. A bundle without the
+list keeps the unguided ``a+7`` path only.
+
+A table is a world-state clip, not a state-layout artifact, so one table serves
+both a full and a reduced contract. Export one from the original tracking NPZ:
+
+.. code-block:: bash
+
+   python3 "$X2/tools/diffusion_d5/export_guidance_reference.py" \
+     --motion "$ORIGINAL_TRACKING_NPZ" \
+     --member-contract "$STORE/$COHORT/<member>/contract.json" \
+     --out "$BUILD/references/<id>.json"
+
+A table must hold at least 17 frames at 50 Hz, the frozen body order, finite
+values, and non-degenerate root quaternions. A non-bootstrap member must embed
+its exact ``member_contract_json``. The bootstrap member needs no extra field,
+and any embedded contract for it must be byte-identical to the loaded member
+contract. Do not resample a clip.
+
+For a reduced contract the model reads the 129 channels that it owns in those
+fixed rows, so the reference pose, root orientation, and body velocities do
+reach the model. The reference root translation does not, because the model has
+no channel for it.
+
+Verify the declarations before you rely on them. The C++ closure suite must
+accept the real bundle, the guidance unit suite must pass, and a one-byte change
+to a ``references/<id>.json`` file must be refused with
+``guidance_references[i] declared sha256 does not match``. Restore the file and
+re-run afterwards.
+
 Limits of the lane adapter
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -801,8 +845,14 @@ Limits of the lane adapter
   reconstruct the dropped channels, so a reduced model is not equivalent to a
   135-D model.
 * Generated future ``root_position`` and ``root_linear_velocity`` channels are
-  meaningless. Declare no guidance reference for such a bundle, and never use
-  those channels in a pose cost.
+  meaningless. A guided reference constrains future state rows, but for a
+  reduced contract the model reads only its own channels of those rows, so the
+  reference root translation never reaches the model. Never use the dropped
+  channels in a pose cost, and treat guided tracking quality as unmeasured.
+* Neither the full nor the reduced model is trained with keyframe inpainting.
+  The trainer never fixes a future state row, so a guided engagement is an
+  out-of-distribution overlay whose quality is unmeasured. This limit is the
+  same for the accepted full-contract bundles.
 * The CUDA execution provider enables TF32, so its arithmetic differs from the
   CPU parity numbers.
 * A passing export and a passing preflight are software results. They do not
