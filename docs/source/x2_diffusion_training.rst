@@ -2,9 +2,10 @@ X2 VGK8 Diffusion Training Pipeline
 ====================================
 
 This page is the runbook for the VGK8 state--latent diffusion pipeline. It
-covers data collection, dataset preparation, D2 training, and offline
-checkpoint evaluation. It does not authorize a run. Every command below starts
-work only when an operator executes it.
+covers data collection, dataset preparation, D2 training, offline checkpoint
+evaluation, and the D5 ONNX export for the controller lane. It does not
+authorize a run. Every command below starts work only when an operator executes
+it.
 
 The pipeline uses the frozen X2 VAE and the no-mixture VGK8 contract. It does
 not change the VAE objective, teacher routing, action contract, control timing,
@@ -40,10 +41,14 @@ before the D1 gates pass.
                  |
                  v
    optional D3 closed-loop simulation
+                 |
+                 v
+   D5 ONNX export for the controller lane
 
 D3 closed-loop simulation is a separate gate. D2 offline evaluation does not
 prove closed-loop stability, real-time performance, hardware quality, or
-deployment readiness.
+deployment readiness. The D5 export is a separate artifact step. It does not
+authorize a controller run, a simulator engagement, or hardware use.
 
 Frozen VGK8 identity
 --------------------
@@ -589,6 +594,222 @@ A GUI run is one branch and one selected cohort member. It does not perform the
 matched baseline-versus-diffusion acceptance comparison. Use ``evaluate.py``
 when a bounded matched pair is required. Keep the GUI output, preflight output,
 and any stop reason with the checkpoint sidecar.
+
+D5 ONNX export and the controller lane
+--------------------------------------
+
+The D5 lane is the deployment engine. The controller loads ONNX graphs, not a
+PyTorch checkpoint. Export one trained checkpoint with the parity gate, then
+assemble the bundle that the controller loader accepts.
+
+The gate reads the physical-state and token widths from the active contract. The
+window geometry, the latent width, the conditioning width, the action width, and
+the 20 DDIM updates stay frozen.
+
+.. code-block:: bash
+
+   export CUDA_VISIBLE_DEVICES=''
+   export UV_PROJECT_ENVIRONMENT="$ROOT/.venv"
+   export PYTHONPATH="$ROOT/src:$ROOT/tests"
+
+   export CHECKPOINT=$RUN/checkpoint-best.pt
+   export NORMALIZATION=logs/diffusion/d1-vgk8-localkin-double-20261013T183840Z/offline/projection.npz
+   export OUT=logs/diagnostics/diffusion-d5-lane-$(date +%Y%m%dT%H%M%S)
+
+   uv run --no-sync python "$ROOT/scripts/experiments/diffusion_d5_parity/validate.py" \
+     --output-dir "$OUT" \
+     --contract docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_vgk8_contract.yaml \
+     --diffusion-checkpoint "$CHECKPOINT" \
+     --normalization-bundle "$NORMALIZATION" \
+     --vae-checkpoint logs/distillation/vae-cov-10k-20261008T154401Z/vae-vgk8-cov-on/output/checkpoint-final.pt \
+     --vae-manifest configs/distillation/x2_tennis_vendor_gains_dr_waist_kd4_v1.yaml \
+     --vae-member vgk001
+
+The gate writes three graphs and one report:
+
+.. list-table:: Gate outputs
+   :header-rows: 1
+
+   * - File
+     - Contents
+   * - ``denoiser.onnx``
+     - the lane graph; this file goes into the bundle
+   * - ``denoiser_native.onnx``
+     - the model at its own width; evidence only
+   * - ``vae_decoder.onnx``
+     - the decoder of the selected VAE member
+   * - ``REPORT.json``
+     - every check, every width, and every hash
+
+Require ``status = pass``, no tolerance warning, and ``lane_adapter.probe``
+equal to zero on both channel sets. Run the gate twice. A repeat run must
+reproduce all three graph files byte for byte.
+
+The controller lane fixes its widths at compile time
+----------------------------------------------------
+
+The X2 controller lane compiles one token layout (``diffusion_types.h``:
+``kStateDim = 135``, ``kLatentDim = 32``, ``kTokenDim = 167``). The loader
+refuses a descriptor that declares any other width, including a narrower
+statistics array. A model trained on a reduced state representation therefore
+cannot load directly.
+
+Every reduced representation in this package is a channel selection of the
+135-channel hybrid state. ``hybrid_to_local_kinematic`` keeps every retained
+channel unchanged and removes only ``root_position`` and
+``root_linear_velocity``. The 129-D ablation is 129 state channels plus the
+32-channel latent, so 161 token channels.
+
+Six filler channels take 129 to 135
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. list-table:: 129-D channel map into the 135-D lane state
+   :header-rows: 1
+
+   * - Model channel
+     - Lane channel
+     - Field
+   * - 0:6
+     - 3:9
+     - ``root_rot6d``
+   * - 6:9
+     - 12:15
+     - ``root_angular_velocity``
+   * - 9:69
+     - 15:75
+     - ``body_positions``
+   * - 69:129
+     - 75:135
+     - ``body_linear_velocities``
+   * - 129:161
+     - 135:167
+     - the 32-channel latent
+
+The lane state has six channels that the model does not own: lane channels 0, 1,
+2 (``root_position``) and 9, 10, 11 (``root_linear_velocity``). Fill them with
+dummy channels to reach the lane width of 135:
+
+* In the graph, the six channels pass through unchanged and the model never
+  reads them.
+* In the statistics artifact, they carry mean ``0.0`` and standard deviation
+  ``1.0``.
+
+The boundary is exact for every channel the model reads, because the graph
+gathers those channels and writes the model result back. It adds no arithmetic
+to them. Nothing is fabricated: do not reconstruct root translation, do not pad
+a reduced state back to 135, and do not upsample any signal.
+
+Statistics artifact for a reduced layout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``emit_stats.py`` places the reduced statistics at their lane positions and
+fills the rest. Pass the layout explicitly, or read it from the gate report so
+that no value is transcribed by hand:
+
+.. code-block:: bash
+
+   python3 "$X2/tools/diffusion_d5/emit_stats.py" \
+     --projection "$NORMALIZATION" \
+     --out "$BUILD/stats" \
+     --source-report "$OUT/REPORT.json"
+
+The tool refuses a layout that does not tile the source width, and it refuses a
+group that the lane does not have. Its report lists the source layout, the
+dropped lane groups, and the filled channels.
+
+Assemble and install the bundle
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reuse every asset that does not depend on the model from an accepted bundle of
+the same VAE cohort, and prove the reuse. Export the bootstrap encoder from the
+same VAE first:
+
+.. code-block:: bash
+
+   uv run --no-sync python "$X2/tools/diffusion_d5/export_bootstrap_encoder.py" \
+     --repo-root "$ROOT" \
+     --contract docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_vgk8_contract.yaml \
+     --vae-checkpoint="$VAE" --vae-manifest="$MANIFEST" --vae-member vgk001 \
+     --model-id "$VAE_MODEL_ID" --contract-id "$MEMBER_CONTRACT_ID" \
+     --out "$BUILD/encoder"
+
+A re-exported encoder must be byte-identical to the accepted encoder. A decoder
+may differ in metadata only, because the export records the checkpoint identity
+of its own arm. Compare decoder graphs with the metadata block removed.
+
+.. code-block:: bash
+
+   python3 "$X2/tools/diffusion_d5/build_bundle.py" --out "$BUILD/bundle" \
+     --denoiser-onnx "$OUT/denoiser.onnx" \
+     --encoder-onnx "$BUILD/encoder/encoder.onnx" \
+     --decoder-onnx "$OUT/vae_decoder.onnx" \
+     --stats-json "$BUILD/stats/stats.json" \
+     --motion-json "$STORE/$COHORT/vgk001/motion.json" \
+     --vae-contract-json "$STORE/$COHORT/vgk001/contract.json" \
+     --vae-descriptor-json "$STORE/$ACCEPTED_BUNDLE/vae_descriptor.json" \
+     --contract-identity "$MEMBER_CONTRACT_ID" \
+     --vae-identity "$VAE_MODEL_ID" \
+     --projection-identity "$STATISTICS_IDENTITY" \
+     --model-identity "$CHECKPOINT_SHA256" \
+     --source-revision-x2 "$X2_REVISION" \
+     --source-revision-mjlab "$MJLAB_REVISION" \
+     --bootstrap-member vgk001 \
+     --frozen-root "$X2" --frozen-root "$ROOT"
+
+Use the checkpoint file digest as ``--model-identity``, the source statistics
+identity as ``--projection-identity``, the VAE member ``contract_id`` as
+``--contract-identity``, and the VAE descriptor ``model_id`` as
+``--vae-identity``. Put the output directory outside both repositories.
+
+Install the bundle and check it with the read-only controller modes:
+
+.. code-block:: bash
+
+   cd "$X2"
+   ./install_d5_bundle.sh "$BUILD/bundle" --name POLICY_NAME
+   docker exec x2-humble bash -lc 'cd /work/x2_docker \
+     && ./start_controller.sh --config x2_sim_diffusion_gpu.yaml --list-policies'
+   docker exec x2-humble bash -lc 'cd /work/x2_docker \
+     && ./start_controller.sh --config x2_sim_diffusion_gpu.yaml \
+        --tracking-policy POLICY_NAME --check-config'
+
+Add one flipped-byte negative control before you trust the preflight. The check
+output does not name the diffusion policy, so a rejection is the proof that the
+check reads the bundle. Restore the file and re-run the check afterwards. The
+C++ loader can also be exercised on the host, without ROS and without ONNX
+Runtime, by building ``x2_diffusion_bundle_tests`` from its CMake source list
+and passing the bundle directory as the optional third argument.
+
+GPU inference is a configuration choice, not a property of the artifact. The
+bundle must declare ``backend.name: cpu_ort``. The lane selects the provider in
+the configuration:
+
+.. code-block:: yaml
+
+   sim:
+     diffusion:
+       execution_provider:
+         name: cuda
+         device_id: 0
+
+Limits of the lane adapter
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* The bundle declares 135 state channels while the model reads 129. The six
+  filler channels are unread in unguided continuation.
+* The adapter is exact only for the channels that the model owns. It does not
+  reconstruct the dropped channels, so a reduced model is not equivalent to a
+  135-D model.
+* Generated future ``root_position`` and ``root_linear_velocity`` channels are
+  meaningless. Declare no guidance reference for such a bundle, and never use
+  those channels in a pose cost.
+* The CUDA execution provider enables TF32, so its arithmetic differs from the
+  CPU parity numbers.
+* A passing export and a passing preflight are software results. They do not
+  measure closed-loop stability, real-time performance, or hardware quality.
+
+A worked example, with hashes and a container preflight, is
+``x2_docker/orchestration/LK129-D5-BUNDLE-20261014.md``.
 
 Throughput benchmark matrix
 ---------------------------

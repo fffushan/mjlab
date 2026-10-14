@@ -1,10 +1,19 @@
 """Run the active D5 numerical and export parity gate.
 
 This command is a bounded, offline qualification check for one frozen artifact
-set.  It loads the active 167-channel denoiser, statistics-only normalizer and
-68/99/32/31 VAE member, exports the denoiser and decoder to ONNX, reloads both
-artifacts with ONNX Runtime, and compares fixed CPU probes against the native
-PyTorch path.
+set.  It loads the active denoiser, statistics-only normalizer and 68/99/32/31
+VAE member, exports the denoiser and decoder to ONNX, reloads both artifacts
+with ONNX Runtime, and compares fixed CPU probes against the native PyTorch
+path.  The physical-state and token widths are read from the active contract;
+the window geometry, latent width, conditioning width, action width and DDIM
+update count stay frozen.
+
+The controller lane is compiled for one token layout (135 hybrid state plus the
+32 latent, so 167 channels).  When the active contract declares a reduced state
+representation, this gate additionally exports a lane-token adapter graph, so
+the D5 loader -- which validates the declared widths and the graph input shape
+-- can load the reduced model unchanged.  The adapter only moves channels across
+the lane boundary: see :mod:`mjlab.tasks.tracking.diffusion.lane_adapter`.
 
 The command does not launch a simulator, controller, robot or hardware trial.
 It does not measure control latency or model quality.
@@ -28,6 +37,12 @@ import onnxruntime as ort
 import torch
 from torch import Tensor, nn
 
+from mjlab.tasks.tracking.diffusion.lane_adapter import (
+  LaneAdapterError,
+  LaneTokenAdapter,
+  describe_lane_adapter,
+  lane_gather_index,
+)
 from mjlab.tasks.tracking.diffusion.model import StateLatentTransformer
 from mjlab.tasks.tracking.diffusion.noising import apply_clean_mask, clean_mask
 from mjlab.tasks.tracking.diffusion.projection import StateLatentNormalizer
@@ -47,10 +62,11 @@ from mjlab.tasks.tracking.diffusion.sampler import (
 )
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE, StudentNormalizer
 
+# Frozen by this gate: the window geometry, the latent width and the decoder/action
+# widths.  The state and token widths are read from the active contract instead, so a
+# reduced state representation is exportable without changing these values.
 _EXPECTED = {
-  "state_dimension": 135,
   "latent_dimension": 32,
-  "token_dimension": 167,
   "conditioning_dimension": 99,
   "action_dimension": 31,
   "sequence_length": 41,
@@ -193,34 +209,54 @@ def _legacy_contract_identity(contract: Any) -> str:
   return hashlib.sha256(encoded).hexdigest()
 
 
-def _assert_dimensions(contract: Any, normalizer: StateLatentNormalizer) -> None:
+def _assert_dimensions(
+  contract: Any, normalizer: StateLatentNormalizer
+) -> dict[str, int]:
+  """Check the frozen invariants and return the contract's own widths."""
+  state_dimension = int(contract.state_dimension)
+  latent_dimension = int(contract.latent_dimension)
+  token_dimension = int(contract.token_dimension)
   observed = {
-    "state_dimension": int(contract.state_dimension),
-    "latent_dimension": int(contract.latent_dimension),
-    "token_dimension": int(contract.token_dimension),
+    "state_dimension": state_dimension,
+    "latent_dimension": latent_dimension,
+    "token_dimension": token_dimension,
     "conditioning_dimension": 99,
     "action_dimension": int(contract.action_dimension),
     "sequence_length": int(contract.window_steps),
     "ddim_updates": 20,
   }
-  if observed != _EXPECTED:
+  frozen = {name: observed[name] for name in _EXPECTED}
+  if frozen != _EXPECTED:
     raise ParityError(f"active contract dimensions differ: {observed}")
-  if contract.projected_state_dimension != 135 or contract.projection_rows != 0:
+  if token_dimension != state_dimension + latent_dimension:
     raise ParityError(
-      "active contract is not statistics-only 135-state normalization: "
+      f"active contract token width {token_dimension} is not the state plus latent "
+      f"width {state_dimension + latent_dimension}"
+    )
+  if (
+    contract.projected_state_dimension != state_dimension
+    or contract.projection_rows != 0
+  ):
+    raise ParityError(
+      f"active contract is not statistics-only {state_dimension}-state normalization: "
       f"projected_state_dimension={contract.projected_state_dimension}, "
       f"projection_rows={contract.projection_rows}"
     )
   if normalizer.contract.identity_hash() != contract.identity_hash():
     raise ParityError("normalizer contract identity differs from active contract")
-  if normalizer.state_stats.mean.shape != (135,):
-    raise ParityError("normalizer state statistics do not have shape (135,)")
-  if normalizer.latent_stats.mean.shape != (32,):
-    raise ParityError("normalizer latent statistics do not have shape (32,)")
+  if normalizer.state_stats.mean.shape != (state_dimension,):
+    raise ParityError(
+      f"normalizer state statistics do not have shape ({state_dimension},)"
+    )
+  if normalizer.latent_stats.mean.shape != (latent_dimension,):
+    raise ParityError(
+      f"normalizer latent statistics do not have shape ({latent_dimension},)"
+    )
+  return observed
 
 
 def _check_statistics_only(
-  path: Path, normalizer: StateLatentNormalizer
+  path: Path, normalizer: StateLatentNormalizer, *, state_dimension: int
 ) -> dict[str, Any]:
   """Check persisted keys and a float64 normalize/denormalize round trip."""
   required = {"state_mean", "state_std", "latent_mean", "latent_std", "metadata"}
@@ -253,7 +289,7 @@ def _check_statistics_only(
       raise ParityError(
         f"could not inspect legacy compatibility matrices in {path}: {exc}"
       ) from exc
-    identity = np.eye(135, dtype=np.float64)
+    identity = np.eye(state_dimension, dtype=np.float64)
     if not np.array_equal(matrix, identity) or not np.array_equal(
       pseudoinverse, identity
     ):
@@ -268,9 +304,9 @@ def _check_statistics_only(
   if metadata_contract.get("projection_rows") != 0:
     raise ParityError("normalizer metadata declares non-zero projection rows")
 
-  state_normalized = np.linspace(-1.25, 1.25, num=41 * 135, dtype=np.float64).reshape(
-    41, 135
-  )
+  state_normalized = np.linspace(
+    -1.25, 1.25, num=41 * state_dimension, dtype=np.float64
+  ).reshape(41, state_dimension)
   latent_normalized = np.linspace(-0.75, 0.75, num=41 * 32, dtype=np.float64).reshape(
     41, 32
   )
@@ -298,6 +334,8 @@ def _build_probe(
   normalizer: StateLatentNormalizer,
   *,
   batch_size: int,
+  state_dimension: int,
+  token_dimension: int,
 ) -> tuple[Tensor, Tensor, dict[str, float]]:
   """Create finite normalized tokens from raw values without fitting statistics."""
   if batch_size <= 0:
@@ -305,9 +343,9 @@ def _build_probe(
   state_normalized = np.linspace(
     -1.25,
     1.25,
-    num=batch_size * 41 * 135,
+    num=batch_size * 41 * state_dimension,
     dtype=np.float64,
-  ).reshape(batch_size, 41, 135)
+  ).reshape(batch_size, 41, state_dimension)
   latent_normalized = np.linspace(
     -0.75,
     0.75,
@@ -326,8 +364,8 @@ def _build_probe(
   clean_tokens = torch.from_numpy(np.asarray(tokens, dtype=np.float32))
   mask_one = clean_mask(
     current_index=8,
-    state_dimension=135,
-    token_dimension=167,
+    state_dimension=state_dimension,
+    token_dimension=token_dimension,
     device="cpu",
   )
   mask = mask_one.unsqueeze(0).expand(batch_size, -1, -1).clone()
@@ -336,9 +374,9 @@ def _build_probe(
   return clean_tokens, mask, {"statistics_token_transform_max_abs": transform_error}
 
 
-def _step_ids(mask: Tensor, source: int) -> Tensor:
-  fixed_state = mask[..., :135].all(dim=-1)
-  fixed_latent = mask[..., 135:].all(dim=-1)
+def _step_ids(mask: Tensor, source: int, *, state_dimension: int) -> Tensor:
+  fixed_state = mask[..., :state_dimension].all(dim=-1)
+  fixed_latent = mask[..., state_dimension:].all(dim=-1)
   result = torch.full((*mask.shape[:2], 2), source, dtype=torch.long)
   result[..., 0] = torch.where(
     fixed_state, torch.zeros_like(result[..., 0]), result[..., 0]
@@ -356,6 +394,7 @@ def _reference_ddim(
   clean_mask: Tensor,
   loaded: LoadedDenoiser,
   seed: int,
+  state_dimension: int,
 ) -> tuple[Tensor, tuple[int, ...], tuple[Tensor, ...]]:
   """Run an independent explicit 20-jump DDIM loop for cross-checking."""
   generator = torch.Generator(device="cpu").manual_seed(seed)
@@ -372,7 +411,7 @@ def _reference_ddim(
   for source, destination in zip(
     loaded.grid.source_ids, loaded.grid.destination_ids, strict=True
   ):
-    step_ids = _step_ids(clean_mask, source)
+    step_ids = _step_ids(clean_mask, source, state_dimension=state_dimension)
     x0_hat = denoiser(sample, step_ids)
     if x0_hat.shape != sample.shape or not torch.isfinite(x0_hat).all().item():
       raise ParityError(
@@ -573,16 +612,18 @@ def _require_graph_shape(
       )
 
 
-def _onnx_denoiser(path: Path) -> tuple[DenoiserCallable, dict[str, Any]]:
+def _onnx_denoiser(
+  path: Path, *, token_dimension: int
+) -> tuple[DenoiserCallable, dict[str, Any]]:
   session = _session(path)
   _require_graph_shape(
     session,
     inputs={
-      "noisy_tokens": (-1, 41, 167),
+      "noisy_tokens": (-1, 41, token_dimension),
       "step_ids": (-1, 41, 2),
     },
     output_name="x0_hat",
-    output_shape=(-1, 41, 167),
+    output_shape=(-1, 41, token_dimension),
   )
 
   def run(noisy_tokens: Tensor, step_ids: Tensor) -> Tensor:
@@ -599,11 +640,77 @@ def _onnx_denoiser(path: Path) -> tuple[DenoiserCallable, dict[str, Any]]:
     "inputs": {
       name: list(value)
       for name, value in {
-        "noisy_tokens": (-1, 41, 167),
+        "noisy_tokens": (-1, 41, token_dimension),
         "step_ids": (-1, 41, 2),
       }.items()
     },
-    "output": ["x0_hat", -1, 41, 167],
+    "output": ["x0_hat", -1, 41, token_dimension],
+  }
+
+
+def _lane_adapter_probe(
+  adapter: DenoiserCallable,
+  native: DenoiserCallable,
+  *,
+  gather_index: np.ndarray,
+  lane_token_dimension: int,
+  state_dimension: int,
+  batch_size: int,
+) -> dict[str, Any]:
+  """Prove the lane adapter is exact on every channel the model reads.
+
+  Both graphs receive the same normalized values on the model's own channels.  The
+  adapter's output on those channels must match the native graph, and the lane channels
+  the model does not own must pass through unchanged.
+  """
+  lane_tokens = torch.linspace(
+    -1.5,
+    1.5,
+    batch_size * 41 * lane_token_dimension,
+    dtype=torch.float32,
+  ).reshape(batch_size, 41, lane_token_dimension)
+  index = torch.from_numpy(np.asarray(gather_index, dtype=np.int64))
+  model_tokens = torch.index_select(lane_tokens, -1, index)
+  mask_one = torch.ones((41, lane_token_dimension), dtype=torch.bool)
+  mask_one[8, state_dimension:] = False
+  mask_one[9:] = False
+  mask = mask_one.unsqueeze(0).expand(batch_size, -1, -1).clone()
+  step_ids = _step_ids(mask, 1000, state_dimension=state_dimension)
+  lane_output = adapter(lane_tokens, step_ids)
+  native_output = native(model_tokens, step_ids)
+  if lane_output.shape != lane_tokens.shape:
+    raise ParityError(f"lane adapter output shape differs: {tuple(lane_output.shape)}")
+  if not torch.isfinite(lane_output).all().item():
+    raise ParityError("lane adapter output is non-finite")
+  adapter_channels = torch.index_select(lane_output, -1, index)
+  dropped = torch.tensor(
+    [
+      position
+      for position in range(lane_token_dimension)
+      if position not in set(int(v) for v in gather_index)
+    ],
+    dtype=torch.long,
+  )
+  dropped_passthrough = _close_metrics(
+    "lane adapter pass-through channels",
+    torch.index_select(lane_output, -1, dropped),
+    torch.index_select(lane_tokens, -1, dropped),
+    atol=0.0,
+    rtol=0.0,
+  )
+  if dropped_passthrough["max_abs"] != 0.0:
+    raise ParityError(
+      "lane adapter changed a lane channel the model does not own: "
+      f"{dropped_passthrough['max_abs']}"
+    )
+  return {
+    "model_channels_max_abs": _close_metrics(
+      "lane adapter vs native graph on the model's channels",
+      adapter_channels,
+      native_output,
+    ),
+    "pass_through_channels": int(dropped.numel()),
+    "pass_through_max_abs": dropped_passthrough["max_abs"],
   }
 
 
@@ -679,8 +786,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
   normalizer = load_normalizer_bundle(normalizer_path, contract=contract)
   if not isinstance(normalizer, StateLatentNormalizer):
     raise ParityError("active normalizer is not the statistics-only implementation")
-  _assert_dimensions(contract, normalizer)
-  statistics_report = _check_statistics_only(normalizer_path, normalizer)
+  dimensions = _assert_dimensions(contract, normalizer)
+  state_dimension = dimensions["state_dimension"]
+  token_dimension = dimensions["token_dimension"]
+  statistics_report = _check_statistics_only(
+    normalizer_path, normalizer, state_dimension=state_dimension
+  )
+  try:
+    lane = describe_lane_adapter(contract.state_slices)
+  except LaneAdapterError as exc:
+    raise ParityError(f"the controller lane cannot serve this contract: {exc}") from exc
+  lane_required = bool(lane["required"])
 
   loaded = load_denoiser(
     diffusion_path,
@@ -702,8 +818,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       "checkpoint contract identity is neither the active semantic identity nor "
       f"the compatible legacy source-bound identity: {checkpoint_contract_identity}"
     )
-  if loaded.model.training or loaded.model.settings.token_dimension != 167:
-    raise ParityError("loaded denoiser is not a frozen 167-channel model")
+  if loaded.model.training or loaded.model.settings.token_dimension != token_dimension:
+    raise ParityError(
+      f"loaded denoiser is not a {token_dimension}-channel model: "
+      f"settings declare {loaded.model.settings.token_dimension}"
+    )
   vae: LoadedVae = load_vae_decoder(
     vae_path,
     manifest_path=manifest_path,
@@ -722,15 +841,18 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     raise ParityError("loaded VAE dimensions differ from 68/99/32/31")
 
   clean_tokens, mask, probe_report = _build_probe(
-    normalizer, batch_size=args.batch_size
+    normalizer,
+    batch_size=args.batch_size,
+    state_dimension=state_dimension,
+    token_dimension=token_dimension,
   )
-  expected_mask = torch.zeros((41, 167), dtype=torch.bool)
+  expected_mask = torch.zeros((41, token_dimension), dtype=torch.bool)
   expected_mask[:8] = True
-  expected_mask[8, :135] = True
+  expected_mask[8, :state_dimension] = True
   if not torch.equal(mask[0], expected_mask):
     raise ParityError("D5 clean mask does not match 8-history/current-state semantics")
   unknown_entries = int((~mask[0]).sum().item())
-  if unknown_entries != 32 + 32 * 167:
+  if unknown_entries != 32 + 32 * token_dimension:
     raise ParityError(f"unexpected unknown-entry count: {unknown_entries}")
 
   conditions = SamplerConditions(clean_tokens, mask)
@@ -761,6 +883,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     clean_mask=mask,
     loaded=loaded,
     seed=args.seed,
+    state_dimension=state_dimension,
   )
 
   fixed_error = float(
@@ -830,20 +953,63 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     "ddim_updates": "20",
   }
   denoiser_path = output / "denoiser.onnx"
+  native_denoiser_path = (
+    output / "denoiser_native.onnx" if lane_required else denoiser_path
+  )
   decoder_path = output / "vae_decoder.onnx"
+  denoiser_metadata = {
+    **metadata_common,
+    "artifact_kind": "diffusion_denoiser",
+    "token_dimension": str(token_dimension),
+    "sequence_length": "41",
+  }
   _export_onnx(
     DenoiserExport(loaded.model),
-    (clean_tokens, _step_ids(mask, 1000)),
-    denoiser_path,
+    (clean_tokens, _step_ids(mask, 1000, state_dimension=state_dimension)),
+    native_denoiser_path,
     input_names=("noisy_tokens", "step_ids"),
     output_name="x0_hat",
-    metadata={
-      **metadata_common,
-      "artifact_kind": "diffusion_denoiser",
-      "token_dimension": "167",
-      "sequence_length": "41",
-    },
+    metadata=denoiser_metadata,
   )
+  lane_denoiser_metadata: dict[str, str] | None = None
+  if lane_required:
+    # The lane graph is the bundle artifact: it keeps the controller's token width and
+    # serves the reduced model through a pure channel boundary.
+    lane_denoiser_metadata = {
+      **denoiser_metadata,
+      "token_dimension": str(lane["lane_token_dimension"]),
+      "lane_adapter": str(lane["lane_adapter"]),
+      "lane_state_dimension": str(lane["lane_state_dimension"]),
+      "lane_token_dimension": str(lane["lane_token_dimension"]),
+      "model_state_dimension": str(lane["model_state_dimension"]),
+      "model_token_dimension": str(lane["model_token_dimension"]),
+      "dropped_lane_state_fields": ",".join(lane["dropped_lane_state_fields"]),
+      "lane_fill_mean": str(lane["fill_mean"]),
+      "lane_fill_std": str(lane["fill_std"]),
+    }
+    lane_probe = torch.linspace(
+      -1.5,
+      1.5,
+      args.batch_size * 41 * lane["lane_token_dimension"],
+      dtype=torch.float32,
+    ).reshape(args.batch_size, 41, lane["lane_token_dimension"])
+    _export_onnx(
+      LaneTokenAdapter(DenoiserExport(loaded.model), contract.state_slices),
+      (
+        lane_probe,
+        _step_ids(
+          torch.ones(
+            (args.batch_size, 41, lane["lane_token_dimension"]), dtype=torch.bool
+          ),
+          1000,
+          state_dimension=lane["lane_state_dimension"],
+        ),
+      ),
+      denoiser_path,
+      input_names=("noisy_tokens", "step_ids"),
+      output_name="x0_hat",
+      metadata=lane_denoiser_metadata,
+    )
   _export_onnx(
     VaeDecoderExport(cast(ConditionalVAE, vae.model)),
     (
@@ -868,7 +1034,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
   expected_denoiser_metadata = {
     **metadata_common,
     "artifact_kind": "diffusion_denoiser",
-    "token_dimension": "167",
+    "token_dimension": str(
+      lane["lane_token_dimension"] if lane_required else token_dimension
+    ),
     "sequence_length": "41",
   }
   expected_decoder_metadata = {
@@ -878,9 +1046,13 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     "conditioning_dimension": "99",
     "action_dimension": "31",
   }
-  denoiser_metadata = _require_metadata(denoiser_path, expected_denoiser_metadata)
+  denoiser_metadata_observed = _require_metadata(
+    denoiser_path, expected_denoiser_metadata
+  )
   decoder_metadata = _require_metadata(decoder_path, expected_decoder_metadata)
-  onnx_denoiser, denoiser_graph = _onnx_denoiser(denoiser_path)
+  onnx_denoiser, denoiser_graph = _onnx_denoiser(
+    native_denoiser_path, token_dimension=token_dimension
+  )
   onnx_decoder, decoder_graph = _onnx_decoder(decoder_path)
   onnx_output, onnx_sources, _ = _reference_ddim(
     onnx_denoiser,
@@ -888,6 +1060,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     clean_mask=mask,
     loaded=loaded,
     seed=args.seed,
+    state_dimension=state_dimension,
   )
   ddim_report["torch_vs_exported_denoiser_oracle"] = _close_metrics(
     "torch DDIM vs exported denoiser DDIM",
@@ -897,6 +1070,25 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
   )
   if onnx_sources != reference_sources:
     raise ParityError("exported denoiser used a different DDIM source grid")
+
+  lane_graph: dict[str, Any] | None = None
+  lane_report: dict[str, Any] | None = None
+  if lane_required:
+    lane_onnx_denoiser, lane_graph = _onnx_denoiser(
+      denoiser_path, token_dimension=lane["lane_token_dimension"]
+    )
+    lane_report = {
+      **lane,
+      "probe": _lane_adapter_probe(
+        lane_onnx_denoiser,
+        onnx_denoiser,
+        gather_index=lane_gather_index(contract.state_slices),
+        lane_token_dimension=lane["lane_token_dimension"],
+        state_dimension=lane["lane_state_dimension"],
+        batch_size=args.batch_size,
+      ),
+      "graph": lane_graph,
+    }
 
   decoder_latent = torch.linspace(
     -1.0, 1.0, args.batch_size * 32, dtype=torch.float32
@@ -924,9 +1116,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
   report = {
     "status": "pass",
-    "status_detail": (
-      "pass_with_tolerance_warnings" if tolerance_warnings else "pass"
-    ),
+    "status_detail": ("pass_with_tolerance_warnings" if tolerance_warnings else "pass"),
     "tolerance_warnings": tolerance_warnings,
     "format": "mjlab-d5-numerical-export-parity-v1",
     "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -954,7 +1144,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       "identity": semantic_contract_identity,
       "checkpoint_identity": checkpoint_contract_identity,
       "checkpoint_identity_mode": checkpoint_identity_mode,
-      "dimensions": dict(_EXPECTED),
+      "dimensions": dimensions,
+      "state_field_slices": {
+        name: [int(span[0]), int(span[1])]
+        for name, span in contract.state_slices.items()
+      },
     },
     "artifacts": {
       "diffusion_checkpoint": {"path": str(diffusion_path), "sha256": diffusion_sha},
@@ -964,7 +1158,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       "exported_denoiser": {
         "path": str(denoiser_path),
         "sha256": _canonical_digest(denoiser_path),
-        "metadata_keys": sorted(denoiser_metadata),
+        "metadata_keys": sorted(denoiser_metadata_observed),
+        "graph": (lane_graph if lane_graph is not None else denoiser_graph),
+      },
+      "exported_native_denoiser": {
+        "path": str(native_denoiser_path),
+        "sha256": _canonical_digest(native_denoiser_path),
         "graph": denoiser_graph,
       },
       "exported_decoder": {
@@ -978,6 +1177,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       "statistics_only": statistics_report,
       "probe": probe_report,
       "ddim": ddim_report,
+      "lane_adapter": lane_report,
       "vae_decoder": decoder_report,
     },
   }
