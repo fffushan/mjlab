@@ -788,6 +788,196 @@ checkpoints fell on 98.7 % and 99.5 % of 2048 rows each. Select the best
 checkpoint for any downstream use, and treat the end of training as unusable for
 these recipes.
 
+One sweep is not reproducible
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The sweep is a diagnostic, not a measurement with a fixed answer. Six runs of the
+same motion (``vgk000``, 256 rows, the same checkpoint, the same host) fell in
+this range:
+
+.. list-table:: ``vgk000``, 256 rows, six runs of one configuration
+   :header-rows: 1
+
+   * - Recording
+     - Fall count of 256
+   * - Off
+     - 122, 132, 137
+   * - On
+     - 134, 135, 139
+
+The spread is **17 rows, or 6.6 %**, for one motion. Two runs of the same
+8-motion arm gave 404 and 401 falls of 2048 (19.7 % and 19.6 %). Recording does
+not change the outcome: the recorded runs fall inside the range of the
+unrecorded runs.
+
+Consequences for a comparison:
+
+- A single run gives each motion a rate that is uncertain by about 4 %. Do not
+  read a small per-motion difference between two models.
+- Two whole arms that differ by about 2 percentage points, or 40 rows of 2048,
+  are not separated by one run each. Repeat a close arm, or say that the two arms
+  are tied.
+- A difference of 7 percentage points or more, and every best-to-last gap, is far
+  larger than this spread and stands as reported.
+
+The cause is not measured. Small floating-point differences in the sampler or in
+the contact solver can change which episodes cross the fall threshold. Enabling
+deterministic kernels and repeating every arm would test that.
+
+Recording robot states
+^^^^^^^^^^^^^^^^^^^^^^
+
+The sweep counts falls and keeps no trajectory. Pass ``--record-states DIR`` to
+write one ``<member>.npz`` per motion with the per-tick robot state, so the
+motion can be rendered and inspected. Recording is off by default, and the tool
+refuses to overwrite an existing file.
+
+.. code-block:: bash
+
+   bash scripts/experiments/diffusion_d3_closed_loop/run_model_ladder.sh \
+     --python /home/fushan/mjlab/.venv/bin/python \
+     --motions vgk000 --num-envs 256 \
+     --extra "--record-states logs/diagnostics/d3-states" \
+     vgk8-baseline-best:logs/diffusion/d2-vgk8-double-20261009/seed0/checkpoint-best.pt
+
+Every array has the shape ``[ticks, rows, width]``, so row ``r`` is one episode
+and tick ``t`` is one control step. The eight channel groups hold 107 values per
+row per tick:
+
+.. list-table:: Recorded channels
+   :header-rows: 1
+
+   * - Group
+     - Width
+   * - ``root_position``
+     - 3
+   * - ``root_quaternion_wxyz``
+     - 4
+   * - ``root_linear_velocity``
+     - 3
+   * - ``root_angular_velocity``
+     - 3
+   * - ``joint_position``
+     - 31
+   * - ``joint_velocity``
+     - 31
+   * - ``action``
+     - 31
+   * - ``tilt_degrees``
+     - 1
+
+The file also carries ``tick``, ``phase`` (0 bootstrap, 1 continuation),
+``active``, ``joint_names``, ``body_names``, ``member``, ``start_frame``,
+``clip_frames``, ``bootstrap_ticks``, ``period_seconds``, ``fall_first_tick``,
+``stop_code`` with ``stop_labels``, and ``complete``.
+
+``--record-rows N`` keeps only the first N rows and ``--record-stride K`` keeps
+every K-th tick, for a smaller file. ``--record-bodies`` adds
+``body_positions`` and ``body_linear_velocities`` (60 values each). The default
+107-value set at 256 rows and about 400 ticks is about 44 MB per motion; the
+body set doubles it. ``logs/`` is git-ignored. A measured run at 256 rows and 60
+ticks recorded 430 bytes per row-tick, which is 44.7 MB for a full 406-tick
+motion, and cost 43.0 s against 42.2 s without recording.
+
+Use your own tool to render the file, or check first that the channels do
+describe the robot:
+
+.. code-block:: bash
+
+   uv run python scripts/experiments/diffusion_d3_closed_loop/verify_recording.py \
+     logs/diagnostics/d3-states/vgk000.npz
+
+That tool writes the recorded root pose and joints back into a fresh
+environment, forwards the kinematics, and compares the rebuilt body positions
+against the recorded ones. It needs a recording made with ``--record-bodies``.
+A measured run reported **4.8e-07 m** at a float32 rounding level, against a
+repeat-read noise floor of 0.0 m.
+
+**Do not build the joint channels from the actor observation.** The actor
+``joint_pos`` term of this task family is a *relative* joint position with added
+encoder bias and noise, and it can be one control step old. A recording built
+from it rebuilt the body pose only to **0.14 m**, which is enough to make a
+render misleading. The recorder reads the simulator's own joint position and
+velocity for this reason.
+
+Playing a recorded state file
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``play_recording.py`` shows one recorded row in a browser. It loads the
+standalone X2 MJCF, writes the recorded root pose and joint positions into the
+model, and computes the kinematics. No physics runs and no policy, checkpoint,
+VAE or dataset is needed, so the picture is exactly the recorded motion.
+
+.. code-block:: bash
+
+   uv run python scripts/experiments/diffusion_d3_closed_loop/play_recording.py \
+     logs/diagnostics/d3-states-vgk000.npz
+
+The default row is the row that falls first. Serve on another port with
+``--port``, choose a row with ``--row``, start slower or faster with ``--rate``
+(``1.0`` is real time at 50 control steps per second), and start looping with
+``--loop``. The page has play, pause, single-step, seek, speed, loop and row
+controls, plus a readout of the tick, the time, the tilt, the lowest body and
+the row's fall tick.
+
+``--row`` takes a row index or one of three names: ``first-fall`` (the
+default), ``last-fall`` (the row that runs longest before it falls) and
+``survivor`` (a row that never falls).
+
+Playback stops 25 ticks after a fall by default, because the sweep stops
+stepping a row once it falls and the rest of that row is a frozen state.
+``--margin-ticks`` changes that. ``--no-recenter`` keeps the recorded world
+position instead of moving the row's start to the origin.
+
+Two checks run without a browser:
+
+.. code-block:: bash
+
+   # rebuild sampled ticks and compare with the recorded body positions
+   uv run python scripts/experiments/diffusion_d3_closed_loop/play_recording.py \
+     logs/diagnostics/d3-states-vgk000.npz --check
+
+   # list the rows, falls first, then exit
+   uv run python scripts/experiments/diffusion_d3_closed_loop/play_recording.py \
+     logs/diagnostics/d3-states-vgk000.npz --list-rows
+
+``--frames DIR`` writes one PNG per interesting tick instead of opening a
+browser, which is useful for a report:
+
+.. code-block:: bash
+
+   uv run python scripts/experiments/diffusion_d3_closed_loop/play_recording.py \
+     logs/diagnostics/d3-states-vgk000.npz --frames /tmp/fall-frames
+
+``--gif PATH`` writes the whole played row as an animated GIF, which is the
+handy way to check how a policy runs and then falls:
+
+.. code-block:: bash
+
+   for m in vgk000 vgk001 vgk002 vgk003 vgk004 vgk005 vgk006 vgk007; do
+     uv run python scripts/experiments/diffusion_d3_closed_loop/play_recording.py \
+       logs/diagnostics/d3-states/$m.npz --row last-fall --track \
+       --gif logs/diagnostics/d3-states/gifs/$m-lastfall.gif
+   done
+
+Each frame carries a caption: member, row, time, tilt and the fall tick. Two
+camera modes are available. Without ``--track`` the camera holds still and the
+whole trajectory stays in view, which shows the travel and costs about
+**1.9 MB** for 406 frames. With ``--track`` the camera follows the robot, so the
+pose is large and clear, at about **9.5 MB** at 640x480 and **6.1 MB** at
+480x360. A measured 406-frame GIF takes about **9 s** to render.
+
+``--gif-stride K`` renders every K-th tick, which halves the file and sets the
+frame delay to ``20 * K`` milliseconds. Use ``--frame-height`` and
+``--frame-width`` to change the size. Nothing that exists is overwritten.
+
+A measured run on ``vgk36-baseline-best``, motion ``vgk000``, row 176: the
+reconstruction matched the recording to **4.8e-06 m**; the row stands at pelvis
+0.628 m and tilt 5.1 deg, the fall threshold is passed at tick 150 (73.1 deg),
+and by tick 160 the robot lies at 89.2 deg with the pelvis at 0.276 m. The
+robot travels about 4 m while it falls, so both camera paths frame the whole
+trajectory; a camera that only frames the robot start loses it.
+
 D5 ONNX export and the controller lane
 --------------------------------------
 

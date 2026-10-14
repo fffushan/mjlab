@@ -54,6 +54,11 @@ from mjlab.tasks.tracking.diffusion.parallel_closed_loop_x2 import (  # noqa: E4
   tilt_degrees_batch,
 )
 from mjlab.tasks.tracking.diffusion.sampler import SamplerConfig  # noqa: E402
+from mjlab.tasks.tracking.diffusion.state_recording import (  # noqa: E402
+  PHASE_CONTINUATION,
+  PHASE_VAE,
+  StateRecorder,
+)
 
 _BOOTSTRAP_PAIRS = 8
 _DEFAULT_ENVS = 256
@@ -134,6 +139,35 @@ def build_parser() -> argparse.ArgumentParser:
     default="summary.json",
     help="file name of the per-member summary inside --output-dir",
   )
+  parser.add_argument(
+    "--record-states",
+    type=Path,
+    default=None,
+    help=(
+      "write one <member>.npz per motion with the per-tick robot state for "
+      "playback and analysis; off by default"
+    ),
+  )
+  parser.add_argument(
+    "--record-rows",
+    type=int,
+    default=None,
+    help="record only the first N rows (default: every row)",
+  )
+  parser.add_argument(
+    "--record-stride",
+    type=int,
+    default=1,
+    help="record every K-th tick (default: 1, that is every tick)",
+  )
+  parser.add_argument(
+    "--record-bodies",
+    action="store_true",
+    help=(
+      "also record the 20 body positions and velocities; this doubles the file "
+      "and is not needed when the pose is rebuilt from the root and the joints"
+    ),
+  )
   return parser
 
 
@@ -156,6 +190,19 @@ def _validate_options(args: Any) -> None:
       "stratified reset draw changes row zero's realization, so the row-zero "
       "comparison would compare two different realizations"
     )
+  if isinstance(args.record_stride, bool) or args.record_stride < 1:
+    raise ParallelDiagnosticError("record-stride must be a positive integer")
+  if args.record_rows is not None and (
+    isinstance(args.record_rows, bool)
+    or not 1 <= args.record_rows <= int(args.num_envs)
+  ):
+    raise ParallelDiagnosticError(
+      f"record-rows must be an integer in [1, {int(args.num_envs)}]"
+    )
+  if args.record_rows is not None and args.record_states is None:
+    raise ParallelDiagnosticError("--record-rows requires --record-states")
+  if args.record_bodies and args.record_states is None:
+    raise ParallelDiagnosticError("--record-bodies requires --record-states")
 
 
 def _resolve_members(args: Any, prepared: Any) -> tuple[str, ...]:
@@ -306,6 +353,14 @@ def run_member(
     "diagnostic_only": True,
     "matched_acceptance": False,
   }
+  # Every name the cleanup path needs is bound before the try block, so a
+  # failure in setup can never mask itself with an unbound name.
+  recorder: StateRecorder | None = None
+  run_complete = False
+  partial = False
+  first_fall_tick = np.full(rows, -1, dtype=np.int64)
+  stop_reason: list[str | None] = [None] * rows
+  max_tilt = np.zeros(rows, dtype=np.float64)
   try:
     model = prepared.vae.model
     _prepare_models(prepared, device)
@@ -317,6 +372,26 @@ def run_member(
       )
     row_actions: list[list[float]] = []
     row_tilts: list[float] = []
+    target = (
+      None
+      if args.record_states is None
+      else Path(args.record_states) / f"{member}.npz"
+    )
+    recorder = (
+      None
+      if target is None
+      else StateRecorder(
+        target,
+        rows=rows,
+        max_ticks=_BOOTSTRAP_PAIRS + budget,
+        stride=int(args.record_stride),
+        recorded_rows=args.record_rows,
+        body_channels=bool(args.record_bodies),
+        period_seconds=_CONTROL_PERIOD,
+        joint_names=runtime.joint_order,
+        body_names=runtime.body_order,
+      )
+    )
     observation = runtime.reset(
       seed=int(prepared.args.seed), start_frame=int(prepared.args.start_frame)
     )
@@ -331,9 +406,6 @@ def run_member(
       else np.array(observation.reference[int(record_row)], copy=True)
     )
     active = np.arange(rows, dtype=np.int64)
-    first_fall_tick = np.full(rows, -1, dtype=np.int64)
-    stop_reason: list[str | None] = [None] * rows
-    max_tilt = np.zeros(rows, dtype=np.float64)
     bootstrap_states: list[Any] = []
     bootstrap_latents: list[np.ndarray] = []
 
@@ -345,6 +417,20 @@ def run_member(
       if record_row is not None:
         row_actions.append([float(value) for value in actions[int(record_row)]
                             .reshape(-1)])
+      if recorder is not None:
+        mask = np.zeros(rows, dtype=bool)
+        mask[active] = True
+        joints = runtime.true_joint_state()
+        recorder.append(
+          tick=int(pre.tick),
+          state=pre.state,
+          joint_position=joints[0],
+          joint_velocity=joints[1],
+          action=actions,
+          active=mask,
+          phase=PHASE_VAE,
+          bodies=pre.state if args.record_bodies else None,
+        )
       transition = runtime.step(actions)
       tilt = tilt_degrees_batch(transition.observation.state)
       max_tilt = np.maximum(max_tilt, tilt)
@@ -403,7 +489,6 @@ def run_member(
     evaluation_steps = np.zeros(rows, dtype=np.int64)
     ticks_run = 0
     wall_budget = float(prepared.args.max_wall_seconds)
-    partial = False
     for _ in range(budget):
       if active.size == 0:
         break
@@ -416,6 +501,20 @@ def run_member(
       )
       actions = np.zeros((rows, 31), dtype=np.float64)
       actions[step.rows] = step.actions
+      if recorder is not None:
+        mask = np.zeros(rows, dtype=bool)
+        mask[step.rows] = True
+        joints = runtime.true_joint_state()
+        recorder.append(
+          tick=int(pre.tick),
+          state=pre.state,
+          joint_position=joints[0],
+          joint_velocity=joints[1],
+          action=actions,
+          active=mask,
+          phase=PHASE_CONTINUATION,
+          bodies=pre.state if args.record_bodies else None,
+        )
       if record_row is not None and int(record_row) in set(
         int(row) for row in step.rows
       ):
@@ -473,9 +572,13 @@ def run_member(
           # unknown rather than a completed budget.
           stop_reason[row] = "incomplete_run"
           partial = True
+    run_complete = not partial
 
     falls = first_fall_tick >= 0
     fall_ticks = first_fall_tick[falls]
+    if recorder is not None:
+      result["recording"] = str(recorder.path)
+      result["recorded_ticks"] = int(recorder.recorded_ticks)
     stops: dict[str, int] = {}
     for reason in stop_reason:
       label = reason if reason is not None else "unknown"
@@ -531,6 +634,36 @@ def run_member(
       )
     return result
   finally:
+    if recorder is not None and recorder.recorded_ticks > 0:
+      try:
+        labels = sorted({reason for reason in stop_reason if reason is not None})
+        codes = np.full(rows, -1, dtype=np.int64)
+        for index, label in enumerate(labels):
+          for row, reason in enumerate(stop_reason):
+            if reason == label:
+              codes[row] = index
+        recorder.write(
+          {
+            "member": member,
+            "seed": int(prepared.args.seed),
+            "start_frame": int(prepared.args.start_frame),
+            "clip_frames": int(runtime.clip_frames),
+            "bootstrap_ticks": _BOOTSTRAP_PAIRS,
+            "fall_degrees": float(args.fall_degrees),
+            "device": str(device),
+            "complete": bool(run_complete),
+            "partial": bool(partial),
+            "fall_first_tick": first_fall_tick,
+            "stop_code": codes,
+            "stop_labels": labels,
+          }
+        )
+      except Exception as exc:  # never mask the run failure
+        print(
+          f"[{member}] recording was not written: {type(exc).__name__}: {exc}",
+          file=sys.stderr,
+          flush=True,
+        )
     runtime.close()
 
 

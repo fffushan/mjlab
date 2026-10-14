@@ -587,6 +587,21 @@ class X2ParallelClosedLoopRuntime:
   def _frame(self) -> int:
     return _scalar_int(self._command.time_steps, name="reference frame")
 
+  def true_joint_state(self) -> tuple[np.ndarray, np.ndarray]:
+    """Return the simulator's own joint position and velocity, one row each.
+
+    The actor conditioning is not the robot state: this task family feeds the
+    policy a relative joint position with added encoder bias and noise, and it
+    may be one control step old.  A recording that must rebuild the robot pose
+    reads these simulator values instead.
+    """
+    data = self.env.scene["robot"].data
+    joints = len(self.joint_order)
+    return (
+      _matrix(data.joint_pos, name="joint_pos", width=joints, rows=self.num_envs),
+      _matrix(data.joint_vel, name="joint_vel", width=joints, rows=self.num_envs),
+    )
+
   def _capture(self) -> ParallelObservation:
     actor = self._cached_actor()
     values = {name: actor[:, span] for name, span in self._slices.items()}

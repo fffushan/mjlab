@@ -7,6 +7,7 @@ numerical claim the parallel driver relies on.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,14 @@ from mjlab.tasks.tracking.diffusion.projection import (
 from mjlab.tasks.tracking.diffusion.sampler import SamplerConfig
 from mjlab.tasks.tracking.diffusion.schedule import DiffusionSchedule, InferenceGrid
 from mjlab.tasks.tracking.diffusion.state import WorldState
+from mjlab.tasks.tracking.diffusion.state_recording import (
+  CHANNEL_NAMES,
+  CHANNEL_WIDTH,
+  PHASE_CONTINUATION,
+  PHASE_VAE,
+  StateRecorder,
+  StateRecordingError,
+)
 from mjlab.tasks.tracking.diffusion.visual_playback import tilt_degrees
 
 
@@ -293,3 +302,170 @@ def test_generator_prefix_parity_is_device_dependent() -> None:
       (4, 3, 7), generator=torch.Generator(device="cuda:0").manual_seed(0), device="cuda:0"
     )
     assert torch.equal(single_cuda[0], wider_cuda[0])
+
+
+def _recorder_arguments(rows: int = 3, **kwargs: Any) -> dict[str, Any]:
+  values: dict[str, Any] = {
+    "rows": rows,
+    "max_ticks": 12,
+    "period_seconds": 0.02,
+    "joint_names": tuple(f"joint-{index}" for index in range(31)),
+    "body_names": tuple(f"body-{index}" for index in range(20)),
+  }
+  values.update(kwargs)
+  return values
+
+
+def _append_tick(recorder: StateRecorder, rows: int, tick: int, phase: int) -> None:
+  state = WorldState.stack([make_state(tick + row) for row in range(rows)])
+  joint_position = np.tile(np.linspace(-0.5, 0.5, 31), (rows, 1))
+  joint_velocity = np.full((rows, 31), 0.1 * tick)
+  action = np.full((rows, 31), 0.25 * tick)
+  active = np.ones(rows, dtype=bool)
+  recorder.append(
+    tick=tick,
+    state=state,
+    joint_position=joint_position,
+    joint_velocity=joint_velocity,
+    action=action,
+    active=active,
+    phase=phase,
+    bodies=state if recorder.body_channels else None,
+  )
+
+
+def test_recorder_writes_a_render_ready_file(tmp_path: Path) -> None:
+  path = tmp_path / "vgk000.npz"
+  recorder = StateRecorder(str(path), **_recorder_arguments())
+  for tick in range(4):
+    _append_tick(recorder, 3, tick, PHASE_VAE if tick < 2 else PHASE_CONTINUATION)
+  written = recorder.write({"member": "vgk000", "fall_first_tick": np.arange(3)})
+  assert written == path
+  with np.load(path, allow_pickle=False) as payload:
+    assert payload["root_position"].shape == (4, 3, 3)
+    assert payload["root_quaternion_wxyz"].shape == (4, 3, 4)
+    assert payload["joint_position"].shape == (4, 3, 31)
+    assert payload["action"].shape == (4, 3, 31)
+    assert payload["tilt_degrees"].shape == (4, 3, 1)
+    assert payload["tick"].tolist() == [0, 1, 2, 3]
+    assert payload["phase"].tolist() == [PHASE_VAE, PHASE_VAE, PHASE_CONTINUATION, PHASE_CONTINUATION]
+    assert payload["active"].all()
+    assert str(payload["member"]) == "vgk000"
+    assert payload["channel_names"].tolist() == list(CHANNEL_NAMES)
+    assert int(payload["channel_width"]) == CHANNEL_WIDTH
+    assert int(payload["body_channels"]) == 0
+    # The recorded pose and joints are the ones the tick held.
+    assert np.isfinite(payload["joint_position"]).all()
+
+
+def test_recorder_rejects_an_existing_target(tmp_path: Path) -> None:
+  path = tmp_path / "vgk000.npz"
+  path.write_bytes(b"evidence")
+  with pytest.raises(StateRecordingError, match="refusing to overwrite"):
+    StateRecorder(str(path), **_recorder_arguments())
+
+
+def test_recorder_honours_stride_and_row_subset(tmp_path: Path) -> None:
+  path = tmp_path / "stride.npz"
+  recorder = StateRecorder(
+    str(path), **_recorder_arguments(rows=4, recorded_rows=2, stride=2)
+  )
+  for tick in range(8):
+    _append_tick(recorder, 4, tick, PHASE_CONTINUATION)
+  recorder.write({})
+  with np.load(path, allow_pickle=False) as payload:
+    assert payload["tick"].tolist() == [0, 2, 4, 6]
+    assert payload["root_position"].shape == (4, 2, 3)
+    assert int(payload["rows"]) == 4
+    assert int(payload["recorded_rows"]) == 2
+
+
+def test_recorder_records_body_channels_only_when_asked(tmp_path: Path) -> None:
+  path = tmp_path / "bodies.npz"
+  recorder = StateRecorder(str(path), **_recorder_arguments(body_channels=True))
+  for tick in range(3):
+    _append_tick(recorder, 3, tick, PHASE_CONTINUATION)
+  recorder.write({})
+  with np.load(path, allow_pickle=False) as payload:
+    assert payload["body_positions"].shape == (3, 3, 60)
+    assert payload["body_linear_velocities"].shape == (3, 3, 60)
+    assert int(payload["body_channels"]) == 1
+  off = tmp_path / "nobodies.npz"
+  plain = StateRecorder(str(off), **_recorder_arguments())
+  with pytest.raises(StateRecordingError, match="body state supplied"):
+    plain.append(
+      tick=0,
+      state=WorldState.stack([make_state(0)] * 3),
+      joint_position=np.zeros((3, 31)),
+      joint_velocity=np.zeros((3, 31)),
+      action=np.zeros((3, 31)),
+      active=np.ones(3, dtype=bool),
+      phase=PHASE_VAE,
+      bodies=WorldState.stack([make_state(0)] * 3),
+    )
+
+
+def test_recorder_fails_closed_on_bad_input_and_empty_write(tmp_path: Path) -> None:
+  recorder = StateRecorder(str(tmp_path / "bad.npz"), **_recorder_arguments())
+  with pytest.raises(StateRecordingError, match="no tick was recorded"):
+    recorder.write({})
+  with pytest.raises(StateRecordingError, match="joint_position must have shape"):
+    recorder.append(
+      tick=0,
+      state=WorldState.stack([make_state(0)] * 3),
+      joint_position=np.zeros((3, 30)),
+      joint_velocity=np.zeros((3, 31)),
+      action=np.zeros((3, 31)),
+      active=np.ones(3, dtype=bool),
+      phase=PHASE_VAE,
+    )
+  with pytest.raises(StateRecordingError, match="active mask"):
+    recorder.append(
+      tick=0,
+      state=WorldState.stack([make_state(0)] * 3),
+      joint_position=np.zeros((3, 31)),
+      joint_velocity=np.zeros((3, 31)),
+      action=np.zeros((3, 31)),
+      active=np.ones(2, dtype=bool),
+      phase=PHASE_VAE,
+    )
+  with pytest.raises(StateRecordingError, match="phase must be"):
+    recorder.append(
+      tick=0,
+      state=WorldState.stack([make_state(0)] * 3),
+      joint_position=np.zeros((3, 31)),
+      joint_velocity=np.zeros((3, 31)),
+      action=np.zeros((3, 31)),
+      active=np.ones(3, dtype=bool),
+      phase=7,
+    )
+  with pytest.raises(StateRecordingError, match="buffer is full"):
+    small = StateRecorder(str(tmp_path / "small.npz"), **_recorder_arguments(max_ticks=1))
+    for tick in range(2):
+      _append_tick(small, 3, tick, PHASE_VAE)
+  with pytest.raises(StateRecordingError, match="metadata key"):
+    filled = StateRecorder(str(tmp_path / "meta.npz"), **_recorder_arguments())
+    _append_tick(filled, 3, 0, PHASE_VAE)
+    filled.write({"rows": 1})
+
+
+def test_recorder_tilt_matches_the_diagnostic(tmp_path: Path) -> None:
+  path = tmp_path / "tilt.npz"
+  recorder = StateRecorder(str(path), **_recorder_arguments())
+  states = [make_state(index) for index in range(3)]
+  recorder.append(
+    tick=0,
+    state=WorldState.stack(states),
+    joint_position=np.zeros((3, 31)),
+    joint_velocity=np.zeros((3, 31)),
+    action=np.zeros((3, 31)),
+    active=np.ones(3, dtype=bool),
+    phase=PHASE_VAE,
+  )
+  recorder.write({})
+  with np.load(path, allow_pickle=False) as payload:
+    assert np.allclose(
+      payload["tilt_degrees"][0, :, 0],
+      np.array([tilt_degrees(state) for state in states]),
+      atol=1e-4,
+    )
