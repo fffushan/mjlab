@@ -1,6 +1,7 @@
 """AgiBot X2 Ultra flat tracking environment configurations."""
 
 from copy import deepcopy
+from dataclasses import fields
 from typing import Literal
 
 from mjlab.asset_zoo.robots import (
@@ -16,10 +17,15 @@ from mjlab.envs import mdp as env_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import BuiltinSensorCfg, ContactMatch, ContactSensorCfg, ObjRef
-from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.tasks.tracking.mdp import MotionCommandCfg, motion_lookahead
+from mjlab.tasks.tracking.mdp.multi_motion_ppo import (
+  MultiMotionPpoCommandCfg,
+  clip_complete,
+)
 from mjlab.tasks.tracking.tracking_env_cfg import VELOCITY_RANGE, make_tracking_env_cfg
 
 from .vendor_gains import apply_vendor_rl_gains
@@ -65,6 +71,13 @@ angular velocity.
 _TORSO_IMU_SITE = "imu_1"
 _TORSO_IMU_GYRO = "robot/imu_1_ang_vel"
 _TORSO_IMU_VELOCIMETER = "robot/imu_1_lin_vel"
+
+_MULTI_MOTION_PREVIEW_S = 0.2
+"""Reference preview offset of the multi-motion teacher, in seconds.
+
+Ten reference steps at the task's 50 Hz control rate, which is one future
+frame of joint positions and velocities.
+"""
 
 
 def _torso_imu_sensors() -> tuple[BuiltinSensorCfg, BuiltinSensorCfg]:
@@ -525,5 +538,77 @@ def agibot_x2_flat_tracking_observation_ablation_env_cfg(
     actor_terms["joint_vel"].scale = 0.05
   else:
     raise ValueError(f"Unknown X2 tracking observation ablation: {ablation}")
+
+  return cfg
+
+
+def agibot_x2_multi_motion_tracking_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create the X2 multi-motion PPO teacher configuration.
+
+  The teacher follows an explicit clip list instead of one reference file. The
+  base is
+  :func:`agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg`,
+  so the robot, vendor gains, action scale, torso anchor, pelvis IMU, actor
+  observations, rewards, and domain randomization stay as they are. Three
+  things differ:
+
+  * The motion command becomes the plain-data
+    :class:`~mjlab.tasks.tracking.mdp.multi_motion_ppo.MultiMotionPpoCommandCfg`.
+    It resolves its YAML manifest into a loaded clip library when the
+    environment builds, not in the serializable configuration. Training samples
+    each clip's phase uniformly; play uses ``start``. Both keep
+    ``standing_start_prob`` at zero, because an episode starts from a perturbed
+    reference frame and not from a standing insert.
+  * The actor and the critic both receive the existing ``motion_lookahead``
+    sample at :data:`_MULTI_MOTION_PREVIEW_S`. The sample carries no reference
+    noise, no reference delay, and no clip identity.
+  * ``clip_complete`` joins the terminations with ``time_out=False``, so the
+    clip endpoint is a reference-task boundary. The physical failures and the
+    episode time limit keep their own terms and their own precedence.
+
+  ``scene.num_envs`` defaults to the paper's 4096 environments for training;
+  play keeps the base configuration's environment count for the viewer.
+  """
+  cfg = agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(play=play)
+
+  motion_cmd = cfg.commands["motion"]
+  assert isinstance(motion_cmd, MotionCommandCfg)
+  motion_values = {
+    field_.name: getattr(motion_cmd, field_.name) for field_ in fields(MotionCommandCfg)
+  }
+  motion_values.update(
+    motion_file="",  # A clip list, not one clip, bounds the mixed rows.
+    motion_manifest="",  # Selected by the training or playback entry point.
+    sampling_mode="start" if play else "uniform",
+    standing_start_prob=0.0,
+    lookahead_s=_MULTI_MOTION_PREVIEW_S,
+  )
+  cfg.commands["motion"] = MultiMotionPpoCommandCfg(**motion_values)
+
+  # The future reference is part of the value estimate too: the return depends
+  # on the requested future motion, so the critic reads the same 62-wide
+  # sample the actor does. Placed after ``command`` to mirror the actor order.
+  critic_group = cfg.observations["critic"]
+  critic_terms: dict[str, ObservationTermCfg] = {}
+  for name, term in critic_group.terms.items():
+    critic_terms[name] = term
+    if name == "command":
+      critic_terms["motion_lookahead"] = ObservationTermCfg(
+        func=motion_lookahead,
+        params={"command_name": "motion"},
+      )
+  critic_group.terms = critic_terms
+
+  # A clip endpoint finishes the reference task for its row; it is not a time
+  # limit, and the termination manager reports a simultaneous physical failure
+  # through its own term.
+  cfg.terminations["clip_complete"] = TerminationTermCfg(
+    func=clip_complete, time_out=False
+  )
+
+  if not play:
+    cfg.scene.num_envs = 4096
 
   return cfg

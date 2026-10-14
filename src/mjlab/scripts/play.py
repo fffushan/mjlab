@@ -3,13 +3,15 @@
 import os
 import sys
 import time as _time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import tyro
+import viser
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
@@ -17,11 +19,58 @@ from mjlab.scripts._cli import maybe_print_top_level_help
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.mdp.commands import load_saved_lookahead_s
+from mjlab.tasks.tracking.mdp.multi_motion_ppo import MultiMotionPpoCommandCfg
 from mjlab.utils.os import get_wandb_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from mjlab.viewer.viser.viewer import CheckpointManager, format_time_ago
+
+
+def select_multi_motion_playback_clip(
+  motion_cmd: MultiMotionPpoCommandCfg, motion_file: str | None
+) -> Path:
+  """Select the explicit playback clip and clear the training manifest.
+
+  Playback runs one clip, so the command's reference source becomes a singleton
+  file.  The manifest is cleared because the command rejects both sources at
+  once, and a restored or defaulted manifest would otherwise be ambiguous.
+  """
+  if motion_file is None:
+    raise ValueError(
+      "The multi-motion tracking task plays one explicit clip: pass\n"
+      "  --motion-file /path/to/motion.npz"
+    )
+  clip = Path(motion_file)
+  if not clip.is_file():
+    raise FileNotFoundError(f"Motion file not found: {clip}")
+  motion_cmd.motion_manifest = ""
+  motion_cmd.motion_file = str(clip)
+  return clip
+
+
+def _skip_command_gui(
+  _server: viser.ViserServer,
+  _get_env_idx: Callable[[], int],
+  on_change: Callable[[], None] | None = None,
+  request_action: Callable[[str, Any], None] | None = None,
+) -> None:
+  """No-op command GUI builder; see :func:`omit_multi_motion_scrubber`."""
+  return None
+
+
+def omit_multi_motion_scrubber(env: ManagerBasedRlEnv) -> None:
+  """Keep the single-motion scrubber out of the multi-motion play view.
+
+  The shared scrubber needs one clip length (``command.motion``), and the
+  multi-motion command deliberately refuses a single-clip loader because no
+  scalar length bounds mixed rows.  Skipping that one panel leaves every other
+  viewer control, and adds no new menu.  The environment core is unchanged:
+  only this environment's command GUI builder is replaced.
+  """
+  # setattr, not an assignment: the manager's declared builder type does not
+  # admit this replacement callable, and the override is deliberately dynamic.
+  setattr(env.command_manager, "create_gui", _skip_command_gui)  # noqa: B010
 
 
 def _parse_wandb_dt(value: str | datetime) -> datetime:
@@ -73,19 +122,28 @@ def run_play(task_id: str, cfg: PlayConfig):
     env_cfg.terminations = {}
     print("[INFO]: Terminations disabled")
 
-  # Check if this is a tracking task by checking for motion command.
-  is_tracking_task = "motion" in env_cfg.commands and isinstance(
-    env_cfg.commands["motion"], MotionCommandCfg
+  # Check if this is a tracking task by checking for motion command.  The
+  # multi-motion teacher is its own case: its reference source is a manifest
+  # clip list, and playback selects one explicit clip from it.
+  raw_motion_cmd = env_cfg.commands.get("motion")
+  multi_motion_cmd = (
+    raw_motion_cmd if isinstance(raw_motion_cmd, MultiMotionPpoCommandCfg) else None
+  )
+  is_tracking_task = (
+    isinstance(raw_motion_cmd, MotionCommandCfg) and multi_motion_cmd is None
   )
 
   if is_tracking_task and cfg._demo_mode:
     # Demo mode: use uniform sampling to see more diversity with num_envs > 1.
-    motion_cmd = env_cfg.commands["motion"]
+    motion_cmd = raw_motion_cmd
     assert isinstance(motion_cmd, MotionCommandCfg)
     motion_cmd.sampling_mode = "uniform"
 
-  if is_tracking_task:
-    motion_cmd = env_cfg.commands["motion"]
+  if multi_motion_cmd is not None:
+    clip = select_multi_motion_playback_clip(multi_motion_cmd, cfg.motion_file)
+    print(f"[INFO]: Using local motion file: {clip}")
+  elif is_tracking_task:
+    motion_cmd = raw_motion_cmd
     assert isinstance(motion_cmd, MotionCommandCfg)
 
     # Check for local motion file first (works for both dummy and trained modes).
@@ -159,8 +217,9 @@ def run_play(task_id: str, cfg: PlayConfig):
     # Restore the lookahead setting used during training so the actor
     # observation dimension matches the checkpoint. The play CLI does not
     # accept --env.* overrides, so this reconstruction is required whenever
-    # the policy was trained with lookahead enabled.
-    if is_tracking_task:
+    # the policy was trained with lookahead enabled.  The network shape itself
+    # is the task's registered configuration, which is fixed for this study.
+    if is_tracking_task or multi_motion_cmd is not None:
       motion_cmd = env_cfg.commands["motion"]
       assert isinstance(motion_cmd, MotionCommandCfg)
       saved_lookahead_s = load_saved_lookahead_s(resume_path, cfg.wandb_run_path)
@@ -187,6 +246,9 @@ def run_play(task_id: str, cfg: PlayConfig):
       "[WARN] Video recording with dummy agents is disabled (no checkpoint/log_dir)."
     )
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+
+  if multi_motion_cmd is not None:
+    omit_multi_motion_scrubber(env)
 
   if TRAINED_MODE and cfg.video:
     print("[INFO] Recording videos during play")

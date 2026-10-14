@@ -1,3 +1,4 @@
+from mjlab.rl import MjlabOnPolicyRunner
 from mjlab.tasks.registry import register_mjlab_task
 from mjlab.tasks.tracking.rl import MotionTrackingOnPolicyRunner
 
@@ -9,8 +10,12 @@ from .env_cfgs import (
   agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg,
   agibot_x2_flat_tracking_observation_ablation_env_cfg,
   agibot_x2_flat_tracking_standing_start_env_cfg,
+  agibot_x2_multi_motion_tracking_env_cfg,
 )
-from .rl_cfg import agibot_x2_tracking_ppo_runner_cfg
+from .rl_cfg import (
+  agibot_x2_multi_motion_ppo_runner_cfg,
+  agibot_x2_tracking_ppo_runner_cfg,
+)
 
 register_mjlab_task(
   task_id="Mjlab-Tracking-Flat-AgiBot-X2",
@@ -199,4 +204,15 @@ register_mjlab_task(
     experiment_name="agibot_x2_tracking_correlated_dr_reduced_perturbations_torso_imu"
   ),
   runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+# The multi-motion teacher is not a single-motion task: it has no reference clip
+# to embed in the policy export, so it runs the standard runner. Its checkpoint
+# is the teacher artifact; ONNX export for a specific clip is step 3 work.
+register_mjlab_task(
+  task_id="Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion",
+  env_cfg=agibot_x2_multi_motion_tracking_env_cfg(),
+  play_env_cfg=agibot_x2_multi_motion_tracking_env_cfg(play=True),
+  rl_cfg=agibot_x2_multi_motion_ppo_runner_cfg(),
+  runner_cls=MjlabOnPolicyRunner,
 )

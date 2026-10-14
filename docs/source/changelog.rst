@@ -4,6 +4,52 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Documented the two-GPU X2 shared-teacher test at
+  ``docs/reports/x2_multi_motion_ppo_2gpu_8192env_100iterations.md``. Two ranks
+  on one container train 8192 environments each over 148 clips for 100
+  iterations. The run is better than the single-GPU reference on every logged
+  scalar, and the episode-length collapse reverses. Batch size, GPU count and
+  hardware changed together, so the result is not a scaling measurement.
+
+- Documented the existing multi-GPU scaling path for the X2 shared teacher in
+  ``docs/plans/x2_multi_motion_ppo_teacher.md``. Environment counts are per GPU;
+  gradients and observation statistics synchronize across workers. The task's
+  multi-GPU runtime and global reference-frame coverage remain unvalidated.
+
+- Documented the all-tennis X2 PPO test at
+  ``docs/reports/x2_multi_motion_ppo_all_tennis_100_iterations.md``. All 148
+  references run with 4096 environments for 100 iterations. The reward curve
+  becomes less negative, but episodes shorten and height-error terminations
+  increase. The report records this limit; teacher quality is not qualified.
+
+- Added the bounded real-GPU X2 PPO smoke driver at
+  ``scripts/experiments/x2_multi_motion_ppo_smoke/run.py``. It checks two clips,
+  8 environments, 10 PPO updates, exact preview, endpoint/subset resets, and
+  checkpoint reload. The local smoke passes; tracking quality is not tested.
+  See ``docs/reports/x2_multi_motion_ppo_teacher_gpu_smoke.md``.
+
+- Added ``Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion`` for one shared PPO teacher.
+  It reads a motion-list YAML, uses the SCDP six-layer actor/critic shape, and
+  gives both networks a configurable future-reference sample (default 0.2 s).
+  Clip completion ends the reference task without a wrap teleport. Local
+  playback and per-clip evaluation support the task. Ten critical tests cover
+  clip isolation, preview, reset boundaries, and evaluator attribution.
+  Software checks and a bounded real-runner smoke pass; policy quality is not tested.
+  See ``docs/reports/x2_multi_motion_ppo_teacher_implementation.md``.
+
+- Added the lean X2 multi-motion PPO teacher plan at
+  ``docs/plans/x2_multi_motion_ppo_teacher.md``. It uses the SCDP six-layer
+  network, one future-reference sample, and existing reference components.
+  Tests cover only critical clip, preview, episode-boundary, and task behavior.
+  Implementation, training, VAE changes, and deployment remain out of scope
+  for this planning request.
+
+- Documented the agreed X2 general-teacher and goal-conditioned latent diffusion
+  design in ``docs/design/x2_general_teacher_goal_conditioned_latent_diffusion.md``.
+  It puts reference preview in the VAE encoder and keeps the decoder reference-free.
+  The note separates SCDP paper evidence, proposed settings, and open interfaces.
+  It does not authorize implementation, training, or deployment.
+
 - Added an opt-in local-kinematic state ablation for X2 diffusion. The new
   contract
   ``docs/plans/beyondmimic_diffusion_d1_no_mixtures_local_kinematic_contract.yaml``

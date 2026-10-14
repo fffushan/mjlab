@@ -1,10 +1,15 @@
 """RL configuration for AgiBot X2 Ultra tracking task."""
 
+from dataclasses import replace
+
 from mjlab.rl import (
   RslRlModelCfg,
   RslRlOnPolicyRunnerCfg,
   RslRlPpoAlgorithmCfg,
 )
+
+_MULTI_MOTION_HIDDEN_DIMS: tuple[int, ...] = (1024, 1024, 1024, 1024, 512, 128)
+"""Actor and critic hidden layers of the multi-motion teacher (SCDP II-D)."""
 
 
 def agibot_x2_tracking_ppo_runner_cfg(
@@ -46,3 +51,24 @@ def agibot_x2_tracking_ppo_runner_cfg(
     num_steps_per_env=24,
     max_iterations=30_000,
   )
+
+
+def agibot_x2_multi_motion_ppo_runner_cfg(
+  experiment_name: str = "agibot_x2_multi_motion_tracking",
+) -> RslRlOnPolicyRunnerCfg:
+  """Create the RL runner configuration for the X2 multi-motion teacher.
+
+  Fork of :func:`agibot_x2_tracking_ppo_runner_cfg` that changes only the
+  network shape, the initial learning rate, and the iteration cap. Both networks
+  get the six specified hidden layers; the initial rate is ``3e-4`` with the
+  inherited adaptive schedule, and the cap is the plan's reference setting, not
+  a launch authorization. The optimizer, ELU activation, actor and critic
+  observation normalization, scalar Gaussian std, and every other PPO setting
+  stay as the single-motion X2 task has them.
+  """
+  cfg = agibot_x2_tracking_ppo_runner_cfg(experiment_name=experiment_name)
+  cfg.actor = replace(cfg.actor, hidden_dims=_MULTI_MOTION_HIDDEN_DIMS)
+  cfg.critic = replace(cfg.critic, hidden_dims=_MULTI_MOTION_HIDDEN_DIMS)
+  cfg.algorithm = replace(cfg.algorithm, learning_rate=3.0e-4)
+  cfg.max_iterations = 100_000
+  return cfg

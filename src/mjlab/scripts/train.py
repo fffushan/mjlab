@@ -6,7 +6,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import tyro
 
@@ -15,8 +15,18 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from mjlab.scripts._cli import maybe_print_top_level_help
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.tasks.tracking.mdp.multi_motion_ppo import (
+  MultiMotionPpoCommand,
+  MultiMotionPpoCommandCfg,
+  resolve_motion_files,
+)
 from mjlab.utils.gpu import select_gpus
-from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_path
+from mjlab.utils.os import (
+  dump_yaml,
+  get_checkpoint_path,
+  get_wandb_checkpoint_path,
+  load_saved_yaml,
+)
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wandb import add_wandb_tags
 from mjlab.utils.wrappers import VideoRecorder
@@ -46,6 +56,84 @@ class TrainConfig:
     return TrainConfig(env=env_cfg, agent=agent_cfg)
 
 
+MOTION_RECORD_FILENAME = "resolved_motions.yaml"
+"""Name of the resolved-reference record written under the run's ``params``."""
+
+
+def resolved_motion_record(
+  motion_cfg: MultiMotionPpoCommandCfg, command: MultiMotionPpoCommand
+) -> dict[str, Any]:
+  """Plain-data record of the reference clips and preview one run resolved.
+
+  ``mapping_digest`` covers the ordered clip identity of the loaded library
+  (source digest, frame count, and rate of every clip), which is the part a
+  resume has to reproduce; the clip entries keep the record readable.
+  """
+  return {
+    "source": motion_cfg.motion_manifest or motion_cfg.motion_file,
+    "preview_s": float(command.cfg.lookahead_s),
+    "mapping_digest": command.library.mapping_digest(),
+    "clips": [
+      {
+        "name": clip.teacher_id,
+        "file": str(clip.motion_file),
+        "frames": int(clip.frames),
+        "fps": float(clip.fps),
+      }
+      for clip in command.library.clips
+    ],
+    "allocation": command.slot_allocation.as_dict(),
+  }
+
+
+def _clip_files(record: dict[str, Any]) -> list[str]:
+  """Return the ordered clip files a resolved-motion record names."""
+  return [str(entry["file"]) for entry in record.get("clips", [])]
+
+
+def motion_record_differences(
+  saved: dict[str, Any], current: dict[str, Any]
+) -> list[str]:
+  """Return the reference differences that resume must not accept silently."""
+  differences: list[str] = []
+  if saved.get("preview_s") != current.get("preview_s"):
+    differences.append(
+      f"preview_s: saved {saved.get('preview_s')!r} != "
+      f"current {current.get('preview_s')!r}"
+    )
+  if saved.get("mapping_digest") != current.get("mapping_digest"):
+    differences.append(
+      f"motion list: saved {_clip_files(saved)} "
+      f"(digest {saved.get('mapping_digest')!r}) != "
+      f"current {_clip_files(current)} (digest {current.get('mapping_digest')!r})"
+    )
+  return differences
+
+
+def check_resume_motion_record(resume_path: Path, current: dict[str, Any]) -> None:
+  """Refuse a resume whose saved reference record disagrees with this run.
+
+  Training writes the record next to the checkpoint, so a local resume has one.
+  A checkpoint obtained without its run files (for example a W&B download) has
+  none: the mismatch cannot be checked then, and the run warns instead of
+  guessing.
+  """
+  record_path = resume_path.parent / "params" / MOTION_RECORD_FILENAME
+  if not record_path.exists():
+    print(
+      f"[WARN] No saved {MOTION_RECORD_FILENAME} next to {resume_path.name}; the "
+      "motion list and preview of the resumed run cannot be verified."
+    )
+    return
+  differences = motion_record_differences(load_saved_yaml(record_path), current)
+  if differences:
+    raise ValueError(
+      f"resume reference mismatch ({record_path}): "
+      + "; ".join(differences)
+      + ". Resume with the same motion list and preview as the checkpoint."
+    )
+
+
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
   if cuda_visible == "":
@@ -70,13 +158,26 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   registry_name: str | None = None
 
-  # Check if this is a tracking task by checking for motion command.
-  is_tracking_task = "motion" in cfg.env.commands and isinstance(
-    cfg.env.commands["motion"], MotionCommandCfg
+  # Check if this is a tracking task by checking for motion command. The
+  # multi-motion teacher is its own case: its reference source is a manifest
+  # clip list, so neither the single-file gate nor the W&B motion artifact
+  # below applies to it.
+  raw_motion_cmd = cfg.env.commands.get("motion")
+  multi_motion_cmd = (
+    raw_motion_cmd if isinstance(raw_motion_cmd, MultiMotionPpoCommandCfg) else None
+  )
+  is_tracking_task = (
+    isinstance(raw_motion_cmd, MotionCommandCfg) and multi_motion_cmd is None
   )
 
-  if is_tracking_task:
-    motion_cmd = cfg.env.commands["motion"]
+  if multi_motion_cmd is not None:
+    resolved_clips = resolve_motion_files(multi_motion_cmd)
+    print(
+      f"[INFO] Multi-motion teacher: {len(resolved_clips)} reference clips from "
+      f"{multi_motion_cmd.motion_manifest or multi_motion_cmd.motion_file}"
+    )
+  elif is_tracking_task:
+    motion_cmd = raw_motion_cmd
     assert isinstance(motion_cmd, MotionCommandCfg)
 
     # Check if motion_file is already set (e.g., via CLI --env.commands.motion.motion-file).
@@ -134,6 +235,22 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
         log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint
       )
 
+  # Record the resolved reference clips and preview, and refuse a resume whose
+  # checkpoint resolved a different motion list or preview.  The record is plain
+  # data: the loaded library stays out of the serializable configuration.
+  if multi_motion_cmd is not None:
+    command = env.command_manager.get_term("motion")
+    if not isinstance(command, MultiMotionPpoCommand):
+      raise RuntimeError(
+        "the multi-motion task registered a "
+        f"{type(command).__name__} command instead of MultiMotionPpoCommand"
+      )
+    record = resolved_motion_record(multi_motion_cmd, command)
+    if resume_path is not None:
+      check_resume_motion_record(resume_path, record)
+    if rank == 0:
+      dump_yaml(log_dir / "params" / MOTION_RECORD_FILENAME, record)
+
   # Only record videos on rank 0 to avoid multiple workers writing to the same files.
   if cfg.video and rank == 0:
     env = VideoRecorder(
@@ -156,6 +273,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   runner_kwargs = {}
   if is_tracking_task:
+    # Only the single-clip runner accepts the registry name; the multi-motion
+    # teacher runs the standard runner, which has no such argument.
     runner_kwargs["registry_name"] = registry_name
 
   # Write config files before runner creation, since the runner mutates agent_cfg

@@ -5,6 +5,11 @@ Status: discussion and architectural rationale, not authorization for new traini
 or implementation. **Use the existing specialist teachers for the current
 BeyondMimic distillation work.** A general teacher remains a future option.
 
+Later decision, 2026-10-14 (+08): the operator selects a new X2 shared-teacher pipeline.
+See [general PPO teacher and goal-conditioned latent diffusion](x2_general_teacher_goal_conditioned_latent_diffusion.md).
+The VAE encoder receives reference preview; the decoder remains reference-free.
+This later design does not change existing specialist-based experiments.
+
 Related documents:
 
 - [VAE distillation architecture](beyondmimic_vae_distillation.md)
