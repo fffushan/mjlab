@@ -38,6 +38,8 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `MERGE-MANIFEST.md` | provenance | lane provenance for the coverage integration tree | historical |
 | `mvp-source-report.md` | note | fixed-state coverage evaluator scope | historical |
 | `x2_multi_motion_ppo_8gpu_nccl_hang_diagnosis.md` | diagnosis | 8-rank multi-motion PPO NCCL hang | not reproduced; cause unknown; one 900-iteration run clean |
+| `x2_multi_motion_ppo_8gpu_20k_resume_result.md` | result | 8-GPU 20,000-iteration shared teacher, resumed from iteration 899 | exit 0; episode collapse solved; root position the weakest term; one seed, no held-out evaluation |
+| `x2_multi_motion_ppo_vs_vgk8_specialists.md` | comparison | shared teacher against the eight per-clip `vgk` specialists | teacher level on root-relative error and zero failures in 2048 episodes; in-distribution; root position not measured |
 
 Two Simplified Chinese documents moved out of this directory to the shared research landing
 page: `research/mjlab/vae-current-issues.zh-CN.md` and
