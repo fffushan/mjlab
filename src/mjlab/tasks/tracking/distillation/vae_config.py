@@ -15,10 +15,33 @@ from enum import Enum
 from typing import Any
 
 SCHEMA_VERSION = 1
+"""The frozen version-1 reference layout, which carries no reference preview."""
+
+PREVIEW_SCHEMA_VERSION = 2
+"""The version-2 layout, which appends one preview frame of reference q and dq.
+
+A preview-dependent teacher cannot be matched by a student that sees only the current
+reference: two references can share a current pose and velocity and still require
+different next actions.  Version 2 therefore adds the same future-reference sample the
+teacher observes, and it leaves the version-1 layout valid so existing checkpoints,
+statistics and installed bundles keep loading.
+"""
+
+SUPPORTED_SCHEMA_VERSIONS = (SCHEMA_VERSION, PREVIEW_SCHEMA_VERSION)
+
 JOINT_DIM = 31
 REFERENCE_DIM = 68
 ACTION_DIM = 31
 LATENT_DIM = 32
+REFERENCE_PREVIEW_FIELD = "motion_lookahead"
+"""Name of the appended version-2 reference field."""
+
+PREVIEW_DIM = 2 * JOINT_DIM
+"""Width of one preview frame: reference joint positions and velocities."""
+
+REFERENCE_DIM_WITH_PREVIEW = REFERENCE_DIM + PREVIEW_DIM
+"""Reference width of the version-2 gravity layout."""
+
 CONDITIONING_DIMS = {
   "gravity": 99,
   "anchor": 102,
@@ -105,7 +128,7 @@ class VaeSchema:
   action_dim: int = ACTION_DIM
 
   def __post_init__(self) -> None:
-    if self.version != SCHEMA_VERSION:
+    if self.version not in SUPPORTED_SCHEMA_VERSIONS:
       raise ValueError(f"unsupported schema version {self.version}")
     if len(self.joint_order) != JOINT_DIM or any(not name for name in self.joint_order):
       raise ValueError(f"joint_order must contain {JOINT_DIM} non-empty names")
@@ -113,18 +136,38 @@ class VaeSchema:
       raise ValueError("joint_order names must be unique")
     if self.latent_dim != LATENT_DIM or self.action_dim != ACTION_DIM:
       raise ValueError("M2 schemas require latent_dim=32 and action_dim=31")
-    expected_reference_dim = 71 if self.mode is DecoderMode.GRAVITY_TWIST else REFERENCE_DIM
+    has_preview = self.version == PREVIEW_SCHEMA_VERSION
+    if has_preview:
+      if not self.reference_fields or self.reference_fields[-1].name != (
+        REFERENCE_PREVIEW_FIELD
+      ):
+        raise ValueError(
+          f"version {PREVIEW_SCHEMA_VERSION} reference fields must end with "
+          f"{REFERENCE_PREVIEW_FIELD!r}"
+        )
+      if self.reference_fields[-1].dimension != PREVIEW_DIM:
+        raise ValueError(
+          f"the {REFERENCE_PREVIEW_FIELD!r} reference field must be {PREVIEW_DIM} wide"
+        )
+    expected_reference_dim = (
+      71 if self.mode is DecoderMode.GRAVITY_TWIST else REFERENCE_DIM
+    )
+    if has_preview:
+      expected_reference_dim += PREVIEW_DIM
     if self.reference_dim != expected_reference_dim:
-      raise ValueError(
-        f"reference layout must have width {expected_reference_dim}"
-      )
+      raise ValueError(f"reference layout must have width {expected_reference_dim}")
     expected = CONDITIONING_DIMS[self.mode.value]
     if self.conditioning_dim != expected:
       raise ValueError(
         f"{self.mode.value} conditioning layout must have width {expected}, "
         f"got {self.conditioning_dim}"
       )
-    if self.reference_names == (
+    # The preview is an addition to the frozen base order, so the version-1 checks run
+    # against the base fields with the preview removed.
+    base_reference_names = (
+      self.reference_names[:-1] if has_preview else self.reference_names
+    )
+    if base_reference_names == (
       "reference_q",
       "reference_dq",
       "anchor_position_error",
@@ -134,7 +177,7 @@ class VaeSchema:
         raise ValueError(
           "anchor-position reference layout is only valid for gravity_twist"
         )
-    elif self.reference_names != (
+    elif base_reference_names != (
       "reference_q",
       "reference_dq",
       "anchor_orientation_error",
@@ -317,8 +360,15 @@ def _field(name: str, dimension: int, frame: str) -> FeatureSpec:
 def make_schema(
   mode: DecoderMode | str = DecoderMode.GRAVITY,
   joint_order: tuple[str, ...] = DEFAULT_JOINT_ORDER,
+  *,
+  preview: bool = False,
 ) -> VaeSchema:
-  """Build one immutable layout, with gravity as the default mode."""
+  """Build one immutable layout, with gravity as the default mode.
+
+  ``preview`` appends one future-reference frame and selects the version-2 layout.  Use it
+  when the teacher observes a reference preview, so the student is not blind to
+  information the teacher used.  The default keeps the frozen version-1 layout exactly.
+  """
   selected = DecoderMode(mode)
   if selected is DecoderMode.GRAVITY_TWIST:
     reference_fields = (
@@ -357,9 +407,14 @@ def make_schema(
         reference_fields[2],
         *common,
       )
+  if preview:
+    reference_fields = reference_fields + (
+      _field(REFERENCE_PREVIEW_FIELD, PREVIEW_DIM, "reference"),
+    )
   return VaeSchema(
     mode=selected,
     joint_order=tuple(joint_order),
+    version=PREVIEW_SCHEMA_VERSION if preview else SCHEMA_VERSION,
     reference_fields=reference_fields,
     conditioning_fields=conditioning_fields,
   )
@@ -386,8 +441,13 @@ __all__ = [
   "JOINT_DIM",
   "LATENT_DIM",
   "ModelSettings",
+  "PREVIEW_DIM",
+  "PREVIEW_SCHEMA_VERSION",
   "REFERENCE_DIM",
+  "REFERENCE_DIM_WITH_PREVIEW",
+  "REFERENCE_PREVIEW_FIELD",
   "SCHEMA_VERSION",
+  "SUPPORTED_SCHEMA_VERSIONS",
   "VAEModelConfig",
   "VaeSchema",
   "make_schema",

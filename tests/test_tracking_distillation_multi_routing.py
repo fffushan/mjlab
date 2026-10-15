@@ -141,6 +141,9 @@ def make_cohort() -> Any:
       dim=ACTION_DIM,
       joint_names=tuple(f"joint_{index:02d}" for index in range(ACTION_DIM)),
     ),
+    # The real contract always declares one cross-member preview duration, and zero keeps
+    # the frozen version-1 reference layout.
+    lookahead_s=0.0,
   )
 
 

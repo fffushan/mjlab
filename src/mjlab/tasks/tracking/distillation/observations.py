@@ -10,6 +10,8 @@ from mjlab.tasks.tracking.distillation.vae_config import (
   ACTION_DIM,
   DEFAULT_SCHEMA,
   JOINT_DIM,
+  PREVIEW_DIM,
+  REFERENCE_PREVIEW_FIELD,
   DecoderMode,
   VaeSchema,
 )
@@ -80,6 +82,10 @@ class ObservationSnapshot:
   relative_joint_q: torch.Tensor
   joint_dq: torch.Tensor
   previous_action: torch.Tensor
+  # The future-reference sample of the version-2 layout.  It stays optional so the frozen
+  # version-1 layout keeps its construction contract; a version-2 pack refuses a snapshot
+  # that omits it, and a version-1 pack ignores it.
+  motion_lookahead: torch.Tensor | None = None
   # Optional until the paper-shaped gravity_twist schema is selected.  Keeping
   # these fields optional preserves construction compatibility for the default
   # 68/99 schema and makes the ablation's required features explicit at pack time.
@@ -122,6 +128,7 @@ class ObservationSnapshot:
     optional_vectors = (
       ("anchor_position_error", self.anchor_position_error, 3),
       ("root_linear_velocity", self.root_linear_velocity, 3),
+      (REFERENCE_PREVIEW_FIELD, self.motion_lookahead, PREVIEW_DIM),
     )
     for name, value, width in optional_vectors:
       if value is None:
@@ -156,6 +163,8 @@ class ObservationSnapshot:
       "joint_dq": self.joint_dq,
       "previous_action": self.previous_action,
     }
+    if self.motion_lookahead is not None:
+      values[REFERENCE_PREVIEW_FIELD] = self.motion_lookahead
     if self.anchor_position_error is not None:
       values["anchor_position_error"] = self.anchor_position_error
     if self.root_linear_velocity is not None:

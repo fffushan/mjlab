@@ -55,6 +55,8 @@ from mjlab.tasks.tracking.distillation.teachers import (
   load_frozen_teacher,
 )
 from mjlab.tasks.tracking.distillation.vae_config import (
+  PREVIEW_SCHEMA_VERSION,
+  REFERENCE_PREVIEW_FIELD,
   DecoderMode,
   VaeSchema,
   make_schema,
@@ -1182,6 +1184,39 @@ def _require_normalized_action(env: Any, action_dim: int, action: torch.Tensor) 
     raise ValueError("refusing to step a non-finite action")
 
 
+def default_schema_for_cohort(cohort: CohortContract) -> VaeSchema:
+  """Build the schema one cohort implies, including its declared reference preview.
+
+  The student must observe the same future reference the teacher used: an encoder that
+  sees only the current reference cannot reproduce a preview-dependent teacher, because
+  two references can share a current pose and velocity and still require different next
+  actions.  The cohort contract already fixes one ``lookahead_s`` for every member, and
+  every cohort manifest written before the preview layout existed declares zero, so this
+  keeps the frozen version-1 layout in place for those runs.
+  """
+  return make_schema(
+    joint_order=cohort.actions.joint_names,
+    preview=float(cohort.lookahead_s) > 0.0,
+  )
+
+
+def _required_preview(values: Mapping[str, torch.Tensor]) -> torch.Tensor:
+  """Return the reference preview, or refuse a version-2 pack without one.
+
+  A version-2 schema against a teacher observation that declares no preview term is a
+  contract mismatch, not a recoverable state: packing it would silently train a student
+  that cannot see what the teacher saw.
+  """
+  preview = values.get(REFERENCE_PREVIEW_FIELD)
+  if preview is None:
+    raise DistillationError(
+      f"the version-{PREVIEW_SCHEMA_VERSION} reference layout needs the "
+      f"{REFERENCE_PREVIEW_FIELD!r} observation term, and the saved teacher "
+      "observation does not declare one"
+    )
+  return preview
+
+
 def _capture_snapshot(
   env: Any,
   *,
@@ -1209,7 +1244,9 @@ def _capture_snapshot(
     raise DistillationError("live actor observations must be a cached flat tensor")
   teacher_observation = obs["actor"].detach().clone()
   if teacher_observation.ndim != 2:
-    raise DistillationError("live actor observation must have shape [B, 164]")
+    raise DistillationError(
+      "live actor observation must be a flat two-dimensional tensor"
+    )
   values = {name: teacher_observation[:, span].clone() for name, span in slices.items()}
   required = _TERM_FEATURES - set(values)
   if required:
@@ -1246,6 +1283,9 @@ def _capture_snapshot(
     relative_joint_q=values["joint_pos"],
     joint_dq=values["joint_vel"],
     previous_action=values["actions"],
+    motion_lookahead=(
+      _required_preview(values) if schema.version == PREVIEW_SCHEMA_VERSION else None
+    ),
   )
   packed = pack_observations(features, schema)
   return DistillationSnapshot(
@@ -1298,7 +1338,7 @@ class DistillationEnvironmentAdapter:
     self.cohort = cohort
     self.teacher_id = teacher_id
     self.teacher_code = 0
-    self.schema = schema or make_schema(joint_order=cohort.actions.joint_names)
+    self.schema = schema or default_schema_for_cohort(cohort)
     if self.schema.joint_order != cohort.actions.joint_names:
       raise DistillationError(
         "live schema joint_order must exactly match cohort.actions.joint_names"
@@ -1390,7 +1430,7 @@ class MultiMotionDistillationAdapter:
     self.env = env
     self.cohort = cohort
     self.bank = bank
-    self.schema = schema or make_schema(joint_order=cohort.actions.joint_names)
+    self.schema = schema or default_schema_for_cohort(cohort)
     if self.schema.joint_order != cohort.actions.joint_names:
       raise DistillationError(
         "live schema joint_order must exactly match cohort.actions.joint_names"

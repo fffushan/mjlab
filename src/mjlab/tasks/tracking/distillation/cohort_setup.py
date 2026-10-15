@@ -136,10 +136,14 @@ class CohortSetup:
     cohort = self.resolve()
     actions = getattr(cohort, "actions", None)
     joint_order = getattr(actions, "joint_names", None)
+    # The student observes the same reference preview the teacher used.  The cohort fixes
+    # one lookahead_s for every member, and every cohort that declares zero keeps the
+    # frozen version-1 layout, so existing runs and checkpoints are unaffected.
+    preview = float(cohort.lookahead_s) > 0.0
     schema = (
-      make_schema(self.schema_mode)
+      make_schema(self.schema_mode, preview=preview)
       if joint_order is None
-      else make_schema(self.schema_mode, joint_order=joint_order)
+      else make_schema(self.schema_mode, joint_order=joint_order, preview=preview)
     )
     if self.coverage_policy is not None:
       if self.schema_mode != "gravity":

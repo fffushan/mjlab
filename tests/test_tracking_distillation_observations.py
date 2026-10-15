@@ -12,8 +12,16 @@ from mjlab.tasks.tracking.distillation.observations import (
 )
 from mjlab.tasks.tracking.distillation.vae_config import (
   DEFAULT_SCHEMA,
+  PREVIEW_DIM,
+  PREVIEW_SCHEMA_VERSION,
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+  REFERENCE_PREVIEW_FIELD,
+  SCHEMA_VERSION,
   DecoderMode,
   ModelSettings,
+  VaeSchema,
+  make_schema,
   schema_for_mode,
 )
 
@@ -32,6 +40,163 @@ def make_snapshot(batch: int = 2) -> ObservationSnapshot:
     joint_dq=values + 300,
     previous_action=values + 400,
   )
+
+
+def add_preview(
+  snapshot: ObservationSnapshot, preview: torch.Tensor | None = None
+) -> ObservationSnapshot:
+  """Copy a snapshot with a marked preview, so a mis-ordered pack is visible."""
+  batch = snapshot.batch_size
+  if preview is None:
+    preview = (
+      torch.arange(batch * PREVIEW_DIM, dtype=torch.float32).reshape(batch, PREVIEW_DIM)
+      + 500
+    )
+  return ObservationSnapshot(
+    reference_q=snapshot.reference_q,
+    reference_dq=snapshot.reference_dq,
+    anchor_orientation_error=snapshot.anchor_orientation_error,
+    projected_gravity=snapshot.projected_gravity,
+    gyro=snapshot.gyro,
+    relative_joint_q=snapshot.relative_joint_q,
+    joint_dq=snapshot.joint_dq,
+    previous_action=snapshot.previous_action,
+    motion_lookahead=preview,
+  )
+
+
+def test_the_frozen_version_one_layout_is_unchanged() -> None:
+  """Existing checkpoints, statistics and bundles must keep loading."""
+  assert SCHEMA_VERSION == 1
+  assert DEFAULT_SCHEMA.version == SCHEMA_VERSION
+  assert (DEFAULT_SCHEMA.reference_dim, DEFAULT_SCHEMA.conditioning_dim) == (68, 99)
+  assert REFERENCE_DIM == 68
+  assert REFERENCE_DIM_WITH_PREVIEW == 130
+  assert PREVIEW_DIM == 62
+  # A default schema is version 1 even though a preview layout now exists.
+  assert make_schema().version == SCHEMA_VERSION
+  assert make_schema().reference_names == (
+    "reference_q",
+    "reference_dq",
+    "anchor_orientation_error",
+  )
+
+
+def test_the_preview_layout_adds_one_reference_frame_only() -> None:
+  schema = make_schema(preview=True)
+  assert schema.version == PREVIEW_SCHEMA_VERSION
+  assert schema.reference_dim == REFERENCE_DIM_WITH_PREVIEW == 130
+  # The decoder stays proprioception-only: the preview reaches it through the latent.
+  assert schema.conditioning_dim == DEFAULT_SCHEMA.conditioning_dim == 99
+  assert schema.conditioning_names == DEFAULT_SCHEMA.conditioning_names
+  assert schema.reference_names == (
+    "reference_q",
+    "reference_dq",
+    "anchor_orientation_error",
+    REFERENCE_PREVIEW_FIELD,
+  )
+  assert schema.mode is DecoderMode.GRAVITY
+
+
+def test_the_preview_pack_keeps_the_version_one_prefix_and_appends_the_preview() -> (
+  None
+):
+  """The first 68 values must not move, so the version-1 layout stays the prefix."""
+  snapshot = make_snapshot(2)
+  marked = add_preview(snapshot)
+  version_one = pack_observations(snapshot, make_schema())
+  version_two = pack_observations(marked, make_schema(preview=True))
+
+  assert version_two.reference.shape == (2, 130)
+  assert torch.equal(version_two.reference[:, :REFERENCE_DIM], version_one.reference)
+  assert torch.equal(version_two.reference[:, REFERENCE_DIM:], marked.motion_lookahead)
+  # The preview carries the future joint positions and then the future velocities.
+  assert version_two.reference[0, 68].item() == 500.0
+  assert version_two.reference[0, 68 + 31].item() == 500.0 + 31.0
+  assert torch.equal(version_two.conditioning, version_one.conditioning)
+
+
+def test_the_preview_pack_refuses_a_snapshot_that_omits_the_preview() -> None:
+  with pytest.raises(ObservationValidationError, match=REFERENCE_PREVIEW_FIELD):
+    pack_observations(make_snapshot(2), make_schema(preview=True))
+
+
+def test_a_version_one_pack_ignores_a_supplied_preview() -> None:
+  packed = pack_observations(add_preview(make_snapshot(2)), make_schema())
+  assert packed.reference.shape == (2, 68)
+
+
+def test_a_preview_of_the_wrong_width_is_refused() -> None:
+  with pytest.raises(ObservationValidationError, match="motion_lookahead"):
+    add_preview(make_snapshot(2), torch.zeros(2, 31))
+
+
+def test_a_version_two_schema_needs_the_preview_field_in_the_last_position() -> None:
+  base = make_schema()
+  with pytest.raises(ValueError, match="must end with"):
+    VaeSchema(
+      mode=base.mode,
+      version=PREVIEW_SCHEMA_VERSION,
+      reference_fields=base.reference_fields,
+      conditioning_fields=base.conditioning_fields,
+    )
+
+
+def test_a_version_two_schema_rejects_a_mis_sized_preview_field() -> None:
+  base = make_schema()
+  wrong = tuple(base.reference_fields) + (
+    base.reference_fields[0].__class__(
+      REFERENCE_PREVIEW_FIELD, 30, base.reference_fields[0].frame
+    ),
+  )
+  with pytest.raises(ValueError, match="must be 62 wide"):
+    VaeSchema(
+      mode=base.mode,
+      version=PREVIEW_SCHEMA_VERSION,
+      reference_fields=wrong,
+      conditioning_fields=base.conditioning_fields,
+    )
+
+
+def test_an_unsupported_schema_version_is_refused() -> None:
+  base = make_schema()
+  with pytest.raises(ValueError, match="unsupported schema version"):
+    VaeSchema(
+      mode=base.mode,
+      version=3,
+      reference_fields=base.reference_fields,
+      conditioning_fields=base.conditioning_fields,
+    )
+
+
+def test_preview_metadata_roundtrips_and_crosses_no_version_boundary() -> None:
+  version_one = make_schema()
+  version_two = make_schema(preview=True)
+  assert VaeSchema.from_metadata(version_two.compatibility_metadata()) == version_two
+  assert VaeSchema.from_metadata(version_one.compatibility_metadata()) == version_one
+  # A version-1 checkpoint must not load into a version-2 run, and the reverse.
+  with pytest.raises(ValueError, match="does not match"):
+    version_one.assert_compatible(version_two.compatibility_metadata())
+  with pytest.raises(ValueError, match="does not match"):
+    version_two.assert_compatible(version_one.compatibility_metadata())
+  assert version_two.compatibility_metadata()["reference_dim"] == 130
+  assert version_two.compatibility_metadata()["schema_version"] == 2
+
+
+def test_the_preview_layout_is_available_for_every_decoder_mode() -> None:
+  for mode in (
+    DecoderMode.GRAVITY,
+    DecoderMode.ANCHOR,
+    DecoderMode.GRAVITY_ANCHOR,
+    DecoderMode.GRAVITY_TWIST,
+  ):
+    base = make_schema(mode)
+    with_preview = make_schema(mode, preview=True)
+    assert with_preview.reference_dim == base.reference_dim + PREVIEW_DIM
+    assert with_preview.conditioning_names == base.conditioning_names
+    assert VaeSchema.from_metadata(with_preview.compatibility_metadata()) == (
+      with_preview
+    )
 
 
 @pytest.mark.parametrize(

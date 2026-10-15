@@ -292,6 +292,26 @@ Added
   format the controller already accepts. Student quality, distillation and
   hardware behaviour are not tested here.
 
+- Added the version-2 reference layout for a preview-dependent teacher
+  (``PREVIEW_SCHEMA_VERSION`` in
+  ``src/mjlab/tasks/tracking/distillation/vae_config.py``). It appends one
+  future-reference frame of joint positions and velocities, so the encoder
+  reference grows from 68 to 130 while the decoder conditioning stays at 99 and
+  the decoder still receives proprioception only. The version-1 layout stays the
+  default and is unchanged, so existing checkpoints, normalizer statistics and
+  installed bundles keep loading; a version-1 and a version-2 schema refuse each
+  other's stored metadata, so a checkpoint cannot cross the boundary silently.
+
+- The student reference layout now follows the cohort's declared ``lookahead_s``.
+  ``default_schema_for_cohort`` in ``distillation/adapter.py`` and the setup
+  builder in ``distillation/cohort_setup.py`` select the version-2 layout exactly
+  when the cohort declares a preview, because an encoder that sees only the
+  current reference cannot reproduce a teacher that used a preview. Every
+  manifest in ``configs/distillation/`` declares zero, so all eleven existing
+  cohorts keep the version-1 layout. A version-2 layout against a teacher
+  observation with no ``motion_lookahead`` term fails closed instead of packing a
+  student that cannot see what the teacher saw.
+
 Fixed
 ^^^^^
 

@@ -13,14 +13,23 @@ import torch
 
 from mjlab.tasks.tracking.distillation.adapter import (
   DistillationEnvironmentAdapter,
+  default_schema_for_cohort,
   validate_live_contract,
 )
-from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
+from mjlab.tasks.tracking.distillation.config import (
+  DistillationError,
+  load_manifest,
+  resolve_cohort,
+)
 from mjlab.tasks.tracking.distillation.environment import (
   SegmentMotionCommand,
   build_distillation_environment,
 )
-from mjlab.tasks.tracking.distillation.vae_config import make_schema
+from mjlab.tasks.tracking.distillation.vae_config import (
+  PREVIEW_SCHEMA_VERSION,
+  SCHEMA_VERSION,
+  make_schema,
+)
 
 
 class FakeSegmentMotionCommand(SegmentMotionCommand):
@@ -66,19 +75,49 @@ _TERM_NAMES_WIDTHS = (
 )
 
 
-def make_fake_adapter() -> tuple[DistillationEnvironmentAdapter, SimpleNamespace]:
-  terms = tuple(
-    SimpleNamespace(name=name, width=width) for name, width in _TERM_NAMES_WIDTHS
+_BASE_TERM_NAMES_WIDTHS = (
+  ("command", 62),
+  ("motion_anchor_ori_b", 6),
+  ("base_ang_vel", 3),
+  ("joint_pos", 31),
+  ("joint_vel", 31),
+  ("actions", 31),
+)
+
+
+def _term_names_widths(lookahead_width: int) -> tuple[tuple[str, int], ...]:
+  """The X2 actor layout, with the reference preview the teacher observed inserted."""
+  if lookahead_width == 0:
+    return _BASE_TERM_NAMES_WIDTHS
+  return (
+    ("command", 62),
+    ("motion_lookahead", lookahead_width),
+    *_BASE_TERM_NAMES_WIDTHS[1:],
   )
+
+
+def make_fake_adapter(
+  lookahead_width: int = 0, lookahead_s: float | None = None
+) -> tuple[DistillationEnvironmentAdapter, SimpleNamespace]:
+  layouts = _term_names_widths(lookahead_width)
+  terms = tuple(SimpleNamespace(name=name, width=width) for name, width in layouts)
   observations = SimpleNamespace(
     terms=terms,
-    names=tuple(name for name, _ in _TERM_NAMES_WIDTHS),
+    names=tuple(name for name, _ in layouts),
   )
   actions = SimpleNamespace(
     dim=31,
     joint_names=tuple(f"joint_{index:02d}" for index in range(31)),
   )
-  cohort = SimpleNamespace(observations=observations, actions=actions)
+  # The real contract always declares one cross-member preview duration, and zero keeps
+  # the frozen version-1 reference layout.
+  cohort = SimpleNamespace(
+    observations=observations,
+    actions=actions,
+    lookahead_s=(
+      (0.2 if lookahead_width else 0.0) if lookahead_s is None else lookahead_s
+    ),
+  )
 
   command: Any = object.__new__(FakeSegmentMotionCommand)
   command.cfg = SimpleNamespace(entity_name="robot")
@@ -97,7 +136,8 @@ def make_fake_adapter() -> tuple[DistillationEnvironmentAdapter, SimpleNamespace
     )
   )
 
-  actor = torch.arange(2 * 164, dtype=torch.float32).reshape(2, 164)
+  total_width = sum(width for _, width in layouts)
+  actor = torch.arange(2 * total_width, dtype=torch.float32).reshape(2, total_width)
   env = SimpleNamespace(
     num_envs=2,
     device=torch.device("cpu"),
@@ -292,3 +332,50 @@ def test_snapshot_has_shared_feature_values_without_second_group_compute() -> No
   torch.testing.assert_close(
     snapshot.features.previous_action, snapshot.teacher_observation[:, 133:164]
   )
+
+
+def test_a_cohort_without_a_preview_keeps_the_frozen_version_one_layout() -> None:
+  """Every cohort written before the preview layout must be unaffected."""
+  adapter, _ = make_fake_adapter()
+  assert adapter.schema.version == SCHEMA_VERSION
+  assert (adapter.schema.reference_dim, adapter.schema.conditioning_dim) == (68, 99)
+  assert adapter.snapshot().packed.reference.shape == (2, 68)
+
+
+def test_a_preview_cohort_packs_the_teacher_preview_into_the_reference() -> None:
+  """The student must see the future reference the teacher used."""
+  adapter, _ = make_fake_adapter(lookahead_width=62)
+  assert adapter.schema.version == PREVIEW_SCHEMA_VERSION
+  assert adapter.schema.reference_dim == 130
+  # The decoder stays proprioception-only at 99.
+  assert adapter.schema.conditioning_dim == 99
+
+  snapshot = adapter.snapshot()
+  reference = snapshot.packed.reference
+  assert reference.shape == (2, 130)
+  # The teacher layout is command, motion_lookahead, motion_anchor_ori_b, ... and the
+  # packed reference is q, dq, anchor, preview, so the preview moves to the end.
+  actor = torch.arange(2 * 226, dtype=torch.float32).reshape(2, 226)
+  torch.testing.assert_close(reference[:, 68:], actor[:, 62:124])
+  torch.testing.assert_close(reference[:, 62:68], actor[:, 124:130])
+  # The version-1 prefix is unmoved.
+  torch.testing.assert_close(reference[:, :62], actor[:, :62])
+
+
+def test_a_version_two_declaration_without_the_preview_term_fails_closed() -> None:
+  """A teacher observation that declares no preview cannot satisfy the new layout."""
+  adapter, _ = make_fake_adapter(lookahead_width=0, lookahead_s=0.2)
+  assert adapter.schema.version == PREVIEW_SCHEMA_VERSION
+  with pytest.raises(DistillationError, match="motion_lookahead"):
+    adapter.snapshot()
+
+
+def test_the_cohort_preview_duration_selects_the_schema_version() -> None:
+  """The derivation rule is one place, so it cannot disagree with the observation."""
+  cohort = SimpleNamespace(
+    actions=SimpleNamespace(joint_names=tuple(f"joint_{i:02d}" for i in range(31))),
+    lookahead_s=0.0,
+  )
+  assert default_schema_for_cohort(cohort).version == SCHEMA_VERSION
+  cohort.lookahead_s = 0.2
+  assert default_schema_for_cohort(cohort).version == PREVIEW_SCHEMA_VERSION
