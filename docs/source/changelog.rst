@@ -327,8 +327,27 @@ Added
   and serves any clip. Measured on the 20k teacher: two clips exported at 226
   observation width, and both pass the loader's own ``_require_onnx_interface``
   check with embedded ``joint_pos``/``joint_vel`` equal to the source clip exactly
-  and ``body_quat_w`` equal at 1e-5. The full 144-clip batch and the cohort
-  manifest are not produced here.
+  and ``body_quat_w`` equal at 1e-5.
+
+- Added the 144-clip multi-motion distillation cohort at
+  ``configs/distillation/x2_tennis_multimotion_v1.yaml``. Every entry is the same
+  20,000-iteration checkpoint with that clip's reference tables embedded, and the
+  clip list is the teacher's own 148-clip training manifest filtered to the 144
+  ``single_*`` references (the four ``standing_*`` clips are excluded). The
+  manifest is generated from the export report, which records 144 distinct ONNX
+  digests and no failures, totalling 2,350,039,928 bytes. ``scripts/export_x2_teacher_reference_onnx.py``
+  gained an explicit ``--only`` name filter, because a partial selection from a
+  larger manifest must be stated rather than silently inferred.
+
+  Validation is partial by necessity. ``load_manifest`` accepts all 144 entries
+  and confirms one shared checkpoint and one shared saved-params pair. Then
+  ``resolve_cohort`` resolves the checkpoint, the actor, the control contract, the
+  observation contract at the derived 226 width, and the ONNX interface, before it
+  stops at the one check that needs the artifacts' own host: the teacher's saved
+  params name an absolute NAS reference manifest, so the clip-membership check
+  cannot run here. That refusal names the path, which is the designed behaviour.
+  Cohort resolution must therefore run where the recorded manifest path exists, and
+  training has not started.
 
 Fixed
 ^^^^^

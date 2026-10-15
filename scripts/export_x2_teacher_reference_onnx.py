@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument("--out-dir", required=True, type=Path)
   parser.add_argument(
+    "--only",
+    default=None,
+    help="Regex filter on the clip file name, applied before naming.",
+  )
+  parser.add_argument(
     "--name-pattern",
     default=None,
     help="Regex whose first group is the clip name; defaults to the file stem.",
@@ -78,6 +83,13 @@ def select_clips(args: argparse.Namespace) -> dict[str, Path]:
   """Map clip names to clips, refusing a name that collides or is unsafe."""
   if args.motion_manifest is not None:
     paths: Sequence[Path] = resolve_manifest_clips(str(args.motion_manifest))
+    # An explicit filter is required before a partial selection: silently exporting every
+    # clip the manifest lists would hide the selection this run intends to make.
+    if args.only:
+      keep = re.compile(args.only)
+      paths = tuple(path for path in paths if keep.search(path.name))
+      if not paths:
+        raise SystemExit(f"no clip matches --only {args.only!r}")
   else:
     paths = tuple(args.clip)
   pattern = re.compile(args.name_pattern) if args.name_pattern else None
