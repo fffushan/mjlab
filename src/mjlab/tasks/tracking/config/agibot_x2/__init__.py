@@ -1,6 +1,8 @@
-from mjlab.rl import MjlabOnPolicyRunner
 from mjlab.tasks.registry import register_mjlab_task
-from mjlab.tasks.tracking.rl import MotionTrackingOnPolicyRunner
+from mjlab.tasks.tracking.rl import (
+  MotionTrackingOnPolicyRunner,
+  MultiMotionTrackingOnPolicyRunner,
+)
 
 from .env_cfgs import (
   agibot_x2_flat_tracking_correlated_dr_env_cfg,
@@ -206,13 +208,15 @@ register_mjlab_task(
   runner_cls=MotionTrackingOnPolicyRunner,
 )
 
-# The multi-motion teacher is not a single-motion task: it has no reference clip
-# to embed in the policy export, so it runs the standard runner. Its checkpoint
-# is the teacher artifact; ONNX export for a specific clip is step 3 work.
+# The multi-motion teacher is not a single-motion task: it has no reference clip to
+# embed in the policy export. Its deploy graph is therefore the raw ``obs -> actions``
+# model and the reference travels as a separate file, which is what lets one policy
+# replay a clip the teacher never trained on. The runner writes that graph plus the
+# metadata that declares the enabled preview offset.
 register_mjlab_task(
   task_id="Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion",
   env_cfg=agibot_x2_multi_motion_tracking_env_cfg(),
   play_env_cfg=agibot_x2_multi_motion_tracking_env_cfg(play=True),
   rl_cfg=agibot_x2_multi_motion_ppo_runner_cfg(),
-  runner_cls=MjlabOnPolicyRunner,
+  runner_cls=MultiMotionTrackingOnPolicyRunner,
 )

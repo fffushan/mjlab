@@ -21,7 +21,13 @@ from mjlab.tasks.tracking.mdp.multi_motion_ppo import (
   MultiMotionPpoCommandCfg,
   clip_complete,
 )
-from mjlab.tasks.tracking.rl import MotionTrackingOnPolicyRunner
+from mjlab.tasks.tracking.rl import (
+  MOTION_LOOKAHEAD_STEPS_KEY,
+  MotionTrackingOnPolicyRunner,
+  MultiMotionTrackingOnPolicyRunner,
+  motion_export_metadata,
+  resolve_lookahead_steps,
+)
 from mjlab.utils.os import dump_yaml, load_saved_yaml
 
 TASK = "Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion"
@@ -73,8 +79,13 @@ def test_multi_motion_task_settings_preview_and_terminations(tmp_path: Path) -> 
   agent = load_rl_cfg(TASK)
   assert isinstance(agent, RslRlOnPolicyRunnerCfg)
 
-  # Standard runner: this task has no single clip to embed in the policy export.
-  assert load_runner_cls(TASK) is MjlabOnPolicyRunner
+  # The teacher has no single clip to embed, so its runner writes the reference-free
+  # graph. It must stay a base-runner subclass: inheriting the single-motion export
+  # would try to embed one clip's tables, which this command refuses.
+  runner = load_runner_cls(TASK)
+  assert runner is MultiMotionTrackingOnPolicyRunner
+  assert issubclass(runner, MjlabOnPolicyRunner)
+  assert not issubclass(runner, MotionTrackingOnPolicyRunner)
 
   # The paper network for both networks, and the base PPO settings elsewhere.
   base_agent = load_rl_cfg(SINGLE_MOTION_TASK)
@@ -185,3 +196,36 @@ def test_single_motion_vendor_gain_task_is_unchanged() -> None:
   assert registered.observations["critic"].terms == base.observations["critic"].terms
   assert registered.terminations == base.terminations
   assert registered.scene.num_envs == base.scene.num_envs == 1
+
+
+def test_deploy_export_declares_the_preview_the_actor_observes() -> None:
+  """The reader compiles a width from metadata, so the export must state the offset.
+
+  The term name is present for a disabled and an enabled preview alike, so the term
+  list cannot distinguish them. Without the declared offset the reader resolves the
+  preview to width zero and refuses the 226-wide graph.
+  """
+  motion_cfg = load_env_cfg(TASK).commands["motion"]
+  assert motion_cfg.lookahead_s == 0.2
+
+  steps = resolve_lookahead_steps(motion_cfg.lookahead_s, CONTROL_HZ)
+  assert steps == PREVIEW_STEPS
+
+  metadata = motion_export_metadata(motion_cfg, steps)
+  assert metadata["anchor_body_name"] == "torso_link"
+  assert metadata["body_names"] == list(motion_cfg.body_names)
+  assert metadata[MOTION_LOOKAHEAD_STEPS_KEY] == steps
+
+  width = sum(ACTOR_TERM_WIDTHS.values())
+  assert width == EXPECTED_ACTOR_WIDTH
+  # The layout the reader would have compiled without the declaration.
+  assert width - ACTOR_TERM_WIDTHS["motion_lookahead"] == 164
+
+
+def test_the_specialist_layout_still_declares_a_disabled_preview() -> None:
+  """Existing 164-wide exports must stay compilable once the key exists."""
+  motion_cfg = load_env_cfg(SINGLE_MOTION_TASK).commands["motion"]
+  assert resolve_lookahead_steps(motion_cfg.lookahead_s, CONTROL_HZ) == 0
+  metadata = motion_export_metadata(motion_cfg, 0)
+  assert metadata[MOTION_LOOKAHEAD_STEPS_KEY] == 0
+  assert sum(ACTOR_TERM_WIDTHS.values()) - ACTOR_TERM_WIDTHS["motion_lookahead"] == 164

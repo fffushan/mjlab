@@ -253,6 +253,45 @@ Added
   and 20 steps is 56.83 ms. The flow package's own ``DEFAULT_CALLS`` stays 20
   because it is the offline generation-scoring grid.
 
+- Added the reference-free deploy export for the X2 shared multi-motion teacher.
+  ``MultiMotionTrackingOnPolicyRunner``
+  (``src/mjlab/tasks/tracking/rl/multi_motion_runner.py``) and
+  ``scripts/export_x2_multi_motion_policy.py`` write the raw ``obs -> actions``
+  graph with the observation normalizer baked in and the deterministic mean as
+  the output. The graph embeds no reference table, so one policy can replay a
+  clip the teacher never trained on. The deployed artifact is local and
+  git-ignored: ``logs/diagnostics/x2-multi-motion-deploy-20261015/policy.onnx``,
+  15909634 bytes, SHA-256
+  ``5e6b7c74fdf820024ffc821ffbda9dd5ccc7de944988d91d6d1f031f8fedca1f``, exported
+  from ``model_19999.pt``. A torch-versus-onnxruntime parity check runs inside
+  the export script. Controller acceptance is not tested, and the X2 loader
+  still requires the embedded-reference interface.
+
+- Added the preview-offset metadata key ``motion_lookahead_steps``
+  (``src/mjlab/tasks/tracking/rl/export_metadata.py``). The X2 controller
+  compiles an observation plan from the export metadata and derives every term
+  width itself, but the term name ``motion_lookahead`` is present for a disabled
+  preview and an enabled one alike, so the term list cannot distinguish them.
+  The export therefore states the offset, and an absent key means a disabled
+  preview, which keeps every export written before this key valid. Training
+  computes ``max(1, ceil(lookahead_s * fps))``; the export mirrors that formula
+  exactly, and a multi-motion command whose rows disagree is refused instead of
+  averaged.
+
+- Added ``scripts/export_x2_reference_bundle.py`` and
+  ``src/mjlab/tasks/tracking/rl/reference_bundle.py``, which convert motion npz
+  clips into the controller's existing ``mjlab-vae-motion`` version 2 JSON plus
+  a manifest carrying source digests. Only reference tables are written, never
+  weights. The writer fails closed on a frame rate other than exactly 50 Hz, a
+  body or joint count mismatch, a non-finite row, a non-unit anchor quaternion,
+  a missing required array, an unsafe clip name and a duplicate clip name.
+
+- Added 23 focused tests for the export metadata and the reference bundle. One
+  test rebuilds the tables of a deployed bundle and compares ``q``, ``dq`` and
+  ``anchor_quat_wxyz`` with tolerance zero, so the writer cannot drift from the
+  format the controller already accepts. Student quality, distillation and
+  hardware behaviour are not tested here.
+
 Fixed
 ^^^^^
 
@@ -350,6 +389,21 @@ Changed
   diffusion run still reports ``ddim_updates: 20`` and start level ``1000``; a
   flow run reports ``euler_x0``, its real process identity and grid, and no
   ``ddim_updates`` field.
+
+- Changed ``Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion`` to register
+  ``MultiMotionTrackingOnPolicyRunner`` instead of ``MjlabOnPolicyRunner``, so a
+  checkpoint save also writes the deploy export. The new runner subclasses the
+  base runner and deliberately does not subclass
+  ``MotionTrackingOnPolicyRunner``, whose export embeds one clip's reference
+  tables; the multi-motion command refuses a single-clip loader by design. The
+  policy graph, the actor and critic layouts and the training path are
+  unchanged.
+
+- Changed the X2 multi-motion export to keep the reference outside the graph.
+  The reference-free layout is what allows one policy to serve many clips, but
+  it also means the reference contract must travel separately. The reference is
+  read from the controller's existing ``mjlab-vae-motion`` file path, so no new
+  controller reader is required.
 
 
 =========
