@@ -1175,16 +1175,7 @@ def _resolve_reference(
     )
   fps = float(fps_values[0])
 
-  declared = _require_str(
-    _saved_motion_cfg(entry, env_config).get("motion_file"),
-    f"{entry.id} env.commands.motion.motion_file",
-  )
-  if Path(declared).name != entry.motion.name:
-    raise DistillationError(
-      f"{entry.id} saved env config references motion {Path(declared).name!r} but the "
-      f"manifest selects {entry.motion.name!r}; the local override must match the "
-      "saved reference"
-    )
+  declared = _saved_reference_clip(entry, env_config)
   return ReferenceSpec(
     motion_path=entry.motion,
     declared_motion_file=declared,
@@ -1221,6 +1212,71 @@ def _saved_motion_cfg(
 ) -> Mapping[str, Any]:
   commands = _require_mapping(env_config.get("commands"), f"{entry.id} env.commands")
   return _require_mapping(commands.get("motion"), f"{entry.id} env.commands.motion")
+
+
+def _saved_reference_clip(entry: TeacherEntry, env_config: Mapping[str, Any]) -> str:
+  """Return the clip the saved env config references, or "" for a manifest reference.
+
+  A single-clip teacher names exactly one motion file, and that name must be the clip the
+  manifest selects.  A teacher that covers many clips names a reference manifest instead
+  and leaves ``motion_file`` empty; for that shape the selected clip must be a member of
+  the saved manifest.  Both forms bind the manifest's clip to the teacher's own saved
+  reference, so neither one can silently pair a teacher with an unrelated clip.
+
+  The empty string is the recorded value for a manifest reference, because no single clip
+  names the reference of a teacher that covers many of them.
+  """
+  motion_cfg = _saved_motion_cfg(entry, env_config)
+  declared = motion_cfg.get("motion_file")
+  manifest = motion_cfg.get("motion_manifest")
+  if declared and manifest:
+    raise DistillationError(
+      f"{entry.id} saved env config sets both motion_file and motion_manifest, so its "
+      "reference source is ambiguous"
+    )
+  if declared:
+    name = _require_str(declared, f"{entry.id} env.commands.motion.motion_file")
+    if Path(name).name != entry.motion.name:
+      raise DistillationError(
+        f"{entry.id} saved env config references motion {Path(name).name!r} but the "
+        f"manifest selects {entry.motion.name!r}; the local override must match the "
+        "saved reference"
+      )
+    return name
+  if not manifest:
+    raise DistillationError(
+      f"{entry.id} saved env config declares neither motion_file nor motion_manifest, "
+      "so its reference cannot be checked against the manifest clip"
+    )
+  path = _require_str(manifest, f"{entry.id} env.commands.motion.motion_manifest")
+  if entry.motion.name not in _saved_manifest_clip_names(entry, path):
+    raise DistillationError(
+      f"{entry.id} saved reference manifest {path!r} does not list "
+      f"{entry.motion.name!r}; a manifest-based teacher may only be paired with a clip "
+      "it declares"
+    )
+  return ""
+
+
+def _saved_manifest_clip_names(entry: TeacherEntry, manifest: str) -> frozenset[str]:
+  """Names of the clips a saved reference manifest declares.
+
+  The import is local because the multi-motion PPO command module imports this package,
+  so a module-level import would be circular.  Reading the manifest here rather than in a
+  second YAML reader keeps one definition of the manifest format.
+  """
+  from mjlab.tasks.tracking.mdp.multi_motion_ppo import (
+    MultiMotionPpoError,
+    resolve_manifest_clips,
+  )
+
+  try:
+    clips = resolve_manifest_clips(manifest)
+  except MultiMotionPpoError as exc:
+    raise DistillationError(
+      f"{entry.id} saved reference manifest {manifest!r} cannot be read: {exc}"
+    ) from exc
+  return frozenset(clip.name for clip in clips)
 
 
 def _require_reference_cadence(

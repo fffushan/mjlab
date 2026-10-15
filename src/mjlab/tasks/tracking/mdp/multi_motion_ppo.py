@@ -121,6 +121,23 @@ def resolve_motion_files(cfg: MultiMotionPpoCommandCfg) -> tuple[Path, ...]:
   return paths
 
 
+def resolve_manifest_clips(manifest: str, root: Path | None = None) -> tuple[Path, ...]:
+  """Return every clip one reference manifest lists, in manifest order.
+
+  This is the single definition of the manifest format.  A caller that must check a
+  reference against a manifest uses this instead of reading the YAML a second time, so the
+  two readers cannot disagree about what the manifest declares.
+
+  Relative paths resolve from the repository root unless ``root`` overrides it.
+
+  Raises:
+    MultiMotionPpoError: if the manifest is missing, malformed, or empty.
+  """
+  base = repository_root() if root is None else root
+  entries = _load_manifest_entries(_resolve_path(base, manifest))
+  return tuple(_resolve_path(base, entry) for entry in entries)
+
+
 def clip_complete(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
   """Per-row mask of rows whose final reference frame was just executed.
 

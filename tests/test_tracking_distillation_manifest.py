@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from tracking_distillation_fixtures import (
+  DEFAULT_TEACHER_IDS,
   DEFAULT_TERMS,
   build_tiny_cohort,
   sha256_file,
@@ -29,6 +32,111 @@ def single_teacher_cohort(root: Path, teacher_id: str = "solo"):
   teacher = write_teacher(root, teacher_id)
   manifest = write_manifest(root / "configs" / "solo.yaml", [teacher], root=root)
   return teacher, manifest
+
+
+def point_saved_config_at_a_manifest(
+  env_config: Path, *, manifest: Path, listed: Sequence[Path]
+) -> None:
+  """Rewrite one saved env config to declare a reference manifest, not one clip.
+
+  A teacher that covers many clips records an empty ``motion_file`` and names its
+  reference manifest instead, which is the shape this repository's multi-motion
+  teacher has.
+  """
+  manifest.write_text("motions:\n" + "".join(f"  - {path}\n" for path in listed))
+  text, count = re.subn(
+    r"^    motion_file: .*$",
+    f"    motion_file: ''\n    motion_manifest: {manifest}",
+    env_config.read_text(),
+    count=1,
+    flags=re.MULTILINE,
+  )
+  assert count == 1, "the fixture no longer writes exactly one motion_file line"
+  env_config.write_text(text)
+
+
+def test_resolve_cohort_accepts_a_manifest_based_reference_teacher(
+  tmp_path: Path,
+) -> None:
+  """A teacher over many clips must bind its clip to its own manifest instead."""
+  cohort = build_tiny_cohort(tmp_path)
+  manifest = tmp_path / "reference.yaml"
+  listed = [teacher.motion for teacher in cohort.teachers]
+  for teacher in cohort.teachers:
+    point_saved_config_at_a_manifest(
+      teacher.env_config, manifest=manifest, listed=listed
+    )
+
+  contract = resolve_cohort(load_manifest(cohort.manifest, tmp_path))
+
+  assert contract.teacher_ids == tuple(DEFAULT_TEACHER_IDS)
+  # No single clip names a many-clip reference, so the recorded value is empty.
+  for teacher in contract.teachers:
+    assert teacher.reference.declared_motion_file == ""
+
+
+def test_resolve_cohort_rejects_a_manifest_that_omits_the_clip(tmp_path: Path) -> None:
+  cohort = build_tiny_cohort(tmp_path)
+  manifest = tmp_path / "reference.yaml"
+  # Both saved configs share one manifest that lists only the first clip.
+  for teacher in cohort.teachers:
+    point_saved_config_at_a_manifest(
+      teacher.env_config, manifest=manifest, listed=[cohort.teachers[0].motion]
+    )
+
+  with pytest.raises(DistillationError, match="does not list"):
+    resolve_cohort(load_manifest(cohort.manifest, tmp_path))
+
+
+def test_resolve_cohort_rejects_an_unreadable_saved_reference_manifest(
+  tmp_path: Path,
+) -> None:
+  """A recorded manifest path that no longer resolves must refuse, not pass."""
+  cohort = build_tiny_cohort(tmp_path)
+  manifest = tmp_path / "reference.yaml"
+  listed = [teacher.motion for teacher in cohort.teachers]
+  for teacher in cohort.teachers:
+    point_saved_config_at_a_manifest(
+      teacher.env_config, manifest=manifest, listed=listed
+    )
+  manifest.unlink()
+
+  with pytest.raises(DistillationError, match="cannot be read"):
+    resolve_cohort(load_manifest(cohort.manifest, tmp_path))
+
+
+def test_resolve_cohort_rejects_both_reference_sources(tmp_path: Path) -> None:
+  cohort = build_tiny_cohort(tmp_path)
+  manifest = tmp_path / "reference.yaml"
+  listed = [teacher.motion for teacher in cohort.teachers]
+  for teacher in cohort.teachers:
+    point_saved_config_at_a_manifest(
+      teacher.env_config, manifest=manifest, listed=listed
+    )
+    text = teacher.env_config.read_text().replace(
+      "    motion_file: ''\n", "    motion_file: /tmp/one_clip.npz\n"
+    )
+    teacher.env_config.write_text(text)
+
+  with pytest.raises(DistillationError, match="ambiguous"):
+    resolve_cohort(load_manifest(cohort.manifest, tmp_path))
+
+
+def test_resolve_cohort_rejects_a_saved_config_with_no_reference_source(
+  tmp_path: Path,
+) -> None:
+  cohort = build_tiny_cohort(tmp_path)
+  for teacher in cohort.teachers:
+    text = teacher.env_config.read_text().replace(
+      re.search(r"^    motion_file: .*$", teacher.env_config.read_text(), re.M).group(),
+      "    motion_file: ''",
+    )
+    teacher.env_config.write_text(text)
+
+  with pytest.raises(
+    DistillationError, match="neither motion_file nor motion_manifest"
+  ):
+    resolve_cohort(load_manifest(cohort.manifest, tmp_path))
 
 
 def test_load_manifest_resolves_relative_paths_and_hashes(tmp_path: Path) -> None:

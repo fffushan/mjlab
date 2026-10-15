@@ -312,6 +312,24 @@ Added
   observation with no ``motion_lookahead`` term fails closed instead of packing a
   student that cannot see what the teacher saw.
 
+- Added ``resolve_manifest_clips`` (``src/mjlab/tasks/tracking/mdp/multi_motion_ppo.py``),
+  the one reader of a reference manifest, so a second caller cannot disagree with the
+  task about what a manifest declares.
+
+- Added the per-clip embedded-reference teacher export that VAE distillation
+  requires. ``MultiMotionTrackingOnPolicyRunner.export_embedded_reference_onnx``
+  and ``scripts/export_x2_teacher_reference_onnx.py`` write the original
+  tracking interface (``obs, time_step`` in; ``actions`` plus seven reference
+  outputs out) with one clip's tables embedded. The weights are the same shared
+  teacher in every export, so a cohort covers many clips with one policy while
+  the loader still verifies each member's reference against its own clip. This is
+  deliberately the opposite shape from the deploy graph, which embeds no reference
+  and serves any clip. Measured on the 20k teacher: two clips exported at 226
+  observation width, and both pass the loader's own ``_require_onnx_interface``
+  check with embedded ``joint_pos``/``joint_vel`` equal to the source clip exactly
+  and ``body_quat_w`` equal at 1e-5. The full 144-clip batch and the cohort
+  manifest are not produced here.
+
 Fixed
 ^^^^^
 
@@ -424,6 +442,18 @@ Changed
   it also means the reference contract must travel separately. The reference is
   read from the controller's existing ``mjlab-vae-motion`` file path, so no new
   controller reader is required.
+
+- Changed the distillation reference check to accept a teacher whose saved env
+  config declares a reference manifest instead of one clip
+  (``_saved_reference_clip`` in ``distillation/config.py``). A shared teacher over
+  many clips records an empty ``motion_file`` and names its manifest, which the
+  check previously refused before any environment existed. The relaxation keeps
+  the binding in both directions: a single-clip teacher must still name exactly
+  the clip the manifest selects, and a manifest-based teacher may only be paired
+  with a clip that manifest lists. A recorded manifest that no longer resolves is
+  refused with its path named rather than assumed, and a saved config that declares
+  both sources or neither is refused. Every manifest under ``configs/distillation/``
+  is single-clip, so all eleven existing cohorts take the unchanged path.
 
 
 =========

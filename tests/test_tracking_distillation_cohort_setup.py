@@ -8,6 +8,8 @@ single-process path uses.  These tests pin both, without a simulator.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from mjlab.tasks.tracking.distillation import cohort_setup
@@ -90,7 +92,13 @@ def test_build_adapter_derives_the_environment_seed_from_the_worker_index(
     cohort_setup, "make_multi_teacher_distillation_adapter", fake_factory
   )
   monkeypatch.setattr(cohort_setup, "load_manifest", lambda path, root: "manifest")
-  monkeypatch.setattr(cohort_setup, "resolve_cohort", lambda manifest: "cohort")
+  # Only the two fields the adapter builder reads: a real cohort contract always
+  # declares a joint order and one cross-member preview duration.
+  fake_cohort = SimpleNamespace(
+    actions=SimpleNamespace(joint_names=tuple(f"joint_{i:02d}" for i in range(31))),
+    lookahead_s=0.0,
+  )
+  monkeypatch.setattr(cohort_setup, "resolve_cohort", lambda manifest: fake_cohort)
   setup = _setup(tmp_path, base_seed=11)
 
   setup.build_adapter(device="cpu", num_envs=2, worker_index=0)
@@ -100,7 +108,7 @@ def test_build_adapter_derives_the_environment_seed_from_the_worker_index(
     worker_env_seed(11, 0),
     worker_env_seed(11, 1),
   ]
-  assert recorded[0]["cohort"] == "cohort"
+  assert recorded[0]["cohort"] is fake_cohort
   assert recorded[0]["teacher_ids"] == ("tennis_000", "tennis_001")
   assert recorded[0]["num_envs"] == 2
   assert recorded[0]["device"] == "cpu"
