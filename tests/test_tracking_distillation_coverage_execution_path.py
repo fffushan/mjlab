@@ -8,6 +8,7 @@ start instead of collecting ordinary rows and reporting coverage it never perfor
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -17,10 +18,12 @@ from mjlab.scripts.distill import _resolve_coverage_choice, _train, _train_cohor
 from mjlab.tasks.tracking.distillation.cohort_setup import (
   COVERAGE_POLICY_CHOICES,
   CohortSetup,
+  coverage_schema_payload,
   require_coverage_execution,
   resolve_coverage_policy,
 )
 from mjlab.tasks.tracking.distillation.coverage_policy import CoveragePolicy
+from mjlab.tasks.tracking.distillation.vae_config import make_schema
 
 
 def test_coverage_policy_choices_match_the_inspect_command() -> None:
@@ -163,3 +166,87 @@ def test_cli_accepts_and_types_the_flag() -> None:
   texts = [getattr(action, "dest", "") for action in options]
   # tyro names flags in kebab case, as it does for repo-root and teacher-ids.
   assert any(name in texts for name in ("coverage-policy", "coverage_policy")), texts
+
+
+def _parity_evidence(
+  schema: dict[str, int], teacher_ids: tuple[str, ...] = ("inc000",)
+) -> str:
+  ids = ",".join(f'"{value}"' for value in teacher_ids)
+  return (
+    '{"kind":"x2-vae-coverage-restore-parity-v1",'
+    '"status":"pass","manifest_sha256":"manifest",'
+    '"policy_input_exact":true,'
+    f'"schema":{json.dumps(schema)},'
+    '"policy_input_max_abs_error":{"teacher_actor_view":0.0,'
+    '"student_reference":0.0,"student_conditioning":0.0,"previous_action":0.0},'
+    f'"teacher_ids":[{ids}]}}'
+  )
+
+
+def _cohort_schema(preview: bool):
+  return make_schema(preview=preview)
+
+
+def test_resolve_coverage_policy_reads_the_schema_it_is_given() -> None:
+  """The policy scope records the layout the task configuration resolved."""
+  legacy = resolve_coverage_policy("difficult-state-coverage")
+  assert dict(legacy.scope)["reference_dim"] == 68
+
+  preview_schema = _cohort_schema(preview=True)
+  preview = resolve_coverage_policy("difficult-state-coverage", schema=preview_schema)
+  declared = dict(preview.scope)
+  assert declared["reference_dim"] == preview_schema.reference_dim == 130
+  assert declared["conditioning_dim"] == preview_schema.conditioning_dim
+  assert declared["latent_dim"] == preview_schema.latent_dim
+  assert declared["action_dim"] == preview_schema.action_dim
+  # The identity names the layout, so the two policies are not interchangeable.
+  assert preview.identity != legacy.identity
+
+
+def test_coverage_gate_accepts_evidence_for_the_resolved_schema(tmp_path) -> None:
+  """A preview cohort's own evidence authorizes it, which the version-1 pin denied."""
+  schema = _cohort_schema(preview=True)
+  policy = resolve_coverage_policy("difficult-state-coverage", schema=schema)
+  evidence = tmp_path / "preview.json"
+  evidence.write_text(_parity_evidence(coverage_schema_payload(schema)))
+  result = require_coverage_execution(
+    policy,
+    evidence,
+    manifest_sha256="manifest",
+    expected_schema=coverage_schema_payload(schema),
+  )
+  assert result["status"] == "pass"
+
+
+def test_coverage_gate_refuses_evidence_for_another_reference_width(tmp_path) -> None:
+  """Width is the point: evidence for one layout must not authorize another."""
+  preview_schema = _cohort_schema(preview=True)
+  policy = resolve_coverage_policy("difficult-state-coverage", schema=preview_schema)
+  legacy_evidence = tmp_path / "legacy.json"
+  legacy_evidence.write_text(_parity_evidence(coverage_schema_payload(_cohort_schema(False))))
+  with pytest.raises(ValueError, match="describes schema"):
+    require_coverage_execution(
+      policy,
+      legacy_evidence,
+      manifest_sha256="manifest",
+      expected_schema=coverage_schema_payload(preview_schema),
+    )
+  # And the version-1 layout still refuses the preview evidence, so the gate is not
+  # merely permissive in one direction.
+  preview_evidence = tmp_path / "preview.json"
+  preview_evidence.write_text(
+    _parity_evidence(coverage_schema_payload(preview_schema))
+  )
+  with pytest.raises(ValueError, match="describes schema"):
+    require_coverage_execution(policy, preview_evidence, manifest_sha256="manifest")
+
+
+def test_coverage_gate_keeps_the_version_1_default_for_old_callers(tmp_path) -> None:
+  """Omitting the resolved schema leaves the earlier contract exactly as it was."""
+  policy = resolve_coverage_policy("difficult-state-coverage")
+  evidence = tmp_path / "legacy.json"
+  evidence.write_text(_parity_evidence(coverage_schema_payload(_cohort_schema(False))))
+  assert (
+    require_coverage_execution(policy, evidence, manifest_sha256="manifest")["status"]
+    == "pass"
+  )

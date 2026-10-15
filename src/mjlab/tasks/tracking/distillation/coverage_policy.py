@@ -508,7 +508,23 @@ class CoveragePolicy:
     return cls()
 
   @classmethod
-  def difficult_state_coverage(cls) -> CoveragePolicy:
+  def difficult_state_coverage(
+    cls,
+    *,
+    reference_dim: int = 68,
+    conditioning_dim: int = 99,
+    latent_dim: int = 32,
+    action_dim: int = 31,
+  ) -> CoveragePolicy:
+    """Build the difficult-state coverage policy for one student schema.
+
+    The four dimensions describe the student this policy tracks.  They are read
+    from the resolved task configuration, not written down here: a preview cohort
+    observes a wider reference than the version-1 layout, and the policy identity
+    records which layout it was built for.  The defaults keep the version-1
+    identity byte-identical, so every existing artifact and evidence file still
+    resolves to the same policy.
+    """
     def root(
       position: dict[str, float],
       rotation: dict[str, float],
@@ -549,10 +565,10 @@ class CoveragePolicy:
       scope=(
         ("root_body", "pelvis"),
         ("anchor_body", "torso_link"),
-        ("reference_dim", 68),
-        ("conditioning_dim", 99),
-        ("latent_dim", 32),
-        ("action_dim", 31),
+        ("reference_dim", reference_dim),
+        ("conditioning_dim", conditioning_dim),
+        ("latent_dim", latent_dim),
+        ("action_dim", action_dim),
         ("reference_fps", 50),
       ),
       tier_probabilities=(("baseline", 0.6), ("moderate", 0.3), ("strong", 0.1)),

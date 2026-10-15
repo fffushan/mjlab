@@ -329,6 +329,21 @@ Added
   check with embedded ``joint_pos``/``joint_vel`` equal to the source clip exactly
   and ``body_quat_w`` equal at 1e-5.
 
+- Fixed the difficult-state coverage gates reading the legacy schema instead of the
+  resolved task configuration.  Four sites wrote the version-1 layout down as magic
+  numbers: the coverage policy scope, two ``CohortSetup`` guards, and the parity
+  evidence validator.  A preview cohort could not enable coverage at all, even with a
+  passing restore-parity report, because the validator demanded ``68/99/32/31``.
+  ``CoveragePolicy.difficult_state_coverage`` now takes the four dimensions, and the
+  training entry point reads them from the cohort through one reader,
+  ``CohortSetup.schema_for_cohort``, which the environment builder also uses.  The
+  validator compares the evidence with that schema, and the environment guard compares
+  the policy's declared scope with it, so a policy and a cohort that disagree are
+  refused for any schema rather than for one named layout.  The policy defaults keep
+  the version-1 identity byte-identical, and a caller that passes no resolved schema
+  keeps the earlier contract exactly, so existing evidence and checkpoints still
+  resolve.  Four regression tests, including both directions of a width mismatch.
+
 - Fixed the cohort environment taking its preview from the base task instead of
   from the cohort.  ``make_multi_motion_cfg`` copies the motion command's fields,
   so a preview-blind base task built a narrow actor observation while the same

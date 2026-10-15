@@ -125,6 +125,26 @@ class CohortSetup:
     """Load and validate the cohort manifest this setup names."""
     return resolve_cohort(load_manifest(self.manifest, self.repo_root))
 
+  def schema_for_cohort(self, cohort: CohortContract) -> VaeSchema:
+    """Resolve the student schema a cohort implies, from the task configuration.
+
+    One reader, used by both the environment builder and the coverage gates, so a
+    gate cannot disagree with the environment it authorizes.  The reference preview
+    follows the cohort's declared ``lookahead_s`` and the joint order follows its
+    action specification.
+    """
+    actions = getattr(cohort, "actions", None)
+    joint_order = getattr(actions, "joint_names", None)
+    # The student observes the same reference preview the teacher used.  The cohort fixes
+    # one lookahead_s for every member, and every cohort that declares zero keeps the
+    # frozen version-1 layout, so existing runs and checkpoints are unaffected.
+    preview = float(cohort.lookahead_s) > 0.0
+    return (
+      make_schema(self.schema_mode, preview=preview)
+      if joint_order is None
+      else make_schema(self.schema_mode, joint_order=joint_order, preview=preview)
+    )
+
   def build_adapter(
     self, *, device: str, num_envs: int, worker_index: int = 0
   ) -> MultiMotionDistillationAdapter:
@@ -134,30 +154,26 @@ class CohortSetup:
     environment exactly, because the derivation adds zero for the first worker.
     """
     cohort = self.resolve()
-    actions = getattr(cohort, "actions", None)
-    joint_order = getattr(actions, "joint_names", None)
-    # The student observes the same reference preview the teacher used.  The cohort fixes
-    # one lookahead_s for every member, and every cohort that declares zero keeps the
-    # frozen version-1 layout, so existing runs and checkpoints are unaffected.
-    preview = float(cohort.lookahead_s) > 0.0
-    schema = (
-      make_schema(self.schema_mode, preview=preview)
-      if joint_order is None
-      else make_schema(self.schema_mode, joint_order=joint_order, preview=preview)
-    )
+    schema = self.schema_for_cohort(cohort)
     if self.coverage_policy is not None:
+      # The policy describes the student it tracks, so the two must agree.  Compare
+      # the declared scope with the resolved schema instead of naming one layout:
+      # that catches a mismatch for any schema, including a preview cohort.
       if self.schema_mode != "gravity":
         raise ValueError(
-          "difficult-state coverage MVP requires the gravity 68/99 schema"
+          "difficult-state coverage requires the gravity conditioning layout"
         )
-      if (
-        schema.reference_dim,
-        schema.conditioning_dim,
-        schema.latent_dim,
-        schema.action_dim,
-      ) != (68, 99, 32, 31):
+      declared = dict(self.coverage_policy.scope)
+      live = {
+        "reference_dim": schema.reference_dim,
+        "conditioning_dim": schema.conditioning_dim,
+        "latent_dim": schema.latent_dim,
+        "action_dim": schema.action_dim,
+      }
+      if any(int(declared.get(name, -1)) != value for name, value in live.items()):
         raise ValueError(
-          "difficult-state coverage MVP requires schema dimensions 68/99/32/31"
+          "difficult-state coverage policy declares a different schema than the "
+          f"resolved cohort: policy {declared}, cohort {live}"
         )
     return make_multi_teacher_distillation_adapter(
       cohort,
@@ -194,15 +210,43 @@ class CohortSetup:
 COVERAGE_POLICY_CHOICES = ("off", "difficult-state-coverage")
 
 
-def resolve_coverage_policy(choice: str) -> CoveragePolicy | None:
-  """Resolve a CLI choice to a coverage policy, or return None for off."""
+def resolve_coverage_policy(
+  choice: str, *, schema: VaeSchema | None = None
+) -> CoveragePolicy | None:
+  """Resolve a CLI choice to a coverage policy, or return None for off.
+
+  ``schema`` is the student schema the resolved task configuration implies.  The
+  policy records it in its scope, so the policy identity says which layout it was
+  built for.  Omitting it keeps the version-1 default identity.
+  """
   if choice not in COVERAGE_POLICY_CHOICES:
     raise ValueError(
       f"unknown coverage policy {choice!r}; expected one of {COVERAGE_POLICY_CHOICES}"
     )
   if choice == "off":
     return None
-  return CoveragePolicy.difficult_state_coverage()
+  if schema is None:
+    return CoveragePolicy.difficult_state_coverage()
+  return CoveragePolicy.difficult_state_coverage(
+    reference_dim=schema.reference_dim,
+    conditioning_dim=schema.conditioning_dim,
+    latent_dim=schema.latent_dim,
+    action_dim=schema.action_dim,
+  )
+
+
+COVERAGE_SCHEMA_FIELDS = (
+  "reference_dim",
+  "conditioning_dim",
+  "latent_dim",
+  "action_dim",
+)
+"""The schema dimensions a coverage policy declares and parity evidence records."""
+
+
+def coverage_schema_payload(schema: VaeSchema) -> dict[str, int]:
+  """The four dimensions, in the form the parity evidence and the policy use."""
+  return {name: int(getattr(schema, name)) for name in COVERAGE_SCHEMA_FIELDS}
 
 
 def require_coverage_execution(
@@ -211,11 +255,17 @@ def require_coverage_execution(
   *,
   manifest_sha256: str | None = None,
   expected_teacher_ids: Sequence[str] | None = None,
+  expected_schema: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
   """Validate the bounded MVP execution gate and return evidence metadata.
 
   The MVP does not execute teacher branches.  It does require a measured
   restore-parity report before it accepts captured states for training.
+
+  ``expected_schema`` is the schema the resolved task configuration implies.  The
+  evidence must describe that same layout, so a report measured for one reference
+  width cannot authorize a run at another.  When it is omitted the version-1 layout
+  is required, which keeps every earlier caller on its existing contract.
   """
   if policy is None:
     return {}
@@ -243,14 +293,22 @@ def require_coverage_execution(
   if payload.get("policy_input_exact") is not True:
     raise ValueError("coverage parity evidence must prove exact policy-input parity")
   schema = payload.get("schema")
-  expected_schema = {
-    "reference_dim": 68,
-    "conditioning_dim": 99,
-    "latent_dim": 32,
-    "action_dim": 31,
-  }
+  if expected_schema is None:
+    # The version-1 layout, for callers that do not resolve a cohort schema.
+    expected_schema = {
+      "reference_dim": 68,
+      "conditioning_dim": 99,
+      "latent_dim": 32,
+      "action_dim": 31,
+    }
+  else:
+    expected_schema = {name: int(value) for name, value in expected_schema.items()}
   if schema != expected_schema:
-    raise ValueError("coverage parity evidence has the wrong 68/99/32/31 schema")
+    raise ValueError(
+      "coverage parity evidence describes schema "
+      f"{dict(schema) if isinstance(schema, Mapping) else schema}, but the resolved "
+      f"cohort describes {expected_schema}"
+    )
   errors = payload.get("policy_input_max_abs_error")
   required_errors = {
     "teacher_actor_view",

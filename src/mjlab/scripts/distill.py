@@ -58,6 +58,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
 )
 from mjlab.tasks.tracking.distillation.cohort_setup import (
   CohortSetup,
+  coverage_schema_payload,
   require_coverage_execution,
   resolve_coverage_policy,
   worker_env_seed,
@@ -2116,12 +2117,26 @@ def _train_cohort(
         "start a new cohort run"
       )
     cohort = _resolve(manifest, repo_root)
-    resolved_coverage = resolve_coverage_policy(coverage_policy)
+    # The task configuration decides the student schema; read it once and give the same
+    # answer to the coverage policy and to the evidence gate, so neither can name a
+    # layout the resolved cohort does not use.
+    resolved_schema = CohortSetup(
+      manifest=manifest,
+      repo_root=repo_root,
+      teacher_ids=tuple(teacher_ids),
+      task_id=task_id,
+      phase_policy=_COHORT_PHASE_POLICY,
+      reset_policy=reset_policy,
+      base_seed=seed,
+      schema_mode=schema_mode,
+    ).schema_for_cohort(cohort)
+    resolved_coverage = resolve_coverage_policy(coverage_policy, schema=resolved_schema)
     coverage_evidence = require_coverage_execution(
       resolved_coverage,
       coverage_parity_evidence,
       manifest_sha256=cohort.manifest.sha256,
       expected_teacher_ids=teacher_ids,
+      expected_schema=coverage_schema_payload(resolved_schema),
     )
     setup = CohortSetup(
       manifest=manifest,
