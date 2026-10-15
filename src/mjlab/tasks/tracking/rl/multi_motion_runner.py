@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import torch
 import wandb
 from rsl_rl.env.vec_env import VecEnv
 from rsl_rl.utils import WandbLogWriter
@@ -22,14 +23,22 @@ from rsl_rl.utils import WandbLogWriter
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx, get_base_metadata
 from mjlab.rl.runner import MjlabOnPolicyRunner
+from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.tasks.tracking.rl.export_metadata import (
   command_lookahead_steps,
   motion_export_metadata,
 )
+from mjlab.tasks.tracking.rl.runner import _OnnxMotionModel
 
 
 class MultiMotionTrackingOnPolicyRunner(MjlabOnPolicyRunner):
-  """Runner that also writes the reference-free deploy graph for the teacher."""
+  """Runner that writes both teacher exports: the deploy graph and the distill teachers.
+
+  The two artifacts are deliberately opposite in shape.  Deployment needs a reference-free
+  ``obs -> actions`` graph so one policy can replay any clip, and distillation needs the
+  embedded-reference ``obs, time_step`` graph so the loader can read a teacher's reference
+  tables.  One runner owns both so they cannot drift apart.
+  """
 
   env: RslRlVecEnvWrapper
 
@@ -68,6 +77,69 @@ class MultiMotionTrackingOnPolicyRunner(MjlabOnPolicyRunner):
     """
     os.makedirs(path, exist_ok=True)
     self.export_policy_to_onnx(path, filename, verbose)
+    onnx_path = Path(path) / filename
+    attach_metadata_to_onnx(str(onnx_path), self.deploy_metadata(run_name))
+    return onnx_path
+
+  def embedded_reference_motion(self, clip: str | Path) -> MotionLoader:
+    """Load one clip in the teacher's tracked-body order.
+
+    A distillation teacher must embed the same reference tables a single-motion command
+    embeds: the tracked bodies of ``commands.motion.body_names`` in that order, selected
+    from the full clip.  The distillation export check compares these tables with the
+    source clip, so a different selection or order would be refused rather than trained on.
+    """
+    env = self.env.unwrapped
+    command = env.command_manager.get_term("motion")
+    cfg = command.cfg
+    robot = env.scene[cfg.entity_name]
+    body_indexes = torch.tensor(
+      robot.find_bodies(cfg.body_names, preserve_order=True)[0],
+      dtype=torch.long,
+    )
+    return MotionLoader(str(clip), body_indexes, device="cpu")
+
+  def export_embedded_reference_onnx(
+    self,
+    clip: str | Path,
+    path: str,
+    filename: str = "policy.onnx",
+    run_name: str = "local",
+    verbose: bool = False,
+  ) -> Path:
+    """Write the embedded-reference export one clip needs for distillation.
+
+    This is a different artifact from :meth:`export_deploy_onnx`.  The distillation loader
+    requires the original tracking interface ``obs, time_step`` with the reference tables
+    bundled, and it reads a teacher's reference out of those tables.  One export therefore
+    serves exactly one clip, while the weights stay the same teacher for every clip.
+    """
+    os.makedirs(path, exist_ok=True)
+    model = _OnnxMotionModel(
+      self.alg.get_policy(), self.embedded_reference_motion(clip)
+    )
+    model.to("cpu")
+    model.eval()
+    torch.onnx.export(
+      model,
+      (torch.zeros(1, model.policy.input_size), torch.zeros(1, 1)),
+      os.path.join(path, filename),
+      export_params=True,
+      opset_version=18,
+      verbose=verbose,
+      input_names=["obs", "time_step"],
+      output_names=[
+        "actions",
+        "joint_pos",
+        "joint_vel",
+        "body_pos_w",
+        "body_quat_w",
+        "body_lin_vel_w",
+        "body_ang_vel_w",
+      ],
+      dynamic_axes={},
+      dynamo=False,
+    )
     onnx_path = Path(path) / filename
     attach_metadata_to_onnx(str(onnx_path), self.deploy_metadata(run_name))
     return onnx_path
