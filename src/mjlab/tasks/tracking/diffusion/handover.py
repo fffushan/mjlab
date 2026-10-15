@@ -40,6 +40,14 @@ default to ``None``, which reproduces the D3 call sequence and sample exactly.
 A sampler may return diagnostics carrying a bounded ``task`` mapping; it is
 attached to :class:`ContinuationStep` for the evaluation report.
 
+One further optional hook replaces the sampler for a different model family:
+when ``sampler`` is supplied, :meth:`ReferenceFreeContinuation.step` calls it
+with the built conditions and the shared generator in place of the frozen
+diffusion ``sample_trajectory``, so a family adapter can close over its own
+model, solver and level grid.  A continuation built with one then needs no
+diffusion ``schedule`` or ``grid``; the default ``None`` keeps the D3 diffusion
+path unchanged.
+
 Two more optional lifecycle hooks stay reporting-only: ``on_reset`` runs right
 after :meth:`ReferenceFreeContinuation.reset` clears history, so a task lane can
 drop its own ledger before the mandatory fresh bootstrap, and ``measured_post``
@@ -281,6 +289,13 @@ PlanTransform = Callable[["ContinuationPlan", WorldState], "ContinuationPlan"]
 # ``sample_trajectory`` and must return ``(sample, diagnostics)``.
 SamplerCallable = Callable[..., tuple[Tensor, Any]]
 SamplerFactory = Callable[["ContinuationPlan", WorldState], SamplerCallable]
+# A non-diffusion family sampler injected into the seam.  It receives the built
+# conditions and the shared generator and returns ``(sample, diagnostics)``,
+# where the diagnostics expose ``denoiser_calls`` and a terminal
+# ``final_index``.  The family model, solver and level grid are closed over by
+# the callable, so a continuation built with one needs no diffusion schedule,
+# inference grid or ``SamplerConfig``.
+FamilySampler = Callable[[SamplerConditions, torch.Generator], tuple[Tensor, Any]]
 # Called after ``reset`` clears history, before the mandatory fresh bootstrap.
 ResetHook = Callable[[], None]
 # Called with one trusted measured post-step (tick, state) observation.
@@ -354,13 +369,14 @@ class ReferenceFreeContinuation:
     *,
     denoiser: Callable[[Tensor, Tensor], Tensor],
     decode: DecodeFn,
-    schedule: DiffusionSchedule,
-    grid: InferenceGrid,
+    schedule: DiffusionSchedule | None = None,
+    grid: InferenceGrid | None = None,
     projection: StateLatentTransformLike,
     contract: DiffusionContract = DEFAULT_CONTRACT,
     device: str | torch.device = "cpu",
     generator: torch.Generator,
     sampler_config: SamplerConfig | None = None,
+    sampler: FamilySampler | None = None,
     plan_transform: PlanTransform | None = None,
     sampler_factory: SamplerFactory | None = None,
     on_reset: ResetHook | None = None,
@@ -373,6 +389,27 @@ class ReferenceFreeContinuation:
       torch.empty(0, device=self._device)
     except (RuntimeError, ValueError) as exc:
       raise HandoverError(f"invalid runtime device {device!r}") from exc
+    diffusion_config: SamplerConfig | None = None
+    if sampler is not None:
+      if not callable(sampler):
+        raise HandoverError("sampler must be callable or None")
+      if sampler_factory is not None:
+        raise HandoverError(
+          "sampler and sampler_factory are mutually exclusive: they replace "
+          "the same sampling call"
+        )
+      if schedule is not None or grid is not None or sampler_config is not None:
+        raise HandoverError(
+          "an injected family sampler owns its own solver and level grid; do "
+          "not pass schedule, grid or sampler_config as well"
+        )
+    else:
+      if schedule is None or grid is None:
+        raise HandoverError(
+          "the default diffusion sampler requires both schedule and grid; "
+          "inject a family sampler to supply its own"
+        )
+      diffusion_config = sampler_config or SamplerConfig(grid)
     self.contract = contract
     self.projection = projection
     self.schedule = schedule
@@ -380,7 +417,8 @@ class ReferenceFreeContinuation:
     self._denoiser = denoiser
     self._decode = decode
     self._generator = generator
-    self._sampler_config = sampler_config or SamplerConfig(grid)
+    self._sampler = sampler
+    self._sampler_config = diffusion_config
     if plan_transform is not None and not callable(plan_transform):
       raise HandoverError("plan_transform must be callable or None")
     if sampler_factory is not None and not callable(sampler_factory):
@@ -476,23 +514,30 @@ class ReferenceFreeContinuation:
       )
     plan = self.plan(current_state, tick=tick)
     conditions = SamplerConditions(plan.clean_tokens, plan.clean_mask)
-    if self._sampler_factory is None:
-      sample, diagnostics = sample_trajectory(
-        self._denoiser,
-        schedule=self.schedule,
-        conditions=conditions,
-        config=self._sampler_config,
-        generator=self._generator,
-      )
+    if self._sampler is not None:
+      # The injected family sampler owns its model, solver and grid; the seam
+      # supplies only the built conditions and the shared generator.
+      sample, diagnostics = self._sampler(conditions, self._generator)
     else:
-      sampler = self._sampler_factory(plan, current_state)
-      sample, diagnostics = sampler(
-        self._denoiser,
-        schedule=self.schedule,
-        conditions=conditions,
-        config=self._sampler_config,
-        generator=self._generator,
-      )
+      # __init__ requires both of these whenever no family sampler is injected.
+      assert self.schedule is not None and self._sampler_config is not None
+      if self._sampler_factory is None:
+        sample, diagnostics = sample_trajectory(
+          self._denoiser,
+          schedule=self.schedule,
+          conditions=conditions,
+          config=self._sampler_config,
+          generator=self._generator,
+        )
+      else:
+        sampler = self._sampler_factory(plan, current_state)
+        sample, diagnostics = sampler(
+          self._denoiser,
+          schedule=self.schedule,
+          conditions=conditions,
+          config=self._sampler_config,
+          generator=self._generator,
+        )
     task_record = _bounded_task_record(getattr(diagnostics, "task", None))
     latent_slice = slice(
       self.contract.projected_state_dimension, self.contract.token_dimension
@@ -566,6 +611,7 @@ __all__ = [
   "ContinuationStep",
   "DecodeFn",
   "ExecutedPair",
+  "FamilySampler",
   "HandoverError",
   "HandoverHistory",
   "MeasuredPostHook",

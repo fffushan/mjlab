@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, cast
@@ -28,6 +29,14 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from ..flow_matching.checkpoint import (
+  FLOW_CHECKPOINT_FORMAT,
+  FlowCheckpointError,
+  _restore_process,
+  load_flow_checkpoint,
+)
+from ..flow_matching.process import FlowMatchingError, LinearNoiseProcess
+from ..flow_matching.sampler import FlowGrid
 from .checkpoint import CheckpointError, load_checkpoint
 from .contract import DEFAULT_CONTRACT, ContractError, DiffusionContract
 from .handover import (
@@ -51,6 +60,13 @@ from .sampler import SamplerConditions, SamplerConfig, sample_trajectory
 from .schedule import DiffusionSchedule, InferenceGrid, build_inference_grid
 from .state import WorldState
 from .trainer import ExponentialMovingAverage
+
+# Closed-loop Euler step count for the flow family.  Measured on 2026-10-15:
+# closed-loop falls over 6 to 20 steps are statistically indistinguishable,
+# while the cost is linear in the step count, and on the robot PC (Orin NX,
+# TensorRT, clock locked) 6 steps is 15.82 ms against a 20 ms control period.
+# The flow package's own ``DEFAULT_CALLS`` stays the offline reference grid of 20.
+DEFAULT_CLOSED_LOOP_SOLVER_STEPS = 6
 
 _SEAM_VS_DIRECT_TOLERANCE = 1.0e-6
 _MAX_SAMPLES = 4
@@ -251,6 +267,187 @@ def load_denoiser(
     config_hash=state.config_hash,
     contract_identity=state.contract_identity,
     projection_hashes=dict(state.projection_hashes),
+    best_validation_loss=state.best_validation_loss,
+    selection_split=state.selection_split,
+    ema_selected=ema_selected,
+    ema_updates=ema_updates,
+    fp32_checked=state.fp32_checked,
+    config_seed=None if seed is None else int(seed),
+  )
+
+
+def _read_flow_process(path: str | Path) -> LinearNoiseProcess:
+  """Read the linear process a flow checkpoint records before model construction.
+
+  ``load_flow_checkpoint`` restores state into a caller-built model, so the
+  model's level-embedding width must be known first.  The checkpoint is read
+  once for this identity; :func:`load_flow_checkpoint` then revalidates the
+  same process mapping, so a tampered process cannot reach the runtime.
+  """
+  try:
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+  except (OSError, RuntimeError, EOFError, ValueError, pickle.UnpicklingError) as exc:
+    raise ReplayError(f"could not read flow checkpoint {path}: {exc}") from exc
+  if (
+    not isinstance(payload, Mapping) or payload.get("format") != FLOW_CHECKPOINT_FORMAT
+  ):
+    raise ReplayError(
+      f"flow checkpoint {path} is unsupported or malformed for the flow family"
+    )
+  try:
+    raw = _restore_process(payload)
+    return LinearNoiseProcess(int(raw["max_level"]))
+  except (FlowCheckpointError, KeyError, TypeError, ValueError) as exc:
+    raise ReplayError(
+      f"flow checkpoint {path} records no valid linear process: {exc}"
+    ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedFlowDenoiser:
+  """Frozen flow checkpoint with its real process, level grid and provenance.
+
+  Unlike :class:`LoadedDenoiser` this record carries the flow family's
+  :class:`LinearNoiseProcess` and :class:`FlowGrid`; it has no diffusion
+  schedule, because the flow family defines none.
+  """
+
+  model: StateLatentTransformer
+  process: LinearNoiseProcess
+  grid: FlowGrid
+  family: str
+  process_identity: str
+  data_identity: str
+  model_identity_hash: str
+  global_step: int
+  config_hash: str
+  projection_hashes: dict[str, str]
+  best_validation_loss: float | None
+  selection_split: str | None
+  ema_selected: bool
+  ema_updates: int | None
+  fp32_checked: bool
+  config_seed: int | None
+
+
+def _flow_solver_grid(process: LinearNoiseProcess, solver_steps: int) -> FlowGrid:
+  """Build the flow solver grid for an explicit Euler step count.
+
+  The step count is an inference-time choice, not a checkpoint property: every
+  step count descends the same trained level scale.
+  :data:`DEFAULT_CLOSED_LOOP_SOLVER_STEPS` steps is the closed-loop default.  A
+  request larger than the checkpoint process ``max_level`` cannot form a
+  strictly descending integer grid, so it fails closed here instead of silently
+  reusing the default.
+  """
+  if isinstance(solver_steps, bool) or not isinstance(solver_steps, int):
+    raise ReplayError("flow solver steps must be an integer")
+  if solver_steps < 1:
+    raise ReplayError("flow solver steps must be a positive integer")
+  if solver_steps > process.max_level:
+    raise ReplayError(
+      f"flow solver steps {solver_steps} exceed the checkpoint process "
+      f"max_level {process.max_level}: a strictly descending integer grid "
+      "cannot be formed"
+    )
+  try:
+    return FlowGrid.uniform(calls=solver_steps, max_level=process.max_level)
+  except FlowMatchingError as exc:
+    raise ReplayError(
+      f"flow solver steps {solver_steps} do not form a valid grid at "
+      f"max_level {process.max_level}: {exc}"
+    ) from exc
+
+
+def load_flow_denoiser(
+  checkpoint_path: str | Path,
+  *,
+  contract: DiffusionContract,
+  projection_bundle: StateLatentTransformLike | None = None,
+  normalizer: StateLatentTransform | None = None,
+  checkpoint_sha256: str | None = None,
+  verify_projection_hashes: bool = True,
+  verify_contract_identity: bool = True,
+  solver_steps: int = DEFAULT_CLOSED_LOOP_SOLVER_STEPS,
+) -> LoadedFlowDenoiser:
+  """Load the x0 flow denoiser with its exact linear process and level grid.
+
+  Mirrors :func:`load_denoiser` at the runtime boundary but consumes flow
+  artifacts: the model is built with the checkpoint's own ``max_level``, the
+  state is restored by :func:`load_flow_checkpoint` with the process and data
+  identities enforced, the same EMA selection and freezing run, and the same
+  projection/normalizer hash consistency is checked against the checkpoint's
+  recorded projection hashes.  The returned :class:`LoadedFlowDenoiser` exposes
+  the trained :class:`LinearNoiseProcess` and a ``solver_steps``-call
+  :class:`FlowGrid` that ends at clean level 0.  No diffusion schedule is built
+  or implied.  A diffusion checkpoint is rejected by the flow format check; a
+  flow checkpoint is rejected by :func:`load_denoiser` by the diffusion format
+  check.
+
+  ``solver_steps`` selects the Euler step count (default
+  :data:`DEFAULT_CLOSED_LOOP_SOLVER_STEPS`).  The loaded record always reports
+  the grid actually built, so a run never claims the default when another count
+  was requested.
+  """
+  if projection_bundle is not None and normalizer is not None:
+    raise ReplayError("pass only one of projection_bundle or normalizer")
+  transforms = normalizer if normalizer is not None else projection_bundle
+  if transforms is None:
+    raise ReplayError("a state/latent normalizer is required")
+  if transforms.contract.identity_hash() != contract.identity_hash():
+    raise ReplayError("normalizer contract identity differs from active contract")
+  if checkpoint_sha256 is not None:
+    verify_file_digest(checkpoint_path, checkpoint_sha256, role="flow checkpoint")
+  if not isinstance(verify_projection_hashes, bool):
+    raise ReplayError("verify_projection_hashes must be a boolean")
+  if not isinstance(verify_contract_identity, bool):
+    raise ReplayError("verify_contract_identity must be a boolean")
+  try:
+    dimensions = contract_dimensions(contract)
+  except ValueError as exc:
+    raise ReplayError(
+      f"active diffusion contract has no usable model layout: {exc}"
+    ) from exc
+  process = _read_flow_process(checkpoint_path)
+  model = StateLatentTransformer(
+    DenoiserSettings.from_contract(contract, training_k=process.max_level)
+  )
+  try:
+    state = load_flow_checkpoint(
+      checkpoint_path,
+      model=model,
+      expected_process_identity=process.identity_hash(),
+      expected_data_identity=(
+        contract.identity_hash() if verify_contract_identity else None
+      ),
+    )
+  except FlowCheckpointError as exc:
+    raise ReplayError(
+      f"frozen flow checkpoint rejected for the {dimensions.label} active "
+      f"contract: {exc}"
+    ) from exc
+  if verify_projection_hashes:
+    if isinstance(transforms, StateLatentNormalizer):
+      verify_normalization_consistency(state.statistics_identity, transforms)
+    else:
+      verify_projection_consistency(
+        state.statistics_identity, cast(ProjectionBundle, transforms)
+      )
+  ema_selected, ema_updates = apply_ema_selection(model, state.ema_state)
+  _freeze(model)
+  grid = _flow_solver_grid(process, solver_steps)
+  seed = state.config.get("seed")
+  return LoadedFlowDenoiser(
+    model=model,
+    process=process,
+    grid=grid,
+    family=state.family,
+    process_identity=state.process_identity,
+    data_identity=state.data_identity,
+    model_identity_hash=state.model_identity_hash,
+    global_step=state.global_step,
+    config_hash=state.config_hash,
+    projection_hashes=dict(state.statistics_identity),
     best_validation_loss=state.best_validation_loss,
     selection_split=state.selection_split,
     ema_selected=ema_selected,
@@ -999,7 +1196,9 @@ def main() -> None:
 
 
 __all__ = [
+  "DEFAULT_CLOSED_LOOP_SOLVER_STEPS",
   "LoadedDenoiser",
+  "LoadedFlowDenoiser",
   "LoadedVae",
   "RecordedHistory",
   "ReplayError",
@@ -1007,6 +1206,7 @@ __all__ = [
   "apply_ema_selection",
   "load_active_contract",
   "load_denoiser",
+  "load_flow_denoiser",
   "load_normalizer_bundle",
   "load_projection_bundle",
   "load_recorded_history",

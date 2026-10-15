@@ -1143,6 +1143,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--checkpoint is required unless --replay names a saved directory"
       )
     output_explicit = args.output_dir is not None
+    if evaluate._model_family(args) == "flow":
+      raise InspectSequenceError(
+        "inspect_sequence.py does not support --model-family flow"
+      )
     prepared = evaluate._prepare(args)
     if not output_explicit:
       label = (

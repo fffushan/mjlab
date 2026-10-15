@@ -144,6 +144,7 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
       "not-run; pass --execute to construct one environment and open the viewer"
     ),
     "branch": args.branch,
+    "model_family": evaluate._prepared_family(prepared),
     "contract": _contract_report(prepared),
     "viewer": {
       "backend": "viser",
@@ -158,12 +159,19 @@ def _preflight_report(prepared: Any) -> dict[str, Any]:
       "max_wall_seconds": args.max_wall_seconds,
       "fall_degrees": _FALL_DEGREES,
     },
-    "sampler": {
-      "ddim_updates": evaluate._FROZEN_DDIM_STEPS,
-      "start_level": evaluate._FROZEN_START_LEVEL,
-      "eta": 0.0,
-      "guidance_strength": 0.0,
-    },
+    "sampler": (
+      evaluate._sampler_report(prepared)
+      if evaluate._prepared_family(prepared) == "flow"
+      else {
+        "model_family": "diffusion",
+        "sampler_method": "ddim",
+        "solver_updates": evaluate._FROZEN_DDIM_STEPS,
+        "ddim_updates": evaluate._FROZEN_DDIM_STEPS,
+        "start_level": evaluate._FROZEN_START_LEVEL,
+        "eta": 0.0,
+        "guidance_strength": 0.0,
+      }
+    ),
     "motion": {
       "frames": prepared.clip_frames,
       "fps": prepared.clip_fps,
@@ -206,6 +214,7 @@ def _write_status(prepared: Any, playback: Any, task_conditioning: Any = None) -
       "diagnostic_only": True,
       "matched_acceptance": False,
       "branch": args.branch,
+      "model_family": evaluate._prepared_family(prepared),
       "contract": _contract_report(prepared),
       "member": args.member,
       "seed": args.seed,

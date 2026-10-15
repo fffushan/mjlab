@@ -47,6 +47,7 @@ from mjlab.tasks.tracking.diffusion.closed_loop_runtime_x2 import (
 )
 from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
 from mjlab.tasks.tracking.diffusion.handover import (
+  FamilySampler,
   HandoverHistory,
   build_reference_free_plan,
 )
@@ -883,6 +884,11 @@ class BatchedReferenceFreeContinuation:
   every row at once.  Each row keeps its own :class:`HandoverHistory`, so the
   measured pre-action pairing is never shared or reordered.
 
+  An injected ``sampler`` replaces that single sampling call for a different
+  model family: it receives the stacked conditions and the shared generator,
+  and closes over its own model, solver and grid.  A continuation built with
+  one needs no diffusion ``schedule`` or ``sampler_config``.
+
   The generator is shared.  Because ``sample_trajectory`` draws its noise in one
   ``torch.randn`` call of the whole batch shape, row ``r`` consumes the
   ``r``-th slice of that draw: every row sees different noise, and a one-row run
@@ -895,16 +901,30 @@ class BatchedReferenceFreeContinuation:
     *,
     denoiser: Any,
     decode: Any,
-    schedule: Any,
+    schedule: Any | None = None,
     projection: Any,
     contract: Any = DEFAULT_CONTRACT,
     device: str | torch.device = "cpu",
     generator: torch.Generator,
-    sampler_config: Any,
+    sampler_config: Any | None = None,
+    sampler: FamilySampler | None = None,
     rows: int,
   ) -> None:
     if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
       raise ParallelRuntimeX2Error("continuation rows must be a positive integer")
+    if sampler is not None:
+      if not callable(sampler):
+        raise ParallelRuntimeX2Error("sampler must be callable or None")
+      if schedule is not None or sampler_config is not None:
+        raise ParallelRuntimeX2Error(
+          "an injected family sampler owns its own solver and level grid; do "
+          "not pass schedule or sampler_config as well"
+        )
+    elif schedule is None or sampler_config is None:
+      raise ParallelRuntimeX2Error(
+        "the default diffusion sampler requires both schedule and "
+        "sampler_config; inject a family sampler to supply its own"
+      )
     self.contract = contract
     self.projection = projection
     self.schedule = schedule
@@ -914,6 +934,7 @@ class BatchedReferenceFreeContinuation:
     self._decode = decode
     self._generator = generator
     self._sampler_config = sampler_config
+    self._sampler = sampler
     self._histories = [HandoverHistory(contract=contract) for _ in range(rows)]
     self._last_tick: int | None = None
     self.denoiser_calls = 0
@@ -1007,13 +1028,22 @@ class BatchedReferenceFreeContinuation:
     ]
     tokens = torch.stack([plan.clean_tokens for plan in plans], dim=0)
     mask = plans[0].clean_mask
-    sample, diagnostics = sample_trajectory(
-      self._denoiser,
-      schedule=self.schedule,
-      conditions=SamplerConditions(tokens, mask),
-      config=self._sampler_config,
-      generator=self._generator,
-    )
+    conditions = SamplerConditions(tokens, mask)
+    family_sampler = self._sampler
+    if family_sampler is not None:
+      # The injected family sampler owns its model, solver and grid; the seam
+      # supplies only the stacked conditions and the shared generator.
+      sample, diagnostics = family_sampler(conditions, self._generator)
+    else:
+      # __init__ requires the diffusion config whenever no sampler is injected.
+      assert self._sampler_config is not None and self.schedule is not None
+      sample, diagnostics = sample_trajectory(
+        self._denoiser,
+        schedule=self.schedule,
+        conditions=conditions,
+        config=self._sampler_config,
+        generator=self._generator,
+      )
     latent_slice = slice(
       self.contract.projected_state_dimension, self.contract.token_dimension
     )

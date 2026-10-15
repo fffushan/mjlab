@@ -318,6 +318,48 @@ def _row_stop_reason(
   return None
 
 
+def _build_continuation(
+  prepared: Any, device: torch.device, rows: int
+) -> BatchedReferenceFreeContinuation:
+  """Build the batched reference-free continuation for the prepared family.
+
+  The flow family injects its own Euler sampler and takes no diffusion
+  schedule or ``SamplerConfig``; the diffusion default is unchanged.
+  """
+
+  def decode(latent: Any, conditioning: Any) -> Any:
+    return prepared.vae.model.decode(latent, conditioning)
+
+  if evaluate._prepared_family(prepared) == "flow":
+    return BatchedReferenceFreeContinuation(
+      denoiser=prepared.denoiser.model,
+      decode=decode,
+      projection=prepared.projection,
+      contract=prepared.contract,
+      device=device,
+      generator=_seeded_generator(device, int(prepared.args.seed)),
+      sampler=evaluate._flow_sampling_adapter(prepared),
+      rows=rows,
+    )
+  return BatchedReferenceFreeContinuation(
+    denoiser=prepared.denoiser.model,
+    decode=decode,
+    schedule=prepared.denoiser.schedule,
+    projection=prepared.projection,
+    contract=prepared.contract,
+    device=device,
+    generator=_seeded_generator(device, int(prepared.args.seed)),
+    sampler_config=SamplerConfig(
+      prepared.denoiser.grid,
+      eta=0.0,
+      guidance_strength=0.0,
+      initial_noise_scale=1.0,
+      start_level=evaluate._FROZEN_START_LEVEL,
+    ),
+    rows=rows,
+  )
+
+
 def run_member(
   prepared: Any,
   *,
@@ -341,6 +383,7 @@ def run_member(
   )
   rows = int(runtime.num_envs)
   started = time.perf_counter()
+  family = evaluate._prepared_family(prepared)
   result: dict[str, Any] = {
     "member": member,
     "rows": rows,
@@ -352,6 +395,9 @@ def run_member(
     "fall_degrees": float(args.fall_degrees),
     "diagnostic_only": True,
     "matched_acceptance": False,
+    "model_family": family,
+    "sampler_method": "euler_x0" if family == "flow" else "ddim",
+    "sampler": evaluate._sampler_report(prepared),
   }
   # Every name the cleanup path needs is bound before the try block, so a
   # failure in setup can never mask itself with an unbound name.
@@ -454,26 +500,7 @@ def run_member(
       bootstrap_latents.append(latents)
       observation = post
 
-    # Handover: freeze the reference for the batch and rebuild each row history.
-    continuation = BatchedReferenceFreeContinuation(
-      denoiser=prepared.denoiser.model,
-      decode=lambda latent, conditioning: prepared.vae.model.decode(
-        latent, conditioning
-      ),
-      schedule=prepared.denoiser.schedule,
-      projection=prepared.projection,
-      contract=prepared.contract,
-      device=device,
-      generator=_seeded_generator(device, int(prepared.args.seed)),
-      sampler_config=SamplerConfig(
-        prepared.denoiser.grid,
-        eta=0.0,
-        guidance_strength=0.0,
-        initial_noise_scale=1.0,
-        start_level=evaluate._FROZEN_START_LEVEL,
-      ),
-      rows=rows,
-    )
+    continuation = _build_continuation(prepared, device, rows)
     for index in range(_BOOTSTRAP_PAIRS):
       continuation.record_executed(
         np.arange(rows, dtype=np.int64),
@@ -923,6 +950,7 @@ def main(argv: list[str] | None = None) -> int:
     return 1
   members = _resolve_members(args, prepared)
   if not args.execute:
+    family = evaluate._prepared_family(prepared)
     print(
       json.dumps(
         {
@@ -936,6 +964,8 @@ def main(argv: list[str] | None = None) -> int:
           "configured_start_frame": int(prepared.args.start_frame),
           "fall_degrees": float(args.fall_degrees),
           "parity": bool(args.parity),
+          "model_family": family,
+          "sampler": evaluate._sampler_report(prepared),
           "checkpoint": str(args.checkpoint),
         },
         indent=1,
@@ -987,6 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
       _write_json(run_dir / f"member-{member}.json", failure)
       print(f"[{member}] failed: {failure['error']}", file=sys.stderr, flush=True)
 
+  family = evaluate._prepared_family(prepared)
   summary = {
     "diagnostic_only": True,
     "matched_acceptance": False,
@@ -1001,6 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
     "members": list(members),
     "results": results,
     "parity": parity,
+    "model_family": family,
+    "sampler_method": "euler_x0" if family == "flow" else "ddim",
+    "sampler": evaluate._sampler_report(prepared),
     "row_semantics": (
       "every row shares one member and one start frame; rows differ only by the "
       "environment's per-row domain randomization and by their own sampler noise"

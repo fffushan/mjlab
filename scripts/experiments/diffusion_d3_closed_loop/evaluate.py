@@ -6,6 +6,12 @@ contract/model/manifest preflight and constructs no simulator.  With
 ``--execute`` it runs exactly one matched VAE-baseline/reference-free diffusion
 pair through the public :func:`run_matched_pair` seam and the private X2
 runtime factory.  This is a measurement harness, not a policy-quality verdict.
+
+``--model-family diffusion|flow`` selects the frozen denoiser and sampler.  The
+diffusion family stays the default, so every existing command keeps its
+behavior.  A flow run loads a flow checkpoint, injects the flow Euler sampler
+into the same continuations, and reports ``euler_x0`` instead of DDIM.  It
+takes no diffusion schedule or inference grid, and it rejects task guidance.
 """
 
 from __future__ import annotations
@@ -44,16 +50,21 @@ from mjlab.tasks.tracking.diffusion.contract import (
 )
 from mjlab.tasks.tracking.diffusion.handover import ReferenceFreeContinuation
 from mjlab.tasks.tracking.diffusion.replay_integration import (
+  DEFAULT_CLOSED_LOOP_SOLVER_STEPS,
   LoadedDenoiser,
+  LoadedFlowDenoiser,
   LoadedVae,
   ReplayError,
   load_active_contract,
   load_denoiser,
+  load_flow_denoiser,
   load_projection_bundle,
   load_vae_decoder,
   sha256_file,
 )
 from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
+from mjlab.tasks.tracking.flow_matching.closed_loop import FlowSamplingAdapter
+from mjlab.tasks.tracking.flow_matching.sampler import FlowSamplerConfig
 
 _MAX_CONTINUATION_STEPS = 5000
 _MAX_WALL_SECONDS = 1200.0
@@ -63,6 +74,14 @@ _FROZEN_DDIM_STEPS = 20
 _FROZEN_START_LEVEL = 1000
 _CONTROL_PERIOD = 0.02
 _DEFAULT_OUTPUT_ROOT = Path("logs/diagnostics/diffusion-d3-visual")
+
+# The two frozen model families.  A checkpoint sidecar declares its family
+# through its schema, so a sidecar and an explicit ``--model-family`` must agree.
+_CHECKPOINT_SIDECAR_SCHEMAS: Mapping[str, str] = {
+  "diffusion": "mjlab-d3-diffusion-checkpoint-v1",
+  "flow": "mjlab-d3-flow-matching-checkpoint-v1",
+}
+_MODEL_FAMILIES = ("diffusion", "flow")
 
 # Representation-independent invariants: the runtime, VAE and asset geometry
 # that this harness can drive.  The physical state, projected-state and token
@@ -116,7 +135,8 @@ class PreparedEvaluation:
   repo_root: Path
   contract: Any
   projection: Any
-  denoiser: LoadedDenoiser
+  family: str
+  denoiser: LoadedDenoiser | LoadedFlowDenoiser
   vae: LoadedVae
   clip_frames: int
   clip_fps: float
@@ -257,6 +277,27 @@ def _parser() -> argparse.ArgumentParser:
     help="deprecated artifact digest metadata; never validated",
   )
   parser.add_argument(
+    "--model-family",
+    choices=list(_MODEL_FAMILIES),
+    default="diffusion",
+    help=(
+      "frozen model family to load and sample (default: diffusion).  The "
+      "checkpoint sidecar schema must declare the same family."
+    ),
+  )
+  parser.add_argument(
+    "--flow-euler-steps",
+    type=int,
+    default=None,
+    help=(
+      "Euler ODE steps for the flow sampler (default: 6, the closed-loop "
+      "choice).  The diffusion family keeps its frozen 20 DDIM updates and "
+      "rejects this option.  The step count must not exceed the checkpoint "
+      "process max_level.  The run report always carries the grid actually "
+      "built."
+    ),
+  )
+  parser.add_argument(
     "--projection",
     type=Path,
     default=None,
@@ -375,6 +416,21 @@ def build_parser() -> argparse.ArgumentParser:
   return _parser()
 
 
+def _model_family(args: argparse.Namespace) -> str:
+  """Return the requested frozen family, defaulting to the diffusion path."""
+  family = str(getattr(args, "model_family", "diffusion"))
+  if family not in _CHECKPOINT_SIDECAR_SCHEMAS:
+    raise ClosedLoopCliError(
+      f"model-family must be one of {list(_MODEL_FAMILIES)}, got {family!r}"
+    )
+  return family
+
+
+def _prepared_family(prepared: PreparedEvaluation) -> str:
+  """Return the family a prepared evaluation loaded."""
+  return str(getattr(prepared, "family", "diffusion"))
+
+
 def _load_checkpoint_sidecar(checkpoint_path: Path, args: argparse.Namespace) -> Path:
   """Load and apply the required YAML sidecar beside a diffusion checkpoint."""
   config_arg = getattr(args, "checkpoint_config", None)
@@ -400,9 +456,13 @@ def _load_checkpoint_sidecar(checkpoint_path: Path, args: argparse.Namespace) ->
     raise ClosedLoopCliError(
       f"checkpoint sidecar must contain a YAML mapping: {config_path}"
     )
-  if payload.get("schema") != "mjlab-d3-diffusion-checkpoint-v1":
+  family = _model_family(args)
+  expected_schema = _CHECKPOINT_SIDECAR_SCHEMAS[family]
+  schema = payload.get("schema")
+  if schema != expected_schema:
     raise ClosedLoopCliError(
-      f"unsupported checkpoint sidecar schema in {config_path}: {payload.get('schema')!r}"
+      f"checkpoint sidecar schema {schema!r} does not declare the {family!r} "
+      f"model family (expected {expected_schema!r}): {config_path}"
     )
   required = (
     "repo_root",
@@ -507,7 +567,26 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
     raise ClosedLoopCliError(f"output-dir exists but is not a directory: {output_dir}")
   if not repo_root.is_dir():
     raise ClosedLoopCliError(f"repo-root is not a directory: {repo_root}")
+  family = _model_family(args)
+  solver_steps = getattr(args, "flow_euler_steps", None)
+  if solver_steps is not None:
+    if family != "flow":
+      raise ClosedLoopCliError(
+        "flow-euler-steps applies to --model-family flow only; the diffusion "
+        f"family keeps its frozen {_FROZEN_DDIM_STEPS} DDIM updates"
+      )
+    if isinstance(solver_steps, bool) or not isinstance(solver_steps, int):
+      raise ClosedLoopCliError("flow-euler-steps must be an integer")
+    if solver_steps < 1:
+      raise ClosedLoopCliError("flow-euler-steps must be a positive integer")
   task_config = getattr(args, "task_config", None)
+  if task_config is not None and family == "flow":
+    # Task guidance is the DDIM-specific D4 seam.  A flow run must never build
+    # it, and this gate runs before any contract, model or environment load.
+    raise ClosedLoopCliError(
+      "model-family flow does not support --task-config: task guidance is "
+      "implemented for the diffusion DDIM sampler only"
+    )
   if task_config is not None:
     task_path = Path(task_config)
     if not task_path.is_file():
@@ -576,8 +655,51 @@ def _require_matched_acceptance_contract(contract: Any) -> None:
     )
 
 
+def _load_frozen_denoiser(
+  family: str,
+  checkpoint_path: Path,
+  contract: Any,
+  projection: Any,
+  solver_steps: int | None = None,
+) -> LoadedDenoiser | LoadedFlowDenoiser:
+  """Load the frozen checkpoint through its own family loader.
+
+  The diffusion loader reads the diffusion checkpoint format and the flow
+  loader reads the flow checkpoint format, so a checkpoint from the other
+  family fails closed here instead of being re-labelled.  ``solver_steps``
+  reaches the flow loader only; the diffusion family keeps its frozen DDIM
+  resolution, which is gated in :func:`_prepare`.
+  """
+  if family == "flow":
+    steps = DEFAULT_CLOSED_LOOP_SOLVER_STEPS if solver_steps is None else solver_steps
+    return load_flow_denoiser(
+      checkpoint_path,
+      contract=contract,
+      checkpoint_sha256=None,
+      projection_bundle=projection,
+      verify_projection_hashes=False,
+      solver_steps=steps,
+    )
+  if family == "flow":
+    return load_flow_denoiser(
+      checkpoint_path,
+      contract=contract,
+      checkpoint_sha256=None,
+      projection_bundle=projection,
+      verify_projection_hashes=False,
+    )
+  return load_denoiser(
+    checkpoint_path,
+    contract=contract,
+    checkpoint_sha256=None,
+    projection_bundle=projection,
+    verify_projection_hashes=False,
+  )
+
+
 def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
   repo_root, device = _validate_request(args)
+  family = _model_family(args)
   contract_path = args.contract.resolve()
   checkpoint_path = args.checkpoint.resolve()
   projection_path = args.projection.resolve()
@@ -597,12 +719,12 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
     raise ClosedLoopCliError(f"VAE manifest/member preflight failed: {exc}") from exc
   try:
     projection = load_projection_bundle(projection_path, contract=contract)
-    denoiser = load_denoiser(
+    denoiser = _load_frozen_denoiser(
+      family,
       checkpoint_path,
-      contract=contract,
-      checkpoint_sha256=None,
-      projection_bundle=projection,
-      verify_projection_hashes=False,
+      contract,
+      projection,
+      getattr(args, "flow_euler_steps", None),
     )
     vae = load_vae_decoder(
       vae_path,
@@ -614,10 +736,16 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
     )
   except (ReplayError, OSError, ValueError) as exc:
     raise ClosedLoopCliError(str(exc)) from exc
-  if denoiser.schedule.training_k != _FROZEN_START_LEVEL:
-    raise ClosedLoopCliError("frozen diffusion schedule must use training level 1000")
-  if denoiser.grid.updates != _FROZEN_DDIM_STEPS:
-    raise ClosedLoopCliError("frozen diffusion inference grid must use 20 DDIM updates")
+  if family == "diffusion":
+    # The frozen diffusion gates apply to the diffusion family only.  A flow
+    # run reports its own real process and grid instead of a diffusion one.
+    denoiser = cast(LoadedDenoiser, denoiser)
+    if denoiser.schedule.training_k != _FROZEN_START_LEVEL:
+      raise ClosedLoopCliError("frozen diffusion schedule must use training level 1000")
+    if denoiser.grid.updates != _FROZEN_DDIM_STEPS:
+      raise ClosedLoopCliError(
+        "frozen diffusion inference grid must use 20 DDIM updates"
+      )
   if (
     vae.reference_dim != 68
     or vae.conditioning_dim != 99
@@ -680,6 +808,7 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
     repo_root=repo_root,
     contract=contract,
     projection=projection,
+    family=family,
     denoiser=denoiser,
     vae=vae,
     clip_frames=clip_frames,
@@ -728,6 +857,65 @@ def _task_config_report(task: SparseTaskSpec | None) -> dict[str, Any] | None:
     "source": task.source.as_dict(),
     "effect": "hard keyframes and/or soft pose-cost guidance on the diffusion branch",
   }
+
+
+def _sampler_report(prepared: PreparedEvaluation) -> dict[str, Any]:
+  """Sampler identity for the prepared model family.
+
+  Both families name their family, solver method, actual grid and solver-update
+  count.  A flow run reports the trained linear process and the flow grid; it
+  has no diffusion schedule and its updates are never labelled DDIM.
+  """
+  if _prepared_family(prepared) == "flow":
+    flow = cast(LoadedFlowDenoiser, prepared.denoiser)
+    return {
+      "model_family": "flow",
+      "sampler_method": "euler_x0",
+      "inference_grid": flow.grid.as_dict(),
+      "solver_updates": flow.grid.calls,
+      "start_level": flow.process.max_level,
+      "start_distribution": "standard_normal",
+      "process_identity": flow.process_identity,
+    }
+  denoiser = cast(LoadedDenoiser, prepared.denoiser)
+  return {
+    "model_family": "diffusion",
+    "sampler_method": "ddim",
+    "inference_grid": denoiser.grid.as_dict(),
+    "solver_updates": denoiser.grid.updates,
+    "ddim_updates": _FROZEN_DDIM_STEPS,
+    "start_level": _FROZEN_START_LEVEL,
+    "eta": 0.0,
+    "guidance_strength": 0.0,
+    "initial_noise_scale": 1.0,
+  }
+
+
+def _checkpoint_provenance(prepared: PreparedEvaluation) -> dict[str, Any]:
+  """Checkpoint provenance with the family's own identity field names."""
+  args = prepared.args
+  denoiser = prepared.denoiser
+  report: dict[str, Any] = {
+    "path": str(args.checkpoint.resolve()),
+    "selected_step": denoiser.global_step,
+    "selection_split": denoiser.selection_split,
+    "best_validation_loss": denoiser.best_validation_loss,
+    "ema_selected": denoiser.ema_selected,
+    "ema_updates": denoiser.ema_updates,
+    "fp32_checked": denoiser.fp32_checked,
+    "config_seed": denoiser.config_seed,
+    "config_hash": denoiser.config_hash,
+    "projection_hashes": dict(denoiser.projection_hashes),
+  }
+  if _prepared_family(prepared) == "flow":
+    flow = cast(LoadedFlowDenoiser, denoiser)
+    report["process_family"] = flow.family
+    report["data_identity"] = flow.data_identity
+    report["process_identity"] = flow.process_identity
+    report["model_identity_hash"] = flow.model_identity_hash
+  else:
+    report["contract_identity"] = cast(LoadedDenoiser, denoiser).contract_identity
+  return report
 
 
 def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
@@ -788,11 +976,10 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
       "max_output_bytes": args.max_output_bytes,
     },
     "sampler": {
-      "ddim_updates": _FROZEN_DDIM_STEPS,
-      "start_level": _FROZEN_START_LEVEL,
-      "eta": 0.0,
-      "guidance_strength": 0.0,
-      "conditioning": "measured runtime gravity + cached actor q/dq/gyro/previous action (99-D)",
+      **_sampler_report(prepared),
+      "conditioning": (
+        "measured runtime gravity + cached actor q/dq/gyro/previous action (99-D)"
+      ),
       "vae_convention": "reference 68-D, conditioning 99-D, raw mean latent 32-D",
     },
     "device": str(prepared.device),
@@ -829,6 +1016,21 @@ def _runtime_factory(prepared: PreparedEvaluation):
   return factory
 
 
+def _flow_sampling_adapter(prepared: PreparedEvaluation) -> FlowSamplingAdapter:
+  """Build the flow-family sampler the continuations call instead of DDIM.
+
+  The adapter closes over the loaded flow model, its real linear process and
+  its 20-call level grid, so the continuation takes no diffusion schedule,
+  inference grid or ``SamplerConfig``.
+  """
+  flow = cast(LoadedFlowDenoiser, prepared.denoiser)
+  return FlowSamplingAdapter(
+    denoiser=flow.model,
+    config=FlowSamplerConfig(grid=flow.grid, process=flow.process),
+    state_dimension=prepared.contract.projected_state_dimension,
+  )
+
+
 def _continuation_factory(
   prepared: PreparedEvaluation, conditioning: TaskConditioning | None = None
 ):
@@ -840,27 +1042,48 @@ def _continuation_factory(
     raise ClosedLoopCliError(
       "a task config requires its task conditioning to be constructed first"
     )
+
+  def decode(latent: Tensor, conditioning_tensor: Tensor) -> Tensor:
+    with torch.no_grad():
+      return prepared.vae.model.decode(latent, conditioning_tensor)
+
+  if _prepared_family(prepared) == "flow":
+    sampler = _flow_sampling_adapter(prepared)
+
+    def flow_factory() -> ReferenceFreeContinuation:
+      generator = torch.Generator(device=prepared.device)
+      generator.manual_seed(args.seed)
+      return build_conditioned_continuation(
+        conditioning=None,
+        denoiser=prepared.denoiser.model,
+        decode=decode,
+        projection=prepared.projection,
+        contract=prepared.contract,
+        device=prepared.device,
+        generator=generator,
+        sampler=sampler,
+      )
+
+    return flow_factory
+
+  denoiser = cast(LoadedDenoiser, prepared.denoiser)
   sampler_config = SamplerConfig(
-    prepared.denoiser.grid,
+    denoiser.grid,
     eta=0.0,
     guidance_strength=0.0,
     initial_noise_scale=1.0,
     start_level=_FROZEN_START_LEVEL,
   )
 
-  def decode(latent: Tensor, conditioning_tensor: Tensor) -> Tensor:
-    with torch.no_grad():
-      return prepared.vae.model.decode(latent, conditioning_tensor)
-
   def factory() -> ReferenceFreeContinuation:
     generator = torch.Generator(device=prepared.device)
     generator.manual_seed(args.seed)
     return build_conditioned_continuation(
       conditioning=conditioning,
-      denoiser=prepared.denoiser.model,
+      denoiser=denoiser.model,
       decode=decode,
-      schedule=prepared.denoiser.schedule,
-      grid=prepared.denoiser.grid,
+      schedule=denoiser.schedule,
+      grid=denoiser.grid,
       projection=prepared.projection,
       contract=prepared.contract,
       device=prepared.device,
@@ -899,19 +1122,7 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
       "reference_dimension": 68,
       "continuation_reference": "absent after enter_reference_free",
     },
-    "checkpoint": {
-      "path": str(args.checkpoint.resolve()),
-      "selected_step": prepared.denoiser.global_step,
-      "selection_split": prepared.denoiser.selection_split,
-      "best_validation_loss": prepared.denoiser.best_validation_loss,
-      "ema_selected": prepared.denoiser.ema_selected,
-      "ema_updates": prepared.denoiser.ema_updates,
-      "fp32_checked": prepared.denoiser.fp32_checked,
-      "config_seed": prepared.denoiser.config_seed,
-      "contract_identity": prepared.denoiser.contract_identity,
-      "config_hash": prepared.denoiser.config_hash,
-      "projection_hashes": dict(prepared.denoiser.projection_hashes),
-    },
+    "checkpoint": _checkpoint_provenance(prepared),
     "projection": {
       "path": str(args.projection.resolve()),
       "sha256": args.projection_sha256,
@@ -927,14 +1138,7 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
       "relocated_artifact_roles": list(prepared.vae.relocated_artifact_roles),
       "joint_order": list(prepared.vae.joint_order),
     },
-    "sampler": {
-      "inference_grid": prepared.denoiser.grid.as_dict(),
-      "ddim_updates": _FROZEN_DDIM_STEPS,
-      "start_level": _FROZEN_START_LEVEL,
-      "eta": 0.0,
-      "guidance_strength": 0.0,
-      "initial_noise_scale": 1.0,
-    },
+    "sampler": _sampler_report(prepared),
     "budget": {
       "bootstrap_pairs": _BOOTSTRAP_PAIRS,
       "continuation_steps": args.continuation_steps,

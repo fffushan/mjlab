@@ -226,6 +226,33 @@ Added
   is software validation on synthetic CPU fixtures; no training run, simulator,
   controller or hardware use is claimed.
 
+- Added ``--model-family diffusion|flow`` to the D3 closed-loop evaluation
+  runner, the parallel driver and the visual diagnostic. The default stays
+  ``diffusion``. A flow run loads a flow checkpoint through the flow loader,
+  injects the flow Euler sampler into the existing single-row and batched
+  continuations, and rejects D4 task guidance during preflight. A flow
+  checkpoint sidecar uses the schema
+  ``mjlab-d3-flow-matching-checkpoint-v1``; a sidecar/family contradiction
+  fails closed. See ``docs/source/x2_flow_matching_training.rst``. This entry is
+  CPU software validation with fake loaders: no flow checkpoint, simulator or
+  GPU run is claimed.
+
+- Added ``--flow-euler-steps N`` to the same runner, driver and visual
+  diagnostic. It sets the flow Euler ODE step count at inference time; the
+  count must not exceed the checkpoint process ``max_level``. The report always
+  carries the grid actually built. The diffusion family keeps its frozen 20 DDIM
+  updates and refuses the flag.
+
+- Changed the closed-loop flow default to **6 Euler steps**
+  (``DEFAULT_CLOSED_LOOP_SOLVER_STEPS`` in ``diffusion/replay_integration.py``),
+  applied by ``load_flow_denoiser`` and by ``--flow-euler-steps``. Six steps is
+  inside the flat closed-loop quality region (6 to 20 steps are statistically
+  indistinguishable over 2048 rows per arm; 5 steps is measurably worse), and on
+  the X2 robot PC with the TensorRT execution provider and a locked GPU clock it
+  is 15.82 ms median against a 20 ms control period, where 10 steps is 24.92 ms
+  and 20 steps is 56.83 ms. The flow package's own ``DEFAULT_CALLS`` stays 20
+  because it is the offline generation-scoring grid.
+
 Fixed
 ^^^^^
 
@@ -316,6 +343,13 @@ Changed
   waits on the bounded worker completion signal, validates and discards the
   warmup plan, and leaves the controller ready for a fresh active request.
   Warmup does not publish an action or claim controller readiness.
+
+- Changed the D3 closed-loop sampler reports to name the model family. The
+  preflight report and the run provenance now state ``model_family``,
+  ``sampler_method``, the actual ``inference_grid`` and ``solver_updates``. A
+  diffusion run still reports ``ddim_updates: 20`` and start level ``1000``; a
+  flow run reports ``euler_x0``, its real process identity and grid, and no
+  ``ddim_updates`` field.
 
 
 =========
