@@ -1095,3 +1095,66 @@ def test_factory_applies_private_reset_policy_to_registered_standing_task(
     "standing_start_prob" in override
     for override in env_cfg._distillation_semantic_overrides
   )
+
+
+@pytest.fixture(scope="module")
+def preview_cohort(tmp_path_factory: pytest.TempPathFactory):
+  root = tmp_path_factory.mktemp("multi-tiny-preview")
+  with (
+    contextlib.redirect_stdout(io.StringIO()),
+    contextlib.redirect_stderr(io.StringIO()),
+  ):
+    return resolve_cohort(
+      load_manifest(build_tiny_cohort(root, lookahead_s=0.2).manifest, root)
+    )
+
+
+def test_factory_takes_the_preview_from_the_cohort_not_the_base_task(
+  preview_cohort, monkeypatch
+) -> None:
+  """A preview cohort must produce its preview even from a preview-blind task.
+
+  The saved teacher configs fix the lookahead and already drive the student
+  reference layout, so the live command has to agree with them.  A base task that
+  declares no preview would otherwise build a narrower actor observation than the
+  teacher export expects.
+  """
+  assert preview_cohort.lookahead_s == 0.2
+  cfg = load_env_cfg(preview_cohort.manifest.base_task)
+  cast(Any, cfg.commands["motion"]).lookahead_s = 0.0
+  monkeypatch.setattr("mjlab.tasks.registry.load_env_cfg", lambda task_id: cfg)
+
+  class _BuiltEnvironment:
+    def __init__(self, cfg, *, device, render_mode=None) -> None:
+      del device, render_mode
+      self.cfg = cfg
+
+  monkeypatch.setattr("mjlab.envs.ManagerBasedRlEnv", _BuiltEnvironment)
+  env = build_multi_motion_environment(
+    preview_cohort, ("tiny_000", "tiny_001"), num_envs=2
+  )
+  env_cfg = cast(Any, env.cfg)
+  assert cast(Any, env_cfg.commands["motion"]).lookahead_s == 0.2
+  assert any(
+    "lookahead_s" in override for override in env_cfg._distillation_semantic_overrides
+  )
+
+
+def test_factory_leaves_an_agreeing_preview_unrecorded(tiny_cohort, monkeypatch) -> None:
+  """No override, no record: an agreeing base task is not an override."""
+  assert tiny_cohort.lookahead_s == 0.0
+  cfg = load_env_cfg(tiny_cohort.manifest.base_task)
+  monkeypatch.setattr("mjlab.tasks.registry.load_env_cfg", lambda task_id: cfg)
+
+  class _BuiltEnvironment:
+    def __init__(self, cfg, *, device, render_mode=None) -> None:
+      del device, render_mode
+      self.cfg = cfg
+
+  monkeypatch.setattr("mjlab.envs.ManagerBasedRlEnv", _BuiltEnvironment)
+  env = build_multi_motion_environment(tiny_cohort, ("tiny_000", "tiny_001"), num_envs=2)
+  env_cfg = cast(Any, env.cfg)
+  assert cast(Any, env_cfg.commands["motion"]).lookahead_s == 0.0
+  assert not any(
+    "lookahead_s" in override for override in env_cfg._distillation_semantic_overrides
+  )

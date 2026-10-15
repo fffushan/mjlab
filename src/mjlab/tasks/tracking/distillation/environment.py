@@ -497,6 +497,14 @@ def build_multi_motion_environment(
   standing_override = motion_cfg.standing_start_prob
   if standing_override != 0.0:
     motion_cfg.standing_start_prob = 0.0
+  # The cohort's preview is not the base task's business.  The saved teacher configs fix
+  # one ``lookahead_s`` for every member and it already drives the student reference
+  # layout, so the live command must produce that same sample.  Otherwise a base task
+  # that declares no preview builds a narrower actor observation than the teacher export
+  # expects, and the two halves of the lane would disagree about the same cohort.
+  lookahead_from_base = motion_cfg.lookahead_s
+  if lookahead_from_base != cohort.lookahead_s:
+    motion_cfg.lookahead_s = cohort.lookahead_s
 
   slot_generator = (
     None if validated_seed is None else torch.Generator().manual_seed(validated_seed)
@@ -524,6 +532,11 @@ def build_multi_motion_environment(
     semantic_overrides.append(
       "private reset policy override: commands.motion.standing_start_prob: "
       f"{standing_override!r} -> 0.0"
+    )
+  if lookahead_from_base != cohort.lookahead_s:
+    semantic_overrides.append(
+      "private preview override: commands.motion.lookahead_s: "
+      f"{lookahead_from_base!r} -> {cohort.lookahead_s!r}"
     )
   cfg.commands["motion"] = make_multi_motion_cfg(
     motion_cfg, plan, reset_policy=reset_policy

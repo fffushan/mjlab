@@ -1,4 +1,7 @@
 # One shared multi-motion teacher over the 144 single-clip tennis references.
+# The base task is the single-motion task the teacher was built from.  The
+# distillation environment swaps in its own multi-motion router, and it takes the
+# preview from this cohort's saved teacher configs rather than from the base task.
 # Each entry is the same checkpoint with that clip's reference tables embedded, which is
 # the shape the distillation loader requires. The teacher's own saved params name a
 # reference manifest instead of one clip, so the saved-params clip check binds each entry
@@ -6,7 +9,7 @@
 version: 1
 name: x2-tennis-multimotion-cohort
 robot: agibot_x2
-base_task: Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion
+base_task: Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations-Vendor-Gains
 teachers:
 - id: single_000
   checkpoint: logs/diagnostics/x2-multi-motion-ppo-8gpu-resume-20k-20261014/training/agibot_x2_multi_motion_tracking/2026-10-14_21-06-44_all-tennis-8192x8-resume-20k/model_19999.pt

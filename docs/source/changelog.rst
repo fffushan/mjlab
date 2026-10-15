@@ -329,6 +329,16 @@ Added
   check with embedded ``joint_pos``/``joint_vel`` equal to the source clip exactly
   and ``body_quat_w`` equal at 1e-5.
 
+- Fixed the cohort environment taking its preview from the base task instead of
+  from the cohort.  ``make_multi_motion_cfg`` copies the motion command's fields,
+  so a preview-blind base task built a narrow actor observation while the same
+  cohort's saved teacher configs, and the student reference layout they drive,
+  already declared the preview.  The two halves of the lane disagreed about one
+  cohort.  ``build_multi_motion_environment`` now applies the cohort's
+  ``lookahead_s`` to the live command and records it as a private semantic
+  override, in the same way it already handles the reset policy.  An agreeing
+  base task records nothing.  Regression tests cover both directions.
+
 - Added the 144-clip multi-motion distillation cohort at
   ``configs/distillation/x2_tennis_multimotion_v1.yaml``. Every entry is the same
   20,000-iteration checkpoint with that clip's reference tables embedded, and the
