@@ -11,7 +11,15 @@ from typing import Any, Mapping, Protocol
 
 import numpy as np
 
+from mjlab.tasks.tracking.distillation.vae_config import (
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+)
+
 from .state import WorldState
+
+REFERENCE_WIDTHS = (REFERENCE_DIM, REFERENCE_DIM_WITH_PREVIEW)
+"""The supported gravity reference widths: version 1 and version 2 preview."""
 
 _STATE_FIELDS = (
   "root_position",
@@ -56,14 +64,19 @@ class D3Observation:
         }
       ),
     )
-    for name, width in (("conditioning", 99), ("reference", 68)):
-      value = getattr(self, name)
-      if value is None and name == "reference":
-        continue
-      array = np.array(value, dtype=np.float64, copy=True)
-      if array.shape != (width,) or not np.isfinite(array).all():
-        raise ValueError(f"{name} must be finite with shape [{width}]")
-      object.__setattr__(self, name, array)
+    conditioning = np.array(self.conditioning, dtype=np.float64, copy=True)
+    if conditioning.shape != (99,) or not np.isfinite(conditioning).all():
+      raise ValueError("conditioning must be finite with shape [99]")
+    object.__setattr__(self, "conditioning", conditioning)
+    if self.reference is not None:
+      reference = np.array(self.reference, dtype=np.float64, copy=True)
+      if reference.shape not in {(width,) for width in REFERENCE_WIDTHS}:
+        raise ValueError(
+          f"reference must have shape [68] or [130], got {reference.shape}"
+        )
+      if not np.isfinite(reference).all():
+        raise ValueError("reference must contain finite values")
+      object.__setattr__(self, "reference", reference)
     if self.reference_frame is not None and (
       isinstance(self.reference_frame, (bool, np.bool_))
       or not isinstance(self.reference_frame, (int, np.integer))
@@ -84,6 +97,29 @@ class D3Transition:
   teleport: bool = False
   reference_boundary: bool = False
   reason: str | None = None
+
+
+def reference_width_from_model(model: Any) -> int:
+  """Return the loaded VAE reference width, defaulting to the version-1 layout.
+
+  ``LoadedVae`` carries ``reference_dim``; the loaded model carries its saved
+  ``schema``.  Only the two supported gravity layouts are accepted here, so a
+  runtime measurement cannot widen the encoder input by accident.
+  """
+  schema = getattr(model, "schema", None)
+  width = getattr(schema, "reference_dim", None)
+  if width is None:
+    width = getattr(model, "reference_dim", None)
+  if width is None:
+    return REFERENCE_DIM
+  if isinstance(width, (bool, np.bool_)) or not isinstance(width, (int, np.integer)):
+    raise ValueError(f"loaded VAE reference width must be an integer, got {width!r}")
+  if int(width) not in REFERENCE_WIDTHS:
+    raise ValueError(
+      "loaded VAE reference width must be 68 (version 1) or 130 "
+      f"(version 2 preview), got {int(width)}"
+    )
+  return int(width)
 
 
 class ClosedLoopRuntime(Protocol):

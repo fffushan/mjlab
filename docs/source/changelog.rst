@@ -412,6 +412,17 @@ Fixed
 Changed
 ^^^^^^^
 
+- Changed the X2 collection and closed-loop startup reference path to accept
+  both frozen gravity VAE layouts. Version 1 keeps reference 68 / conditioning
+  99 / latent 32 / action 31. Version 2 adds one 62-wide q/dq preview at
+  ``t + 0.2 s`` for reference 130, derives it from the cohort declaration, and
+  checks it against the loaded model schema. The preview stays clip-local and
+  reference-free after handover. The flow token layout is unchanged at 41 rows
+  by 167 channels (135 state + 32 latent). Documented the preview experiment
+  inputs in ``docs/source/x2_flow_matching_training.rst``. Local CPU tests use a
+  synthetic VAE; no preview checkpoint, collection, training or simulator run is
+  validated.
+
 - Changed the batched D1 collection report to report resource limits truthfully:
   a run stopped by a wall-clock, inactivity or stored-output budget now writes
   ``partial: true`` and a ``stop_reason``, warns on standard error and exits

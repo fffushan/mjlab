@@ -38,6 +38,13 @@ from mjlab.tasks.tracking.distillation.environment import (
   SegmentMotionCommandCfg,
   _apply_saved_observation_timing,
 )
+from mjlab.tasks.tracking.distillation.vae_config import (
+  JOINT_DIM,
+  PREVIEW_DIM,
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+  REFERENCE_PREVIEW_FIELD,
+)
 
 
 class RuntimeX2Error(RuntimeError):
@@ -45,6 +52,12 @@ class RuntimeX2Error(RuntimeError):
 
 
 _REFERENCE_TERMINATIONS: tuple[str, ...] = ("anchor_pos", "anchor_ori", "ee_body_pos")
+_CONDITIONING_TERMS: tuple[str, ...] = (
+  "base_ang_vel",
+  "joint_pos",
+  "joint_vel",
+  "actions",
+)
 _EXPECTED_ACTOR_TERMS: tuple[str, ...] = (
   "command",
   "motion_anchor_ori_b",
@@ -53,7 +66,34 @@ _EXPECTED_ACTOR_TERMS: tuple[str, ...] = (
   "joint_vel",
   "actions",
 )
-_EXPECTED_ACTOR_WIDTHS: tuple[int, ...] = (62, 6, 3, 31, 31, 31)
+_EXPECTED_ACTOR_WIDTHS: tuple[int, ...] = (
+  2 * JOINT_DIM,
+  6,
+  3,
+  JOINT_DIM,
+  JOINT_DIM,
+  JOINT_DIM,
+)
+_ZERO_LOOKAHEAD_ACTOR_TERMS: tuple[str, ...] = (
+  _EXPECTED_ACTOR_TERMS[0],
+  REFERENCE_PREVIEW_FIELD,
+  *_EXPECTED_ACTOR_TERMS[1:],
+)
+_ZERO_LOOKAHEAD_ACTOR_WIDTHS: tuple[int, ...] = (
+  _EXPECTED_ACTOR_WIDTHS[0],
+  0,
+  *_EXPECTED_ACTOR_WIDTHS[1:],
+)
+_PREVIEW_ACTOR_TERMS: tuple[str, ...] = (
+  _EXPECTED_ACTOR_TERMS[0],
+  REFERENCE_PREVIEW_FIELD,
+  *_EXPECTED_ACTOR_TERMS[1:],
+)
+_PREVIEW_ACTOR_WIDTHS: tuple[int, ...] = (
+  _EXPECTED_ACTOR_WIDTHS[0],
+  PREVIEW_DIM,
+  *_EXPECTED_ACTOR_WIDTHS[1:],
+)
 _SIGNATURE_FIELDS: tuple[str, ...] = (
   "root_position",
   "root_quaternion_wxyz",
@@ -62,29 +102,79 @@ _SIGNATURE_FIELDS: tuple[str, ...] = (
 )
 
 
-def _validate_actor_layout(observations: Any) -> None:
-  """Accept only the pinned channels and an explicitly empty lookahead slot."""
+def _cohort_lookahead_s(cohort: Any) -> float:
+  """Return the cohort's declared preview duration, defaulting to version 1."""
+  try:
+    value = float(getattr(cohort, "lookahead_s", 0.0))
+  except (TypeError, ValueError) as exc:
+    raise RuntimeX2Error(f"cohort lookahead_s is not a number: {exc}") from exc
+  if not math.isfinite(value) or value < 0.0:
+    raise RuntimeX2Error(
+      f"cohort lookahead_s must be finite and non-negative, got {value!r}"
+    )
+  return value
+
+
+def _has_reference_preview(cohort: Any) -> bool:
+  return _cohort_lookahead_s(cohort) > 0.0
+
+
+def _reference_width(preview: bool) -> int:
+  return REFERENCE_DIM_WITH_PREVIEW if preview else REFERENCE_DIM
+
+
+def _actor_width(preview: bool) -> int:
+  return sum(_PREVIEW_ACTOR_WIDTHS if preview else _EXPECTED_ACTOR_WIDTHS)
+
+
+def _validate_actor_layout(observations: Any, *, preview: bool) -> int:
+  """Accept only the pinned channels plus the cohort-declared preview term."""
   names = tuple(observations.names)
   widths = tuple(observations.widths)
-  empty_lookahead_names = (
-    _EXPECTED_ACTOR_TERMS[0],
-    "motion_lookahead",
-    *_EXPECTED_ACTOR_TERMS[1:],
-  )
-  empty_lookahead_widths = (
-    _EXPECTED_ACTOR_WIDTHS[0],
-    0,
-    *_EXPECTED_ACTOR_WIDTHS[1:],
-  )
-  if (names, widths) not in (
-    (_EXPECTED_ACTOR_TERMS, _EXPECTED_ACTOR_WIDTHS),
-    (empty_lookahead_names, empty_lookahead_widths),
-  ):
-    raise RuntimeX2Error(
-      "unsupported schema: expected the pinned actor channels with at most "
-      "the known zero-width motion_lookahead slot, got "
-      f"{names!r}/{widths!r}"
+  if preview:
+    allowed = ((_PREVIEW_ACTOR_TERMS, _PREVIEW_ACTOR_WIDTHS),)
+  else:
+    allowed = (
+      (_EXPECTED_ACTOR_TERMS, _EXPECTED_ACTOR_WIDTHS),
+      (_ZERO_LOOKAHEAD_ACTOR_TERMS, _ZERO_LOOKAHEAD_ACTOR_WIDTHS),
     )
+  if (names, widths) not in allowed:
+    expected = "the 62-wide declared preview" if preview else "no preview"
+    raise RuntimeX2Error(
+      "unsupported schema: expected the pinned actor channels with "
+      f"{expected}, got {names!r}/{widths!r}"
+    )
+  expected_dim = sum(widths)
+  if int(getattr(observations, "total_dim", expected_dim)) != expected_dim:
+    raise RuntimeX2Error(
+      "unsupported schema: actor term widths do not sum to the declared "
+      f"observation width {expected_dim}"
+    )
+  return expected_dim
+
+
+def _assemble_reference(
+  values: Mapping[str, np.ndarray], *, preview: bool
+) -> np.ndarray:
+  """Build the gravity reference in saved schema order for one or many rows."""
+  parts = [
+    np.asarray(values["command"])[..., : 2 * JOINT_DIM],
+    np.asarray(values["motion_anchor_ori_b"]),
+  ]
+  if preview:
+    preview_value = values.get(REFERENCE_PREVIEW_FIELD)
+    if preview_value is None:
+      raise RuntimeX2Error(
+        f"the preview layout needs the {REFERENCE_PREVIEW_FIELD!r} observation term"
+      )
+    parts.append(np.asarray(preview_value))
+  reference = np.concatenate(parts, axis=-1)
+  expected = _reference_width(preview)
+  if reference.shape[-1] != expected:
+    raise RuntimeX2Error(
+      f"reference must have width {expected}, got {reference.shape[-1]}"
+    )
+  return reference
 
 
 def _never_terminate(env: Any, **_: Any) -> torch.Tensor:
@@ -267,6 +357,10 @@ class X2ClosedLoopRuntime:
     self.cohort = cohort
     self.member = member
     self.audit = audit
+    self._lookahead_s = _cohort_lookahead_s(cohort)
+    self._preview = self._lookahead_s > 0.0
+    self._reference_width = _reference_width(self._preview)
+    self._actor_width = _actor_width(self._preview)
     self._closed = False
     self._has_reset = False
     self._phase = "vae"
@@ -324,13 +418,13 @@ class X2ClosedLoopRuntime:
       "actor_observation_layout": {
         "names": list(cohort.observations.names),
         "widths": list(cohort.observations.widths),
-        "dimension": 164,
+        "dimension": self._actor_width,
         "ignored_zero_width_terms": [
           name
           for name, width in zip(
             cohort.observations.names, cohort.observations.widths, strict=True
           )
-          if name == "motion_lookahead" and width == 0
+          if name == REFERENCE_PREVIEW_FIELD and width == 0
         ],
       },
       "action_boundary": "direct env.step(action_tensor), shape [1, 31]",
@@ -341,7 +435,21 @@ class X2ClosedLoopRuntime:
         "noise_or_delay_update": False,
         "projected_gravity": "robot.data.projected_gravity_b (root frame)",
         "conditioning_width": 99,
-        "reference_width": 68,
+        "reference_width": self._reference_width,
+      },
+      "reference_layout": {
+        "width": self._reference_width,
+        "preview": self._preview,
+        "preview_field": REFERENCE_PREVIEW_FIELD if self._preview else None,
+        "preview_width": PREVIEW_DIM if self._preview else 0,
+        "cohort_lookahead_s": self._lookahead_s,
+        "order": [
+          "reference_q",
+          "reference_dq",
+          "anchor_orientation_error",
+          *([REFERENCE_PREVIEW_FIELD] if self._preview else []),
+        ],
+        "source": "cached actor observation of the same command frame",
       },
       "reference_read_boundaries": {
         "reset": "allowed for deterministic frame initialization",
@@ -429,16 +537,12 @@ class X2ClosedLoopRuntime:
         "frozen diffusion state order"
       )
     observations = self.cohort.observations
-    _validate_actor_layout(observations)
-    widths = tuple(observations.widths)
-    if int(getattr(observations, "total_dim", sum(widths))) != 164:
+    expected_actor_dim = _validate_actor_layout(observations, preview=self._preview)
+    actor_dim = int(getattr(self.cohort.actor, "obs_dim", expected_actor_dim))
+    if actor_dim != expected_actor_dim:
       raise RuntimeX2Error(
-        "unsupported schema: expected 164-D cached actor observations"
-      )
-    actor_dim = int(getattr(self.cohort.actor, "obs_dim", 164))
-    if actor_dim != 164:
-      raise RuntimeX2Error(
-        f"unsupported schema: expected actor obs_dim 164, got {actor_dim}"
+        "unsupported schema: expected actor obs_dim "
+        f"{expected_actor_dim}, got {actor_dim}"
       )
     control_period = float(self.cohort.control.control_period_s)
     if not math.isclose(control_period, DEFAULT_CONTRACT.period_seconds, abs_tol=1e-9):
@@ -547,11 +651,12 @@ class X2ClosedLoopRuntime:
     if isinstance(actor, torch.Tensor):
       actor = actor.detach().cpu().numpy()
     actor_array = np.asarray(actor, dtype=np.float64)
-    if actor_array.shape == (164,):
+    if actor_array.shape == (self._actor_width,):
       actor_array = actor_array[None]
-    if actor_array.shape != (1, 164):
+    if actor_array.shape != (1, self._actor_width):
       raise RuntimeX2Error(
-        f"cached actor observation must have shape [1, 164], got {actor_array.shape}"
+        "cached actor observation must have shape "
+        f"[1, {self._actor_width}], got {actor_array.shape}"
       )
     if not np.isfinite(actor_array).all():
       raise RuntimeX2Error("cached actor observation contains non-finite values")
@@ -562,7 +667,12 @@ class X2ClosedLoopRuntime:
 
   def _capture_observation(self) -> D3Observation:
     actor = self._cached_actor()
-    values = {name: actor[span].copy() for name, span in self._slices.items()}
+    if self._phase == "vae":
+      values = {name: actor[span].copy() for name, span in self._slices.items()}
+    else:
+      # Reference-free continuation reads only the actual conditioning terms;
+      # the command, anchor and preview slices are not touched at all.
+      values = {name: actor[self._slices[name]].copy() for name in _CONDITIONING_TERMS}
     robot_data = self.env.scene["robot"].data
     gravity = _row(robot_data.projected_gravity_b, name="projected_gravity_b", width=3)
     conditioning = np.concatenate(
@@ -581,11 +691,11 @@ class X2ClosedLoopRuntime:
     reference: np.ndarray | None = None
     reference_frame: int | None = None
     if self._phase == "vae":
-      reference = np.concatenate(
-        (values["command"][:62], values["motion_anchor_ori_b"])
-      )
-      if reference.shape != (68,):
-        raise RuntimeX2Error(f"reference must have shape [68], got {reference.shape}")
+      reference = _assemble_reference(values, preview=self._preview)
+      if reference.shape != (self._reference_width,):
+        raise RuntimeX2Error(
+          f"reference must have shape [{self._reference_width}], got {reference.shape}"
+        )
       reference_frame = self._frame()
     return D3Observation(
       state=self._world_state(),
@@ -795,10 +905,20 @@ def _validate_cohort_static(cohort: Any) -> None:
   """Reject unsupported frozen D3 inputs before constructing an environment."""
   try:
     observations = cohort.observations
-    _validate_actor_layout(observations)
-    if int(observations.total_dim) != 164 or int(cohort.actor.obs_dim) != 164:
-      raise RuntimeX2Error("unsupported schema: expected a 164-D actor observation")
-    if len(tuple(cohort.actions.joint_names)) != 31:
+    preview = _has_reference_preview(cohort)
+    expected_actor_dim = _validate_actor_layout(observations, preview=preview)
+    actor_dim = int(getattr(cohort.actor, "obs_dim", expected_actor_dim))
+    if int(observations.total_dim) != expected_actor_dim:
+      raise RuntimeX2Error(
+        "unsupported schema: expected a "
+        f"{expected_actor_dim}-D actor observation, got {observations.total_dim}"
+      )
+    if actor_dim != expected_actor_dim:
+      raise RuntimeX2Error(
+        "unsupported schema: expected actor obs_dim "
+        f"{expected_actor_dim}, got {actor_dim}"
+      )
+    if len(tuple(cohort.actions.joint_names)) != JOINT_DIM:
       raise RuntimeX2Error("unsupported joint schema: expected 31 action joints")
     if not math.isclose(
       float(cohort.control.control_period_s),
@@ -865,8 +985,10 @@ def _build_private_environment(
   cfg = copy.deepcopy(load_env_cfg(selected_task))
   cfg.seed = seed
   teacher = cohort.teacher(member)
-  overrides = _apply_saved_observation_timing(
-    cfg, teacher.env_config, str(teacher.entry.env_config)
+  overrides = list(
+    _apply_saved_observation_timing(
+      cfg, teacher.env_config, str(teacher.entry.env_config)
+    )
   )
   cfg.scene.num_envs = 1
   cfg.auto_reset = False
@@ -875,6 +997,18 @@ def _build_private_environment(
     raise RuntimeX2Error(f"registered task {selected_task!r} has no motion command")
   private_motion = ClosedLoopMotionCommandCfg.from_config(motion_cfg)
   private_motion.motion_file = str(teacher.entry.motion)
+  # The saved teacher exports fix one preview duration for every cohort member,
+  # and it already drives the student reference layout.  The base task often
+  # declares no preview, so apply the cohort's value here as the private
+  # builder does in the collection lane.
+  lookahead_from_base = private_motion.lookahead_s
+  lookahead_from_cohort = _cohort_lookahead_s(cohort)
+  if lookahead_from_base != lookahead_from_cohort:
+    private_motion.lookahead_s = lookahead_from_cohort
+    overrides.append(
+      "private preview override: commands.motion.lookahead_s: "
+      f"{lookahead_from_base!r} -> {lookahead_from_cohort!r}"
+    )
   cfg.commands["motion"] = private_motion
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=None)
   env.cfg.__dict__["_closed_loop_semantic_overrides"] = tuple(overrides)

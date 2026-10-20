@@ -6,6 +6,7 @@ construct MuJoCo, allocate a GPU environment, or claim physical evidence.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from argparse import Namespace
 from dataclasses import replace
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mjlab.tasks.tracking.diffusion import closed_loop_types
 from mjlab.tasks.tracking.diffusion.contract import (
   DEFAULT_CONTRACT,
   LOCAL_KINEMATIC_SCHEMA,
@@ -437,10 +439,11 @@ def test_source_fingerprints_use_imported_files_not_artifact_root(
   provenance = evaluate._source_fingerprints()
   assert evaluate.__file__ is not None
   assert provenance["executed_cli"]["path"] == str(Path(evaluate.__file__).resolve())
-  assert (
-    provenance["modules"]["mjlab.tasks.tracking.diffusion.closed_loop_types"]["sha256"]
-    == "6d603152f0685b51f98e8550dfb8f1ea6a03b926c88964d3b62e92bb4e38f129"
-  )
+  assert closed_loop_types.__file__ is not None
+  module_path = Path(closed_loop_types.__file__).resolve()
+  entry = provenance["modules"]["mjlab.tasks.tracking.diffusion.closed_loop_types"]
+  assert entry["path"] == str(module_path)
+  assert entry["sha256"] == hashlib.sha256(module_path.read_bytes()).hexdigest()
   assert provenance["modules"]["mjlab.tasks.tracking.diffusion.closed_loop"][
     "path"
   ].endswith("src/mjlab/tasks/tracking/diffusion/closed_loop.py")

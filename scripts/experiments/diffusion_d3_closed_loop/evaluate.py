@@ -39,6 +39,7 @@ from mjlab.tasks.tracking.diffusion.closed_loop import (
   persist_evaluation_report,
   run_matched_pair,
 )
+from mjlab.tasks.tracking.diffusion.closed_loop_types import REFERENCE_WIDTHS
 from mjlab.tasks.tracking.diffusion.conditioned_continuation import (
   SparseTaskSpec,
   TaskConditioning,
@@ -747,12 +748,12 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
         "frozen diffusion inference grid must use 20 DDIM updates"
       )
   if (
-    vae.reference_dim != 68
+    vae.reference_dim not in REFERENCE_WIDTHS
     or vae.conditioning_dim != 99
     or vae.latent_dim != 32
     or vae.action_dim != 31
   ):
-    raise ClosedLoopCliError("frozen VAE dimensions are not 68/99/32/31")
+    raise ClosedLoopCliError("frozen VAE dimensions are not (68 or 130)/99/32/31")
   clip_frames = int(teacher.reference.frames)
   clip_fps = float(teacher.reference.fps)
   if clip_frames < 2 or args.start_frame >= clip_frames:
@@ -980,7 +981,10 @@ def _preflight_report(prepared: PreparedEvaluation) -> dict[str, Any]:
       "conditioning": (
         "measured runtime gravity + cached actor q/dq/gyro/previous action (99-D)"
       ),
-      "vae_convention": "reference 68-D, conditioning 99-D, raw mean latent 32-D",
+      "vae_convention": (
+        f"reference {prepared.vae.reference_dim}-D, conditioning 99-D, "
+        "raw mean latent 32-D"
+      ),
     },
     "device": str(prepared.device),
     "artifact_root": str(prepared.repo_root),
@@ -1118,8 +1122,11 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
     "conditioning": {
       "source": "real mjlab runtime projected_gravity_b plus cached actor base_ang_vel/joint_pos/joint_vel/previous_applied_action",
       "dimension": 99,
-      "reference_source": "real mjlab motion command reference first 62 values plus motion_anchor_ori_b",
-      "reference_dimension": 68,
+      "reference_source": (
+        "real mjlab motion command reference first 62 values plus motion_anchor_ori_b"
+        + (" plus motion_lookahead" if prepared.vae.reference_dim == 130 else "")
+      ),
+      "reference_dimension": prepared.vae.reference_dim,
       "continuation_reference": "absent after enter_reference_free",
     },
     "checkpoint": _checkpoint_provenance(prepared),

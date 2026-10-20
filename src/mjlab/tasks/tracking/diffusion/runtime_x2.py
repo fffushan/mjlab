@@ -329,6 +329,10 @@ class X2MotionEnvironment:
     self.adapter = make_distillation_adapter(
       cohort, teacher_id, num_envs=1, device=device, seed=seed
     )
+    # The adapter's schema is the cohort's live layout, including a declared
+    # reference preview; the scalar observation derives its width from it.
+    self._schema = self.adapter.schema
+    self._reference_width = int(self._schema.reference_dim)
     self.env = self.adapter.env
     # The D1 contract forbids any mid-trial reset, so the environment may never
     # reset itself: the collector owns every reset boundary.
@@ -583,7 +587,7 @@ class X2MotionEnvironment:
     metrics = self._reference_metrics()
     return VaeObservation(
       state=self._world_state(),
-      reference=_as_numpy(snapshot.packed.reference[0], 68),
+      reference=_as_numpy(snapshot.packed.reference[0], self._reference_width),
       conditioning=_as_numpy(snapshot.packed.conditioning[0], 99),
       motion_id=self.teacher_id,
       reference_frame=int(snapshot.reference_frame[0].item()),
@@ -720,12 +724,14 @@ class X2MultiMotionEnvironment:
     from mjlab.tasks.tracking.distillation.adapter import (
       _capture_snapshot,
       _term_slices,
+      default_schema_for_cohort,
     )
-    from mjlab.tasks.tracking.distillation.vae_config import make_schema
 
     self._capture_snapshot = _capture_snapshot
     self._slices = _term_slices(cohort)
-    self._schema = make_schema(joint_order=cohort.actions.joint_names)
+    # The batched runtime packs the cohort's live layout, preview included;
+    # a preview cohort must not fall back to the preview-blind base schema.
+    self._schema = default_schema_for_cohort(cohort)
     self._install_termination_masks()
     self._install_reference_advance_mask()
 
@@ -1242,6 +1248,7 @@ def build_x2_runtime(request: Any) -> Any:
   """
   import os
 
+  from mjlab.tasks.tracking.distillation.adapter import default_schema_for_cohort
   from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 
   from .runtime import RuntimeBundle
@@ -1308,6 +1315,7 @@ def build_x2_runtime(request: Any) -> Any:
     raise RuntimeX2Error(f"frozen cohort manifest is missing: {manifest_path}")
   manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
   cohort = resolve_cohort(load_manifest(manifest_path, repo_root=repo_root))
+  live_schema = default_schema_for_cohort(cohort)
   cohort_ids = tuple(cohort.teacher_ids)
   rollout_ids = resolve_rollout_ids(
     cohort_ids, os.environ.get("MJLAB_D1_ROLLOUT_TEACHERS", "")
@@ -1411,6 +1419,8 @@ def build_x2_runtime(request: Any) -> Any:
       "rollout_teachers": list(rollout_ids),
       "vae_checkpoint": selected_contract.vae_checkpoint,
       "vae_sha256": selected_contract.vae_sha256,
+      "vae_schema": live_schema.compatibility_metadata(),
+      "cohort_lookahead_s": float(cohort.lookahead_s),
       "state_dimension": contract_layout.state_dimension,
       "token_dimension": contract_layout.token_dimension,
       "window_steps": contract_layout.window_steps,

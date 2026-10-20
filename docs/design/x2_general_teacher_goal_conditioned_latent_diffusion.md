@@ -321,3 +321,93 @@ The proposed architecture, training quality, inference latency, and hardware beh
 The earlier discussion retains its historical specialist-teacher decision.
 This record defines a new shared-teacher direction.
 Existing experiment status stays unchanged.
+
+## 11. Preview-aware flow-matching next step
+
+Planning review: 2026-10-20 (+08).
+Original status: proposed scope; no implementation or new run authorized by that review.
+Implementation update: the [local port and CPU acceptance](../plans/x2_preview_vae_flow_matching_implementation.md#final-acceptance-2026-10-20-08) are complete.
+The following text retains the planning rationale and pre-port findings.
+This section updates the diffusion direction above to the existing x0 flow-matching family.
+
+The preview-aware VAE reference is now 130-dimensional, including one sample at `t + 0.2 s`.
+Conditioning stays 99-dimensional; the latent stays 32-dimensional; actions stay 31-dimensional.
+The encoder can retain action-relevant preview information through its latent.
+Action distillation does not guarantee reconstruction of every preview feature.
+
+### Keep the flow core unchanged
+
+For the existing hybrid representation, each token remains `[state(135), latent(32)]`, or 167 channels.
+The window remains eight past rows, one current row, and 32 future rows at 50 Hz.
+The Transformer does not consume the raw 68- or 130-dimensional encoder reference.
+The existing linear noising process, x0 loss, and Euler sampler need no preview-specific mathematical change.
+See [`flow_matching/trainer.py`](../../src/mjlab/tasks/tracking/flow_matching/trainer.py)
+and [`flow_matching/sampler.py`](../../src/mjlab/tasks/tracking/flow_matching/sampler.py).
+Changing to latent-only tokens or changing the physical-state representation is outside this minimal port.
+
+Keep the training algorithm, but train a new model with new data and statistics.
+A new VAE changes latent coordinates even when their width stays 32.
+Do not reuse the old flow weights, latent statistics, or token caches as compatible artifacts.
+
+### Port collection and VAE integration
+
+Pre-implementation source inspection found these legacy assumptions outside the flow core:
+
+- [`diffusion/adapter.py`](../../src/mjlab/tasks/tracking/diffusion/adapter.py)
+  pins observation reference widths and `FrozenVaePolicy` to 68.
+- [`diffusion/runtime_x2.py`](../../src/mjlab/tasks/tracking/diffusion/runtime_x2.py)
+  constructs the batched schema with `make_schema(...)`, without cohort preview.
+  Its scalar observation path also pins the reference width to 68.
+- [`diffusion/replay_integration.py`](../../src/mjlab/tasks/tracking/diffusion/replay_integration.py)
+  rejects a loaded VAE unless its reference width is 68.
+- The single and batched closed-loop paths pin 68-wide startup references.
+  [`closed_loop_runtime_x2.py`](../../src/mjlab/tasks/tracking/diffusion/closed_loop_runtime_x2.py)
+  also permits only absent or zero-width `motion_lookahead` in the actor layout.
+
+Use the loaded VAE schema and the cohort preview declaration consistently.
+Preserve the legacy schema; do not replace every 68 with 130.
+Update the new collection contract and cohort selection for all 144 `single_*` clips.
+Bind one frozen checkpoint, its normalizers, the 0.2-second preview, and the action contract.
+
+Collect VAE-controlled rollouts, not PPO rollouts with latents attached afterward:
+
+```text
+pre-action actual state s_t
+aligned reference [q_t, dq_t, orientation_error_t, q_(t+10), dq_(t+10)]
+    -> frozen encoder mean z_t
+    -> frozen decoder(z_t, actual conditioning_t)
+    -> clean action; apply declared collection perturbation separately
+    -> simulator step
+```
+
+Store the actual decoded latent with its pre-action state.
+Keep clean and executed actions separate when collection adds action noise.
+Clamp preview within the same clip.
+Never join training windows across resets, reference teleports, or controller changes.
+Split rollout groups before fitting train-only statistics and building token caches.
+
+### Separate preview support from goal control
+
+Preview in the training latent does not tell deployment which future motion the operator wants.
+A history-conditioned flow can learn possible continuations without an external reference stream.
+Specific pose or velocity goals still need an explicit conditioning or guidance path.
+
+The current flow evaluation runner rejects `--task-config`.
+Its existing sparse-goal integration is specific to the diffusion DDIM sampler.
+See [`evaluate.py`](../../scripts/experiments/diffusion_d3_closed_loop/evaluate.py)
+and the [flow runbook](../source/x2_flow_matching_training.rst).
+Porting inference-time guidance may preserve the training architecture and objective.
+Adding a learned goal input requires suitable labels and training/model integration.
+Choose this separately; neither follows automatically from the preview-aware VAE.
+
+### Lean validation before a full run
+
+1. Freeze the selected VAE checkpoint and make the collection/startup paths schema-aware.
+2. Check one normal frame, one clip-end frame, and a subset reset for aligned preview and latent/action parity.
+3. Collect a small sample and verify state-latent timing, boundaries, and unchanged 167-channel tokens.
+4. Run a bounded train-save-load check and a short reference-free continuation after VAE startup.
+5. Only then authorize full collection and a fresh flow training budget.
+
+Validation here is source inspection only.
+Preview-aware flow collection, training, closed-loop behavior, and goal control are not tested.
+The current VAE training job is unchanged.

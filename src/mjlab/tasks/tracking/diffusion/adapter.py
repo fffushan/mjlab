@@ -16,6 +16,13 @@ from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 import numpy as np
 import torch
 
+from mjlab.tasks.tracking.distillation.vae_config import (
+  CONDITIONING_DIMS,
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+  DecoderMode,
+)
+
 from .state import WorldState
 
 
@@ -75,12 +82,43 @@ _PPO_ACTION_SLICE = slice(
   sum(width for _, width in _PPO_OBSERVATION_LAYOUT[:_PPO_ACTION_FIELD_INDEX]),
   sum(width for _, width in _PPO_OBSERVATION_LAYOUT[: _PPO_ACTION_FIELD_INDEX + 1]),
 )
+_SUPPORTED_GRAVITY_REFERENCE_WIDTHS = (REFERENCE_DIM, REFERENCE_DIM_WITH_PREVIEW)
+_GRAVITY_CONDITIONING_DIM = CONDITIONING_DIMS[DecoderMode.GRAVITY.value]
+
+
+def _require_supported_reference_width(name: str, width: int) -> None:
+  """Accept exactly the frozen gravity reference layouts, never an arbitrary width."""
+  if width not in _SUPPORTED_GRAVITY_REFERENCE_WIDTHS:
+    raise AdapterError(
+      f"{name} width must be {REFERENCE_DIM} or "
+      f"{REFERENCE_DIM_WITH_PREVIEW}, got {width}"
+    )
 
 
 def _vector(name: str, value: Sequence[float] | np.ndarray, width: int) -> np.ndarray:
   result = np.asarray(value, dtype=np.float64)
   if result.shape != (width,) or not np.isfinite(result).all():
     raise AdapterError(f"{name} must be finite with shape [{width}]")
+  return result.copy()
+
+
+def _reference_vector(name: str, value: Any) -> np.ndarray:
+  """Validate one scalar reference against the two supported gravity widths."""
+  result = np.asarray(value, dtype=np.float64)
+  if result.ndim != 1 or not np.isfinite(result).all():
+    raise AdapterError(f"{name} must be finite with shape [width]")
+  _require_supported_reference_width(name, int(result.shape[0]))
+  return result.copy()
+
+
+def _reference_matrix(name: str, value: Any) -> np.ndarray:
+  """Validate one batched reference against the two supported gravity widths."""
+  result = np.asarray(value, dtype=np.float64)
+  if result.ndim != 2 or not np.isfinite(result).all():
+    raise AdapterError(f"{name} must be finite with shape [N, width]")
+  if result.shape[0] == 0:
+    raise AdapterError(f"{name} must contain at least one row")
+  _require_supported_reference_width(name, int(result.shape[1]))
   return result.copy()
 
 
@@ -329,9 +367,13 @@ class VaeObservationBatch:
 
   def __post_init__(self) -> None:
     batch = self.state.count
-    object.__setattr__(self, "reference", _matrix("reference", self.reference, 68))
     object.__setattr__(
-      self, "conditioning", _matrix("conditioning", self.conditioning, 99)
+      self, "reference", _reference_matrix("reference", self.reference)
+    )
+    object.__setattr__(
+      self,
+      "conditioning",
+      _matrix("conditioning", self.conditioning, _GRAVITY_CONDITIONING_DIM),
     )
     if self.reference.shape[0] != batch or self.conditioning.shape[0] != batch:
       raise AdapterError("VAE batch state and inputs must have the same row count")
@@ -400,16 +442,26 @@ class VaeObservationTensorBatch:
   reference_phase: np.ndarray | None = None
 
   def __post_init__(self) -> None:
-    for name, value, width in (
-      ("reference", self.reference, 68),
-      ("conditioning", self.conditioning, 99),
+    if not isinstance(self.reference, torch.Tensor):
+      raise AdapterError("tensor reference must be a torch.Tensor")
+    if self.reference.ndim != 2 or self.reference.shape[0] == 0:
+      raise AdapterError("tensor reference must have shape [N, width] with N > 0")
+    _require_supported_reference_width("tensor reference", int(self.reference.shape[1]))
+    if self.reference.dtype != torch.float32:
+      raise AdapterError("tensor reference must be float32")
+    if not isinstance(self.conditioning, torch.Tensor):
+      raise AdapterError("tensor conditioning must be a torch.Tensor")
+    if (
+      self.conditioning.ndim != 2
+      or self.conditioning.shape[1] != _GRAVITY_CONDITIONING_DIM
+      or self.conditioning.shape[0] == 0
     ):
-      if not isinstance(value, torch.Tensor):
-        raise AdapterError(f"tensor {name} must be a torch.Tensor")
-      if value.ndim != 2 or value.shape[1] != width or value.shape[0] == 0:
-        raise AdapterError(f"tensor {name} must have shape [N, {width}] with N > 0")
-      if value.dtype != torch.float32:
-        raise AdapterError(f"tensor {name} must be float32")
+      raise AdapterError(
+        f"tensor conditioning must have shape [N, {_GRAVITY_CONDITIONING_DIM}] "
+        "with N > 0"
+      )
+    if self.conditioning.dtype != torch.float32:
+      raise AdapterError("tensor conditioning must be float32")
     if self.reference.device != self.conditioning.device:
       raise AdapterError("tensor reference and conditioning must share a device")
     if self.reference.shape[0] != self.conditioning.shape[0]:
@@ -542,9 +594,13 @@ class VaeObservation:
   end_effector_z_error: float | None = None
 
   def __post_init__(self) -> None:
-    object.__setattr__(self, "reference", _vector("reference", self.reference, 68))
     object.__setattr__(
-      self, "conditioning", _vector("conditioning", self.conditioning, 99)
+      self, "reference", _reference_vector("reference", self.reference)
+    )
+    object.__setattr__(
+      self,
+      "conditioning",
+      _vector("conditioning", self.conditioning, _GRAVITY_CONDITIONING_DIM),
     )
     if not self.motion_id or self.reference_frame < 0:
       raise AdapterError("motion_id and reference_frame are invalid")
@@ -645,9 +701,23 @@ class FrozenVaePolicy:
     if artifact_metadata is not None:
       action_contract.verify_metadata(artifact_metadata)
     schema = getattr(model, "schema", None)
-
-    if schema is None or schema.reference_dim != 68 or schema.conditioning_dim != 99:
+    if schema is None:
       raise AdapterError("VAE model does not implement the frozen gravity schema")
+    mode = getattr(schema, "mode", DecoderMode.GRAVITY)
+    reference_dim = int(schema.reference_dim)
+    conditioning_dim = int(schema.conditioning_dim)
+    if (
+      mode is not DecoderMode.GRAVITY
+      or reference_dim not in _SUPPORTED_GRAVITY_REFERENCE_WIDTHS
+      or conditioning_dim != _GRAVITY_CONDITIONING_DIM
+    ):
+      raise AdapterError(
+        "VAE model does not implement a supported frozen gravity schema: "
+        f"mode={getattr(mode, 'value', mode)!r}, reference {reference_dim}, "
+        f"conditioning {conditioning_dim}"
+      )
+    self.schema = schema
+    self.reference_width = reference_dim
     model.eval()
     parameters = getattr(model, "parameters", None)
     if parameters is not None:
@@ -685,6 +755,7 @@ class FrozenVaePolicy:
     read so an unusable inference device fails closed.
     """
     from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
+    from mjlab.tasks.tracking.distillation.adapter import default_schema_for_cohort
     from mjlab.tasks.tracking.distillation.checkpoint import (
       CheckpointValidationError,
       load_cohort_member_inference,
@@ -719,6 +790,7 @@ class FrozenVaePolicy:
         cohort,
         teacher_id,
         device=selected_device,
+        expected_schema=default_schema_for_cohort(cohort),
       )
     except (CheckpointValidationError, ValueError, OSError) as exc:
       raise AdapterError(
@@ -774,11 +846,19 @@ class FrozenVaePolicy:
     reference: Sequence[float] | np.ndarray,
     conditioning: Sequence[float] | np.ndarray,
   ) -> tuple[np.ndarray, np.ndarray]:
+    reference_values = np.asarray(reference, dtype=np.float64)
+    if reference_values.ndim != 1:
+      raise AdapterError("reference must be a one-dimensional vector")
+    self._check_reference_width(
+      int(reference_values.shape[0]), "scalar VAE observation"
+    )
     reference_tensor = torch.as_tensor(
-      _vector("reference", reference, 68), dtype=torch.float32
+      _vector("reference", reference_values, self.reference_width),
+      dtype=torch.float32,
     )[None]
     conditioning_tensor = torch.as_tensor(
-      _vector("conditioning", conditioning, 99), dtype=torch.float32
+      _vector("conditioning", conditioning, _GRAVITY_CONDITIONING_DIM),
+      dtype=torch.float32,
     )[None]
     device = self._model_device()
     if device is not None:
@@ -800,6 +880,13 @@ class FrozenVaePolicy:
 
   def action(self, observation: VaeObservation) -> tuple[np.ndarray, np.ndarray]:
     return self.latent_and_action(observation.reference, observation.conditioning)
+
+  def _check_reference_width(self, width: int, source: str) -> None:
+    if width != self.reference_width:
+      raise AdapterError(
+        f"{source} reference width {width} disagrees with the frozen VAE "
+        f"schema width {self.reference_width}"
+      )
 
   def _model_device(self) -> torch.device | None:
     """The frozen model's parameter device, or ``None`` for a parameterless model."""
@@ -823,6 +910,9 @@ class FrozenVaePolicy:
     self, observation: VaeObservationBatch
   ) -> tuple[np.ndarray, np.ndarray]:
     """Run one VAE encode/decode call for all supplied rows."""
+    self._check_reference_width(
+      int(observation.reference.shape[1]), "batched VAE observation"
+    )
     reference = torch.as_tensor(observation.reference, dtype=torch.float32)
     conditioning = torch.as_tensor(observation.conditioning, dtype=torch.float32)
     device = self._model_device()
@@ -856,6 +946,9 @@ class FrozenVaePolicy:
     """
     if not isinstance(observation, VaeObservationTensorBatch):
       raise AdapterError("tensor VAE batch must be a VaeObservationTensorBatch")
+    self._check_reference_width(
+      int(observation.reference.shape[1]), "tensor VAE observation"
+    )
     reference = observation.reference
     conditioning = observation.conditioning
     device = self._model_device()

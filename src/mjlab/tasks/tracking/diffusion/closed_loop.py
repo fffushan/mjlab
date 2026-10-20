@@ -29,7 +29,17 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .closed_loop_types import ClosedLoopRuntime, D3Observation, D3Transition
+from mjlab.tasks.tracking.distillation.vae_config import (
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+)
+
+from .closed_loop_types import (
+  ClosedLoopRuntime,
+  D3Observation,
+  D3Transition,
+  reference_width_from_model,
+)
 from .contract import (
   FROZEN_SCHEMA,
   LEGACY_SCHEMA,
@@ -50,7 +60,9 @@ _STATE_FIELDS = (
 )
 _LATENT_WIDTH = 32
 _ACTION_WIDTH = 31
-_REFERENCE_WIDTH = 68
+_REFERENCE_WIDTH = REFERENCE_DIM
+_REFERENCE_WIDTH_WITH_PREVIEW = REFERENCE_DIM_WITH_PREVIEW
+_REFERENCE_WIDTHS = (_REFERENCE_WIDTH, _REFERENCE_WIDTH_WITH_PREVIEW)
 _CONDITIONING_WIDTH = 99
 _BOOTSTRAP_PAIRS = 8
 _DEFAULT_PERIOD = 0.02
@@ -494,8 +506,15 @@ def _tilt_degrees(state: WorldState) -> float:
   return float(np.degrees(np.arccos(np.clip(up_z, -1.0, 1.0))))
 
 
-def _validate_observation(observation: Any) -> D3Observation:
+def _validate_observation(
+  observation: Any, *, reference_width: int = _REFERENCE_WIDTH
+) -> D3Observation:
   """Validate a runtime-owned observation, including fake-runtime inputs."""
+  if reference_width not in _REFERENCE_WIDTHS:
+    raise ClosedLoopEvaluationError(
+      f"unsupported reference width {reference_width!r}; supported widths are "
+      f"{list(_REFERENCE_WIDTHS)}"
+    )
   try:
     if not _is_integer(observation.tick):
       raise ClosedLoopEvaluationError("observation tick must be integral and not bool")
@@ -514,7 +533,7 @@ def _validate_observation(observation: Any) -> D3Observation:
     reference = (
       None
       if reference_value is None
-      else _finite_array("observation reference", reference_value, (_REFERENCE_WIDTH,))
+      else _finite_array("observation reference", reference_value, (reference_width,))
     )
     reference_frame = observation.reference_frame
     if reference_frame is not None and not _is_integer(reference_frame):
@@ -584,9 +603,10 @@ def _validate_phase_observation(
   *,
   reference_free: bool,
   clip_frames: int,
+  reference_width: int = _REFERENCE_WIDTH,
 ) -> str | None:
   try:
-    _validate_observation(observation)
+    _validate_observation(observation, reference_width=reference_width)
   except ClosedLoopEvaluationError:
     return "nonfinite"
   if reference_free:
@@ -808,6 +828,7 @@ def _post_step_reason(
   reference_free: bool,
   clip_frames: int,
   budget: EvaluationBudget,
+  reference_width: int = _REFERENCE_WIDTH,
 ) -> tuple[str | None, D3Observation | None]:
   terminated = bool(getattr(transition, "terminated", False))
   reset = bool(getattr(transition, "reset", False))
@@ -823,7 +844,9 @@ def _post_step_reason(
       return "terminated", None
     return ("reset" if reset else "teleport"), None
   try:
-    post = _validate_observation(transition.observation)
+    post = _validate_observation(
+      transition.observation, reference_width=reference_width
+    )
   except ClosedLoopEvaluationError:
     return "nonfinite", None
   post_tilt = _tilt_degrees(post.state)
@@ -906,6 +929,7 @@ def _run_bootstrap(
   model: VaeModel,
   model_device: torch.device,
   latent_normalizer: LatentNormalizer | None,
+  reference_width: int = _REFERENCE_WIDTH,
 ) -> D3Observation | None:
   current = observation
   for _ in range(_BOOTSTRAP_PAIRS):
@@ -913,6 +937,7 @@ def _run_bootstrap(
       current,
       reference_free=reference_free,
       clip_frames=int(runtime.clip_frames),
+      reference_width=reference_width,
     )
     if phase_reason is not None:
       builder.stop(phase_reason)
@@ -954,6 +979,7 @@ def _run_bootstrap(
         reference_free=reference_free,
         clip_frames=int(runtime.clip_frames),
         budget=budget,
+        reference_width=reference_width,
       )
     except Exception as exc:
       reason, post = "runtime_error", None
@@ -993,6 +1019,7 @@ def _score_baseline(
   model_device: torch.device,
   budget: EvaluationBudget,
   latent_normalizer: LatentNormalizer | None,
+  reference_width: int = _REFERENCE_WIDTH,
 ) -> None:
   steps = 0
   while True:
@@ -1010,6 +1037,7 @@ def _score_baseline(
       current,
       reference_free=False,
       clip_frames=int(runtime.clip_frames),
+      reference_width=reference_width,
     )
     if phase_reason is not None:
       builder.stop(phase_reason)
@@ -1050,6 +1078,7 @@ def _score_baseline(
         reference_free=False,
         clip_frames=int(runtime.clip_frames),
         budget=budget,
+        reference_width=reference_width,
       )
     except Exception as exc:
       reason, post = "runtime_error", None
@@ -1169,6 +1198,7 @@ def _score_diffusion(
   continuation: ReferenceFreeContinuation,
   *,
   budget: EvaluationBudget,
+  reference_width: int = _REFERENCE_WIDTH,
 ) -> None:
   steps = 0
   normalizer = _continuation_latent_normalizer(continuation)
@@ -1187,6 +1217,7 @@ def _score_diffusion(
       current,
       reference_free=True,
       clip_frames=int(runtime.clip_frames),
+      reference_width=reference_width,
     )
     if phase_reason is not None:
       builder.stop(phase_reason)
@@ -1248,6 +1279,7 @@ def _score_diffusion(
         reference_free=True,
         clip_frames=int(runtime.clip_frames),
         budget=budget,
+        reference_width=reference_width,
       )
       prediction = (
         None
@@ -1817,6 +1849,7 @@ def _run_branch(
   model_device: torch.device,
   latent_normalizer: LatentNormalizer | None = None,
   baseline: _BranchBuilder | None = None,
+  reference_width: int = _REFERENCE_WIDTH,
 ) -> tuple[BranchReport, _BranchBuilder]:
   builder = _BranchBuilder(name, seed, start_frame)
   runtime: ClosedLoopRuntime | None = None
@@ -1831,7 +1864,10 @@ def _run_branch(
         f"start_frame {start_frame} is outside clip [0, {runtime.clip_frames})"
       )
     builder.runtime_provenance = _runtime_provenance(runtime)
-    current = _validate_observation(runtime.reset(seed=seed, start_frame=start_frame))
+    current = _validate_observation(
+      runtime.reset(seed=seed, start_frame=start_frame),
+      reference_width=reference_width,
+    )
     builder.initial_time_s = current.sim_time_s
     builder.last_time_s = current.sim_time_s
     builder.initial_reference = current.reference_frame
@@ -1849,6 +1885,7 @@ def _run_branch(
       model=model,
       model_device=model_device,
       latent_normalizer=latent_normalizer,
+      reference_width=reference_width,
     )
     if current is None:
       pass
@@ -1867,6 +1904,7 @@ def _run_branch(
           model_device=model_device,
           budget=budget,
           latent_normalizer=latent_normalizer,
+          reference_width=reference_width,
         )
       elif baseline is None:
         builder.stop("pair_mismatch", "baseline bootstrap is unavailable")
@@ -1897,7 +1935,9 @@ def _run_branch(
             current.sim_time_s,
             current.segment_id,
           )
-          handed = _validate_observation(runtime.enter_reference_free())
+          handed = _validate_observation(
+            runtime.enter_reference_free(), reference_width=reference_width
+          )
           builder.handover_record = {
             "entered": True,
             "advanced_simulation": False,
@@ -1921,7 +1961,14 @@ def _run_branch(
             builder.stop("reference_leakage")
           else:
             current = handed
-            _score_diffusion(runtime, builder, current, continuation, budget=budget)
+            _score_diffusion(
+              runtime,
+              builder,
+              current,
+              continuation,
+              budget=budget,
+              reference_width=reference_width,
+            )
   except Exception as exc:
     builder.add_error(exc)
   finally:
@@ -1998,6 +2045,10 @@ def run_matched_pair(
     raise ClosedLoopEvaluationError("runtime_factory must be callable")
   if not hasattr(model, "encode") or not hasattr(model, "decode"):
     raise ClosedLoopEvaluationError("model must expose encode and decode")
+  try:
+    reference_width = reference_width_from_model(model)
+  except ValueError as exc:
+    raise ClosedLoopEvaluationError(str(exc)) from exc
   if not callable(continuation_factory):
     raise ClosedLoopEvaluationError("continuation_factory must be callable")
   if latent_normalizer is not None and not callable(latent_normalizer):
@@ -2028,6 +2079,7 @@ def run_matched_pair(
     budget=budget,
     model_device=resolved_device,
     latent_normalizer=latent_normalizer,
+    reference_width=reference_width,
   )
   diffusion_report, _diffusion_builder = _run_branch(
     name="diffusion",
@@ -2039,6 +2091,7 @@ def run_matched_pair(
     budget=budget,
     model_device=resolved_device,
     baseline=baseline_builder,
+    reference_width=reference_width,
   )
   pairing = _compare_bootstrap(
     baseline_builder,
@@ -2081,7 +2134,8 @@ def run_matched_pair(
         dict(diffusion_report.provenance),
       ],
       "model_inputs": {
-        "vae_reference_width": _REFERENCE_WIDTH,
+        "vae_reference_width": reference_width,
+        "vae_reference_preview": reference_width == _REFERENCE_WIDTH_WITH_PREVIEW,
         "vae_conditioning_width": _CONDITIONING_WIDTH,
         "latent_width": _LATENT_WIDTH,
         "action_width": _ACTION_WIDTH,

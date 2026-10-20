@@ -44,14 +44,18 @@ from typing_extensions import override
 
 from mjlab.viewer.viser.viewer import UpdateReason, ViserPlayViewer
 
-from .closed_loop_types import ClosedLoopRuntime, D3Observation, D3Transition
+from .closed_loop_types import (
+  ClosedLoopRuntime,
+  D3Observation,
+  D3Transition,
+  reference_width_from_model,
+)
 from .state import WorldState
 
 _BOOTSTRAP_PAIRS = 8
 _ACTION_WIDTH = 31
 _LATENT_WIDTH = 32
 _CONDITIONING_WIDTH = 99
-_REFERENCE_WIDTH = 68
 _DEFAULT_PERIOD = 0.02
 _DEFAULT_FALL_DEGREES = 70.0
 _TIME_TOLERANCE = 1.0e-8
@@ -163,6 +167,10 @@ class VisualDiagnosticPlayback:
       getattr(model, "decode", None)
     ):
       raise VisualPlaybackError("model must expose encode(reference) and decode()")
+    try:
+      self._reference_width = reference_width_from_model(model)
+    except ValueError as exc:
+      raise VisualPlaybackError(str(exc)) from exc
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
       raise VisualPlaybackError("max_steps must be a nonnegative integer")
     if mode == _MODE_DIFFUSION and not callable(continuation_factory):
@@ -400,8 +408,10 @@ class VisualDiagnosticPlayback:
     """Decode the deterministic VAE mean, mirroring the frozen evaluator path."""
     reference = np.ascontiguousarray(observation.reference, dtype=np.float32)
     conditioning = np.ascontiguousarray(observation.conditioning, dtype=np.float32)
-    if reference.shape != (_REFERENCE_WIDTH,):
-      raise VisualPlaybackError("observation reference must have shape [68]")
+    if reference.shape != (self._reference_width,):
+      raise VisualPlaybackError(
+        f"observation reference must have shape [{self._reference_width}]"
+      )
     if conditioning.shape != (_CONDITIONING_WIDTH,):
       raise VisualPlaybackError("observation conditioning must have shape [99]")
     reference_tensor = torch.from_numpy(reference).to(device=self._device)[None]
@@ -544,6 +554,7 @@ class VisualDiagnosticPlayback:
       "authority": "single-branch-visual-diagnostic",
       "branch": self._mode,
       "member": self._member,
+      "reference_width": self._reference_width,
       "phase": self._phase,
       "stopped": self._stopped,
       "stop_reason": self._stop_reason,

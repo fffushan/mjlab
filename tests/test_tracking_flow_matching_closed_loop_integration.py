@@ -275,11 +275,15 @@ def test_flow_run_rejects_task_guidance_before_loading_any_model(
   assert calls == []
 
 
+@pytest.mark.parametrize("reference_dim", [68, 130])
 def test_flow_prepare_dispatches_the_flow_loader_and_reports_euler_x0(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference_dim: int
 ) -> None:
   checkpoint = _checkpoint(tmp_path, _FLOW_SCHEMA)
   calls = _patch_flow_loaders(monkeypatch, _flow_record())
+  vae = _vae_record()
+  vae.reference_dim = reference_dim
+  monkeypatch.setattr(evaluate, "load_vae_decoder", lambda *a, **k: vae)
   prepared = evaluate._prepare(_request(tmp_path, checkpoint, "flow"))
   assert calls == ["flow"]
   assert prepared.family == "flow"
@@ -305,6 +309,12 @@ def test_flow_prepare_dispatches_the_flow_loader_and_reports_euler_x0(
   assert provenance["checkpoint"]["process_family"] == "x0_linear_flow"
   assert provenance["checkpoint"]["data_identity"] == prepared.denoiser.data_identity
   assert "contract_identity" not in provenance["checkpoint"]
+  assert report["vae"]["reference_dimension"] == reference_dim
+  assert f"reference {reference_dim}-D" in sampler["vae_convention"]
+  assert provenance["conditioning"]["reference_dimension"] == reference_dim
+  assert ("motion_lookahead" in provenance["conditioning"]["reference_source"]) == (
+    reference_dim == 130
+  )
 
 
 def test_diffusion_prepare_keeps_the_default_loader_and_ddim_reporting(

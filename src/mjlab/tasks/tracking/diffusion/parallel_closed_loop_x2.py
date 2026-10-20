@@ -9,9 +9,11 @@ The parallel boundary keeps the same semantics and the same numbers:
 
 * the same private motion command class, so the reference is frozen and the
   reference guards are disabled at handover exactly as in the single-row path;
-* the same 164-D cached actor observation, sliced by cohort term, so the 99-D
-  gravity conditioning is built from the same channels;
-* the same 68-D VAE reference during the bootstrap only;
+* the same schema-sized (164-D or 226-D) cached actor observation, sliced by
+  cohort term, so the 99-D gravity conditioning is built from the same
+  channels;
+* the same schema-sized 68-D (version 1) or 130-D preview (version 2) VAE
+  reference during the bootstrap only;
 * the same measured pre-action pairing of a state with the latent decoded on it.
 
 Every row is pinned to one cohort member and one start frame, so the reference
@@ -41,9 +43,15 @@ import numpy as np
 import torch
 
 from mjlab.tasks.tracking.diffusion.closed_loop_runtime_x2 import (
+  _CONDITIONING_TERMS,
   ClosedLoopMotionCommandCfg,
+  _actor_width,
+  _assemble_reference,
+  _cohort_lookahead_s,
   _never_terminate,
+  _reference_width,
   _term_slices,
+  _validate_actor_layout,
 )
 from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
 from mjlab.tasks.tracking.diffusion.handover import (
@@ -62,6 +70,12 @@ from mjlab.tasks.tracking.distillation.environment import (
   RuntimeSeedProvenance,
   _apply_saved_observation_timing,
 )
+from mjlab.tasks.tracking.distillation.vae_config import (
+  PREVIEW_DIM,
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+  REFERENCE_PREVIEW_FIELD,
+)
 
 _REFERENCE_TERMINATIONS: tuple[str, ...] = ("anchor_pos", "anchor_ori", "ee_body_pos")
 _SIGNATURE_FIELDS: tuple[str, ...] = (
@@ -73,7 +87,7 @@ _SIGNATURE_FIELDS: tuple[str, ...] = (
 _ACTION_WIDTH = 31
 _LATENT_WIDTH = 32
 _CONDITIONING_WIDTH = 99
-_REFERENCE_WIDTH = 68
+_REFERENCE_WIDTHS = (REFERENCE_DIM, REFERENCE_DIM_WITH_PREVIEW)
 _PERIOD_SECONDS = 0.02
 
 
@@ -223,17 +237,25 @@ class ParallelObservation:
 
   def __post_init__(self) -> None:
     rows = self.state.count
-    for name, width in (
-      ("conditioning", _CONDITIONING_WIDTH),
-      ("reference", _REFERENCE_WIDTH),
+    conditioning = np.array(self.conditioning, dtype=np.float64, copy=True)
+    if (
+      conditioning.shape != (rows, _CONDITIONING_WIDTH)
+      or not np.isfinite(conditioning).all()
     ):
-      value = getattr(self, name)
-      if value is None and name == "reference":
-        continue
-      array = np.array(value, dtype=np.float64, copy=True)
-      if array.shape != (rows, width) or not np.isfinite(array).all():
-        raise ParallelRuntimeX2Error(f"{name} must be finite with shape [{rows}, {width}]")
-      object.__setattr__(self, name, array)
+      raise ParallelRuntimeX2Error(
+        f"conditioning must be finite with shape [{rows}, {_CONDITIONING_WIDTH}]"
+      )
+    object.__setattr__(self, "conditioning", conditioning)
+    if self.reference is not None:
+      reference = np.array(self.reference, dtype=np.float64, copy=True)
+      if (
+        reference.shape not in {(rows, width) for width in _REFERENCE_WIDTHS}
+        or not np.isfinite(reference).all()
+      ):
+        raise ParallelRuntimeX2Error(
+          f"reference must be finite with shape [{rows}, 68] or [{rows}, 130]"
+        )
+      object.__setattr__(self, "reference", reference)
     if self.reference_frame is not None:
       frames = np.array(self.reference_frame, dtype=np.int64, copy=True).reshape(-1)
       if frames.shape != (rows,) or np.any(frames < 0):
@@ -295,6 +317,10 @@ class X2ParallelClosedLoopRuntime:
     self.cohort = cohort
     self.member = member
     self.audit = audit
+    self._lookahead_s = _cohort_lookahead_s(cohort)
+    self._preview = self._lookahead_s > 0.0
+    self._reference_width = _reference_width(self._preview)
+    self._actor_width = _actor_width(self._preview)
     self._closed = False
     self._has_reset = False
     self._phase = "vae"
@@ -361,13 +387,32 @@ class X2ParallelClosedLoopRuntime:
         f"direct env.step(action_tensor), shape [{self.num_envs}, 31]"
       ),
       "auto_reset": {"requested": False, "applied": True},
+      "actor_observation_layout": {
+        "names": list(cohort.observations.names),
+        "widths": list(cohort.observations.widths),
+        "dimension": self._actor_width,
+      },
       "cached_observation_capture": {
         "source": "env.obs_buf / observation_manager cache",
         "update_history": False,
         "noise_or_delay_update": False,
         "projected_gravity": "robot.data.projected_gravity_b (root frame)",
         "conditioning_width": _CONDITIONING_WIDTH,
-        "reference_width": _REFERENCE_WIDTH,
+        "reference_width": self._reference_width,
+      },
+      "reference_layout": {
+        "width": self._reference_width,
+        "preview": self._preview,
+        "preview_field": REFERENCE_PREVIEW_FIELD if self._preview else None,
+        "preview_width": PREVIEW_DIM if self._preview else 0,
+        "cohort_lookahead_s": self._lookahead_s,
+        "order": [
+          "reference_q",
+          "reference_dq",
+          "anchor_orientation_error",
+          *([REFERENCE_PREVIEW_FIELD] if self._preview else []),
+        ],
+        "source": "cached actor observation of the same command frame",
       },
       "reference_read_boundaries": {
         "reset": "allowed for deterministic frame initialization",
@@ -417,9 +462,7 @@ class X2ParallelClosedLoopRuntime:
     try:
       command = self.env.command_manager.get_term("motion")
     except (AttributeError, KeyError, TypeError) as exc:
-      raise ParallelRuntimeX2Error(
-        "environment has no motion command term"
-      ) from exc
+      raise ParallelRuntimeX2Error("environment has no motion command term") from exc
     if not hasattr(command, "time_steps"):
       raise ParallelRuntimeX2Error(
         "motion command lacks an integer reference frame clock"
@@ -451,20 +494,22 @@ class X2ParallelClosedLoopRuntime:
       raise ParallelRuntimeX2Error(
         f"unsupported body order: live robot is missing {missing}"
       )
-    command_bodies = tuple(getattr(getattr(self._command, "cfg", None), "body_names", ()))
+    command_bodies = tuple(
+      getattr(getattr(self._command, "cfg", None), "body_names", ())
+    )
     if command_bodies and command_bodies != expected_bodies:
       raise ParallelRuntimeX2Error(
         "unsupported body order: motion command body order differs from the "
         "frozen diffusion state order"
       )
     observations = self.cohort.observations
-    widths = tuple(observations.widths)
-    if int(getattr(observations, "total_dim", sum(widths))) != 164:
+    expected_actor_dim = _validate_actor_layout(observations, preview=self._preview)
+    actor_dim = int(getattr(self.cohort.actor, "obs_dim", expected_actor_dim))
+    if actor_dim != expected_actor_dim:
       raise ParallelRuntimeX2Error(
-        "unsupported schema: expected 164-D cached actor observations"
+        "unsupported schema: expected actor obs_dim "
+        f"{expected_actor_dim}, got {actor_dim}"
       )
-    if int(getattr(self.cohort.actor, "obs_dim", 164)) != 164:
-      raise ParallelRuntimeX2Error("unsupported schema: expected actor obs_dim 164")
     if abs(float(self.cohort.control.control_period_s) - _PERIOD_SECONDS) > 1e-9:
       raise ParallelRuntimeX2Error(
         "unsupported timing: cohort control period must be 0.02 s"
@@ -482,7 +527,9 @@ class X2ParallelClosedLoopRuntime:
     saved: dict[str, tuple[Any, Any, dict[str, Any]]] = {}
     for name in _REFERENCE_TERMINATIONS:
       if name not in active:
-        raise ParallelRuntimeX2Error(f"tracking task is missing reference guard {name!r}")
+        raise ParallelRuntimeX2Error(
+          f"tracking task is missing reference guard {name!r}"
+        )
       index = active.index(name)
       try:
         term_cfg = configs[index]
@@ -551,9 +598,7 @@ class X2ParallelClosedLoopRuntime:
     return np.concatenate(
       (
         _matrix(data.root_link_pos_w, name="root_link_pos_w", width=3, rows=rows),
-        _matrix(
-          data.root_link_quat_w, name="root_link_quat_w", width=4, rows=rows
-        ),
+        _matrix(data.root_link_quat_w, name="root_link_quat_w", width=4, rows=rows),
         _matrix(data.joint_pos, name="joint_pos", width=joints, rows=rows),
         _matrix(data.joint_vel, name="joint_vel", width=joints, rows=rows),
       ),
@@ -573,11 +618,12 @@ class X2ParallelClosedLoopRuntime:
     if isinstance(actor, torch.Tensor):
       actor = actor.detach().cpu().numpy()
     array = np.asarray(actor, dtype=np.float64)
-    if array.shape == (164,) and rows == 1:
+    if array.shape == (self._actor_width,) and rows == 1:
       array = array[None]
-    if array.shape != (rows, 164):
+    if array.shape != (rows, self._actor_width):
       raise ParallelRuntimeX2Error(
-        f"cached actor observation must have shape [{rows}, 164], got {array.shape}"
+        "cached actor observation must have shape "
+        f"[{rows}, {self._actor_width}], got {array.shape}"
       )
     if not np.isfinite(array).all():
       raise ParallelRuntimeX2Error(
@@ -605,7 +651,12 @@ class X2ParallelClosedLoopRuntime:
 
   def _capture(self) -> ParallelObservation:
     actor = self._cached_actor()
-    values = {name: actor[:, span] for name, span in self._slices.items()}
+    if self._phase == "vae":
+      values = {name: actor[:, span] for name, span in self._slices.items()}
+    else:
+      # Reference-free continuation reads only the actual conditioning terms;
+      # the command, anchor and preview slices are not touched at all.
+      values = {name: actor[:, self._slices[name]] for name in _CONDITIONING_TERMS}
     data = self.env.scene["robot"].data
     gravity = _matrix(
       data.projected_gravity_b,
@@ -631,12 +682,11 @@ class X2ParallelClosedLoopRuntime:
     reference: np.ndarray | None = None
     reference_frame: np.ndarray | None = None
     if self._phase == "vae":
-      reference = np.concatenate(
-        (values["command"][:, :62], values["motion_anchor_ori_b"]), axis=1
-      )
-      if reference.shape != (self.num_envs, _REFERENCE_WIDTH):
+      reference = _assemble_reference(values, preview=self._preview)
+      if reference.shape != (self.num_envs, self._reference_width):
         raise ParallelRuntimeX2Error(
-          f"reference must have shape [{self.num_envs}, 68], got {reference.shape}"
+          "reference must have shape "
+          f"[{self.num_envs}, {self._reference_width}], got {reference.shape}"
         )
       reference_frame = np.full(self.num_envs, self._frame(), dtype=np.int64)
     return ParallelObservation(
@@ -744,8 +794,7 @@ class X2ParallelClosedLoopRuntime:
     after = self._signature_now()
     if not np.array_equal(before, after):
       raise ParallelRuntimeX2Error(
-        "enter_reference_free changed physical state; refusing a discontinuous "
-        "handover"
+        "enter_reference_free changed physical state; refusing a discontinuous handover"
       )
     self._phase = "reference_free"
     self._provenance["mode"] = "reference_free"
@@ -835,7 +884,9 @@ class X2ParallelClosedLoopRuntime:
         and post_frame != pre_frame + 1
         and not terminal_no_advance
       )
-      boundary = bool(available or post_frame >= self.clip_frames - 1 or frame_discontinuity)
+      boundary = bool(
+        available or post_frame >= self.clip_frames - 1 or frame_discontinuity
+      )
       if boundary:
         reference_boundary[:] = True
       if interrupted or completed or frame_discontinuity:
@@ -945,9 +996,7 @@ class BatchedReferenceFreeContinuation:
 
   def ready(self, rows: Iterable[int]) -> np.ndarray:
     """Report which of the given rows hold a complete history."""
-    return np.array(
-      [self._histories[int(row)].ready for row in rows], dtype=bool
-    )
+    return np.array([self._histories[int(row)].ready for row in rows], dtype=bool)
 
   def record_executed(
     self, rows: Iterable[int], states: WorldState, latents: np.ndarray
@@ -1055,7 +1104,10 @@ class BatchedReferenceFreeContinuation:
       .astype(np.float64)
     )
     executed = np.stack(
-      [self.projection.denormalize_latent(normalized[position]) for position in range(len(ids))],
+      [
+        self.projection.denormalize_latent(normalized[position])
+        for position in range(len(ids))
+      ],
       axis=0,
     )
     if executed.shape != (len(ids), _LATENT_WIDTH) or not np.isfinite(executed).all():
@@ -1073,7 +1125,10 @@ class BatchedReferenceFreeContinuation:
     if not isinstance(decoded, torch.Tensor):
       raise ParallelRuntimeX2Error("decoder must return a torch tensor")
     actions = (
-      decoded.detach().to(device="cpu", dtype=torch.float32).numpy().reshape(len(ids), -1)
+      decoded.detach()
+      .to(device="cpu", dtype=torch.float32)
+      .numpy()
+      .reshape(len(ids), -1)
     )
     if actions.shape != (len(ids), _ACTION_WIDTH) or not np.isfinite(actions).all():
       raise ParallelRuntimeX2Error(
@@ -1155,8 +1210,10 @@ def _build_parallel_private_environment(
   cfg = copy.deepcopy(load_env_cfg(selected_task))
   cfg.seed = seed
   teacher = cohort.teacher(member)
-  overrides = _apply_saved_observation_timing(
-    cfg, teacher.env_config, str(teacher.entry.env_config)
+  overrides = list(
+    _apply_saved_observation_timing(
+      cfg, teacher.env_config, str(teacher.entry.env_config)
+    )
   )
   cfg.scene.num_envs = int(num_envs)
   cfg.auto_reset = False
@@ -1167,6 +1224,17 @@ def _build_parallel_private_environment(
     )
   private_motion = ClosedLoopMotionCommandCfg.from_config(motion_cfg)
   private_motion.motion_file = str(teacher.entry.motion)
+  # Mirror the single-row builder: the saved teacher exports fix the preview
+  # duration, and the base task may declare none.  A version-1 cohort records
+  # no override because the value already agrees.
+  lookahead_from_base = private_motion.lookahead_s
+  lookahead_from_cohort = _cohort_lookahead_s(cohort)
+  if lookahead_from_base != lookahead_from_cohort:
+    private_motion.lookahead_s = lookahead_from_cohort
+    overrides.append(
+      "private preview override: commands.motion.lookahead_s: "
+      f"{lookahead_from_base!r} -> {lookahead_from_cohort!r}"
+    )
   cfg.commands["motion"] = private_motion
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=None)
   env.cfg.__dict__["_closed_loop_semantic_overrides"] = tuple(overrides)

@@ -52,6 +52,9 @@ Inputs
 * Frozen data contract:
   ``docs/plans/beyondmimic_diffusion_d1_no_mixtures_contract.yaml``.
 * A D1 dataset directory with split assignments and train-only statistics.
+* A preview run also needs the 144-member cohort manifest
+  ``configs/distillation/x2_tennis_multimotion_v1.yaml`` and a contract
+  revision that selects the frozen preview VAE.
 
 The model dimensions come from the frozen contract through
 ``DenoiserSettings.from_contract``. The flow config holds only the linear process
@@ -59,6 +62,88 @@ field ``max_level`` and the shared training fields. It holds no ``noise``
 section; ``scheduler: cosine`` is the learning-rate schedule only.
 
 Run the commands with ``uv run``.
+
+Preview-aware VAE (version 2)
+-----------------------------
+
+The flow family accepts both frozen gravity VAE layouts. Version 1 keeps
+reference 68 / conditioning 99 / latent 32 / action 31. Version 2 uses reference
+130 / conditioning 99 / latent 32 / action 31. The extra 62 reference values are
+one q/dq sample at ``t + 0.2 s`` for the same clip. The decoder still receives
+only the latent and the same 99 gravity conditioning values, so it has no direct
+reference input.
+
+The cohort declares the live layout. Every member of one manifest shares one
+``lookahead_s`` in its saved teacher export. Collection and closed-loop startup
+derive the live layout from that declaration and check it against the loaded
+VAE schema. A 68-wide observation with a preview model fails, and
+a 130-wide observation with a no-preview model fails. The code accepts no other
+reference width.
+
+The preview stays clip-local. It is sampled from the same command frame as the
+current reference, clamps to the clip's last frame at the clip end, and does not
+cross a subset reset into another clip. After handover, the continuation reads
+no reference or preview values. It decodes from the generated latent and fresh
+99-D gravity conditioning.
+
+The token layout does not change: 41 rows by 167 channels, where 135 channels
+are the physical state and 32 are the latent. The current row stays at index 8,
+with 8 history rows and 32 future rows. The flow process, x0 loss, linear path
+and Euler sampler are also unchanged.
+
+Preview experiment preparation (not authorized)
+-----------------------------------------------
+
+This page does not authorize collection, training or evaluation. A later
+operator authorization must supply the missing values and budgets. Use the
+existing inputs and selection mechanism; do not add a second cohort registry.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Input
+     - Status for a preview experiment
+   * - VAE checkpoint
+     - Unset. Select the frozen preview-aware artifact at authorization time.
+   * - VAE checkpoint SHA-256
+     - Unset. Compute it from the selected file and record it in the new
+       contract revision. Do not reuse an old no-preview digest or write a
+       digest from memory.
+   * - Cohort manifest
+     - ``configs/distillation/x2_tennis_multimotion_v1.yaml``, 144 members.
+       Its saved teacher exports declare a 0.2 s preview.
+   * - Manifest SHA-256
+     - Compute it from the selected manifest file and record it with the
+       contract's cohort manifest. The collection runtime records its own
+       manifest digest.
+   * - Collection selection
+     - Set ``MJLAB_D1_COHORT_MANIFEST`` to the manifest. Set
+       ``MJLAB_D1_ROLLOUT_TEACHERS`` to every member, or to a pilot subset of
+       those 144 IDs. The existing comma-separated selection accepts
+       non-contiguous IDs.
+   * - Dataset, statistics, caches, run directory
+     - New paths. The 0.2 s preview changes the encoder input, so old VAE
+       latent statistics, normalizers, projections, token caches and
+       checkpoints are not valid for this experiment.
+   * - Collection and training budgets
+     - Unset. Set the trial count, environment count, update budget and
+       wall-clock limit only in the authorized run plan.
+
+The existing collection mechanics stay in
+``docs/source/x2_diffusion_training.rst``. Use its D1 collection, window,
+statistics and token-cache steps with these preview inputs.
+
+The new contract revision must record the 130-wide encoder layout
+(``dimensions.encoder_command: 130``) for audit. The runtime still derives the
+live width from the cohort and the loaded model schema. Also record the selected
+checkpoint and digest, the cohort manifest and its digest, and
+``decoder_mode: gravity``. Keep the existing 135-D physical state, 32-D latent,
+167-channel token and 41-row window. Keep ``execution_authorized: false`` in the
+preparation revision.
+
+Assign groups to train, validation and test before windowing. Fit state and
+latent statistics on the training split only. Do not fit on validation or test
+windows, and do not reuse learned artifacts from an earlier run.
 
 Step 1: prepare the token caches
 --------------------------------
@@ -131,6 +216,13 @@ checkpoint, injects the flow Euler sampler into the existing continuations, and
 reports ``sampler_method: euler_x0`` instead of DDIM. The environment, VAE
 bootstrap, measured history, decoder, termination rules, metrics, recorder and
 browser playback are shared with the diffusion path.
+
+The shared D3 closed-loop CLI accepts both supported VAE reference widths
+(68 or 130), with conditioning 99 / latent 32 / action 31 unchanged.
+The ``evaluate.py`` preflight report and run provenance record the loaded
+reference width. ``evaluate_parallel.py`` and ``view.py`` share its admission check.
+Real preview runs still need a selected VAE, compatible flow artifacts, and
+separate execution authorization.
 
 A flow run takes no diffusion schedule and no diffusion inference grid. It also
 rejects ``--task-config``: the D4 sparse task guidance is implemented for the
@@ -313,6 +405,39 @@ the grid call count, and start level equal to the process ``max_level``. A flow
 report never contains ``ddim_updates``, and flow updates are never called DDIM.
 A flow checkpoint has no diffusion schedule, no diffusion grid and no cosine
 schedule, so none is fabricated.
+
+Preview validation status
+-------------------------
+
+Software validation at the source level is separated from artifact and run
+validation.
+
+Tested on CPU with synthetic tensors only:
+
+* Version 1 and version 2 reference layouts reach the encoder, and the
+  collection wrapper returns the deterministic 32-D encoder mean and the 31-D
+  action decoded from that mean.
+* Scalar, batched and device-tensor collection paths accept the declared layout
+  and reject a width that disagrees with the loaded model schema.
+* Scalar and batched startup build 68-D or 130-D references in saved schema
+  order. The clip-end sample clamps to the last frame of the same clip.
+* After handover, the runtime reads no command, anchor or preview reference
+  slices. The continuation still accepts a 32-D latent and 99-D conditioning.
+* The assembled reference joins the unchanged 41x167 state-latent window, and
+  the existing flow sampler consumes that window.
+* The shared CLI accepts the preview width and reports it in preflight and
+  run provenance, using stub artifact loaders.
+* The existing flow closed-loop continuation tests still pass.
+
+Not tested:
+
+* Loading a real preview VAE checkpoint. No preview artifact was selected.
+* Real preview collection, simulator rollout, training or controller deployment.
+* The D3 closed-loop CLI with real preview VAE and flow artifacts.
+* Tracking quality, policy stability and physical readiness.
+
+No collection, training, simulator, GPU or remote job was executed for this
+change.
 
 Scope of the claims
 -------------------

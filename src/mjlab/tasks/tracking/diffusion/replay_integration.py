@@ -29,6 +29,14 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from mjlab.tasks.tracking.distillation.vae_config import (
+  ACTION_DIM,
+  CONDITIONING_DIMS,
+  LATENT_DIM,
+  REFERENCE_DIM,
+  REFERENCE_DIM_WITH_PREVIEW,
+)
+
 from ..flow_matching.checkpoint import (
   FLOW_CHECKPOINT_FORMAT,
   FlowCheckpointError,
@@ -554,17 +562,32 @@ def load_vae_decoder(
   model = inference.model
   schema = model.schema
   settings = model.settings
+  preview = float(cohort.lookahead_s) > 0.0
+  expected_reference_dim = REFERENCE_DIM_WITH_PREVIEW if preview else REFERENCE_DIM
+  mode = getattr(schema, "mode", None)
+  mode_name = getattr(mode, "value", mode)
+  if mode_name is not None and mode_name != "gravity":
+    raise ReplayError(
+      "frozen VAE does not implement a supported gravity decoder mode: "
+      f"got {mode_name!r}"
+    )
   if (
-    schema.conditioning_dim != 99
-    or schema.reference_dim != 68
-    or settings.latent_dim != 32
-    or schema.action_dim != 31
+    schema.reference_dim not in (REFERENCE_DIM, REFERENCE_DIM_WITH_PREVIEW)
+    or schema.conditioning_dim != CONDITIONING_DIMS["gravity"]
+    or settings.latent_dim != LATENT_DIM
+    or schema.action_dim != ACTION_DIM
   ):
     raise ReplayError(
-      "frozen VAE does not implement the frozen gravity schema "
-      "(reference 68 / conditioning 99 / latent 32 / action 31): got "
+      "frozen VAE does not implement a supported gravity schema "
+      "(reference 68 or 130 / conditioning 99 / latent 32 / action 31): got "
       f"{schema.reference_dim}/{schema.conditioning_dim}/"
       f"{settings.latent_dim}/{schema.action_dim}"
+    )
+  if schema.reference_dim != expected_reference_dim:
+    raise ReplayError(
+      "frozen VAE reference width disagrees with the live cohort layout: "
+      f"model {schema.reference_dim}, cohort {expected_reference_dim} "
+      f"(lookahead_s={float(cohort.lookahead_s)!r})"
     )
   _freeze(model)
   return LoadedVae(
@@ -1160,6 +1183,10 @@ def main() -> None:
       "member": vae.member_id,
       "relocated_artifact_roles": list(vae.relocated_artifact_roles),
       "joint_order": list(vae.joint_order),
+      "reference_dim": vae.reference_dim,
+      "conditioning_dim": vae.conditioning_dim,
+      "latent_dim": vae.latent_dim,
+      "action_dim": vae.action_dim,
     },
     "history": {
       "shard": str(args.history_shard),
