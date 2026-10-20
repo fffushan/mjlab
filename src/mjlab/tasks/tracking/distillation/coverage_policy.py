@@ -648,8 +648,22 @@ class CoveragePolicy:
       raise CoveragePolicyError("off policy must contain only mode/version")
     if mode != "difficult-state-coverage":
       raise CoveragePolicyError(f"invalid coverage mode {mode!r}")
-    # The enabled contract is immutable P0 data; reject partial or altered data.
-    expected = cls.difficult_state_coverage()
+    # The enabled contract is immutable P0 data; reject partial or altered data.  The
+    # scope names the student layout the policy was built for, so rebuild the canonical
+    # policy with that layout: a preview cohort observes a wider reference, and its
+    # identity differs from the version-1 one.  Reading the layout from the payload keeps
+    # every version-1 payload byte-identical, because its scope carries the defaults.
+    declared_scope = payload.get("scope")
+    try:
+      scope_map = dict(declared_scope or {})  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+      scope_map = {}
+    expected = cls.difficult_state_coverage(
+      reference_dim=int(scope_map.get("reference_dim", 68)),
+      conditioning_dim=int(scope_map.get("conditioning_dim", 99)),
+      latent_dim=int(scope_map.get("latent_dim", 32)),
+      action_dim=int(scope_map.get("action_dim", 31)),
+    )
     candidate = dict(payload)
     candidate.pop("contract_id", None)
     expected_payload = expected.as_dict()

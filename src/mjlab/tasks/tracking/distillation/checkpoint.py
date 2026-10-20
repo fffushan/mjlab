@@ -1579,7 +1579,16 @@ def load_cohort_member_inference(
     and coverage_config.get("mode") == "difficult-state-coverage"
   ):
     nested_identity = coverage_config.get("policy_identity")
-    expected_identity = CoveragePolicy.difficult_state_coverage().identity
+    # The policy identity records the student layout it was built for, so rebuild the
+    # canonical policy from this checkpoint's own schema instead of the version-1
+    # defaults.  A preview cohort stores a wider reference dimension and therefore a
+    # different identity; comparing it against the defaults refused a valid artifact.
+    expected_identity = CoveragePolicy.difficult_state_coverage(
+      reference_dim=schema.reference_dim,
+      conditioning_dim=schema.conditioning_dim,
+      latent_dim=schema.latent_dim,
+      action_dim=schema.action_dim,
+    ).identity
     if not isinstance(nested_identity, str) or nested_identity != expected_identity:
       raise CheckpointValidationError(
         "resolved coverage policy identity is missing or invalid"

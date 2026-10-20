@@ -22,6 +22,7 @@ from tracking_distillation_fixtures import build_tiny_cohort, write_reference_cl
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.distillation.config import load_manifest, resolve_cohort
 from mjlab.tasks.tracking.distillation.environment import (
+  build_distillation_environment,
   build_multi_motion_environment,
 )
 from mjlab.tasks.tracking.distillation.motion_library import (
@@ -1155,6 +1156,59 @@ def test_factory_leaves_an_agreeing_preview_unrecorded(tiny_cohort, monkeypatch)
   env = build_multi_motion_environment(tiny_cohort, ("tiny_000", "tiny_001"), num_envs=2)
   env_cfg = cast(Any, env.cfg)
   assert cast(Any, env_cfg.commands["motion"]).lookahead_s == 0.0
+
+
+def test_pinned_environment_takes_the_preview_from_the_cohort_not_the_base_task(
+  preview_cohort, monkeypatch
+) -> None:
+  """The pinned single-motion builder must produce the cohort's preview too.
+
+  ``evaluate-cohort`` pins one motion at a time through this builder.  A
+  preview-blind base task would otherwise expose a zero-width ``motion_lookahead``
+  term against a teacher export that saved a wider one, and the evaluator refuses
+  the pair as a live-contract disagreement instead of measuring it.
+  """
+  assert preview_cohort.lookahead_s == 0.2
+  cfg = load_env_cfg(preview_cohort.manifest.base_task)
+  cast(Any, cfg.commands["motion"]).lookahead_s = 0.0
+  monkeypatch.setattr("mjlab.tasks.registry.load_env_cfg", lambda task_id: cfg)
+
+  class _BuiltEnvironment:
+    def __init__(self, cfg, *, device, render_mode=None) -> None:
+      del device, render_mode
+      self.cfg = cfg
+
+  monkeypatch.setattr("mjlab.envs.ManagerBasedRlEnv", _BuiltEnvironment)
+  env = build_distillation_environment(preview_cohort, "tiny_000", num_envs=1)
+  env_cfg = cast(Any, env.cfg)
+  assert cast(Any, env_cfg.commands["motion"]).lookahead_s == 0.2
+  assert any(
+    "lookahead_s" in override for override in env_cfg._distillation_semantic_overrides
+  )
+
+
+def test_pinned_environment_leaves_an_agreeing_preview_unrecorded(
+  tiny_cohort, monkeypatch
+) -> None:
+  """A version-1 cohort keeps the frozen layout and records no override."""
+  assert tiny_cohort.lookahead_s == 0.0
+  cfg = load_env_cfg(tiny_cohort.manifest.base_task)
+  monkeypatch.setattr("mjlab.tasks.registry.load_env_cfg", lambda task_id: cfg)
+
+  class _BuiltEnvironment:
+    def __init__(self, cfg, *, device, render_mode=None) -> None:
+      del device, render_mode
+      self.cfg = cfg
+
+  monkeypatch.setattr("mjlab.envs.ManagerBasedRlEnv", _BuiltEnvironment)
+  env = build_distillation_environment(tiny_cohort, "tiny_000", num_envs=1)
+  env_cfg = cast(Any, env.cfg)
+  assert cast(Any, env_cfg.commands["motion"]).lookahead_s == 0.0
+  assert not [
+    override
+    for override in env_cfg._distillation_semantic_overrides
+    if "lookahead_s" in override
+  ]
   assert not any(
     "lookahead_s" in override for override in env_cfg._distillation_semantic_overrides
   )

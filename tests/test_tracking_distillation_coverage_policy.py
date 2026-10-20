@@ -91,3 +91,23 @@ def test_nested_direct_policy_validators_reject_malformed_settings() -> None:
     replace(
       policy, runtime=type(policy.runtime)(per_segment_opportunity_probability=1.1)
     )
+
+
+def test_preview_schema_policy_identity_round_trips_through_from_dict() -> None:
+  """A preview cohort's identity survives from_dict and differs from version 1.
+
+  The identity records the student layout the policy was built for.  A version-2
+  cohort observes a wider reference preview, so its identity must differ from the
+  version-1 one, and ``from_dict`` must accept its own payload.  The checkpoint
+  gates rebuild the expected identity from the artifact's own schema, so a
+  reconstruction that silently fell back to the version-1 defaults refused a valid
+  checkpoint.
+  """
+  v1 = CoveragePolicy.difficult_state_coverage()
+  v2 = CoveragePolicy.difficult_state_coverage(
+    reference_dim=130, conditioning_dim=99, latent_dim=32, action_dim=31
+  )
+  assert v2.identity != v1.identity
+  assert CoveragePolicy.from_dict(v1.as_dict()).identity == v1.identity
+  assert CoveragePolicy.from_dict(v2.as_dict()).identity == v2.identity
+  assert CoveragePolicy.from_dict(v2.as_dict()) == v2

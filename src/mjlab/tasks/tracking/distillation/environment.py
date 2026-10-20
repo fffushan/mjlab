@@ -410,8 +410,10 @@ def build_distillation_environment(
   validated_seed = _validate_factory_seed(seed)
   if validated_seed is not None:
     cfg.seed = validated_seed
-  semantic_overrides = _apply_saved_observation_timing(
-    cfg, teacher.env_config, str(teacher.entry.env_config)
+  semantic_overrides = list(
+    _apply_saved_observation_timing(
+      cfg, teacher.env_config, str(teacher.entry.env_config)
+    )
   )
   if num_envs is not None:
     if num_envs <= 0:
@@ -422,6 +424,20 @@ def build_distillation_environment(
     raise ValueError(f"registered task {selected_task!r} has no motion command")
   motion_cfg = make_segment_motion_cfg(motion_cfg)
   motion_cfg.motion_file = str(teacher.entry.motion)
+  # The cohort's preview is not the base task's business.  Every member of a cohort
+  # shares one ``lookahead_s`` and the saved teacher exports were produced with it, so a
+  # pinned single-motion environment must produce that same sample.  Without this the
+  # base task's (often zero) preview exposes a narrower ``motion_lookahead`` term than
+  # the teacher artifact expects, and the pinned lane refuses a valid pair.  A cohort
+  # that declares zero keeps the frozen version-1 layout, because the override is then
+  # a no-op.  This mirrors ``build_multi_motion_environment`` exactly.
+  lookahead_from_base = motion_cfg.lookahead_s
+  if lookahead_from_base != cohort.lookahead_s:
+    motion_cfg.lookahead_s = cohort.lookahead_s
+    semantic_overrides.append(
+      "private preview override: commands.motion.lookahead_s: "
+      f"{lookahead_from_base!r} -> {cohort.lookahead_s!r}"
+    )
   cfg.commands["motion"] = motion_cfg
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=render_mode)
   env.cfg.__dict__["_distillation_semantic_overrides"] = semantic_overrides
