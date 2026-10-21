@@ -4,6 +4,16 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the opt-in raw X2 joint-pose collector at
+  ``scripts/experiments/joint_pose_collection/collect.py``. It rolls out the
+  frozen multi-motion PPO teacher on explicit reference clips and writes
+  achieved root quaternion (world frame, ``wxyz``), joint position and joint
+  velocity with per-trajectory boundaries. It restores the checkpoint's saved
+  preview, reads terminal state before manual reset, and refuses an existing
+  output directory or non-finite recorded poses. This is raw data collection
+  only: no heading alignment, 6D packing, VAE, flow model, reference adapter,
+  or controller change. See ``scripts/experiments/joint_pose_collection/README.md``.
+
 - Documented the two-GPU X2 shared-teacher test at
   ``docs/reports/x2_multi_motion_ppo_2gpu_8192env_100iterations.md``. Two ranks
   on one container train 8192 environments each over 148 clips for 100
