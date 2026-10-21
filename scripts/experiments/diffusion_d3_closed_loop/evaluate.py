@@ -581,13 +581,6 @@ def _validate_request(args: argparse.Namespace) -> tuple[Path, torch.device]:
     if solver_steps < 1:
       raise ClosedLoopCliError("flow-euler-steps must be a positive integer")
   task_config = getattr(args, "task_config", None)
-  if task_config is not None and family == "flow":
-    # Task guidance is the DDIM-specific D4 seam.  A flow run must never build
-    # it, and this gate runs before any contract, model or environment load.
-    raise ClosedLoopCliError(
-      "model-family flow does not support --task-config: task guidance is "
-      "implemented for the diffusion DDIM sampler only"
-    )
   if task_config is not None:
     task_path = Path(task_config)
     if not task_path.is_file():
@@ -698,6 +691,20 @@ def _load_frozen_denoiser(
   )
 
 
+def _require_task_family_support(family: str, task: SparseTaskSpec) -> None:
+  """Refuse the task guidance a family cannot serve.
+
+  Hard keyframes rewrite the plan and are sampler-independent, so a flow run
+  serves them.  Soft pose goals need ``PoseCost`` over a diffusion schedule and
+  therefore stay DDIM-only; refusing here is the single gate for that rule.
+  """
+  if family == "flow" and (task.goals or task.strength > 0.0):
+    raise ClosedLoopCliError(
+      "model-family flow supports hard keyframes only: soft pose goals need "
+      "the guided DDIM sampler"
+    )
+
+
 def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
   repo_root, device = _validate_request(args)
   family = _model_family(args)
@@ -784,6 +791,7 @@ def _prepare(args: argparse.Namespace) -> PreparedEvaluation:
       )
     except (ValueError, OSError) as exc:
       raise ClosedLoopCliError(f"task-config rejected: {exc}") from exc
+    _require_task_family_support(family, task)
     detail = task.source.verification_detail or {}
     # Only fresh loader checks supply integrity paths, never caller-authored
     # verification detail.  The receipt is nested under loader_recheck.
@@ -1058,7 +1066,7 @@ def _continuation_factory(
       generator = torch.Generator(device=prepared.device)
       generator.manual_seed(args.seed)
       return build_conditioned_continuation(
-        conditioning=None,
+        conditioning=conditioning,
         denoiser=prepared.denoiser.model,
         decode=decode,
         projection=prepared.projection,
@@ -1226,7 +1234,14 @@ def _execute(prepared: PreparedEvaluation) -> EvaluationReport:
     None
     if task is None
     else TaskConditioning(
-      task, projection=prepared.projection, contract=prepared.contract
+      task,
+      projection=prepared.projection,
+      contract=prepared.contract,
+      delegate_sampler=(
+        _flow_sampling_adapter(prepared)
+        if _prepared_family(prepared) == "flow"
+        else None
+      ),
     )
   )
   report = run_matched_pair(

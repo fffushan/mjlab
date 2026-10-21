@@ -45,7 +45,10 @@ from mjlab.tasks.tracking.diffusion.handover import (
   ReferenceFreeContinuation,
   build_reference_free_plan,
 )
-from mjlab.tasks.tracking.diffusion.inpainting import TimedStateKeyframe
+from mjlab.tasks.tracking.diffusion.inpainting import (
+  TimedStateKeyframe,
+  active_keyframe_targets,
+)
 from mjlab.tasks.tracking.diffusion.pose_costs import PoseCostWeights, TimedPoseGoal
 from mjlab.tasks.tracking.diffusion.projection import (
   FeatureStats,
@@ -459,6 +462,77 @@ def test_default_plan_is_unchanged_when_no_task_is_installed() -> None:
   )
   assert torch.equal(plan.clean_tokens, expected.clean_tokens)
   assert torch.equal(plan.clean_mask, expected.clean_mask)
+
+
+# --------------------------------------------------------------------------
+# family sampler behind the task lane
+# --------------------------------------------------------------------------
+
+
+def _task_plan(*, tick: int = 3):
+  return build_reference_free_plan(
+    _history(), make_state(8), projection=_projection(), tick=tick
+  )
+
+
+def test_family_delegate_sampler_serves_the_tick_and_the_keyframe_fixes_only_state() -> (
+  None
+):
+  """A family sampler replaces the DDIM call for that tick and keeps the record."""
+  plan = _task_plan()
+  current = make_state(8)
+  calls: list[object] = []
+
+  class _Diagnostics:
+    denoiser_calls = 7
+
+  def delegate(conditions: object, generator: object):
+    calls.append((conditions, generator))
+    return plan.clean_tokens.clone(), _Diagnostics()
+
+  conditioning = TaskConditioning(
+    _spec(mode="keyframe", keyframes=(_keyframe(5),)),
+    projection=_projection(),
+    delegate_sampler=delegate,
+  )
+  sampler = conditioning.sampler_factory(plan, current)
+  sample, diagnostics = sampler(plan.clean_tokens, None)
+  assert len(calls) == 1
+  assert diagnostics.task["denoiser_calls"] == 7
+  assert torch.equal(sample, plan.clean_tokens)
+
+  rewritten = conditioning.plan_transform(plan, current)
+  state_dimension = DEFAULT_CONTRACT.projected_state_dimension
+  keyframe = _keyframe(5)
+  row = active_keyframe_targets(plan, (keyframe,))[0].row
+  assert bool(rewritten.clean_mask[row, :state_dimension].all())
+  assert not bool(rewritten.clean_mask[row, state_dimension:].any())
+  assert not torch.equal(
+    rewritten.clean_tokens[row, :state_dimension],
+    plan.clean_tokens[row, :state_dimension],
+  )
+  assert torch.equal(
+    rewritten.clean_tokens[row, state_dimension:],
+    plan.clean_tokens[row, state_dimension:],
+  )
+
+
+def test_family_delegate_refuses_soft_pose_goals() -> None:
+  """Soft goals need the DDIM guided sampler, so a family delegate refuses them."""
+  spec = _spec(
+    mode="poseguided",
+    goals=(_goal(5),),
+    strength=0.5,
+    weights=PoseCostWeights(
+      root_position=1.0, root_orientation=1.0, body_positions=1.0
+    ),
+  )
+  with pytest.raises(TaskConditioningError, match="hard keyframes only"):
+    TaskConditioning(
+      spec,
+      projection=_projection(),
+      delegate_sampler=lambda conditions, generator: None,
+    )
 
 
 # --------------------------------------------------------------------------

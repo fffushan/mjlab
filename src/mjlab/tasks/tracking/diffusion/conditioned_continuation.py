@@ -45,6 +45,7 @@ from .contract import DEFAULT_CONTRACT, DiffusionContract
 from .guidance import GuidanceConfig, sample_trajectory_guided
 from .handover import (
   ContinuationPlan,
+  FamilySampler,
   ReferenceFreeContinuation,
   SamplerCallable,
 )
@@ -356,12 +357,25 @@ class TaskConditioning:
     *,
     projection: ProjectionBundle,
     contract: DiffusionContract = DEFAULT_CONTRACT,
+    delegate_sampler: FamilySampler | None = None,
   ) -> None:
     if not isinstance(spec, SparseTaskSpec):
       raise TaskConditioningError("task conditioning requires a SparseTaskSpec")
+    if delegate_sampler is not None:
+      if not callable(delegate_sampler):
+        raise TaskConditioningError("delegate_sampler must be callable or None")
+      # Soft pose goals need the DDIM guided sampler (PoseCost over a diffusion
+      # schedule).  A family run supports hard keyframes only, so refuse the
+      # combination here instead of silently sampling without the goals.
+      if spec.goals or spec.strength > 0.0:
+        raise TaskConditioningError(
+          "soft pose goals need the guided DDIM sampler; a family sampler run "
+          "supports hard keyframes only"
+        )
     self.spec = spec
     self.projection = projection
     self.contract = contract
+    self._delegate_sampler = delegate_sampler
     self._pending: dict[int, _TickTaskState] = {}
     self._plan_ticks: list[int] = []
     self._observed: dict[int, dict[str, Any]] = {}
@@ -490,6 +504,18 @@ class TaskConditioning:
   def _unguided_sampler(self, state: _TickTaskState) -> SamplerCallable:
     """Wrap the frozen unguided sampler only to expose the task record."""
     record = state.as_dict(mode=self.spec.mode, strength=self.spec.strength)
+    delegate = self._delegate_sampler
+    if delegate is not None:
+
+      def family_sampler(conditions: Any, generator: Any) -> tuple[Tensor, Any]:
+        sample, diagnostics = delegate(conditions, generator)
+        state.denoiser_calls = int(diagnostics.denoiser_calls)
+        self._summary["denoiser_calls"] += state.denoiser_calls
+        record.update(state.as_dict(mode=self.spec.mode, strength=self.spec.strength))
+        self._validate_tick_record(record)
+        return sample, _TaskDiagnostics(diagnostics, record)
+
+      return family_sampler
 
     def sampler(
       denoiser: Any,

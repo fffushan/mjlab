@@ -366,10 +366,14 @@ def test_default_diffusion_path_is_unchanged_without_an_injected_sampler() -> No
   assert measured.actions.shape == (rows, 31) and np.isfinite(measured.actions).all()
 
 
-def test_injected_sampler_rejects_the_diffusion_arguments_and_hooks() -> None:
+def test_injected_sampler_rejects_the_diffusion_arguments_and_accepts_a_task_factory() -> (
+  None
+):
   adapter = _flow_adapter(_FlowNetwork())
-  with pytest.raises(HandoverError, match="mutually exclusive"):
-    _flow_continuation(sampler=adapter, sampler_factory=lambda plan, state: adapter)
+  # A task factory may replace the tick's sampler; its result then takes the
+  # family convention (conditions, generator).  Only the diffusion arguments are
+  # refused with an injected family sampler.
+  _flow_continuation(sampler=adapter, sampler_factory=lambda plan, state: adapter)
   with pytest.raises(HandoverError, match="owns its own solver and level grid"):
     _flow_continuation(sampler=adapter, schedule=DiffusionSchedule.build())
   with pytest.raises(HandoverError, match="owns its own solver and level grid"):

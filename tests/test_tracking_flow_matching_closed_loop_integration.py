@@ -260,19 +260,22 @@ def test_diffusion_sidecar_rejects_the_flow_family(tmp_path: Path) -> None:
     evaluate._validate_request(flow)
 
 
-def test_flow_run_rejects_task_guidance_before_loading_any_model(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-  checkpoint = _checkpoint(tmp_path, _FLOW_SCHEMA)
-  calls = _patch_flow_loaders(monkeypatch, _flow_record())
-  task = tmp_path / "task.json"
-  task.write_text("{}\n", encoding="utf-8")
-  args = _request(tmp_path, checkpoint, "flow", ["--task-config", str(task)])
-  with pytest.raises(
-    evaluate.ClosedLoopCliError, match="does not support --task-config"
-  ):
-    evaluate._prepare(args)
-  assert calls == []
+def test_flow_family_accepts_hard_keyframes_and_refuses_soft_pose_goals() -> None:
+  """The family supports hard keyframes; PoseCost guidance stays DDIM-only."""
+  from types import SimpleNamespace
+
+  keyframes_only = SimpleNamespace(goals=(), strength=0.0)
+  evaluate._require_task_family_support("flow", keyframes_only)
+  evaluate._require_task_family_support("diffusion", keyframes_only)
+
+  with_goals = SimpleNamespace(goals=(object(),), strength=0.0)
+  with pytest.raises(evaluate.ClosedLoopCliError, match="hard keyframes only"):
+    evaluate._require_task_family_support("flow", with_goals)
+  evaluate._require_task_family_support("diffusion", with_goals)
+
+  strength_only = SimpleNamespace(goals=(), strength=0.5)
+  with pytest.raises(evaluate.ClosedLoopCliError, match="hard keyframes only"):
+    evaluate._require_task_family_support("flow", strength_only)
 
 
 @pytest.mark.parametrize("reference_dim", [68, 130])

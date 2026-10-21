@@ -393,11 +393,9 @@ class ReferenceFreeContinuation:
     if sampler is not None:
       if not callable(sampler):
         raise HandoverError("sampler must be callable or None")
-      if sampler_factory is not None:
-        raise HandoverError(
-          "sampler and sampler_factory are mutually exclusive: they replace "
-          "the same sampling call"
-        )
+      # A task ``sampler_factory`` is allowed alongside an injected family
+      # sampler: its result replaces that sampler for the tick and therefore
+      # takes the family calling convention ``(conditions, generator)``.
       if schedule is not None or grid is not None or sampler_config is not None:
         raise HandoverError(
           "an injected family sampler owns its own solver and level grid; do "
@@ -516,8 +514,14 @@ class ReferenceFreeContinuation:
     conditions = SamplerConditions(plan.clean_tokens, plan.clean_mask)
     if self._sampler is not None:
       # The injected family sampler owns its model, solver and grid; the seam
-      # supplies only the built conditions and the shared generator.
-      sample, diagnostics = self._sampler(conditions, self._generator)
+      # supplies only the built conditions and the shared generator.  A task
+      # factory result replaces it for that tick and takes the same convention.
+      step_sampler = (
+        self._sampler_factory(plan, current_state)
+        if self._sampler_factory is not None
+        else self._sampler
+      )
+      sample, diagnostics = step_sampler(conditions, self._generator)
     else:
       # __init__ requires both of these whenever no family sampler is injected.
       assert self.schedule is not None and self._sampler_config is not None
