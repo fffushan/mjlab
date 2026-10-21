@@ -23,6 +23,17 @@ Added
   records configured ranges, not force magnitudes. The default CLI remains one
   seed, start phase, and no pushes.
 
+- Added a non-destructive eligibility gate for raw X2 joint-pose schema2
+  collections at ``scripts/experiments/joint_pose_collection/gate.py``. It
+  writes a hash-bound JSON index and a retained/rejected report, and never
+  edits raw data. A trajectory is kept only when its stored outcome is
+  ``complete``, its root quaternion and joint position/velocity samples are
+  finite, and it has at least one complete 41-row window (8 history, current,
+  32 future). Failed, budget-stopped, non-finite, and too-short trajectories
+  are rejected whole; push exposure is not required. No windows are
+  materialized, normalized, or wired into training. See
+  ``scripts/experiments/joint_pose_collection/README.md``.
+
 - Documented the two-GPU X2 shared-teacher test at
   ``docs/reports/x2_multi_motion_ppo_2gpu_8192env_100iterations.md``. Two ranks
   on one container train 8192 environments each over 148 clips for 100

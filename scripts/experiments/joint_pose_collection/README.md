@@ -175,16 +175,117 @@ The collector stores no root position, root linear velocity, body state, command
 reference value, policy observation, or action. The `31` joint width above is the
 X2 contract; the manifest's `joint_names` is authoritative for a different robot.
 
+## Eligibility gate
+
+The gate at `scripts/experiments/joint_pose_collection/gate.py` reads complete
+schema-version 2 collection manifests and their NPZ files. It writes one compact
+eligibility index and never edits, deletes, or rewrites raw data. It does not
+materialize windows, normalize values, fit statistics, or load a model. It is
+not wired into any trainer.
+
+```sh
+PYTHONPATH="$PWD/src" uv run --no-sync python \
+  scripts/experiments/joint_pose_collection/gate.py \
+  --manifest logs/joint_pose_collection/start/manifest.json \
+             logs/joint_pose_collection/uniform_baseline/manifest.json \
+             logs/joint_pose_collection/uniform_disturbed/manifest.json \
+  --output-dir logs/joint_pose_eligibility/batch12
+```
+
+Pass all manifests after one `--manifest` flag. Each explicit manifest is a
+separate input, and results are grouped by `sampling_mode/scenario`, so
+`start/baseline` and `uniform/baseline` stay distinct even when motion names,
+seeds, and scenario labels overlap. The output directory must be new and must
+be outside every input collection directory. An existing directory is refused;
+the gate does not resume or overwrite.
+
+### Policy and window contract
+
+A trajectory is eligible only when all of these hold:
+
+- its stored `trajectory_outcome` is `complete`;
+- `root_quat_wxyz`, `joint_pos`, and `joint_vel` are finite throughout its
+  recorded row range; and
+- it has at least `41` raw rows.
+
+The window is fixed: `8` history rows, the current row, and `32` future rows,
+with no padding and no cross-trajectory rows. For `S` actions there are `S + 1`
+rows and `max(S - 39, 0)` candidate windows. A `41`-row trajectory has one
+window; a `42`-row trajectory has two. The report stores the half-open range of
+window-start rows: each start `s` means raw rows `[s, s + 41)`.
+
+The gate rejects the whole trajectory. It does not salvage a prefix of a
+failed or budget-stopped trajectory, and it does not keep windows around a
+corrupt sample. Rejection reasons are disjoint and use this precedence:
+
+1. `outcome_non_complete`: stored outcome is `failure` or `budget`.
+2. `nonfinite_state`: a required raw state value is non-finite.
+3. `too_short`: a complete trajectory has fewer than `41` rows.
+
+A complete trajectory shorter than one window is still a valid raw record, but
+it has no eligible training window and is reported as `too_short`. Push
+exposure is not a gate requirement: complete disturbed trajectories are kept
+with pushes, without pushes, or with a zero push count. Stored outcome labels
+are used as recorded; the gate does not infer success from clip-end length and
+adds no height, tilt, contact, tracking-error, quaternion-normalization, or
+push-severity threshold. A `failure` label means a task termination fired. It
+is not proof of ground contact or an exact fall detector. A `complete` label is
+not proof of perfect tracking.
+
+### Output
+
+The gate writes `<output-dir>/eligibility.json`. It is a compact JSON object
+with `schema_version: 1` and `kind: x2_joint_pose_eligibility`. It contains:
+
+- `policy` and `window_contract`, including the fixed dimensions and rejection
+  precedence;
+- `inputs`, with each manifest path, SHA256, schema, task, joint names, control
+  timing, seeds, and group;
+- `files`, with each NPZ path, SHA256, motion provenance, run/seed/scenario/
+  sampling identity, and per-trajectory records;
+- each trajectory's row range, outcome, accepted/rejected status, primary
+  reason, candidate/retained/rejected window counts, and retained window-start
+  range;
+- `totals`, `by_group`, `by_motion`, `by_reason`, and `count_identities`.
+
+The hashes cover the exact bytes that were parsed and validated. Each NPZ array
+is read once per file, so memory is bounded by one NPZ plus the index. The
+count identities are exact: candidate windows equal retained plus rejected
+windows, and all trajectories equal accepted plus rejected trajectories.
+
+A future consumer, including a preprocessing or training stage that does not
+yet exist, must read this index and honor its accepted status and retained
+window ranges. The gate does not prove training readiness, sample independence,
+or recovery quality. It also does not reopen the source motion clip; the
+manifest's motion path is copied as provenance, and the raw NPZ state is what
+is validated.
+
+The gate refuses an incomplete manifest, an unsupported schema version, an
+absent NPZ, duplicate manifest or NPZ sources, inconsistent joint order or
+control timing, malformed offsets/ticks, NPZ provenance or outcome-count
+mismatches, an unknown outcome label, a clip output path that escapes its
+collection directory, and an output directory inside an input collection.
+
 ## Tests
 
 ```sh
 PYTHONPATH="$PWD/src" uv run --no-sync pytest -x -vv \
-  -o faulthandler_timeout=30 tests/test_joint_pose_collection.py
+  -o faulthandler_timeout=30 tests/test_joint_pose_collection.py \
+  tests/test_joint_pose_collection_gate.py
 ```
 
-The tests use fake environments. They check achieved-versus-reference state,
-initial/terminal row ownership, asynchronous endings, reset contamination,
-frozen no-grad inference, NPZ fields and joint order, saved-preview wiring,
-seed budgets, phase selection, push timing and inactive-row exclusion, and
-output/budget refusal. They do not run the simulator or validate teacher
-quality, push magnitudes, or collection outcomes in a real environment.
+The collector tests use fake environments. They check achieved-versus-reference
+state, initial/terminal row ownership, asynchronous endings, reset
+contamination, frozen no-grad inference, NPZ fields and joint order,
+saved-preview wiring, seed budgets, phase selection, push timing and
+inactive-row exclusion, and output/budget refusal. They do not run the
+simulator or validate teacher quality, push magnitudes, or collection outcomes
+in a real environment.
+
+The gate tests use small synthetic schema2 collections. They check the public
+CLI, the `40`/`41`/`42`-row boundaries, whole-trajectory failure and budget
+exclusion, non-finite root/quaternion, joint-position, and joint-velocity
+rejection, push-independent disturbed retention, trajectory-boundary ranges,
+multiple group identities, hashes and count round-trips, malformed input
+refusal, unchanged input bytes, and the absence of simulator imports or window
+materialization. They do not validate a real batch or training quality.
