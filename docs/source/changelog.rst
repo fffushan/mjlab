@@ -14,6 +14,15 @@ Added
   only: no heading alignment, 6D packing, VAE, flow model, reference adapter,
   or controller change. See ``scripts/experiments/joint_pose_collection/README.md``.
 
+- Extended the raw X2 joint-pose collector with a finite multi-seed budget, a
+  start/uniform reference-phase option, opt-in interval root-velocity pushes,
+  and separate baseline/disturbed scenario labels. Collector schema version 2
+  adds per-trajectory run, seed, initial reference frame, scenario, and push
+  count/tick evidence. Baseline still removes ``push_robot``; the disturbed
+  option reuses the task's existing ``push_by_setting_velocity`` term and
+  records configured ranges, not force magnitudes. The default CLI remains one
+  seed, start phase, and no pushes.
+
 - Documented the two-GPU X2 shared-teacher test at
   ``docs/reports/x2_multi_motion_ppo_2gpu_8192env_100iterations.md``. Two ranks
   on one container train 8192 environments each over 148 clips for 100

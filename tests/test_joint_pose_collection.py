@@ -9,6 +9,7 @@ compiled.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import pathlib
@@ -131,6 +132,8 @@ class _FakeEnv:
     frames: int,
     failures: dict[int, set[int]] | None = None,
     steps: int | None = None,
+    push_events: dict[int, list[int]] | None = None,
+    push_recorder: Any = None,
   ) -> None:
     self.num_envs = rows
     self.device = "cpu"
@@ -173,6 +176,9 @@ class _FakeEnv:
       cast(Any, self),
     )
     self.step_index = 0
+    self.episode_length_buf = torch.zeros(rows, dtype=torch.long)
+    self.push_events = push_events or {}
+    self.push_recorder = push_recorder
     self.reset_step = 0
     self.pending = torch.zeros(rows, dtype=torch.bool)
     self.resets: list[list[int]] = []
@@ -187,6 +193,7 @@ class _FakeEnv:
     self.resets.append([int(index) for index in env_ids.tolist()])
     self.pending[env_ids] = False
     self.command.time_steps[env_ids] = 0
+    self.episode_length_buf[env_ids] = 0
     self.reset_step += 1
     # A recorded post-reset row would carry these values.
     self.robot.data.root_link_quat_w[env_ids] = torch.tensor([0.5, 0.5, 0.5, 0.5])
@@ -212,7 +219,13 @@ class _FakeEnv:
     self.robot.data.root_link_quat_w[:, 0] = 1.0 + 0.001 * tick
     self.robot.data.joint_pos[:] = 1000.0 * (index + 1.0) + base + 100.0 * tick
     self.robot.data.joint_vel[:] = 2000.0 * (index + 1.0) + base - 10.0 * tick
+    self.episode_length_buf += 1
     dones = self.termination_manager.compute()
+    pushed_rows = self.push_events.get(self.step_index)
+    if pushed_rows:
+      if self.push_recorder is None:
+        raise RuntimeError("scripted push has no recorder")
+      self.push_recorder.record(self, torch.tensor(pushed_rows, dtype=torch.long))
     self.command.time_steps = torch.minimum(
       self.command.time_steps + 1, self.command.row_lengths - 1
     )
@@ -252,6 +265,9 @@ def test_public_parser_validation_and_overwrite_refusal(tmp_path: Path) -> None:
   assert config.output_dir == output
   assert config.num_envs == 3
   assert config.seed == 11
+  assert config.num_seeds == 1
+  assert config.sampling_mode == "start"
+  assert config.push_interval_s is None
   assert config.max_steps == 4
   module.validate_config(config)
 
@@ -259,8 +275,22 @@ def test_public_parser_validation_and_overwrite_refusal(tmp_path: Path) -> None:
     module.validate_config(replace(config, num_envs=0))
   with pytest.raises(ValueError, match="seed"):
     module.validate_config(replace(config, seed=-1))
+  with pytest.raises(ValueError, match="num_seeds"):
+    module.validate_config(replace(config, num_seeds=0))
+  with pytest.raises(ValueError, match="sampling_mode"):
+    module.validate_config(replace(config, sampling_mode=cast(Any, "adaptive")))
   with pytest.raises(ValueError, match="max_steps"):
     module.validate_config(replace(config, max_steps=0))
+  with pytest.raises(ValueError, match="push_interval_s"):
+    module.validate_config(replace(config, push_interval_s=(-1.0, 2.0)))
+  with pytest.raises(ValueError, match="push_interval_s"):
+    module.validate_config(replace(config, push_interval_s=(1.0, float("nan"))))
+  with pytest.raises(ValueError, match="push_linear_velocity_range"):
+    module.validate_config(replace(config, push_linear_velocity_range=(0.5, -0.5)))
+  with pytest.raises(ValueError, match="push_angular_velocity_range"):
+    module.validate_config(
+      replace(config, push_angular_velocity_range=(0.0, float("inf")))
+    )
   with pytest.raises(FileNotFoundError, match="reference clip"):
     module.validate_config(replace(config, motion_file=[tmp_path / "missing.npz"]))
   no_params = tmp_path / "no_params" / "model_0.pt"
@@ -276,11 +306,54 @@ def test_public_parser_validation_and_overwrite_refusal(tmp_path: Path) -> None:
     module.prepare_output_dir(output)
 
 
+def test_public_parser_reads_seed_phase_and_push_options(tmp_path: Path) -> None:
+  module = _collector_module()
+  checkpoint = _checkpoint(tmp_path)
+  clip = _clip(tmp_path)
+
+  config = module.parse_config(
+    [
+      "--checkpoint-file",
+      str(checkpoint),
+      "--motion-file",
+      str(clip),
+      "--output-dir",
+      str(tmp_path / "run_output"),
+      "--num-seeds",
+      "3",
+      "--sampling-mode",
+      "uniform",
+      "--push-interval-s",
+      "1.0",
+      "2.0",
+      "--push-linear-velocity-range",
+      "-0.3",
+      "0.4",
+      "--push-angular-velocity-range",
+      "-0.6",
+      "0.7",
+    ]
+  )
+
+  assert config.num_seeds == 3
+  assert config.sampling_mode == "uniform"
+  assert config.push_interval_s == (1.0, 2.0)
+  assert config.push_linear_velocity_range == (-0.3, 0.4)
+  assert config.push_angular_velocity_range == (-0.6, 0.7)
+  assert module.collection_scenario(config) == "disturbed"
+  module.validate_config(config)
+
+
 def test_configure_preserves_saved_preview_and_reports_defaults(tmp_path: Path) -> None:
   module = _collector_module()
   clip = _clip(tmp_path)
   checkpoint = _checkpoint(tmp_path, lookahead_s=0.2)
   env_cfg = load_env_cfg(TASK, play=False)
+  motion_cmd = env_cfg.commands["motion"]
+  assert isinstance(motion_cmd, MultiMotionPpoCommandCfg)
+  pose_range = dict(motion_cmd.pose_range)
+  velocity_range = dict(motion_cmd.velocity_range)
+  joint_position_range = motion_cmd.joint_position_range
 
   settings = module.configure_collection_env(
     env_cfg,
@@ -291,8 +364,6 @@ def test_configure_preserves_saved_preview_and_reports_defaults(tmp_path: Path) 
     episode_length_s=0.08,
   )
 
-  motion_cmd = env_cfg.commands["motion"]
-  assert isinstance(motion_cmd, MultiMotionPpoCommandCfg)
   assert env_cfg.auto_reset is False
   assert env_cfg.episode_length_s == pytest.approx(0.08)
   assert env_cfg.scene.num_envs == 4
@@ -310,10 +381,40 @@ def test_configure_preserves_saved_preview_and_reports_defaults(tmp_path: Path) 
     "episode_length_s": 0.08,
     "lookahead_s": 0.2,
     "sampling_mode": "start",
+    "standing_start_prob": 0.0,
     "auto_reset": False,
     "actor_corruption": True,
     "push_robot_event": False,
+    "push_interval_s": None,
+    "push_velocity_range": None,
   }
+  assert dict(motion_cmd.pose_range) == pose_range
+  assert dict(motion_cmd.velocity_range) == velocity_range
+  assert motion_cmd.joint_position_range == joint_position_range
+
+  random_phase_cfg = load_env_cfg(TASK, play=False)
+  random_motion_cmd = random_phase_cfg.commands["motion"]
+  assert isinstance(random_motion_cmd, MultiMotionPpoCommandCfg)
+  random_pose_range = dict(random_motion_cmd.pose_range)
+  random_velocity_range = dict(random_motion_cmd.velocity_range)
+  random_joint_range = random_motion_cmd.joint_position_range
+  random_settings = module.configure_collection_env(
+    random_phase_cfg,
+    clip,
+    checkpoint,
+    num_envs=4,
+    seed=7,
+    episode_length_s=0.08,
+    sampling_mode="uniform",
+  )
+  assert random_motion_cmd.sampling_mode == "uniform"
+  assert random_motion_cmd.lookahead_s == pytest.approx(0.2)
+  assert dict(random_motion_cmd.pose_range) == random_pose_range
+  assert dict(random_motion_cmd.velocity_range) == random_velocity_range
+  assert random_motion_cmd.joint_position_range == random_joint_range
+  assert random_settings["sampling_mode"] == "uniform"
+  assert random_settings["standing_start_prob"] == 0.0
+  assert "push_robot" not in random_phase_cfg.events
 
   missing = tmp_path / "no_params" / "model_0.pt"
   missing.parent.mkdir(parents=True)
@@ -326,6 +427,66 @@ def test_configure_preserves_saved_preview_and_reports_defaults(tmp_path: Path) 
       num_envs=1,
       seed=0,
       episode_length_s=0.08,
+    )
+
+
+def test_configure_installs_recorded_disturbed_push(tmp_path: Path) -> None:
+  module = _collector_module()
+  clip = _clip(tmp_path)
+  checkpoint = _checkpoint(tmp_path)
+  recorder = module.PushRecorder(2)
+  velocity_range = module.resolved_push_velocity_range(
+    module.CollectionConfig(
+      checkpoint_file=checkpoint,
+      motion_file=[clip],
+      output_dir=tmp_path / "run",
+      push_linear_velocity_range=(-0.3, 0.4),
+      push_angular_velocity_range=(-0.6, 0.7),
+      push_interval_s=(1.0, 2.0),
+    )
+  )
+  env_cfg = load_env_cfg(TASK, play=False)
+
+  settings = module.configure_collection_env(
+    env_cfg,
+    clip,
+    checkpoint,
+    num_envs=2,
+    seed=9,
+    episode_length_s=0.08,
+    push_interval_s=(1.0, 2.0),
+    push_velocity_range=velocity_range,
+    push_recorder=recorder,
+  )
+
+  event = env_cfg.events["push_robot"]
+  assert event.mode == "interval"
+  assert event.interval_range_s == (1.0, 2.0)
+  assert event.params == {}
+  assert event.func.recorder is recorder
+  assert event.func.velocity_range == velocity_range
+  assert copy.deepcopy(event.func) is event.func
+  assert copy.deepcopy(event).func.recorder is recorder
+  assert settings["push_robot_event"] is True
+  assert settings["push_interval_s"] == [1.0, 2.0]
+  assert settings["push_velocity_range"] == {
+    "x": [-0.3, 0.4],
+    "y": [-0.3, 0.4],
+    "z": [-0.3, 0.4],
+    "roll": [-0.6, 0.7],
+    "pitch": [-0.6, 0.7],
+    "yaw": [-0.6, 0.7],
+  }
+
+  with pytest.raises(ValueError, match="disturbed collection"):
+    module.configure_collection_env(
+      load_env_cfg(TASK, play=False),
+      clip,
+      checkpoint,
+      num_envs=2,
+      seed=9,
+      episode_length_s=0.08,
+      push_interval_s=(1.0, 2.0),
     )
 
 
@@ -389,6 +550,87 @@ def test_collect_clip_records_actual_state_and_async_trajectories() -> None:
 
   # Every row the environment marked done was reset before the next step.
   assert env.resets == [[0], [0, 2], [1]]
+
+
+def test_collect_clip_records_initial_frame_and_late_completion() -> None:
+  module = _collector_module()
+  env = _FakeEnv(rows=3, frames=6)
+  env.command.time_steps = torch.tensor([5, 0, 3], dtype=torch.long)
+
+  rollout = module.collect_clip(
+    env,
+    env.command,
+    lambda obs: torch.zeros(3, 1),
+    step_budget=6,
+    seed=11,
+    run_index=2,
+  )
+
+  assert rollout.trajectory_initial_frame.tolist() == [5, 0, 3]
+  assert rollout.trajectory_steps.tolist() == [1, 6, 3]
+  assert rollout.trajectory_outcome.tolist() == ["complete"] * 3
+  assert rollout.trajectory_offsets.tolist() == [0, 2, 9, 13]
+  assert rollout.tick[0:2].tolist() == [0, 1]
+  assert rollout.tick[2:9].tolist() == [0, 1, 2, 3, 4, 5, 6]
+  assert rollout.tick[9:13].tolist() == [0, 1, 2, 3]
+  assert rollout.trajectory_seed.tolist() == [11, 11, 11]
+  assert rollout.trajectory_run_index.tolist() == [2, 2, 2]
+  assert rollout.trajectory_scenario.tolist() == ["baseline"] * 3
+  assert rollout.trajectory_push_count.tolist() == [0, 0, 0]
+  assert rollout.push_offsets.tolist() == [0, 0, 0, 0]
+  assert rollout.push_tick.size == 0
+
+
+def test_collect_clip_push_evidence_uses_first_episode_only() -> None:
+  module = _collector_module()
+  recorder = module.PushRecorder(2)
+  env = _FakeEnv(
+    rows=2,
+    frames=8,
+    failures={0: {1}},
+    push_events={
+      0: [0, 1],
+      1: [0, 1],
+      2: [1],
+      3: [0],
+      4: [1],
+    },
+    push_recorder=recorder,
+  )
+
+  rollout = module.collect_clip(
+    env,
+    env.command,
+    lambda obs: torch.zeros(2, 1),
+    step_budget=8,
+    scenario="disturbed",
+    push_recorder=recorder,
+  )
+
+  assert rollout.trajectory_outcome.tolist() == ["failure", "complete"]
+  assert rollout.trajectory_steps.tolist() == [2, 8]
+  assert rollout.trajectory_scenario.tolist() == ["disturbed", "disturbed"]
+  assert rollout.trajectory_push_count.tolist() == [2, 4]
+  assert rollout.push_offsets.tolist() == [0, 2, 6]
+  # Row 0 pushes on tick 1 and on its terminal tick 2. The push at step index
+  # 3 is in a later episode on the reset row and must not be recorded.
+  assert rollout.push_tick.tolist() == [1, 2, 1, 2, 3, 5]
+  assert rollout.push_env_index.tolist() == [0, 0, 1, 1, 1, 1]
+
+  quiet_recorder = module.PushRecorder(2)
+  quiet_env = _FakeEnv(rows=2, frames=2, push_recorder=quiet_recorder)
+  quiet = module.collect_clip(
+    quiet_env,
+    quiet_env.command,
+    lambda obs: torch.zeros(2, 1),
+    step_budget=2,
+    scenario="disturbed",
+    push_recorder=quiet_recorder,
+  )
+  assert quiet.trajectory_outcome.tolist() == ["complete", "complete"]
+  assert quiet.trajectory_push_count.tolist() == [0, 0]
+  assert quiet.push_offsets.tolist() == [0, 0, 0]
+  assert quiet.push_tick.size == 0
 
 
 def test_collect_clip_budget_labels_and_refuses_zero_budget() -> None:
@@ -487,10 +729,27 @@ def test_collect_writes_npz_and_manifest_without_simulator(
   assert manifest["collection"]["actor_corruption"] is True
   assert manifest["collection"]["push_robot_event"] is False
   assert manifest["collection"]["auto_reset"] is False
+  assert manifest["collection"]["num_seeds"] == 1
+  assert manifest["collection"]["seeds"] == [5]
+  assert manifest["collection"]["num_clips"] == 2
+  assert manifest["collection"]["num_seed_runs"] == 1
+  assert manifest["collection"]["num_clip_rollouts"] == 2
+  assert manifest["collection"]["total_trajectories"] == 6
+  assert manifest["collection"]["scenario"] == "baseline"
+  assert manifest["collection"]["disturbance"] is None
+  assert manifest["collection"]["sampling_mode"] == "start"
+  assert manifest["collection"]["standing_start_prob"] == 0.0
+  assert manifest["schema_version"] == 2
   assert manifest["joint_names"] == list(JOINT_NAMES)
   assert manifest["control_dt_s"] == pytest.approx(STEP_DT)
   assert manifest["clips"][0]["file"] == str(clip.resolve())
   assert manifest["clips"][0]["frames"] == 4
+  assert manifest["clips"][0]["run_index"] == 0
+  assert manifest["clips"][0]["seed"] == 5
+  assert manifest["clips"][0]["scenario"] == "baseline"
+  assert manifest["clips"][0]["disturbance"] is None
+  assert manifest["clips"][0]["sampling_mode"] == "start"
+  assert manifest["clips"][0]["pushes_observed"] == 0
   assert manifest["clips"][0]["step_budget"] == 4
   assert manifest["clips"][0]["budget_source"] == "clip_length"
   assert manifest["clips"][0]["outcomes"] == {
@@ -500,6 +759,8 @@ def test_collect_writes_npz_and_manifest_without_simulator(
   }
   assert manifest["clips"][1]["file"] == str(second_clip.resolve())
   assert manifest["clips"][1]["frames"] == 3
+  assert manifest["clips"][1]["run_index"] == 0
+  assert manifest["clips"][1]["seed"] == 5
   assert manifest["clips"][1]["step_budget"] == 3
   assert manifest["clips"][1]["budget_source"] == "clip_length"
   assert manifest["clips"][1]["outcomes"] == {
@@ -527,12 +788,28 @@ def test_collect_writes_npz_and_manifest_without_simulator(
       "trajectory_env_index",
       "trajectory_outcome",
       "trajectory_steps",
+      "trajectory_initial_frame",
+      "trajectory_seed",
+      "trajectory_run_index",
+      "trajectory_scenario",
+      "trajectory_push_count",
+      "push_offsets",
+      "push_tick",
+      "push_env_index",
     }
     assert payload["root_quat_wxyz"].shape == (15, 4)
     assert payload["joint_pos"].shape == (15, JOINT_DIM)
     assert payload["joint_vel"].shape == (15, JOINT_DIM)
     assert payload["trajectory_offsets"].tolist() == [0, 5, 10, 15]
     assert payload["trajectory_outcome"].tolist() == ["complete"] * 3
+    assert payload["trajectory_initial_frame"].tolist() == [0, 0, 0]
+    assert payload["trajectory_seed"].tolist() == [5, 5, 5]
+    assert payload["trajectory_run_index"].tolist() == [0, 0, 0]
+    assert payload["trajectory_scenario"].tolist() == ["baseline"] * 3
+    assert payload["trajectory_push_count"].tolist() == [0, 0, 0]
+    assert payload["push_offsets"].tolist() == [0, 0, 0, 0]
+    assert payload["push_tick"].size == 0
+    assert payload["push_env_index"].size == 0
     assert payload["tick"].tolist() == [0, 1, 2, 3, 4] * 3
     # Joint order is the robot's order: the first three initial rows are
     # 1000, 2000 and 3000, each with the joint index added in column order.
@@ -555,3 +832,119 @@ def test_collect_writes_npz_and_manifest_without_simulator(
   with pytest.raises(FileExistsError, match="already exists"):
     module.collect(config)
   assert len(envs) == 2
+
+
+def test_collect_multi_seed_uses_unique_outputs_and_provenance(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  module = _collector_module()
+  checkpoint = _checkpoint(tmp_path)
+  clip = _clip(tmp_path, frames=2)
+  output = tmp_path / "multi_seed"
+  envs: list[_FakeEnv] = []
+  configs: list[Any] = []
+
+  def build_env(cfg: Any, device: str) -> _FakeEnv:
+    configs.append(cfg)
+    env = _FakeEnv(rows=cfg.scene.num_envs, frames=2)
+    envs.append(env)
+    return env
+
+  monkeypatch.setattr(module, "ManagerBasedRlEnv", build_env)
+  monkeypatch.setattr(module, "RslRlVecEnvWrapper", lambda env, clip_actions=None: env)
+  monkeypatch.setattr(module, "load_runner_cls", lambda task: _FakeRunner)
+  monkeypatch.setattr(module, "configure_torch_backends", lambda: None)
+  _FakeRunner.loaded = []
+
+  config = module.CollectionConfig(
+    checkpoint_file=checkpoint,
+    motion_file=[clip],
+    output_dir=output,
+    num_envs=2,
+    seed=7,
+    num_seeds=3,
+  )
+  manifest = module.collect(config)
+
+  assert [cfg.seed for cfg in configs] == [7, 8, 9]
+  assert manifest["collection"]["num_seeds"] == 3
+  assert manifest["collection"]["seeds"] == [7, 8, 9]
+  assert manifest["collection"]["num_seed_runs"] == 3
+  assert manifest["collection"]["num_clip_rollouts"] == 3
+  assert manifest["collection"]["total_trajectories"] == 6
+  assert [entry["run_index"] for entry in manifest["clips"]] == [0, 1, 2]
+  assert [entry["seed"] for entry in manifest["clips"]] == [7, 8, 9]
+  outputs = [entry["output"] for entry in manifest["clips"]]
+  assert len(set(outputs)) == 3
+  assert outputs == [
+    "trajectories/run000_seed007_000_clip_000_agibot_x2_tracking_baseline.npz",
+    "trajectories/run001_seed008_000_clip_000_agibot_x2_tracking_baseline.npz",
+    "trajectories/run002_seed009_000_clip_000_agibot_x2_tracking_baseline.npz",
+  ]
+  assert len(list((output / "trajectories").glob("*.npz"))) == 3
+  for entry in manifest["clips"]:
+    payload = np.load(output / entry["output"])
+    try:
+      assert payload["trajectory_seed"].tolist() == [entry["seed"]] * 2
+      assert payload["trajectory_run_index"].tolist() == [entry["run_index"]] * 2
+      assert payload["trajectory_scenario"].tolist() == ["baseline"] * 2
+      assert payload["trajectory_initial_frame"].tolist() == [0, 0]
+    finally:
+      payload.close()
+  assert len(envs) == 3 and all(env.closed for env in envs)
+
+
+def test_collect_disturbed_labels_zero_pushes_truthfully(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  module = _collector_module()
+  checkpoint = _checkpoint(tmp_path)
+  clip = _clip(tmp_path, frames=2)
+  output = tmp_path / "disturbed"
+
+  monkeypatch.setattr(
+    module,
+    "ManagerBasedRlEnv",
+    lambda cfg, device: _FakeEnv(rows=cfg.scene.num_envs, frames=2),
+  )
+  monkeypatch.setattr(module, "RslRlVecEnvWrapper", lambda env, clip_actions=None: env)
+  monkeypatch.setattr(module, "load_runner_cls", lambda task: _FakeRunner)
+  monkeypatch.setattr(module, "configure_torch_backends", lambda: None)
+  _FakeRunner.loaded = []
+
+  config = module.CollectionConfig(
+    checkpoint_file=checkpoint,
+    motion_file=[clip],
+    output_dir=output,
+    num_envs=2,
+    seed=3,
+    sampling_mode="uniform",
+    push_interval_s=(1.0, 2.0),
+    push_linear_velocity_range=(-0.3, 0.4),
+    push_angular_velocity_range=(-0.6, 0.7),
+  )
+  manifest = module.collect(config)
+
+  assert manifest["collection"]["scenario"] == "disturbed"
+  assert manifest["collection"]["push_robot_event"] is True
+  assert manifest["collection"]["sampling_mode"] == "uniform"
+  disturbance = manifest["collection"]["disturbance"]
+  assert disturbance["kind"] == "simulated_root_velocity_delta"
+  assert disturbance["interval_s"] == [1.0, 2.0]
+  assert disturbance["velocity_range"]["x"] == [-0.3, 0.4]
+  assert disturbance["velocity_range"]["yaw"] == [-0.6, 0.7]
+  entry = manifest["clips"][0]
+  assert entry["scenario"] == "disturbed"
+  assert entry["sampling_mode"] == "uniform"
+  assert entry["pushes_observed"] == 0
+  assert entry["output"] == (
+    "trajectories/run000_seed003_000_clip_000_agibot_x2_tracking_disturbed.npz"
+  )
+  payload = np.load(output / entry["output"])
+  try:
+    assert payload["trajectory_scenario"].tolist() == ["disturbed"] * 2
+    assert payload["trajectory_push_count"].tolist() == [0, 0]
+    assert payload["push_offsets"].tolist() == [0, 0, 0]
+    assert payload["push_tick"].size == 0
+  finally:
+    payload.close()
