@@ -136,20 +136,34 @@ D4 suites. The same **4 D4 CLI tests** fail with and without this change (`test_
 `_validate_request` now requires the checkpoint sidecar before any task validation. That is
 pre-existing and out of scope here.
 
-### Why T3 is blocked
+### T3 completed (2026-10-17 18:35 +08)
 
-The task-preparation tool refuses a flow recording, twice:
+The end-to-end run works. Two producer fixes were needed, and neither weakens a claim:
 
-1. `task_config.py:360` requires `provenance.integrity.unchanged is True`. A flow run records
-   `provenance.integrity: null`, so a flow recording can never qualify as a task source.
-2. The weaker `--source-shard` route needs a raw D1 NPZ shard. The local `vgk000.npz` files are D3
-   state bundles, not D1 shards, and are rejected as unreadable.
+1. The run's `vae` provenance did not record the VAE **file** digest, and the task checker compares
+   the contract's `vae.sha256` against it. The block's `member_artifact_hashes.checkpoint` is the
+   **cohort member's teacher** checkpoint, not the VAE, which is why the two never matched. The run
+   now writes `vae.sha256 = sha256_file(vae checkpoint)`.
+2. A flow sidecar records its contract as a **path**, not an identity hash, so the flow run's
+   `checkpoint` provenance carried no `contract_identity`. The flow run now reports the identity of
+   the contract it loaded from that sidecar and validated the checkpoint's data identity against.
 
-**Decision needed, not taken unilaterally:** may a flow recording be accepted as a task source with
-an explicit `loader_structural_only` verification label instead of the diffusion integrity record?
-That is a provenance claim, so it needs an operator decision. With it, T3 is a two-run check
-(`evaluate.py --model-family flow` once to record, `prepare_task_config.py`, then run with
-`--task-config`); without it, T3 needs a freshly verified D1 shard for the member.
+Result, `logs/diagnostics/flow-keyframe-20261017/run3` (vgk000, seed 0, frame 45, 20 plans,
+keyframe at tick 12, task file `qualification: verified`):
+
+| Fact | Value |
+|---|---|
+| Sampler for every plan | `euler_x0`, 6 updates, **120 denoiser calls** (20 × 6) |
+| Keyframe applied | **`keyframe_steps: 4`** plans |
+| Soft-guidance calls | `vjp_calls: 0`, `cost_calls: 0`, `guided_steps: 0` |
+| Realized root position error at tick 12 | **2.29 mm** |
+| Realized root orientation (chordal) | 0.0202 |
+| Realized body positions | **RMS 3.67 mm**, max 7.99 mm |
+| Unreached / missing / expired targets | none |
+
+So the flow family serves a hard keyframe through the task lane, keeps its own sampler, and the
+measured state reaches the requested pose. The task file claims `verified`, with the loader's
+recheck list in its `source.verification`.
 
 ### T5 pending
 

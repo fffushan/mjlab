@@ -922,6 +922,11 @@ def _checkpoint_provenance(prepared: PreparedEvaluation) -> dict[str, Any]:
     report["data_identity"] = flow.data_identity
     report["process_identity"] = flow.process_identity
     report["model_identity_hash"] = flow.model_identity_hash
+    # The flow sidecar records its contract as a path, not as an identity hash.
+    # The run reports the contract it loaded from that sidecar and validated the
+    # checkpoint's data identity against, so a recording can be bound back to a
+    # frozen contract the same way a diffusion recording is.
+    report["contract_identity"] = prepared.contract.identity_hash()
   else:
     report["contract_identity"] = cast(LoadedDenoiser, denoiser).contract_identity
   return report
@@ -1152,6 +1157,10 @@ def _provenance(prepared: PreparedEvaluation, started: float) -> dict[str, Any]:
       "member_artifact_hashes": dict(prepared.teacher_hashes),
       "relocated_artifact_roles": list(prepared.vae.relocated_artifact_roles),
       "joint_order": list(prepared.vae.joint_order),
+      # The frozen VAE file digest: this is the value the contract pins.  The
+      # member artifact hashes above belong to the cohort member (its teacher
+      # checkpoint and motion), not to the VAE file.
+      "sha256": sha256_file(args.vae_checkpoint.resolve()),
     },
     "sampler": _sampler_report(prepared),
     "budget": {
