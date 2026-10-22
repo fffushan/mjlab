@@ -386,6 +386,13 @@ class FlowMatchingRunner:
   def _microbatch_loss(self) -> Tensor:
     """Channel-mean x0 MSE on the generated rows of one drawn microbatch."""
     indices = self.dataset.draw_indices(self.cfg.micro_batch, self._index_generator)
+    # Gather in ascending order.  A microbatch is a mean over its rows, so the
+    # order inside it is irrelevant, but the storage read pattern is not: 512
+    # windows drawn at random from a 356 GB memory map cost a page fault each and
+    # defeat readahead, which measured 2.7 MB/s on the shared NAS against 74 MB/s
+    # for a sequential read of the same file.  Sorting turns the batch into a few
+    # ascending runs and lets the page cache work.
+    indices = torch.sort(indices).values
     clean = torch.stack([self.dataset[int(index)] for index in indices.tolist()])
     clean = clean.to(device=self.device, dtype=torch.float32)
     _finite(clean, "training window")
