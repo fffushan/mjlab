@@ -131,6 +131,14 @@ correct this ratio.
 | Gate source | commit `185ea1e4d` |
 | Tracker checkpoint | SHA-256 `82f0dc32…`, `model_19999.pt` |
 
+## Measurement
+
+The dataset has been measured for trackability and mode coverage. Results and the
+tooling that produced them are in `x2_joint_pose_trackability_and_modes.md`.
+Briefly: 10.4 % of segments fail when replayed as references, the dominant
+termination is end-effector height, and the achieved motion is more upright, more
+crouched and 14 % slower than the reference. No data has been removed.
+
 ## Limitations
 
 1. The raw format has no root translation and no body kinematics. A replay test

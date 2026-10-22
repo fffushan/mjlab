@@ -31,6 +31,7 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `x2_joint_pose_dataset_summary.md` | dataset record | latent-free X2 joint-pose dataset: format, storage, location, limitations | prepared; not yet used by training |
 | `x2_joint_pose_datasets.md` | comparison | D1 window dataset versus the raw joint-pose dataset | introduction |
 | `x2_latent_free_joint_space_feasibility.md` | feasibility | latent-free joint-space flow proposal and the S1/S2/S3 plan | plan; S1 done |
+| `x2_joint_pose_trackability_and_modes.md` | measurement + tool note | trackability pass 1, mode coverage, and the survey tooling | pass 1 measured; no data removed |
 | `tracking_footstep_experiments.md` | experiment log | G1 29DOF mode-15 footstep tracking experiments | 2026-09-11 record; not revalidated |
 | `ACCEPTANCE-20261007.md` | acceptance | difficult-state coverage integration acceptance | supersedes the removed `PARENT-ACCEPTANCE.md` |
 | `beyondmimic_diffusion_d1_throughput_integration.md` | validation | D1 collection and dataset throughput integration | implemented; speed not measured |
