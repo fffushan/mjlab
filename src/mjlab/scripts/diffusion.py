@@ -1084,6 +1084,10 @@ def _command_collect(args: argparse.Namespace) -> int:
       "control_transitions": transitions,
       "ou_trials_attempted": ou_attempted,
       "ou_trials_skipped": ou_skipped,
+      "abandoned_trials": [
+        {"episode_id": episode_id, "reason": reason}
+        for episode_id, reason in batch.abandoned_trials
+      ],
       "partial": batch.partial,
       "stop_reason": batch.stop_reason,
       "unstarted_trials": batch.unstarted_trials,

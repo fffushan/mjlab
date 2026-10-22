@@ -203,6 +203,39 @@ def test_slot_scheduler_replaces_rows_and_admits_pair_locally() -> None:
   assert {spec.pair_id for spec in replacements.values()} == {"a", "b"}
 
 
+def test_slot_scheduler_abandons_one_pair_without_stopping_the_rest() -> None:
+  clean_a = TrialSpec("run", "a", 7, 3, pair_id="a", initial_state_id="ia")
+  ou_a = TrialSpec("run", "a", 7, 3, "ou", pair_id="a", initial_state_id="ia")
+  clean_b = TrialSpec("run", "b", 8, 4, pair_id="b", initial_state_id="ib")
+  ou_b = TrialSpec("run", "b", 8, 4, "ou", pair_id="b", initial_state_id="ib")
+  scheduler = TrialSlotScheduler((clean_a, ou_a, clean_b, ou_b), 2)
+  started = scheduler.fill()
+  slot_a = next(slot for slot, spec in started.items() if spec.pair_id == "a")
+  abandoned = scheduler.abandon(slot_a, reason="ou rows could not reproduce")
+  assert abandoned.pair_id == "a"
+  assert scheduler.abandoned_trials == (
+    ("run:a:7:3:clean", "ou rows could not reproduce"),
+  )
+  # The remaining partner of the retired pair is skipped, not collected, and the
+  # unrelated pair still runs to completion.
+  assert scheduler.skipped_ou_pairs == ("a",)
+  scheduler.fill()
+  for _ in range(6):
+    active = scheduler.active
+    if not active:
+      break
+    for slot, spec in list(active.items()):
+      result = type(
+        "Result",
+        (),
+        {"spec": spec, "qualification": type("Q", (), {"qualified": True})()},
+      )()
+      scheduler.complete(slot, result)
+  assert not scheduler.active and not scheduler.pending
+  completed = {result.spec.episode_id for result in scheduler.results}
+  assert completed == {"run:b:8:4:clean", "run:b:8:4:ou"}
+
+
 def test_batched_rows_are_bit_identical_to_single_row_rows() -> None:
   config = QualificationConfig(control_steps=4, retained_steps=2)
   scalar_vae, scalar_ppo = _policies()

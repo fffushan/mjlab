@@ -11,6 +11,7 @@ import torch
 
 from .adapter import (
   ActionContract,
+  AdapterError,
   FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
@@ -253,6 +254,7 @@ class BatchedCollectionResult:
   stop_reason: str | None = None
   progress: CollectionProgress | None = None
   unstarted_trials: int = 0
+  abandoned_trials: tuple[tuple[str, str], ...] = ()
 
   @property
   def partial(self) -> bool:
@@ -282,6 +284,7 @@ class TrialSlotScheduler:
     self._blocked_pairs: set[str] = set()
     self._results: dict[str, TrialOutcome] = {}
     self._skipped_ou_pairs: list[str] = []
+    self._abandoned: dict[str, str] = {}
 
   @property
   def active(self) -> dict[int, TrialSpec]:
@@ -294,6 +297,38 @@ class TrialSlotScheduler:
   @property
   def skipped_ou_pairs(self) -> tuple[str, ...]:
     return tuple(self._skipped_ou_pairs)
+
+  @property
+  def abandoned_trials(self) -> tuple[tuple[str, str], ...]:
+    return tuple(self._abandoned.items())
+
+  def abandon(self, slot: int, *, reason: str) -> TrialSpec:
+    """Retire an admitted trial that cannot run and skip the rest of its pair.
+
+    The frozen parity guard proves that this row cannot reproduce its clean
+    partner's initial state.  Retiring only that pair keeps the rest of the
+    schedule running instead of ending the whole collection; the pair and the
+    reason stay visible in the run report.
+    """
+    spec = self._active.pop(slot, None)
+    if spec is None:
+      raise CollectorError(f"slot {slot} is not active")
+    pair_id = spec.pair_id
+    if pair_id:
+      self._blocked_pairs.add(pair_id)
+      kept: list[TrialSpec] = []
+      skipped = 0
+      for pending in self._pending:
+        if pending.pair_id == pair_id and pending.phase == "ou":
+          skipped += 1
+        else:
+          kept.append(pending)
+      self._pending = kept
+      if spec.phase == "ou":
+        skipped += 1
+      self._skipped_ou_pairs.extend([pair_id] * max(skipped, 1))
+    self._abandoned[spec.episode_id] = reason
+    return spec
 
   @property
   def results(self) -> tuple[TrialOutcome, ...]:
@@ -807,7 +842,19 @@ class DiffusionCollector:
             raise CollectorError(
               "OU trial was admitted without its clean partner snapshot"
             )
-          self.env.restore_initial_state_batch(np.asarray([slot]), (snapshots[key],))
+          try:
+            self.env.restore_initial_state_batch(np.asarray([slot]), (snapshots[key],))
+          except AdapterError as exc:
+            # One pair that cannot reproduce its clean partner state is retired
+            # instead of ending the whole worker.  The pair and the exact reason
+            # stay in the run report, so the loss is visible and counted.
+            scheduler.abandon(slot, reason=str(exc))
+            active_specs[slot] = None
+            slot_rows[slot] = []
+            slot_latents[slot] = 0.0
+            if controller_ppo[slot]:
+              controller_ppo[slot] = False
+            continue
           remaining_ou[key] -= 1
           if remaining_ou[key] <= 0:
             # No scheduled OU trial still needs this initial state.
@@ -1080,6 +1127,7 @@ class DiffusionCollector:
       stop_reason,
       progress,
       unstarted_trials,
+      scheduler.abandoned_trials,
     )
 
 
