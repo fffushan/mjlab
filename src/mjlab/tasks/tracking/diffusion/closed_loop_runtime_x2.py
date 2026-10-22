@@ -1027,8 +1027,13 @@ def build_closed_loop_runtime(
   member: str,
   device: str,
   seed: int,
+  compare_reference_arrays: bool = True,
 ) -> ClosedLoopRuntime:
-  """Build one verified private X2 runtime for a selected cohort member."""
+  """Build one verified private X2 runtime for a selected cohort member.
+
+  ``compare_reference_arrays=False`` is for playback, where the teacher ONNX is
+  never executed and the reference motion may be any clip.
+  """
   manifest, cohort = _validate_factory_inputs(manifest_path, repo_root, member, seed)
   env: Any | None = None
   try:
@@ -1040,7 +1045,11 @@ def build_closed_loop_runtime(
       seed=seed,
     )
     audit = validate_live_contract(
-      env, cohort, member, task_id=cohort.manifest.base_task
+      env,
+      cohort,
+      member,
+      task_id=cohort.manifest.base_task,
+      compare_reference_arrays=compare_reference_arrays,
     )
     runtime = X2ClosedLoopRuntime(
       env,

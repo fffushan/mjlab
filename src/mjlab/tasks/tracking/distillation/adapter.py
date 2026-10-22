@@ -545,9 +545,18 @@ def _compare_body_reference_arrays(
 
 
 def audit_live_asset(
-  env: Any, cohort: CohortContract, teacher_id: str
+  env: Any,
+  cohort: CohortContract,
+  teacher_id: str,
+  *,
+  compare_reference_arrays: bool = True,
 ) -> AssetFrameAudit:
-  """Audit compiled frames, numeric body references, and real joint bindings."""
+  """Audit compiled frames, numeric body references, and real joint bindings.
+
+  ``compare_reference_arrays=False`` skips the clip-versus-ONNX body reference
+  comparison.  Playback sets it because the teacher ONNX is never executed
+  there, so an embedded reference that describes another clip is harmless.
+  """
   command = env.command_manager.get_term("motion")
   if not isinstance(command, SegmentMotionCommand):
     raise DistillationError(
@@ -591,7 +600,11 @@ def audit_live_asset(
     )
     for sensor in selected.sensors
   )
-  compared, errors = _compare_body_reference_arrays(selected, tracked_indices)
+  compared, errors = (
+    _compare_body_reference_arrays(selected, tracked_indices)
+    if compare_reference_arrays
+    else ((), ())
+  )
   sensor_names = tuple(sensor.sensor_name for sensor in selected.sensors)
   for sensor_name in sensor_names:
     try:
@@ -1026,6 +1039,7 @@ def validate_live_contract(
   teacher_id: str = "tennis_000",
   *,
   task_id: str | None = None,
+  compare_reference_arrays: bool = True,
 ) -> LiveContractAudit:
   """Reject semantic saved/live mismatches before collecting any labels."""
   teacher = cohort.teacher(teacher_id)
@@ -1059,7 +1073,9 @@ def validate_live_contract(
 
   action_term = env.action_manager.get_term(teacher.actions.term)
   _validate_live_action_term(teacher, action_term)
-  asset = audit_live_asset(env, cohort, teacher_id)
+  asset = audit_live_asset(
+    env, cohort, teacher_id, compare_reference_arrays=compare_reference_arrays
+  )
   _validate_live_control_parameters(env, cohort, teacher_id, action_term)
   return LiveContractAudit(
     teacher_id=teacher_id,
