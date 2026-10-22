@@ -28,6 +28,9 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `vae-sample-budget-implementation.md` | validation | collection-linked VAE sample budgets | implemented and validated |
 | `vae-throughput-defaults-and-collection.md` | validation | throughput defaults and combined reference validation | implemented and validated |
 | `tracking_policy_command_recording.md` | tool note | recording native tracking policy commands and reading the stages | current tool |
+| `x2_joint_pose_dataset_summary.md` | dataset record | latent-free X2 joint-pose dataset: format, storage, location, limitations | prepared; not yet used by training |
+| `x2_joint_pose_datasets.md` | comparison | D1 window dataset versus the raw joint-pose dataset | introduction |
+| `x2_latent_free_joint_space_feasibility.md` | feasibility | latent-free joint-space flow proposal and the S1/S2/S3 plan | plan; S1 done |
 | `tracking_footstep_experiments.md` | experiment log | G1 29DOF mode-15 footstep tracking experiments | 2026-09-11 record; not revalidated |
 | `ACCEPTANCE-20261007.md` | acceptance | difficult-state coverage integration acceptance | supersedes the removed `PARENT-ACCEPTANCE.md` |
 | `beyondmimic_diffusion_d1_throughput_integration.md` | validation | D1 collection and dataset throughput integration | implemented; speed not measured |
