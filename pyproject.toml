@@ -64,6 +64,7 @@ list-envs = "mjlab.scripts.list_envs:main"
 viz-nan = "mjlab.scripts.nan_viz:main"
 export-scene = "mjlab.scripts.export_scene:main"
 distill = "mjlab.scripts.distill:main"
+train-flow = "mjlab.scripts.train_flow:main"
 
 [dependency-groups]
 dev = [
