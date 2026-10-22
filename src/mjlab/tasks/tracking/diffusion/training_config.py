@@ -66,6 +66,16 @@ class TrainingConfig:
   state_loss_weight: float = 1.0
   latent_loss_weight: float = 1.0
   history_state_dropout_probability: float = 0.0
+  # Named state fields raised to pure noise for every row and excluded from the
+  # loss.  The mask removes information the deployed policy cannot obtain, such
+  # as root translation on a robot without a stable world estimator.
+  masked_state_fields: tuple[str, ...] = ()
+  # Per-window probability that the named fields are masked.  1.0 masks every
+  # window; 0.0 disables the mask and keeps the unmasked path bit-identical.
+  masked_state_probability: float = 1.0
+  # Value written into masked channels after normalization.  Zero is the
+  # normalized mean; a larger magnitude is easier to audit in stored tokens.
+  masked_state_fill_value: float = 0.0
   checkpoint_every: int | None = None
 
   def validate(
@@ -194,6 +204,29 @@ class TrainingConfig:
       or self.checkpoint_every <= 0
     ):
       raise TrainingConfigError("checkpoint_every must be a positive integer")
+    fields = tuple(self.masked_state_fields)
+    if fields:
+      from .state import HYBRID_STATE, StateValidationError, state_field_channels
+
+      try:
+        channels = state_field_channels(fields)
+      except StateValidationError as exc:
+        raise TrainingConfigError(f"invalid masked_state_fields: {exc}") from exc
+      if len(channels) >= HYBRID_STATE.dimension:
+        raise TrainingConfigError("masked_state_fields would mask the whole state")
+    if (
+      not isinstance(self.masked_state_probability, (int, float))
+      or isinstance(self.masked_state_probability, bool)
+      or not math.isfinite(float(self.masked_state_probability))
+      or not 0.0 <= float(self.masked_state_probability) <= 1.0
+    ):
+      raise TrainingConfigError("masked_state_probability must be finite and in [0, 1]")
+    if (
+      not isinstance(self.masked_state_fill_value, (int, float))
+      or isinstance(self.masked_state_fill_value, bool)
+      or not math.isfinite(float(self.masked_state_fill_value))
+    ):
+      raise TrainingConfigError("masked_state_fill_value must be a finite number")
 
   def as_dict(self) -> dict[str, object]:
     """Serialize valid fields without authorizing training execution.
@@ -295,6 +328,9 @@ class TrainingConfig:
       "state_loss_weight",
       "latent_loss_weight",
       "history_state_dropout_probability",
+      "masked_state_fields",
+      "masked_state_fill_value",
+      "masked_state_probability",
       "checkpoint_every",
     }
     for name in sorted(ablation_fields):

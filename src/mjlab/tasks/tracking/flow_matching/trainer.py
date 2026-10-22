@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -41,6 +42,7 @@ from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 
 from ..diffusion.contract import DiffusionContract
 from ..diffusion.noising import clean_mask
+from ..diffusion.state import state_field_channels
 from ..diffusion.trainer import (
   ExponentialMovingAverage,
   _as_tokens,
@@ -184,6 +186,20 @@ class FlowTrainer:
     self.history_dropout_generator = _generator(self.device, self.training.seed + 3)
     self._history_dropout_windows = 0
     self._history_total_windows = 0
+    self.state_mask_generator = _generator(self.device, self.training.seed + 4)
+    self._state_mask_windows = 0
+    self._state_mask_total_windows = 0
+    # Optional state-field mask: the named fields are raised to pure noise on
+    # every row and excluded from the loss, so the model cannot read them.
+    masked = tuple(self.training.masked_state_fields)
+    self._state_mask_channels = tuple(state_field_channels(masked) if masked else ())
+    self._loss_channel_weight: Tensor | None = None
+    if self._state_mask_channels:
+      weight = torch.ones(
+        self.contract.token_dimension, dtype=torch.float32, device=self.device
+      )
+      weight[list(self._state_mask_channels)] = 0.0
+      self._loss_channel_weight = weight
     self.identity = _dataset_identity(self.train_dataset)
     self.config_hash = config.sha256()
     self.process_identity = self.process.identity_hash()
@@ -306,9 +322,14 @@ class FlowTrainer:
       "noise_generator": self.noise_generator.get_state(),
       "sampler_generator": self.sampler_generator.get_state(),
       "history_dropout_generator": self.history_dropout_generator.get_state(),
+      "state_mask_generator": self.state_mask_generator.get_state(),
       "history_dropout_counters": {
         "windows": self._history_dropout_windows,
         "total": self._history_total_windows,
+      },
+      "state_mask_counters": {
+        "windows": self._state_mask_windows,
+        "total": self._state_mask_total_windows,
       },
     }
 
@@ -323,6 +344,14 @@ class FlowTrainer:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
       self.noise_generator.set_state(state["noise_generator"])
       self.sampler_generator.set_state(state["sampler_generator"])
+      if "state_mask_generator" in state:
+        self.state_mask_generator.set_state(state["state_mask_generator"])
+      elif self._state_mask_channels and float(
+        self.training.masked_state_probability
+      ) not in (0.0, 1.0):
+        raise FlowTrainerError(
+          "checkpoint lacks the state-mask RNG state for a stochastic mask run"
+        )
       if "history_dropout_generator" in state:
         self.history_dropout_generator.set_state(state["history_dropout_generator"])
       elif float(self.training.history_state_dropout_probability) != 0.0:
@@ -333,6 +362,10 @@ class FlowTrainer:
       if isinstance(counters, Mapping):
         self._history_dropout_windows = int(counters.get("windows", 0))
         self._history_total_windows = int(counters.get("total", 0))
+      mask_counters = state.get("state_mask_counters")
+      if isinstance(mask_counters, Mapping):
+        self._state_mask_windows = int(mask_counters.get("windows", 0))
+        self._state_mask_total_windows = int(mask_counters.get("total", 0))
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
       if isinstance(exc, FlowTrainerError):
         raise
@@ -362,13 +395,22 @@ class FlowTrainer:
 
   def _loader(self) -> DataLoader[Any]:
     sampler = self._sampler()
+    # Window reads are small and scattered in a multi-gigabyte cache.  On a
+    # local NVMe a single in-process reader costs most of a step, so an operator
+    # may overlap the reads with worker processes.  The default stays 0, which
+    # keeps the historical behaviour bit-identical.
+    workers = int(os.environ.get("MJLAB_FLOW_DATALOADER_WORKERS", "0"))
+    if workers < 0:
+      raise FlowTrainerError("MJLAB_FLOW_DATALOADER_WORKERS must be non-negative")
     return DataLoader(
       self.train_dataset,
       batch_size=self.training.microbatch_size,
       sampler=sampler,
       shuffle=sampler is None,
       generator=self.sampler_generator if sampler is None else None,
-      num_workers=0,
+      num_workers=workers,
+      persistent_workers=False,
+      prefetch_factor=4 if workers else None,
       drop_last=False,
     )
 
@@ -426,6 +468,28 @@ class FlowTrainer:
       process=self.process,
       generator=self.noise_generator,
     )
+    state_mask = _history_dropout_mask(
+      batch,
+      float(self.training.masked_state_probability)
+      if self._state_mask_channels
+      else 0.0,
+      generator=self.state_mask_generator,
+      device=self.device,
+    )
+    if self._state_mask_channels and bool(state_mask.any()):
+      # Replace the named fields on the selected windows with their normalized
+      # mean, which is zero.  The token layout is unchanged, the value carries
+      # no sample information, and the levels stay per row because the linear
+      # path is defined per row rather than per channel.
+      channels = list(self._state_mask_channels)
+      tokens_override = noised.tokens.clone()
+      fill = float(self.training.masked_state_fill_value)
+      selected = state_mask[:, None, None]
+      replacement = torch.full_like(tokens_override[..., channels], fill)
+      tokens_override[..., channels] = torch.where(
+        selected, replacement, tokens_override[..., channels]
+      )
+      noised = replace(noised, tokens=tokens_override)
     step_ids = torch.stack((noised.state_levels, noised.latent_levels), dim=-1)
     if not self._fp32_checked:
       prediction = self.model(noised.tokens, step_ids)
@@ -436,8 +500,17 @@ class FlowTrainer:
         prediction = self.model(noised.tokens, step_ids)
       _finite_tensor(prediction, "denoiser output")
     target = clean
-    loss = F.mse_loss(prediction.float(), target, reduction="mean")
+    error = (prediction.float() - target) ** 2
+    if self._loss_channel_weight is None:
+      # Plain channel-mean x0 MSE; unmasked runs keep the original expression.
+      loss = error.mean()
+    else:
+      # Masked channels carry no input information on any row, so they are
+      # excluded from the mean instead of spending capacity on them.
+      weight = self._loss_channel_weight
+      loss = (error * weight).sum() / (weight.sum() * error.shape[0] * error.shape[1])
     _finite_tensor(loss, "loss")
+    self._last_state_mask = state_mask
     return (
       loss,
       prediction.float(),
@@ -546,6 +619,10 @@ class FlowTrainer:
           self._history_total_windows += total_windows
           epoch_dropout_windows += dropout_windows
           epoch_total_windows += total_windows
+          state_mask_flags = getattr(self, "_last_state_mask", None)
+          if state_mask_flags is not None:
+            self._state_mask_windows += int(state_mask_flags.sum().item())
+            self._state_mask_total_windows += int(state_mask_flags.numel())
           metrics = _x0_metrics(
             prediction,
             target,
@@ -663,6 +740,23 @@ class FlowTrainer:
       "effective_batch_size": self.training.effective_batch_size,
       "history_state_dropout_probability": float(
         self.training.history_state_dropout_probability
+      ),
+      "masked_state_fields": list(self.training.masked_state_fields),
+      "masked_state_fill_value": float(self.training.masked_state_fill_value),
+      "masked_state_probability": float(self.training.masked_state_probability),
+      "masked_state_windows": self._state_mask_windows,
+      "masked_state_total_windows": self._state_mask_total_windows,
+      "masked_state_window_fraction": (
+        float(self._state_mask_windows) / float(self._state_mask_total_windows)
+        if self._state_mask_total_windows
+        else 0.0
+      ),
+      "masked_state_channels": list(self._state_mask_channels),
+      "masked_state_fraction_of_state": (
+        float(len(self._state_mask_channels))
+        / float(self.contract.projected_state_dimension)
+        if self._state_mask_channels
+        else 0.0
       ),
       "history_state_dropout_windows": self._history_dropout_windows,
       "history_state_total_windows": self._history_total_windows,

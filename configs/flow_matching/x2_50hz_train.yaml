@@ -31,3 +31,12 @@ training:
   eval_split: validation
   eval_seed: 0
   history_state_dropout_probability: 0.0
+  # Named hybrid-state fields replaced by their normalized mean (zero) on every
+  # row and excluded from the loss.  Use for information the deployed robot
+  # cannot measure, for example root translation with no world estimator.
+  # Accepted names: root_position, root_rot6d, root_linear_velocity,
+  # root_angular_velocity, body_positions, body_linear_velocities.
+  masked_state_fields: []
+  # Constant written into masked channels, in normalized units.  Zero is the
+  # normalized mean; 6.0 is easier to audit because no real sample reaches it.
+  masked_state_fill_value: 0.0

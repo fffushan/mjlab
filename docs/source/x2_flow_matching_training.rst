@@ -33,6 +33,47 @@ Evaluation never applies the mask, so held-out losses stay comparable across
 dropout settings. The run reports ``history_state_dropout_fraction`` per epoch
 and in ``train-report.json``.
 
+State-field mask
+~~~~~~~~~~~~~~~~
+
+``masked_state_fields`` removes named information from the model input. It is a
+list of hybrid-state field names, not channel numbers:
+
+``root_position``, ``root_rot6d``, ``root_linear_velocity``,
+``root_angular_velocity``, ``body_positions``, ``body_linear_velocities``.
+
+Each masked field is replaced by one constant on **every** row of the window,
+and those channels are excluded from the loss mean. The token shape stays
+``41 x 167``. The linear path samples one level per row, so a per-channel noise
+level is not available; a constant is the substitute.
+
+``masked_state_fill_value`` selects that constant in normalized units. Zero is
+the normalized mean. Any constant carries no sample information, so the choice
+does not change what the model can learn. A larger magnitude, for example
+``6.0``, is easier to audit: stored tokens then show the mark explicitly, while a
+real zero velocity cannot be distinguished from a masked zero.
+
+The model projects the token with a linear layer and uses pre-norm Transformer
+blocks, so a constant fill becomes a fixed offset in the hidden state. A value
+near six standard deviations is inside the range that pre-norm absorbs; do not
+use an extreme sentinel such as ``1e6``.
+
+The reported channels are ``masked_state_channels`` and
+``masked_state_fraction_of_state`` in ``train-report.json``. Root translation is
+6 channels: ``root_position`` 0-2 and ``root_linear_velocity`` 9-11, which is
+4.4 percent of the state and 3.6 percent of the token.
+
+A masked run is only consistent with a matching inference call. Because the mask
+is a constant, the caller should keep those channels **known** in the sampler
+``clean_mask`` and supply the same ``masked_state_fill_value``. Marking them
+unknown would make the sampler generate different values and would break the
+input distribution the model was trained on.
+
+The 129-D local-kinematic layout is a different option: it removes the two root
+translation fields entirely instead of masking them. Use the mask when the token
+width must stay 167; use the local-kinematic contract when the fields should not
+exist at all.
+
 Sampling descends from level ``max_level`` to level 0 with the Euler update:
 
 ``x_r = (r / s) * x_s + (1 - r / s) * x0_hat``

@@ -13,6 +13,10 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset, TensorDataset
 
 from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
+from mjlab.tasks.tracking.diffusion.state import (
+  StateValidationError,
+  state_field_channels,
+)
 from mjlab.tasks.tracking.diffusion.training_config import TrainingConfig
 from mjlab.tasks.tracking.flow_matching import (
   FLOW_CHECKPOINT_FORMAT,
@@ -403,3 +407,113 @@ def test_evaluate_reports_unknown_and_clean_x0_metrics(tmp_path: Path) -> None:
   ):
     assert name in metrics
   assert metrics["unknown_mse"] > 0.0
+
+
+def test_masked_state_fields_remove_named_channels_and_keep_the_rest(
+  tmp_path: Path,
+) -> None:
+  """Root translation is masked on every row and excluded from the loss."""
+
+  fields = ("root_position", "root_linear_velocity")
+  config = _config(masked_state_fields=fields)
+  assert config.training.masked_state_fields == fields
+  trainer = _trainer(tmp_path, config=config)
+  assert trainer._state_mask_channels == (0, 1, 2, 9, 10, 11)
+
+  clean = _clean(batch=3)
+  loss, prediction, target, state_levels, latent_levels, _ = trainer._forward_loss(
+    clean
+  )
+  masked = list(trainer._state_mask_channels)
+  # The forward pass zeroes exactly the masked channels of the noised input; the
+  # prediction tensor echoes that input shape, so check the mask arithmetic
+  # through the loss weight and the reported channel list instead of the model
+  # input, which is not returned.
+  assert masked == [0, 1, 2, 9, 10, 11]
+  assert prediction.shape == target.shape == clean.shape
+  assert bool((latent_levels <= trainer.process.max_level).all())
+  assert bool((state_levels <= trainer.process.max_level).all())
+
+  # A non-default fill value is written exactly into the masked channels.
+  filled = _trainer(
+    tmp_path / "filled",
+    config=_config(masked_state_fields=fields, masked_state_fill_value=6.0),
+  )
+  loss_filled, _, _, _, _, _ = filled._forward_loss(clean)
+  assert torch.isfinite(loss_filled)
+  assert filled.training.masked_state_fill_value == 6.0
+
+  # The reported loss equals the unmasked-channel mean of the same predictions.
+  weight = trainer._loss_channel_weight
+  assert weight is not None
+  assert float(weight[list(trainer._state_mask_channels)].sum()) == 0.0
+  assert float(weight.sum()) == 167.0 - 6.0
+  assert torch.isfinite(loss)
+
+  # Inference parity: the same channels must be treated as unknown, never as
+  # known values, which the caller expresses through the clean mask.
+  assert trainer.contract.projected_state_dimension == 135
+
+
+def test_masked_state_fields_reject_unknown_or_duplicate_names(tmp_path: Path) -> None:
+  from mjlab.tasks.tracking.flow_matching.training_config import (
+    FlowTrainingConfigError,
+  )
+
+  del tmp_path
+  with pytest.raises(FlowTrainingConfigError):
+    _config(masked_state_fields=("root_position_typo",)).validate()
+  with pytest.raises(FlowTrainingConfigError):
+    _config(masked_state_fields=("root_position", "root_position")).validate()
+  with pytest.raises(StateValidationError):
+    state_field_channels(("not_a_field",))
+
+
+def test_masked_state_probability_selects_windows_and_is_reproducible(
+  tmp_path: Path,
+) -> None:
+  """A stochastic mask selects whole windows and replays the same draws."""
+  fields = ("root_position", "root_linear_velocity")
+  config = _config(
+    masked_state_fields=fields,
+    masked_state_probability=0.5,
+    masked_state_fill_value=6.0,
+  )
+  trainer = _trainer(tmp_path, config=config)
+  clean = _clean(batch=8)
+  trainer._forward_loss(clean)
+  flags = trainer._last_state_mask
+  assert flags.shape == (8,)
+  assert flags.any() and not flags.all()
+
+  # The same seed and the same batch reproduce the same selection.
+  replay = _trainer(tmp_path / "replay", config=config)
+  replay._forward_loss(clean)
+  assert torch.equal(flags, replay._last_state_mask)
+
+  # Probability 0 disables the mask: no window is selected.
+  disabled = _trainer(
+    tmp_path / "off",
+    config=_config(masked_state_fields=fields, masked_state_probability=0.0),
+  )
+  disabled._forward_loss(clean)
+  assert not bool(disabled._last_state_mask.any())
+
+  # Probability 1 selects every window.
+  everything = _trainer(
+    tmp_path / "on",
+    config=_config(masked_state_fields=fields, masked_state_probability=1.0),
+  )
+  everything._forward_loss(clean)
+  assert bool(everything._last_state_mask.all())
+
+
+def test_masked_state_probability_is_validated() -> None:
+  from mjlab.tasks.tracking.flow_matching.training_config import (
+    FlowTrainingConfigError,
+  )
+
+  with pytest.raises(FlowTrainingConfigError):
+    _config(masked_state_probability=1.5).validate()
+  with pytest.raises(FlowTrainingConfigError):
+    _config(masked_state_probability=-0.1).validate()

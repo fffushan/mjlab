@@ -466,6 +466,25 @@ def world_to_hybrid_windows(
   )
 
 
+def state_field_channels(fields: Iterable[str]) -> tuple[int, ...]:
+  """Resolve packed-state channel indices for the named hybrid state fields.
+
+  Used by the training-time state mask: the caller names fields, never raw
+  channel numbers, so a layout change cannot silently move a mask.  Unknown
+  names, duplicates and empty names fail closed.
+  """
+  names = tuple(fields)
+  if any(not isinstance(name, str) or not name for name in names):
+    raise StateValidationError("masked state fields must be non-empty names")
+  if len(set(names)) != len(names):
+    raise StateValidationError(f"masked state fields repeat a name: {names}")
+  channels: list[int] = []
+  for name in names:
+    item = HYBRID_STATE.field(name)
+    channels.extend(range(item.start, item.stop))
+  return tuple(sorted(channels))
+
+
 def _state_vector(name: str, value: np.ndarray, width: int) -> np.ndarray:
   result = np.asarray(value, dtype=np.float64)
   if result.ndim == 0 or result.shape[-1] != width:
@@ -606,6 +625,7 @@ __all__ = [
   "hybrid_to_world",
   "local_kinematic_to_hybrid",
   "local_kinematic_to_world",
+  "state_field_channels",
   "world_to_hybrid",
   "world_to_hybrid_windows",
   "world_to_local_kinematic",
