@@ -1,8 +1,9 @@
 # Preview-aware VAE to latent flow matching: implementation plan
 
 Date: 2026-10-20 (+08).
-Status: local port accepted. The operator authorizes commit, isolated server staging, and the bounded smoke in section 11.
-Full collection and flow training remain unauthorized.
+Status: local port, final-VAE data-path smoke, fresh statistics/caches, and bounded flow-training smoke are accepted.
+Original launcher/audit failures remain preserved; see sections 12 and 13.
+Full collection and long training remain unauthorized.
 Model for every delegated stage: `ds-oc/deepseek-flash:max`.
 Source baseline: `948ae52c177bcb6800bf25581a9ca51f5065aafe` in `mjlab`.
 
@@ -281,3 +282,156 @@ Acceptance:
 If the child lacks monitored execution tools, it must ask the parent to run the prepared command.
 Use native workflow scheduling for a pending checkpoint. Never wait with an untracked sleep loop.
 Stop and ask on a code defect, missing artifact, identity mismatch, new installation, or budget change.
+
+## 12. Final-VAE smoke acceptance, 2026-10-20 (+08)
+
+**Accepted scope:** real simulator collection and offline data validation for eight selected motions.
+Application source stays at `295402f7374e772a62e74f6cef012cd614eb163f`.
+No runtime source changed after that commit. No second GPU rollout ran.
+
+The final VAE completed at iteration 10000 with `exit=0`.
+Its trainer and seven collectors exited before the smoke started.
+Final checkpoint:
+`/home/fushan/mjlab/logs/distillation/x2-multimotion-vae-10k-resume2-20261019/train/checkpoint-final.pt`.
+
+| Bound input | SHA-256 |
+| --- | --- |
+| Final VAE, 4,344,228,754 bytes | `9d069b4552ec2a25990160477a99de24c3025c39ee1221660ebaf25b54a5ee00` |
+| 144-member cohort manifest | `cd597b1cf1f734562c37295233f2165aa62399544aee485dff5d47075dceaf21` |
+| Smoke data contract | `558de16628fd67df12554c54dc0b6826113a8bf4fa0654b55960872c8b9e6b1a` |
+
+### Validation evidence
+
+- Original monitored driver: 20:53:03–20:59:43 (+08), within its 900-second cap.
+- Collection: exit 0, 184.511 seconds, no timeout, sampled GPU memory peak 639 MiB.
+- All 48 trials qualified under the existing five-second criteria. No trials were rejected or skipped.
+- Six trials ran per motion: one seed, three start phases, and clean/perturbed pairs.
+- Outcome labels: 16 VAE-only trials and 32 VAE-to-standing-recovery trials.
+- Stored rows: 12000; VAE rows 7998; recovery rows 4002.
+- Accepted rows: 5146; verification-only rows: 6854. Recovery rows are not latent-training data.
+- Stored data: 14,080,051 bytes, or 13.4 MiB.
+- Store inspection, action-arithmetic replay, and window building passed.
+- Valid raw windows: **3210**, each **41x167**; train 2656, validation 224, test 330.
+- Every selected motion has valid windows, ranging from 384 to 440.
+- Corrected offline audit: **21/21 checks true**, no errors, exit 0 in 37.823 seconds.
+- Parent verified the audit hashes, exact correction, unchanged row/window counts, and committed handoff code.
+
+### Audit-only false failure
+
+The original driver exits 1 at its final audit. That failed result remains preserved.
+Its assertion incorrectly requires the last VAE frame to equal the first recovery frame.
+The VAE row records the pre-action frame. Recovery starts at the following post-step frame.
+For `single_000`, the last VAE row has frame 451 and the first recovery row has frame 452.
+
+The corrected assertion requires an exact one-frame advance, the clip's final frame, and the boundary marker.
+All 32 handoff trials meet these conditions. No tolerance or collection threshold changes.
+The corrected audit uses the same saved store and writes a separate `audit-corrected.json`.
+Original `audit.json`, `exit.status`, and `logs/audit.log` remain unchanged and failed.
+The workflow accepts the collected data and corrected audit, not an invented successful original exit status.
+
+### Artifacts, cleanup, and limits
+
+Remote worktree: `/home/fushan/mjlab-preview-vae-smoke-20261020`.
+Data: `logs/diffusion/preview-vae-smoke-20261020/` under that worktree.
+Contract and driver logs: `logs/diagnostics/preview-vae-smoke-20261020/` under that worktree.
+Local evidence:
+
+- [Original monitor log](../../logs/diagnostics/preview-flow-port-20261020/smoke-monitor.log).
+- [Final worker audit](../../logs/diagnostics/preview-flow-port-20261020/smoke-final-evidence/worker-final-audit.md).
+- [Corrected audit](../../logs/diagnostics/preview-flow-port-20261020/smoke-final-evidence/audit-corrected.json).
+- [Preserved original audit](../../logs/diagnostics/preview-flow-port-20261020/smoke-final-evidence/audit.json).
+- [Preserved original exit status](../../logs/diagnostics/preview-flow-port-20261020/smoke-final-evidence/exit.status).
+
+Parent cleanup check at 21:00:38 (+08), and worker recheck at 21:05 (+08), find no smoke processes.
+All eight GPUs return to 1 MiB and 0% utilization.
+Main NAS branch, HEAD, and workstream dirty-file status snapshots match before and after.
+The transient queue lock is excluded from that status comparison. No queue operation was performed.
+
+Limits: eight of 144 motions, one seed, bounded trials, no hardware or general tracking-quality claim.
+The dynamic run proves model loading and collection with the 130/99/32/31 layout.
+Preview clamping and deterministic mean-latent lineage also use committed source and earlier critical-test evidence.
+This smoke does not independently re-decode saved rows or record a second live preview-value probe.
+No new statistics, token caches, flow training, or trained-flow continuation were produced.
+Next: separately authorize collection scope, train-only statistics, fresh caches, and a bounded flow-training smoke.
+
+## 13. Fresh statistics/cache and flow-training smoke, 2026-10-20 (+08)
+
+The operator says: “Ok, launch them” after the section 12 handoff.
+Authorization covers fresh train-only statistics, new token caches, and a bounded flow-training smoke.
+It does not authorize more collection, long training, simulator evaluation, or a model change.
+
+Use the accepted eight-clip store and original split assignments as read-only inputs.
+Copy the small store into a separate dataset directory. Keep original artifacts and failed audit files unchanged.
+Use the same final VAE and data-contract hashes from section 12.
+
+Execution plan, Workflow #21:
+
+- Source: committed `295402f73` in `/home/fushan/mjlab-preview-vae-smoke-20261020`.
+- New root: `logs/flow/preview-vae-flow-smoke-25updates-20261020/` under that worktree.
+- Build a persisted window index; fit statistics from **2656 train windows only**.
+- Build and validate fresh caches for train 2656, validation 224, and test 330 windows.
+- Use four CPU workers for index/statistics and one cache writer. Cache ceiling: 1 GiB per split.
+- Run **25 optimizer updates** on one currently idle GPU, with no resume or old flow weights.
+- Keep `configs/flow_matching/x2_50hz_train.yaml` unchanged except for its artifact-contract path in a private copy.
+- Preserve the 512 effective batch, 128 microbatch, accumulation 4, BF16, and 10000-update warmup.
+- Reload `checkpoint-last.pt` and generate **8 validation windows** with the existing default Euler sampler.
+- Limit the whole command to 900 seconds, plus brief exact-process cleanup.
+- Require finite metrics, exact update/window counts, saved/reloaded checkpoint identity, and unchanged original input hashes.
+- Preserve all stage logs and exit codes. Stop on failure; do not change code or increase the budget automatically.
+
+Preparation result: index, train-only statistics, cache build, and cache validation each exit 0.
+Monitor #6 then stops on a launcher-only report-path assumption, before GPU training.
+`build-token-cache --validate-only` deliberately ignores `--json` and prints its report to standard output.
+The continuation consumes the saved successful output. It does not rebuild any prepared artifact.
+Monitor #7 runs only the unstarted training and generation stages.
+The original overall deadline remains **21:38:45 (+08)**. The first failed log and exit status remain preserved.
+
+The short warmup-only training run checks execution and checkpoint handling, not learning quality.
+No training-quality or deployment claim follows from generation metrics or baseline comparisons.
+
+### Accepted result
+
+Workflow #21 is accepted after direct artifact and cleanup checks.
+Monitor #6 preserves the preparation-launcher failure. Monitor #7 exits 0 for the remaining stages.
+No successful preparation stage or training update was repeated.
+The original command starts at **21:23:45 (+08)**. The continuation finishes at **21:29:17 (+08)**.
+This is within the original **21:38:45 (+08)** deadline.
+
+| Check | Result |
+| --- | --- |
+| Train-only statistics | 2656 training windows; no validation/test fitting |
+| Fresh cache shapes | train `(2656,41,167)`, validation `(224,41,167)`, test `(330,41,167)` |
+| Cache data | float32; all values finite; validation passes |
+| Training | exactly 25 optimizer updates; exit 0; 51.752 seconds |
+| Checkpoint reload/generation | 8 validation windows, 20 default Euler calls; exit 0; 17.996 seconds |
+| Sampled training GPU memory peak | 2125 MiB on physical GPU 0 |
+| Source and original inputs | source `295402f73` tracked-clean; input hashes unchanged |
+| Cleanup | no owned flow processes; all eight GPUs 1 MiB / 0% at 21:30:34 (+08) |
+
+Identities:
+
+- Statistics: `1dd4d8166dc982370e0f6c1edb5a94d1393955070f57e9c3fc2258614e682707`.
+- Train cache: `55e704cec2d0aaad6b6d3d80fa416ed0dc6b8244d4f55553c16eb459cac8b669`.
+- Validation cache: `d6e54b0dd300899cfdaa9d124ad0d3e0a6011b9cca77d39ed7272536ace27723`.
+- Test cache: `110b46e4bcc2b09a24234bef6eeac9376911ece5a5f1574a1372fcac0acf2e5d`.
+- `checkpoint-last.pt`: `44de8d4b4760c6bbe8de29db2d489fc3389b327e10cc60358bcf417d1d73ef34`, 322260127 bytes.
+- Generated sample: `53fb0234d563bb7e8fa0d0adb5d802309c714650fdfdb3c39d3f76a2247a9a68`.
+
+Training loss is 2.295902; best validation loss is 2.523321.
+All generation baseline gates are false on the eight sampled validation windows.
+The 25-update run remains inside the unchanged 10000-update warmup; this is not a learned-policy quality pass.
+It proves data preparation, optimization, checkpoint saving/loading, identity checks, and finite generation execute together.
+
+Remote run: `/home/fushan/mjlab-preview-vae-smoke-20261020/logs/flow/preview-vae-flow-smoke-25updates-20261020/`.
+The dataset is under `dataset/`, the model under `train25/`, and the launcher evidence under `control/`.
+Local evidence:
+
+- [Original preparation log](../../logs/diagnostics/preview-flow-port-20261020/flow-training-smoke/monitor.log).
+- [Successful continuation log](../../logs/diagnostics/preview-flow-port-20261020/flow-training-smoke/monitor-continue.log).
+- [Result summary](../../logs/diagnostics/preview-flow-port-20261020/flow-training-smoke/evidence/summary.json).
+- [Training report](../../logs/diagnostics/preview-flow-port-20261020/flow-training-smoke/evidence/train.json).
+- [Generation report](../../logs/diagnostics/preview-flow-port-20261020/flow-training-smoke/evidence/generation-smoke.json).
+
+Next: choose and authorize the 144-motion collection and training budgets.
+These smoke statistics cover eight clips only. Refit statistics and rebuild caches for the expanded dataset.
+No full collection, long training, trained-flow simulator test, or deployment has started.
