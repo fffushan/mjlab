@@ -82,6 +82,15 @@ _QUATERNION_WIDTH = 4
 HISTORY_TOLERANCE = 1.0e-4
 """Largest allowed change of the conditioning rows a sampler returns."""
 
+KEYFRAME_CURRENT = "current"
+"""The anchor row: the first row a window generates, and the row the tracker calls now."""
+
+KEYFRAME_LAST = "last"
+"""The last row of the window: the chunk's final frame."""
+
+KEYFRAME_NAMES = (KEYFRAME_CURRENT, KEYFRAME_LAST)
+"""Row positions a keyframe pin can name, resolved from the model geometry."""
+
 
 class RolloutError(ValueError):
   """A rollout input, checkpoint or sampler does not match its contract."""
@@ -399,8 +408,15 @@ class WindowSampler(Protocol):
   channels: int
 
   def sample(
-    self, history: Tensor, *, steps: int, generator: torch.Generator
-  ) -> Tensor: ...
+    self,
+    history: Tensor,
+    *,
+    steps: int,
+    generator: torch.Generator,
+    pinned: Mapping[int, Tensor] | None = None,
+  ) -> Tensor:
+    """Return one window; ``pinned`` rows must also come back unchanged."""
+    ...
 
 
 class JointPoseFlowSampler:
@@ -451,7 +467,12 @@ class JointPoseFlowSampler:
     self._device = device
 
   def sample(
-    self, history: Tensor, *, steps: int, generator: torch.Generator
+    self,
+    history: Tensor,
+    *,
+    steps: int,
+    generator: torch.Generator,
+    pinned: Mapping[int, Tensor] | None = None,
   ) -> Tensor:
     """Generate one window from clean history, then return it on the CPU.
 
@@ -459,6 +480,12 @@ class JointPoseFlowSampler:
     start as pure Gaussian at ``max_level``; the uniform integer grid descends
     in ``steps`` denoiser calls.  The mask marks whole rows known or unknown, so
     the state/latent split the sampler infers cannot change any step id.
+
+    ``pinned`` holds extra clean rows by row index, in normalized channels.  They
+    are the inpainting surface: the sampler restores them at level 0 after every
+    step, so the generated rows have to reach them.  The model was trained with
+    clean rows only in the history, so a pinned future row is an inference-time
+    request, not a trained behaviour.
     """
     if not isinstance(history, Tensor):
       raise RolloutError("history must be a torch tensor")
@@ -478,6 +505,19 @@ class JointPoseFlowSampler:
       device=self._device,
     )
     clean[0, : self.past_steps] = history.to(device=self._device, dtype=torch.float32)
+    if pinned:
+      for row, values in pinned.items():
+        index = _index(row, "pinned row")
+        if not self.past_steps <= index < self.window_steps:
+          raise RolloutError(
+            f"pinned row {index} must lie in [{self.past_steps}, {self.window_steps})"
+          )
+        tensor = torch.as_tensor(values, dtype=torch.float32, device=self._device)
+        if tuple(tensor.shape) != (self.channels,):
+          raise RolloutError(
+            f"pinned row {index} must be [{self.channels}], got {tuple(tensor.shape)}"
+          )
+        clean[0, index] = tensor
     if not bool(torch.isfinite(clean).all()):
       raise RolloutError("history contains NaN or Inf")
     mask = torch.zeros(
@@ -486,6 +526,8 @@ class JointPoseFlowSampler:
       device=self._device,
     )
     mask[:, : self.past_steps] = True
+    if pinned:
+      mask[0, list(pinned)] = True
     grid = FlowGrid.uniform(calls=calls, max_level=self.max_level)
     with torch.no_grad():
       sample, _ = sample_trajectory(
@@ -661,6 +703,8 @@ class ChunkRecord:
   overlap_rms_rad: float | None
   joint_drift_rms_rad: float | None
   yaw_drift_deg: float | None
+  pinned: tuple[int, ...] = ()
+  seam_rms_rad: float | None = None
 
 
 @dataclass(frozen=True)
@@ -746,6 +790,46 @@ def _wrapped_degrees(delta_rad: float) -> float:
   return float(np.rad2deg(np.arctan2(np.sin(delta_rad), np.cos(delta_rad))))
 
 
+def parse_keyframes(spec: str) -> tuple[str, ...]:
+  """Resolve one keyframe request into the row names to pin.
+
+  ``"none"`` or an empty string pins nothing.  Otherwise a comma-separated list
+  of :data:`KEYFRAME_NAMES`, in any order and without duplicates.  The names are
+  row positions, resolved from the model geometry by :func:`rollout`, so they do
+  not depend on the window size.
+  """
+  if not isinstance(spec, str):
+    raise RolloutError("keyframes must be a string")
+  text = spec.strip().lower()
+  if text in ("", "none"):
+    return ()
+  names = [item.strip() for item in text.split(",") if item.strip()]
+  unknown = [name for name in names if name not in KEYFRAME_NAMES]
+  if unknown:
+    raise RolloutError(
+      f"unknown keyframes {unknown}; choose none or {', '.join(KEYFRAME_NAMES)}"
+    )
+  if len(set(names)) != len(names):
+    raise RolloutError(f"keyframes {spec!r} repeats a name")
+  return tuple(name for name in KEYFRAME_NAMES if name in names)
+
+
+def _reference_row(
+  clip: ClipArrays,
+  frame: int,
+  anchor_yaw: float,
+  normalization: ChannelNormalization,
+  channels: int,
+) -> np.ndarray:
+  """Return one normalized clip row expressed in the window's anchor frame."""
+  row = np.empty((1, channels), dtype=np.float64)
+  quat = np.asarray(clip.root_quat_wxyz[frame], dtype=np.float64)
+  row[0, ROOT_ROT6D] = quat_to_6d(quat[None, :])[0]
+  row[0, JOINT_POSITIONS] = np.asarray(clip.joint_pos[frame], dtype=np.float64)
+  row[0, JOINT_VELOCITIES] = np.asarray(clip.joint_vel[frame], dtype=np.float64)
+  return _normalize(normalization, rotate_rows(row, quat_from_yaw(-anchor_yaw)))[0]
+
+
 def rollout(
   *,
   clip: ClipArrays,
@@ -756,6 +840,7 @@ def rollout(
   steps: int,
   generator: torch.Generator,
   drift_limit: float | None = None,
+  keyframes: str = "none",
 ) -> RolloutResult:
   """Generate one reference series from one clip, chunk by chunk.
 
@@ -766,6 +851,13 @@ def rollout(
 
   The series stops at ``target_frames`` rows, or after the first chunk whose
   joint drift against the clip exceeds ``drift_limit`` when that limit is given.
+
+  ``keyframes`` pins reference rows inside every window: ``"current"`` fixes the
+  anchor row, ``"last"`` fixes the chunk's final row, and both are given as a
+  comma-separated list.  A pinned row is the recorded clip frame for the same
+  absolute frame, so the chunk becomes a bridge between two real poses.  Pin
+  both to keep the value: with ``stride = window - past - 1`` the last row of a
+  chunk is the anchor row of the next, and the loop rewrites it.
   """
   past = _index(sampler.past_steps, "sampler.past_steps")
   window = _index(sampler.window_steps, "sampler.window_steps")
@@ -811,6 +903,13 @@ def rollout(
     if not np.isfinite(limit) or limit < 0.0:
       raise RolloutError("drift_limit must be finite and non-negative")
 
+  keyframe_names = parse_keyframes(keyframes)
+  keyframe_rows: dict[int, str] = {}
+  if KEYFRAME_CURRENT in keyframe_names:
+    keyframe_rows[past] = KEYFRAME_CURRENT
+  if KEYFRAME_LAST in keyframe_names:
+    keyframe_rows[window - 1] = KEYFRAME_LAST
+
   stride = window - past - 1
   span = max(0, frames - window)
   chunk_count = (span + stride - 1) // stride + 1
@@ -835,13 +934,40 @@ def rollout(
     history = series[centre - past : centre]
     local = rotate_rows(history, quat_from_yaw(-anchor_yaw))
     normalized = _normalize(normalization, local)
+    pinned: dict[int, np.ndarray] = {}
+    for row in keyframe_rows:
+      frame = start + row
+      if frame >= clip.rows:
+        # The clip has run out, so that keyframe does not exist.
+        continue
+      pinned[row] = _reference_row(clip, frame, anchor_yaw, normalization, channels)
+    seam = None
+    if past in pinned and previous is not None:
+      # How far the pinned pose sits from the value the previous chunk wrote at
+      # the same frame: the snap the pin introduces at the seam.
+      local_previous = rotate_rows(previous[None, :], quat_from_yaw(-anchor_yaw))
+      seam = _rms(
+        normalization.denormalize(local_previous)[0, JOINT_POSITIONS]
+        - normalization.denormalize(pinned[past][None, :])[0, JOINT_POSITIONS]
+      )
     sampled = sampler.sample(
       torch.from_numpy(np.ascontiguousarray(normalized, dtype=np.float32)),
       steps=calls,
       generator=generator,
+      pinned={
+        row: torch.from_numpy(np.ascontiguousarray(row_values, dtype=np.float32))
+        for row, row_values in pinned.items()
+      },
     )
     values = _sampled_window(sampled, window, channels)
-    deviation = 0.0 if past == 0 else float(np.max(np.abs(values[:past] - normalized)))
+    checks: list[tuple[np.ndarray, np.ndarray]] = []
+    if past:
+      checks.append((np.arange(past), normalized))
+    for row, row_values in pinned.items():
+      checks.append((np.array([row]), row_values[None, :]))
+    deviation = 0.0
+    for rows, expected in checks:
+      deviation = max(deviation, float(np.max(np.abs(values[rows] - expected))))
     if deviation > HISTORY_TOLERANCE:
       raise RolloutError(
         f"chunk {index} changed its conditioning rows by {deviation:.3g}, above "
@@ -876,6 +1002,8 @@ def rollout(
         overlap_rms_rad=overlap,
         joint_drift_rms_rad=drift,
         yaw_drift_deg=yaw_drift,
+        pinned=tuple(sorted(pinned)),
+        seam_rms_rad=seam,
       )
     )
     if limit is not None and drift is not None and drift > limit:
@@ -898,6 +1026,9 @@ def rollout(
 
 
 __all__ = [
+  "KEYFRAME_CURRENT",
+  "KEYFRAME_LAST",
+  "KEYFRAME_NAMES",
   "ChunkRecord",
   "ClipArrays",
   "HISTORY_TOLERANCE",
@@ -908,6 +1039,7 @@ __all__ = [
   "encode_window",
   "joint_pose_flow",
   "matrix_from_quat",
+  "parse_keyframes",
   "quat_from_6d",
   "quat_from_yaw",
   "quat_mul",

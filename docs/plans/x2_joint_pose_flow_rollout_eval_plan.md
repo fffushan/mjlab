@@ -1,7 +1,9 @@
 # X2 joint-pose flow: offline rollout to closed-loop playback (MVP)
 
 Date: 2026-10-23 (+08).
-Status: plan, approved for implementation. No code written, no run, no checkpoint loaded.
+Status: implemented and validated on 2026-10-23. Code, tests and the first
+measurement are recorded in `docs/reports/x2_joint_pose_flow_rollout_mvp.md`;
+this document keeps the decisions, the contract and the runbook.
 Scope: one tool that turns a trained window-generating flow model and one reference
 clip into one long reference motion file, then runs the frozen X2 multi-motion
 teacher on that file in closed loop, with a recorded-clip control arm.
@@ -81,6 +83,7 @@ The **export** stage is joint-pose specific, because the body substitution needs
 | `src/mjlab/tasks/tracking/joint_pose/rollout.py` | window codec, `WindowSampler` protocol, `joint_pose_flow` backend, chunk loop, diagnostics |
 | `src/mjlab/scripts/joint_pose_rollout.py` | tyro CLI, npz writer, control file, JSON record |
 | `tests/test_joint_pose_flow_rollout.py` | CPU tests, tiny checkpoint fixture, toy-schema model |
+| `scripts/play_reference.py` | reference-only kinematic playback; added after the first measurement, see 7.4 |
 | `docs/reports/x2_joint_pose_flow_rollout_mvp.md` | evidence and limits |
 
 Two untracked files in this worktree, `scripts/export_x2_joint_pose_bundle.py` and
@@ -185,35 +188,126 @@ pair.
 
 All tests run on CPU with a tiny model. No dataset directory is needed.
 
-## 7. Commands
+## 7. Runbook
+
+Prerequisites: one joint-pose flow checkpoint plus its `projection.npz`, one
+tracking clip, and the frozen teacher checkpoint with its `params/env.yaml`.
+The arms used below are staged at `~/data/joint-pose-flow-20261023/<arm>/`.
+
+### 7.1 Generate the pair
 
 ```bash
-# M3: build the pair
+C=~/data/joint-pose-flow-20261023/400k-b512-mask02-20261022
 uv run python -m mjlab.scripts.joint_pose_rollout \
-  --checkpoint-file /home/fushan/runs/joint-pose-flow/<arm>/model_0400000.pt \
-  --projection /home/fushan/data/mjlab-latent-free-144/data/projection.npz \
+  --checkpoint-file $C/model_0400000.pt \
+  --projection $C/projection.npz \
   --motion-file data/tennis/single_000_zhanghongyu_agibot_x2_tracking.npz \
-  --start-frame 0 --target-frames 453 --steps 20 --seed 0 \
+  --start-frame 0 --target-frames 453 --steps 20 --seed 0 --device cuda:0 \
   --output-dir logs/diagnostics/joint-pose-rollout-<date>/single_000
-
-# visual arm
-uv run play Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion \
-  --checkpoint-file logs/diagnostics/x2-multi-motion-ppo-8gpu-resume-20k-20261014/training/agibot_x2_multi_motion_tracking/2026-10-14_21-06-44_all-tennis-8192x8-resume-20k/model_19999.pt \
-  --motion-file <out>/generated.npz
-
-# numeric arm, both files, same seed
-uv run python scripts/evaluate_tracking_policy.py \
-  --checkpoint-file <same teacher>/model_19999.pt \
-  --motion-file <out>/generated.npz \
-  --task Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion \
-  --num-envs 512 --seed 0 --output-json <out>/generated-eval.json
 ```
 
-`--projection` is optional; it defaults to the `data_dir` recorded in the
-checkpoint, and the trained arms record a `data_dir` that no longer exists, so
-pass it explicitly for them. The evaluator's default task is the G1 task, so
-`--task` is mandatory here. `play` needs `params/env.yaml` beside the teacher
-checkpoint to restore `lookahead_s 0.2`; without it the actor width is wrong.
+Writes `generated.npz`, `control.npz` and `rollout.json`. 453 frames take about
+6 s, most of it process start.
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--checkpoint-file` | joint-pose flow checkpoint | required |
+| `--motion-file` | tracking clip | required |
+| `--output-dir` | output directory | required |
+| `--projection` | `projection.npz` with `mean` and `std` | `<checkpoint data_dir>/projection.npz` |
+| `--start-frame` | first clip frame written | `0` |
+| `--target-frames` | rows wanted in both files | clip length − start frame |
+| `--steps` | denoiser calls per chunk | `20` |
+| `--keyframes` | `none`, or `current`, `last`, `current,last`; pins reference rows inside every window | `none` |
+| `--parameters` | `auto`, `ema`, `model` | `auto` |
+| `--drift-limit` | stop early above this joint drift, radians | off |
+| `--device` | `cuda:0` or `cpu` | `cpu` |
+
+`--projection` is required for these arms: the checkpoint records
+`data_dir: /tmp/joint-pose-144/data`, which does not exist. Any clip under
+`data/tennis/single_*.npz` works; keep `start_frame + target_frames` inside the
+clip.
+
+`--keyframes` pins recorded clip rows inside every generated window. `current`
+is row `past_steps` of the window, the anchor row the tracker calls now; `last`
+is row `window_steps - 1`. Both names resolve from the model geometry, so they
+stay correct for a different window size. Pin both: with `stride = window -
+past - 1` the last row of a chunk is the anchor row of the next, and the loop
+rewrites it, so pinning only `last` loses the value one chunk later. A pinned
+row is the clip frame at the same absolute frame, expressed in the window's
+anchor frame, so each chunk becomes a bridge between two real poses and the
+heading is re-anchored on the reference every `stride` frames. The model was
+trained with clean rows only in the history, so this is an inference-time
+request, not a trained behaviour. Each chunk reports `pinned` and
+`seam_rms_rad`, the snap between the generated history and the pinned pose.
+
+### 7.2 Read the record first
+`rollout.json` holds one entry per chunk with `joint_drift_rms_rad` and
+`yaw_drift_deg` against the clip. A large chunk-0 value means the checkpoint is
+not usable and a longer rollout will not help. On `single_000` at step 400000
+chunk 0 is 0.067 rad and the heading error passes 45 degrees at frame 183.
+
+### 7.3 Closed-loop arms
+
+Visual, with the frozen teacher:
+
+```bash
+T=logs/diagnostics/x2-multi-motion-ppo-8gpu-resume-20k-20261014/training/agibot_x2_multi_motion_tracking/2026-10-14_21-06-44_all-tennis-8192x8-resume-20k/model_19999.pt
+uv run play Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion \
+  --checkpoint-file $T \
+  --motion-file logs/diagnostics/joint-pose-rollout-<date>/single_000/generated.npz
+```
+
+`play` needs `params/env.yaml` beside the checkpoint to restore `lookahead_s 0.2`;
+without it the actor width is wrong. The viewer has no exit condition, so close
+the window.
+
+Numeric, both arms, same seed:
+
+```bash
+for arm in control generated; do
+  uv run python scripts/evaluate_tracking_policy.py \
+    --checkpoint-file $T \
+    --motion-file logs/diagnostics/joint-pose-rollout-<date>/single_000/$arm.npz \
+    --task Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion \
+    --num-envs 512 --seed 0 \
+    --output-json logs/diagnostics/joint-pose-rollout-<date>/single_000/$arm-eval.json
+done
+```
+
+The evaluator's default task is the G1 task, so `--task` is mandatory. Without
+the control arm the generated number means nothing.
+
+### 7.4 Reference-only playback
+
+`scripts/play_reference.py` shows the reference alone: it writes the pose into
+`mj_forward` every frame and runs no physics, no policy and no episode, so the
+walkthrough does not stop when a reference would make the robot fall. Playback
+repeats until the window is closed, and the camera tracks the pelvis.
+
+```bash
+uv run python scripts/play_reference.py --motion-file <out>/generated.npz
+uv run python scripts/play_reference.py --motion-file <out>/control.npz
+```
+
+| Flag | Effect |
+|---|---|
+| `--speed` | playback rate, `0.5` is half speed |
+| `--passes N` | fixed number of passes, `0` repeats forever |
+| `--once` | one pass, then hold the last pose |
+| `--start-frame`, `--end-frame` | frame range |
+| `--free-camera` | disable pelvis tracking |
+| `--check-only` | verify and print, open no window |
+| `--allow-mismatch` | play despite a failed layout check |
+
+The tool checks itself before playing: it sets `qpos` from the file, runs
+forward kinematics and compares with the stored `body_pos_w`. Exit 2 means no
+sampled frame reproduces its stored bodies, so the joint order or the root
+layout is wrong. A generated file matches at its clip-prefix rows and disagrees
+later, which is reported and allowed: on `single_000` the worst mismatch is
+0.48 m while the best is 0.00 mm, because the body channels are the clip's and
+the joints are the model's. The viewer therefore shows the model's joints under
+the clip's root pose, and feet leave the floor where that mismatch is large.
 
 ## 8. Limits the report must state
 

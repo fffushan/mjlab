@@ -12,7 +12,20 @@ Added
   diagnostics. The generated file takes its body channels from the recorded
   clip rows for the same absolute frames, because the 68-channel window carries
   no root translation. Generation is open loop: no simulator and no robot is
-  involved. See ``docs/plans/x2_joint_pose_flow_rollout_eval_plan.md``.
+  involved. ``--keyframes current,last`` pins the anchor row and the window's
+  last row to the reference, which bounds heading drift at the cost of a
+  measured seam at every chunk.
+  See ``docs/plans/x2_joint_pose_flow_rollout_eval_plan.md``.
+
+- Added ``scripts/play_reference.py``, a kinematic playback of one tracking
+  reference. It writes the file's root pose and joint angles into the X2 model
+  every frame and renders, with no physics, no policy and no episode reset, so
+  inspection does not stop when a reference would make the robot fall. Playback
+  repeats until the window closes and the camera tracks the pelvis. Before
+  playing it verifies that forward kinematics reproduces the stored body poses
+  and refuses a file that never matches, which separates a scrambled joint order
+  from a generated file whose body channels are the recorded clip's.
+  ``--check-only`` prints the check and exits.
 
 - Added the opt-in raw X2 joint-pose collector at
   ``scripts/experiments/joint_pose_collection/collect.py``. It rolls out the

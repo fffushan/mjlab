@@ -15,6 +15,8 @@ Model source: stable arm `400k-b512-mask02-20261022`, final checkpoint
 | `src/mjlab/tasks/tracking/joint_pose/rollout.py` (886 lines) | implemented: window codec, `WindowSampler` protocol, `joint_pose_flow` backend, chunk loop, diagnostics |
 | `src/mjlab/scripts/joint_pose_rollout.py` (351 lines) | implemented: CLI, generated/control pair, `rollout.json` |
 | `tests/test_joint_pose_flow_rollout.py` (462 lines) | implemented: 16 tests, CPU only |
+| `scripts/play_reference.py` | implemented: reference-only kinematic playback, added after the first measurement (3.6) |
+| `--keyframes current,last` inpainting | implemented after the first measurement (3.7): pins the anchor row and the window's last row to the reference |
 | Changelog bullet | added |
 | Dataset directory read | none: schema comes from the checkpoint payload |
 | Hardcoded window geometry in the loop | none: `past_steps`, `window_steps`, `channels` come from the model |
@@ -42,6 +44,21 @@ Artifacts are in `logs/diagnostics/joint-pose-rollout-20261023/single_000/`
 
 `--projection` is required for these arms. The checkpoint records
 `data_dir: /tmp/joint-pose-144/data`, which does not exist.
+
+The reference alone is inspected with the kinematic player, which runs no
+policy and no episode:
+
+```bash
+uv run python scripts/play_reference.py \
+  --motion-file logs/diagnostics/joint-pose-rollout-20261023/single_000/generated.npz
+```
+
+The keyframe arm adds one flag to the generator command:
+
+```bash
+uv run python -m mjlab.scripts.joint_pose_rollout ... --keyframes current,last \
+  --output-dir logs/diagnostics/joint-pose-rollout-20261023/single_000-keyframes
+```
 
 ## 3. Validation evidence
 
@@ -126,6 +143,62 @@ which termination term fired.
 `motion_lookahead` term. The viewer loop has no exit condition, so each run ended
 by the harness timeout (exit 124) after stepping. No exception occurred.
 `play` is a visual check only and produced no numbers.
+
+### 3.6 Reference-only playback
+
+`scripts/play_reference.py` plays the reference alone, with no physics, no policy
+and no episode reset, so inspection never stops when the reference would make
+the robot fall. Playback loops until the window closes and the camera tracks the
+pelvis.
+
+| File | forward kinematics vs stored bodies |
+|---|---:|
+| `control.npz` | 0.00 mm worst, 0.00 mm best |
+| `generated.npz` | **481.57 mm worst, 0.00 mm best** |
+| control with the joint columns reversed (a deliberate fault) | 639.27 mm worst, 291.47 mm best, refused with exit 2 |
+
+The zero best value is the clip-prefix rows, which are real joints. The 0.48 m
+worst value is the substitution defect, measured: at those frames the stored
+body channels and the generated joints describe different poses. The viewer
+shows the model's joints under the clip's root pose, so feet leave the floor
+where that mismatch is large. Exit codes verified: 0 when playable, 2 when no
+sampled frame reproduces its bodies, 1 when no viewer is available.
+
+### 3.7 Keyframe inpainting, `current,last`
+
+`WindowSampler.sample` now accepts `pinned` rows. `JointPoseFlowSampler` marks
+them clean and restores them at level 0 after every Euler step. `rollout` builds
+each pinned row from the clip in the window's anchor frame, passes it, and fails
+if the sampler does not return it unchanged. The names resolve from the model
+geometry: `current` is row `past_steps` (8 here), `last` is row
+`window_steps - 1` (40 here). Both are pinned because with `stride = 32` the last
+row of a chunk is the anchor row of the next.
+
+Like-for-like pair: `start_frame 0`, `target_frames 453`, `steps 20`, `seed 0`,
+`model_0400000.pt`, 14 chunks each.
+
+| Metric | `none` | `current,last` |
+|---|---:|---:|
+| chunk interior joint drift, mean of 14 chunks (pinned rows excluded) | 0.361 rad | **0.299 rad (−17 %)** |
+| whole-file joint RMS against control | 0.383 rad | 0.316 rad |
+| snap at the seam, per chunk | – | 0.251–0.375 rad |
+| forward kinematics vs stored bodies, worst | 481.57 mm | 467.59 mm |
+| teacher, 128 envs, seed 0, complete | 0 / 128 | 0 / 128 |
+| failure time, median | 1.52 s | **2.40 s** (phase 0.265, max 3.1 s) |
+| `r_mpkpe` | 0.0774 | 0.0809 |
+| `jvel` | 1.0022 | 1.2625 |
+
+Read the heading with care. `yaw_drift_deg` reports 0.0 on every pinned chunk,
+but that is tautological: the metric samples the chunk's last row, which is the
+pinned one. The real heading evidence is that the anchor yaw now equals the
+clip's at every chunk, and that survival moved from 1.5 s to 2.4 s.
+
+So the pin works mechanically and is not free. It removes heading drift, cuts
+the interior joint error by 17 %, and buys about 0.9 s of teacher survival. It
+also adds a 0.25–0.38 rad snap at every chunk and sharpens the velocity
+reference, which raises `jvel` from 1.00 to 1.26. It does not fix interior
+accuracy: no episode completes, and the worst frame is still 0.47 m away from
+the stored bodies.
 
 ## 4. Interpretation
 

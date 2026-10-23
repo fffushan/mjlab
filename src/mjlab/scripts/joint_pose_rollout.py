@@ -47,6 +47,7 @@ from mjlab.tasks.tracking.joint_pose.rollout import (
   RolloutError,
   RolloutResult,
   joint_pose_flow,
+  parse_keyframes,
   rollout,
 )
 
@@ -74,6 +75,7 @@ _RECORD_KEYS = (
   "projection",
   "clip",
   "seed",
+  "keyframes",
 )
 """Record fields the caller supplies; the rest are written from the rollout."""
 
@@ -277,6 +279,7 @@ def main(
   parameters: str = "auto",
   projection: str | None = None,
   drift_limit: float | None = None,
+  keyframes: str = "none",
 ) -> None:
   """Roll one clip with one checkpoint and write the generated/control pair."""
   clip_path = Path(motion_file).expanduser()
@@ -304,6 +307,10 @@ def main(
   projection_path = _projection_path(projection, scheme)
   normalization = _normalization(projection_path)
 
+  try:
+    keyframe_names = parse_keyframes(keyframes)
+  except RolloutError as exc:
+    raise SystemExit(str(exc)) from exc
   generator = torch.Generator(device=device).manual_seed(int(seed))
   try:
     result = rollout(
@@ -315,6 +322,7 @@ def main(
       steps=int(steps),
       generator=generator,
       drift_limit=drift_limit,
+      keyframes=keyframes,
     )
   except (RolloutError, JointPoseEvaluationError) as exc:
     raise SystemExit(f"rollout failed: {exc}") from exc
@@ -327,6 +335,7 @@ def main(
     "projection": str(projection_path),
     "clip": str(clip_path),
     "seed": int(seed),
+    "keyframes": ",".join(keyframe_names) if keyframe_names else "none",
   }
   destination = Path(output_dir).expanduser()
   record = write_pair(
@@ -340,7 +349,8 @@ def main(
   print(
     f"rollout {record['rows']}/{record['target_frames']} rows, "
     f"{len(record['chunks'])} chunks, stride {record['stride']}, "
-    f"stop {record['stop_reason']}, step {record['global_step']}",
+    f"stop {record['stop_reason']}, keyframes {record['keyframes']}, "
+    f"step {record['global_step']}",
     flush=True,
   )
   for name in OUTPUT_FILES:

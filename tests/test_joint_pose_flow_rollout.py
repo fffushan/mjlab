@@ -28,6 +28,8 @@ from mjlab.tasks.tracking.joint_pose.config import JointPoseDatasetCfg
 from mjlab.tasks.tracking.joint_pose.evaluate import ChannelNormalization
 from mjlab.tasks.tracking.joint_pose.model import build_denoiser
 from mjlab.tasks.tracking.joint_pose.rollout import (
+  KEYFRAME_CURRENT,
+  KEYFRAME_LAST,
   ChunkRecord,
   ClipArrays,
   RolloutError,
@@ -35,6 +37,7 @@ from mjlab.tasks.tracking.joint_pose.rollout import (
   encode_window,
   joint_pose_flow,
   matrix_from_quat,
+  parse_keyframes,
   quat_from_6d,
   quat_from_yaw,
   quat_mul,
@@ -56,6 +59,7 @@ _JOINTS = 31
 _FPS = 50.0
 _M3_KEYS = (
   "checkpoint global_step parameters schema stride chunk_count projection clip seed "
+  "keyframes "
   "start_frame target_frames rows steps stop_reason chunks substitution"
 ).split()
 
@@ -129,19 +133,30 @@ class _StubSampler:
     self.calls = 0
 
   def sample(
-    self, history: torch.Tensor, *, steps: int, generator: torch.Generator
+    self,
+    history: torch.Tensor,
+    *,
+    steps: int,
+    generator: torch.Generator,
+    pinned: dict[int, torch.Tensor] | None = None,
   ) -> torch.Tensor:
+    self.pinned_rows = () if pinned is None else tuple(sorted(pinned))
     self.calls += 1
     if self.windows is None:
       future = torch.zeros(
         (self.window_steps - self.past_steps, self.channels), dtype=history.dtype
       )
-      return torch.cat((history, future), dim=0)
+      window = torch.cat((history, future), dim=0)
+      for row, values in (pinned or {}).items():
+        window[row] = values
+      return window
     assert self.calls <= self.windows.shape[0], "more chunks than recorded windows"
     window = self.windows[self.calls - 1]
     np.testing.assert_allclose(
       history.numpy(), window[: self.past_steps], atol=1.0e-4, rtol=0.0
     )
+    for row, values in (pinned or {}).items():
+      np.testing.assert_allclose(window[row], values.numpy(), atol=1.0e-4, rtol=0.0)
     return torch.from_numpy(window.copy())
 
 
@@ -288,6 +303,119 @@ def test_stub_reconstruction_replays_the_clip(
     assert chunk.overlap_rms_rad <= 1.0e-6
   for chunk in result.chunks:
     assert chunk.joint_drift_rms_rad <= 1.0e-5
+
+
+def test_parse_keyframes_resolves_names() -> None:
+  assert parse_keyframes("none") == ()
+  assert parse_keyframes("") == ()
+  assert parse_keyframes("current") == (KEYFRAME_CURRENT,)
+  assert parse_keyframes("last") == (KEYFRAME_LAST,)
+  assert parse_keyframes("last,current") == (KEYFRAME_CURRENT, KEYFRAME_LAST)
+  assert parse_keyframes(" CURRENT , last ") == (KEYFRAME_CURRENT, KEYFRAME_LAST)
+  with pytest.raises(RolloutError, match="unknown keyframes"):
+    parse_keyframes("middle")
+  with pytest.raises(RolloutError, match="repeats a name"):
+    parse_keyframes("last,last")
+
+
+@pytest.mark.parametrize(
+  ("geometry", "target_frames"),
+  [pytest.param(_REAL, 200, id="real"), pytest.param(_TOY, 100, id="toy")],
+)
+def test_keyframes_pin_the_reference_rows(
+  geometry: dict[str, int], target_frames: int
+) -> None:
+  past = geometry["past_steps"]
+  window = geometry["window_steps"]
+  channels = geometry["channels"]
+  start = 3
+  quat, pos, vel = _synthetic_clip(start + target_frames + window + 4)
+  clip = ClipArrays(root_quat_wxyz=quat, joint_pos=pos, joint_vel=vel, fps=_FPS)
+  count = _chunk_count(window, past, target_frames)
+  sampler = _StubSampler(
+    past_steps=past,
+    window_steps=window,
+    channels=channels,
+    windows=_encode_windows(clip, start, count, past_steps=past, window_steps=window),
+  )
+  result = rollout(
+    clip=clip,
+    sampler=sampler,
+    normalization=_identity(channels),
+    start_frame=start,
+    target_frames=target_frames,
+    steps=1,
+    generator=torch.Generator().manual_seed(0),
+    keyframes="current,last",
+  )
+  assert sampler.pinned_rows == (past, window - 1)
+  expected = clip.joint_pos[start : start + target_frames]
+  assert np.max(np.abs(result.joint_pos - expected)) <= 1.0e-5
+  stride = window - past - 1
+  for chunk in result.chunks:
+    assert past in chunk.pinned
+    assert set(chunk.pinned) <= {past, window - 1}
+  # The first chunk has no previous value to snap away from.
+  assert result.chunks[0].seam_rms_rad is None
+  for chunk in result.chunks[1:]:
+    assert chunk.seam_rms_rad is not None and chunk.seam_rms_rad <= 1.0e-5
+  # The final chunk can run past the clip end, and then only the current row exists.
+  last = result.chunks[-1]
+  frame = start + stride * last.index + window - 1
+  if frame >= clip.rows:
+    assert last.pinned == (past,)
+  else:
+    assert last.pinned == (past, window - 1)
+
+
+def test_keyframes_default_pins_nothing() -> None:
+  geometry = _REAL
+  past, window = geometry["past_steps"], geometry["window_steps"]
+  quat, pos, vel = _synthetic_clip(120)
+  clip = ClipArrays(root_quat_wxyz=quat, joint_pos=pos, joint_vel=vel, fps=_FPS)
+  sampler = _StubSampler(
+    past_steps=past,
+    window_steps=window,
+    channels=geometry["channels"],
+    windows=_encode_windows(
+      clip, 0, _chunk_count(window, past, 60), past_steps=past, window_steps=window
+    ),
+  )
+  result = rollout(
+    clip=clip,
+    sampler=sampler,
+    normalization=_identity(geometry["channels"]),
+    start_frame=0,
+    target_frames=60,
+    steps=1,
+    generator=torch.Generator().manual_seed(0),
+  )
+  assert sampler.pinned_rows == ()
+  assert all(chunk.pinned == () for chunk in result.chunks)
+  assert all(chunk.seam_rms_rad is None for chunk in result.chunks)
+
+
+def test_sampler_honours_pinned_rows(tmp_path: Path) -> None:
+  checkpoint = tmp_path / "model_0007000.pt"
+  torch.save(_payload(data_dir=str(tmp_path / "absent")), checkpoint)
+  sampler = joint_pose_flow(checkpoint)
+  history = torch.from_numpy(
+    np.linspace(
+      -1.0, 1.0, sampler.past_steps * sampler.channels, dtype=np.float32
+    ).reshape(sampler.past_steps, sampler.channels)
+  )
+  row = sampler.window_steps - 1
+  pinned_value = torch.linspace(-2.0, 2.0, sampler.channels)
+  seeded = torch.Generator().manual_seed(5)
+  plain = sampler.sample(history, steps=2, generator=seeded.manual_seed(5))
+  sampled = sampler.sample(
+    history, steps=2, generator=seeded.manual_seed(5), pinned={row: pinned_value}
+  )
+  torch.testing.assert_close(sampled[row], pinned_value, atol=1.0e-6, rtol=0.0)
+  assert not torch.equal(plain[row], sampled[row])
+  torch.testing.assert_close(
+    sampled[: sampler.past_steps], history, atol=1.0e-6, rtol=0.0
+  )
 
 
 def test_chunk_count_and_file_rows_follow_the_formula() -> None:
@@ -459,6 +587,7 @@ def written_pair(tmp_path: Path) -> dict[str, object]:
     "projection": str(tmp_path / "projection.npz"),
     "clip": "clip.npz",
     "seed": 0,
+    "keyframes": "none",
   }
   out_dir = tmp_path / "out"
   write_pair(
