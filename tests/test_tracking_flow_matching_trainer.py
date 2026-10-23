@@ -265,6 +265,30 @@ def test_resume_restores_generators_and_reproduces_the_next_step(
   assert torch.equal(latent_levels, expected_latent)
 
 
+def test_resume_restores_a_checkpoint_whose_rng_states_left_cpu(
+  tmp_path: Path,
+) -> None:
+  # ``load_flow_checkpoint`` moves every payload tensor to the training device,
+  # so a CUDA resume hands the RNG states back as a CUDA ByteTensor while
+  # ``set_rng_state`` accepts only a CPU one.  An int32 copy reproduces the same
+  # mismatch on a CPU-only test.
+  config = _config(epochs=1, max_updates=2)
+  first = _trainer(tmp_path / "first", config=config)
+  checkpoint = first._save("checkpoint-probe.pt", epoch=0, best_validation_loss=None)
+  payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+  payload["rng_state"]["torch"] = payload["rng_state"]["torch"].to(torch.int32)
+  payload["rng_state"]["torch_cuda"] = None
+  for name in ("noise_generator", "sampler_generator"):
+    payload["rng_state"][name] = payload["rng_state"][name].to(torch.int32)
+  tampered = tmp_path / "checkpoint-moved.pt"
+  torch.save(payload, tampered)
+
+  resumed = _trainer(tmp_path / "resumed", config=config, resume=tampered)
+  assert resumed.global_step == 0
+  assert resumed.noise_generator.get_state().dtype == torch.uint8
+  assert resumed.sampler_generator.get_state().dtype == torch.uint8
+
+
 def test_resume_rejects_mismatched_identity(tmp_path: Path) -> None:
   config = _config(epochs=1, max_updates=2)
   first = _trainer(tmp_path / "first", config=config)

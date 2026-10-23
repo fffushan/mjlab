@@ -98,6 +98,21 @@ def _mean_tensor_or_zero(value: Tensor) -> Tensor:
   return value.mean().float()
 
 
+def _rng_state_tensor(value: Any) -> Tensor:
+  """Return one serialized RNG state as the CPU ByteTensor the APIs expect.
+
+  ``load_flow_checkpoint`` moves every tensor in the payload to the training
+  device.  ``torch.set_rng_state`` and ``Generator.set_state`` accept only a
+  CPU ByteTensor, so resuming a CUDA run used to fail with "resume RNG state
+  cannot be restored" even though the saved state was intact.  CPU tests never
+  caught it because there the move to the training device is a no-op.
+  """
+  tensor = value if isinstance(value, Tensor) else torch.as_tensor(value)
+  if tensor.dtype != torch.uint8:
+    tensor = tensor.to(torch.uint8)
+  return tensor.detach().to("cpu").contiguous()
+
+
 def _x0_metrics(
   prediction: Tensor,
   target: Tensor,
@@ -341,13 +356,17 @@ class FlowTrainer:
     try:
       random.setstate(state["python"])
       np.random.set_state(state["numpy"])
-      torch.set_rng_state(state["torch"])
+      torch.set_rng_state(_rng_state_tensor(state["torch"]))
       if state.get("torch_cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
-      self.noise_generator.set_state(state["noise_generator"])
-      self.sampler_generator.set_state(state["sampler_generator"])
+        torch.cuda.set_rng_state_all(
+          [_rng_state_tensor(item) for item in state["torch_cuda"]]
+        )
+      self.noise_generator.set_state(_rng_state_tensor(state["noise_generator"]))
+      self.sampler_generator.set_state(_rng_state_tensor(state["sampler_generator"]))
       if "state_mask_generator" in state:
-        self.state_mask_generator.set_state(state["state_mask_generator"])
+        self.state_mask_generator.set_state(
+          _rng_state_tensor(state["state_mask_generator"])
+        )
       elif self._state_mask_channels and float(
         self.training.masked_state_probability
       ) not in (0.0, 1.0):
@@ -355,7 +374,9 @@ class FlowTrainer:
           "checkpoint lacks the state-mask RNG state for a stochastic mask run"
         )
       if "history_dropout_generator" in state:
-        self.history_dropout_generator.set_state(state["history_dropout_generator"])
+        self.history_dropout_generator.set_state(
+          _rng_state_tensor(state["history_dropout_generator"])
+        )
       elif float(self.training.history_state_dropout_probability) != 0.0:
         raise FlowTrainerError(
           "checkpoint lacks history dropout RNG state for a non-zero dropout run"
