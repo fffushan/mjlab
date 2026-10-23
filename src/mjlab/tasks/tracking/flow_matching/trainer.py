@@ -596,6 +596,26 @@ class FlowTrainer:
     block_norms = (
       gradient_norms_by_block(self.model) if self.diagnostics is not None else None
     )
+    # One number names this update everywhere it appears in the recorder: the
+    # count of completed updates when its batches were consumed.  The trigger
+    # checkpoint, the capture file and the stored window indices all use it, so
+    # the replay offset stays unambiguous.
+    step_before = self.global_step
+    trigger = None
+    if self.diagnostics is not None:
+      mean_loss = float(
+        sum(float(item["loss"]) for item in pending) / float(len(pending))
+      )
+      trigger = self.diagnostics.would_trigger(update_index=step_before, loss=mean_loss)
+      if trigger is not None and self.diagnostics.checkpoint_allowed():
+        # Saved BEFORE the step: this is the weights that produced the batch,
+        # so the recorded loss can be replayed and checked against it.
+        self._save(
+          f"checkpoint-trigger-{step_before:07d}.pt",
+          epoch=epoch,
+          best_validation_loss=self.best_validation_loss,
+        )
+        self.diagnostics.checkpoint_written()
     for group in self.optimizer.param_groups:
       group["lr"] = learning_rate
     self.optimizer.step()
@@ -612,7 +632,7 @@ class FlowTrainer:
     result["gradient_norm"] = float(gradient_norm)
     self._last_train_loss = result["loss"]
     if self.diagnostics is not None:
-      trigger = self.diagnostics.end_update(
+      self.diagnostics.end_update(
         update_index=self.global_step,
         learning_rate=learning_rate,
         loss=result["loss"],
@@ -621,14 +641,7 @@ class FlowTrainer:
         blocks=block_norms,
       )
       if trigger is not None:
-        # A capture alone cannot be replayed without the weights that produced
-        # it, so a trigger also saves the step as its own checkpoint.
-        self._save(
-          f"checkpoint-trigger-{self.global_step:07d}.pt",
-          epoch=epoch,
-          best_validation_loss=self.best_validation_loss,
-        )
-        self.diagnostics.dump(update_index=self.global_step, reason="loss_trigger")
+        self.diagnostics.dump(update_index=step_before, reason="loss_trigger")
     return result
 
   def _save(self, name: str, *, epoch: int, best_validation_loss: float | None) -> Path:

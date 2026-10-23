@@ -40,12 +40,14 @@ ENV_RING_SIZE = "MJLAB_FLOW_DIAGNOSTICS_RING"
 ENV_TRIGGER_FACTOR = "MJLAB_FLOW_DIAGNOSTICS_TRIGGER"
 ENV_BASELINE_WINDOW = "MJLAB_FLOW_DIAGNOSTICS_BASELINE"
 ENV_LEVEL_BINS = "MJLAB_FLOW_DIAGNOSTICS_LEVEL_BINS"
+ENV_MAX_CHECKPOINTS = "MJLAB_FLOW_DIAGNOSTICS_MAX_CHECKPOINTS"
 
 _DEFAULT_RING_SIZE = 16
 _DEFAULT_TRIGGER_FACTOR = 8.0
 _DEFAULT_BASELINE_WINDOW = 100
 _DEFAULT_LEVEL_BINS = 10
 _PARAMETER_NORM_EVERY = 50
+_DEFAULT_MAX_CHECKPOINTS = 5
 
 
 class FlowDiagnosticsError(RuntimeError):
@@ -187,6 +189,7 @@ class FlowDiagnostics:
     trigger_factor: float = _DEFAULT_TRIGGER_FACTOR,
     baseline_window: int = _DEFAULT_BASELINE_WINDOW,
     level_bins: int = _DEFAULT_LEVEL_BINS,
+    max_checkpoints: int = _DEFAULT_MAX_CHECKPOINTS,
   ) -> None:
     if state_dimension <= 0 or token_dimension <= state_dimension:
       raise FlowDiagnosticsError(
@@ -214,6 +217,11 @@ class FlowDiagnostics:
     self.trigger_factor = float(trigger_factor)
     self.baseline_window = int(baseline_window)
     self.level_bins = int(level_bins)
+    if max_checkpoints < 0:
+      raise FlowDiagnosticsError("max_checkpoints must not be negative")
+    self.max_checkpoints = int(max_checkpoints)
+    self._checkpoints_written = 0
+    self._pending_trigger: dict[str, Any] | None = None
     self.updates_path = self.directory / "updates.jsonl"
     self._ring: deque[_BatchCapture] = deque(maxlen=self.ring_size)
     self._pending: _BatchCapture | None = None
@@ -254,6 +262,9 @@ class FlowDiagnostics:
         ENV_BASELINE_WINDOW, _DEFAULT_BASELINE_WINDOW, minimum=1
       ),
       level_bins=_env_int(ENV_LEVEL_BINS, _DEFAULT_LEVEL_BINS, minimum=1),
+      max_checkpoints=_env_int(
+        ENV_MAX_CHECKPOINTS, _DEFAULT_MAX_CHECKPOINTS, minimum=0
+      ),
     )
 
   def begin_batch(self, *, update_index: int, window_indices: Tensor | None) -> None:
@@ -351,6 +362,24 @@ class FlowDiagnostics:
         )
         self._ring.append(capture)
 
+  def would_trigger(self, *, update_index: int, loss: float) -> dict[str, Any] | None:
+    """Decide whether this update triggers, before the optimizer step.
+
+    The decision has to happen before the step for two reasons: the triggering
+    checkpoint must hold the weights that produced the batch, or the replay
+    cannot be checked against the recorded loss, and the checkpoint budget must
+    be honoured before any file is written.
+    """
+    self._pending_trigger = self._check_trigger(update_index, loss, append=False)
+    return self._pending_trigger
+
+  def checkpoint_allowed(self) -> bool:
+    """Return whether one more trigger checkpoint fits the budget."""
+    return self._checkpoints_written < self.max_checkpoints
+
+  def checkpoint_written(self) -> None:
+    self._checkpoints_written += 1
+
   def end_update(
     self,
     *,
@@ -394,25 +423,39 @@ class FlowDiagnostics:
     self._microbatches = 0
     with self.updates_path.open("a", encoding="utf-8") as handle:
       handle.write(json.dumps(row, sort_keys=True) + "\n")
-    return self._check_trigger(update_index, loss)
+    self._losses.append(float(loss))
+    trigger = self._pending_trigger
+    self._pending_trigger = None
+    if trigger is not None:
+      self._triggered += 1
+    return trigger
 
-  def _check_trigger(self, update_index: int, loss: float) -> dict[str, Any] | None:
+  def _check_trigger(
+    self, update_index: int, loss: float, *, append: bool = True
+  ) -> dict[str, Any] | None:
+    """Decide a trigger without consuming the baseline sample.
+
+    ``would_trigger`` asks before the optimizer step and leaves the sample for
+    ``end_update`` to append, so one update contributes exactly one baseline
+    entry no matter how many times the decision is inspected.
+    """
     baseline = (
       float(np.median(np.asarray(self._losses, dtype=float))) if self._losses else 0.0
     )
-    self._losses.append(float(loss))
-    if len(self._losses) < self.baseline_window or baseline <= 0.0:
+    previous = len(self._losses) + (0 if append else 1)
+    if append:
+      self._losses.append(float(loss))
+    if previous < self.baseline_window or baseline <= 0.0:
       return None
     if not math.isfinite(loss) or loss <= self.trigger_factor * baseline:
       return None
-    self._triggered += 1
     return {
       "kind": "trigger",
       "update_index": int(update_index),
       "loss": float(loss),
       "baseline": baseline,
       "trigger_factor": self.trigger_factor,
-      "triggered": self._triggered,
+      "triggered": self._triggered + 1,
     }
 
   def dump(self, *, update_index: int, reason: str) -> Path:

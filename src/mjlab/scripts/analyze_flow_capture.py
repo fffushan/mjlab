@@ -78,6 +78,12 @@ def _parser() -> argparse.ArgumentParser:
     default=8,
     help="windows used for the attention pass; attention weights are 41x41 per head",
   )
+  parser.add_argument(
+    "--chunk",
+    type=int,
+    default=512,
+    help="windows per forward pass; the per-layer hooks are not enabled here",
+  )
   return parser
 
 
@@ -120,8 +126,7 @@ def _rebuild_noised(
   pieces: list[Tensor] = []
   offset = 0
   for index, count in enumerate(rows.tolist()):
-    generator = torch.Generator(device="cpu")
-    generator.set_state(torch.from_numpy(states[index].copy()))
+    generator = _generator_for_state(states[index], device)
     piece_clean = clean[offset : offset + count]
     state_levels = torch.as_tensor(
       capture["state_levels"][offset : offset + count], dtype=torch.long
@@ -155,6 +160,30 @@ def _rebuild_noised(
     "history_dropout_windows": int(np.asarray(capture["history_dropout"]).sum()),
   }
   return tokens, info
+
+
+def _generator_for_state(state: np.ndarray, device: torch.device) -> torch.Generator:
+  """Rebuild the generator that produced a recorded noise draw.
+
+  A CUDA generator serializes a 16-byte Philox state, a CPU generator a 5 056
+  byte MT19937 state, and each rejects the other's.  The device is therefore
+  taken from the state size rather than assumed.
+  """
+  tensor = torch.from_numpy(np.ascontiguousarray(state))
+  cpu_state_bytes = torch.Generator(device="cpu").get_state().numel()
+  if int(tensor.numel()) == int(cpu_state_bytes):
+    generator = torch.Generator(device="cpu")
+    generator.set_state(tensor)
+    return generator
+  if device.type != "cuda":
+    raise SystemExit(
+      "the capture holds a CUDA generator state; rerun with --device cuda:N"
+    )
+  # The generator lives on the device, but set_state takes the 16-byte Philox
+  # state as a CPU ByteTensor even then.
+  generator = torch.Generator(device=device)
+  generator.set_state(tensor)
+  return generator
 
 
 def process_state_dimension(capture: Mapping[str, np.ndarray]) -> int:
@@ -198,14 +227,16 @@ def _attention_stats(
   }
 
 
-def _forward_with_hooks(
+def _hook_pass(
   model: StateLatentTransformer,
   tokens: Tensor,
   step_ids: Tensor,
-  *,
-  attention_windows: int,
 ) -> dict[str, Any]:
-  """Run one forward pass and collect activation, norm and attention evidence."""
+  """Collect activation, normalization and attention evidence on a few windows.
+
+  Retaining per-layer activations for the whole capture needs about 16 GiB, so
+  the loss pass runs separately in chunks and this pass sees a small subset.
+  """
   layers = list(model.encoder.layers)
   layer_inputs: dict[int, Tensor] = {}
   norm_inputs: dict[str, float] = {}
@@ -258,17 +289,15 @@ def _forward_with_hooks(
     handles.append(layer.register_forward_hook(capture_activation(f"layer{index}")))
 
   with torch.no_grad():
-    prediction = model(tokens, step_ids)
+    model(tokens, step_ids)
   for handle in handles:
     handle.remove()
 
   attention: dict[str, Any] = {}
   for index in sorted(layer_inputs):
-    subset = layer_inputs[index][:attention_windows]
-    for key, value in _attention_stats(subset, layers[index]).items():
+    for key, value in _attention_stats(layer_inputs[index], layers[index]).items():
       attention[f"layer{index}_{key}"] = value
   return {
-    "prediction": prediction,
     "activation_norm": activation_norm,
     "normalization_input": norm_inputs,
     "attention": attention,
@@ -329,19 +358,46 @@ def _replay_error(
   A capture ring spans several updates, and every update uses the weights it
   produced.  Comparing the whole ring against one checkpoint would therefore
   report a difference that is real training progress, not a replay defect.
+
+  The offset depends on when the checkpoint was written.  A pre-step snapshot
+  (the current behaviour) carries the step that consumed the batch; an older
+  post-step snapshot carries that step plus one.  Both are tried, and the
+  closer match is reported with the offset that produced it, so mixed
+  checkpoints stay readable instead of silently mislabelled.
   """
   recorded = np.asarray(capture["window_loss"], dtype=np.float64)
   updates = np.asarray(capture["microbatch_update_index"], dtype=np.int64)
   rows = np.repeat(updates, np.asarray(capture["microbatch_rows"], dtype=np.int64))
   if rows.size != recorded.size:
     return 0, float("nan")
-  # ``update_index`` is the count of completed updates when the batch was
-  # consumed, so the weights that produced it are those of step + 1.
-  matched = rows + 1 == int(step)
-  if not bool(matched.any()):
-    return 0, float("nan")
-  delta = np.abs(window_loss[matched] - recorded[matched])
-  return int(matched.sum()), float(delta.max())
+  best: tuple[int, float] = (0, float("nan"))
+  for offset in (0, 1):
+    matched = rows + offset == int(step)
+    if not bool(matched.any()):
+      continue
+    delta = float(np.abs(window_loss[matched] - recorded[matched]).max())
+    if best[0] == 0 or delta < best[1]:
+      best = (int(matched.sum()), delta)
+  return best
+
+
+def _chunked_window_loss(
+  model: StateLatentTransformer,
+  tokens: Tensor,
+  clean: Tensor,
+  step_ids: Tensor,
+  *,
+  chunk: int,
+) -> np.ndarray:
+  """Mean squared error per window, evaluated in bounded chunks."""
+  values: list[Tensor] = []
+  with torch.no_grad():
+    for start in range(0, int(tokens.shape[0]), chunk):
+      stop = start + chunk
+      prediction = model(tokens[start:stop], step_ids[start:stop])
+      error = (prediction.float() - clean[start:stop].float()) ** 2
+      values.append(error.mean(dim=(1, 2)).detach().to("cpu"))
+  return torch.cat(values).numpy()
 
 
 def _distribution(values: np.ndarray) -> dict[str, float]:
@@ -381,11 +437,11 @@ def _analyze(args: argparse.Namespace) -> dict[str, Any]:
       device=device,
     )
     step_ids = _step_ids(capture, device)
-    forward = _forward_with_hooks(
-      model, tokens, step_ids, attention_windows=args.attention_windows
+    window_loss = _chunked_window_loss(
+      model, tokens, clean.to(device), step_ids, chunk=args.chunk
     )
-    error = (forward["prediction"].float() - clean.to(device)) ** 2
-    window_loss = error.mean(dim=(1, 2)).detach().to("cpu").numpy()
+    subset = min(int(args.attention_windows), int(tokens.shape[0]))
+    forward = _hook_pass(model, tokens[:subset], step_ids[:subset])
     per_window[label] = window_loss
     matched, replay_error = _replay_error(
       capture, window_loss, step=int(payload.get("global_step", -1))

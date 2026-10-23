@@ -143,9 +143,18 @@ def test_trigger_writes_a_capture_and_a_checkpoint(
   assert payload["generator_state"].shape[0] == payload["microbatch_rows"].size
   assert int(payload["microbatch_rows"].sum()) == payload["window_indices"].size
   assert payload["window_loss"].size == payload["window_indices"].size
-  assert sorted(p.name for p in (tmp_path / "run").glob("checkpoint-trigger-*.pt"))
+  triggers = sorted((tmp_path / "run").glob("checkpoint-trigger-*.pt"))
+  assert triggers
+  # The checkpoint budget bounds a runaway arm: it keeps writing captures but
+  # stops spending 307 MB per update.
+  assert len(triggers) <= trainer.diagnostics.max_checkpoints
   sidecar = json.loads(captures[0].with_suffix(".json").read_text())
   assert sidecar["reason"] == "loss_trigger"
+  # The trigger checkpoint must hold the weights that produced the triggering
+  # batch, which is why it is written before the optimizer step.  Its step is
+  # therefore the update index the row records, not that index plus one.
+  checkpoint = torch.load(triggers[0], map_location="cpu", weights_only=False)
+  assert checkpoint["global_step"] == sidecar["update_index"]
 
 
 def test_channel_groups_follow_the_names_and_fall_back_on_a_mismatch() -> None:
