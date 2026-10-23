@@ -123,6 +123,20 @@ class FlowMatchingTrainerCfg:
   max_level: int = 1000
   history_dropout_probability: float = 0.0
 
+  final_norm: bool = False
+  """Ablation: normalise the residual stream before the output projection.
+
+  ``False`` is the shared Transformer, whose encoder omits a final norm.  The
+  variant adds ``2 * width`` parameters and is not weight-compatible with a base
+  checkpoint except through ``load_base_state_dict``.
+  """
+  init_seed: int | None = None
+  """Seed for the initial parameter draw; ``None`` uses the process RNG state.
+
+  A base arm and a final-norm arm built with the same value start from identical
+  shared weights, which is what makes the ablation a matched pair.
+  """
+
   checkpoint_every: int = 10000
   log_every: int = 100
 
@@ -145,6 +159,10 @@ class FlowMatchingTrainerCfg:
       raise JointPoseFlowConfigError(
         "history_dropout_probability must be in [0, 1)"
       )
+    if not isinstance(self.final_norm, bool):
+      raise JointPoseFlowConfigError("final_norm must be bool")
+    if self.init_seed is not None and not isinstance(self.init_seed, int):
+      raise JointPoseFlowConfigError("init_seed must be an integer or None")
     if self.scheduler not in ("cosine", "constant"):
       raise JointPoseFlowConfigError(f"unknown scheduler {self.scheduler!r}")
     if self.mixed_precision not in ("bf16", "fp16", "none"):
@@ -205,6 +223,8 @@ class FlowMatchingTrainerCfg:
         "ema_max_decay": self.ema_max_decay,
         "max_level": self.max_level,
         "history_dropout_probability": self.history_dropout_probability,
+        "final_norm": self.final_norm,
+        "init_seed": self.init_seed,
         "checkpoint_every": self.checkpoint_every,
         "log_every": self.log_every,
     }

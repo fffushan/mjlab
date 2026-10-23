@@ -59,6 +59,7 @@ RESUME_CRITICAL_FIELDS = (
     "ema_max_decay",
     "max_level",
     "history_dropout_probability",
+    "final_norm",
     "seed",
     "max_steps",
 )
@@ -135,6 +136,8 @@ class FlowMatchingRunner:
       width=width,
       layers=layers,
       heads=heads,
+      final_norm=cfg.final_norm,
+      init_seed=cfg.init_seed,
     ).to(self.device)
     self.ema = ExponentialMovingAverage(
       self.model, power=cfg.ema_power, max_decay=cfg.ema_max_decay
