@@ -12,7 +12,10 @@ from the model.
 
 from __future__ import annotations
 
+import torch
+
 from ..diffusion.model import DenoiserSettings, StateLatentTransformer
+from ..diffusion.model_final_norm import build_final_norm_denoiser
 from .config import JointPoseDatasetCfg
 
 
@@ -52,13 +55,26 @@ def build_denoiser(
   width: int | None = None,
   layers: int | None = None,
   heads: int | None = None,
+  final_norm: bool = False,
+  init_seed: int | None = None,
 ) -> StateLatentTransformer:
-  """Build the x0-predicting denoiser for one prepared joint-pose dataset."""
-  return StateLatentTransformer(
-    denoiser_settings(
-      dataset, max_level=max_level, width=width, layers=layers, heads=heads
-    )
+  """Build the x0-predicting denoiser for one prepared joint-pose dataset.
+
+  ``final_norm`` selects the ablation variant that normalises the residual
+  stream before the output projection; ``False`` builds the shared Transformer
+  unchanged.  ``init_seed`` makes the initial draw reproducible, so a base arm
+  and a final-norm arm can start from identical shared weights.
+  """
+  settings = denoiser_settings(
+    dataset, max_level=max_level, width=width, layers=layers, heads=heads
   )
+  if final_norm:
+    return build_final_norm_denoiser(settings, init_seed=init_seed)
+  if init_seed is None:
+    return StateLatentTransformer(settings)
+  with torch.random.fork_rng(devices=[]):
+    torch.manual_seed(int(init_seed) % (2**63))
+    return StateLatentTransformer(settings)
 
 
 __all__ = ["build_denoiser", "denoiser_settings"]

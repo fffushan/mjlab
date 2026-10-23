@@ -171,6 +171,15 @@ class StateLatentTransformer(nn.Module):
 
   def forward(self, noisy_tokens: Tensor, step_ids: Tensor) -> Tensor:
     """Predict clean tokens from noisy tokens and two per-token step ids."""
+    return self.output_projection(self._encode(noisy_tokens, step_ids))
+
+  def _encode(self, noisy_tokens: Tensor, step_ids: Tensor) -> Tensor:
+    """Validate the inputs and return the encoder residual stream.
+
+    The residual stream is returned unnormalised, because this class omits the
+    final encoder norm.  A subclass that adds one applies it to this value
+    before the output projection, not inside this method.
+    """
     if noisy_tokens.ndim != 3:
       raise ValueError(
         "noisy_tokens must have shape [B, sequence_length, token_dimension]"
@@ -207,8 +216,7 @@ class StateLatentTransformer(nn.Module):
     projected = projected + self.position_embedding.unsqueeze(0)
     projected = projected + self.state_step_embedding(step_ids[..., 0])
     projected = projected + self.latent_step_embedding(step_ids[..., 1])
-    encoded = self.encoder(projected)
-    return self.output_projection(encoded)
+    return self.encoder(projected)
 
   def parameter_count(self) -> int:
     """Return the number of trainable and non-trainable model parameters."""

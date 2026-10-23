@@ -4,6 +4,16 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added the offline joint-pose rollout tool at
+  ``mjlab.scripts.joint_pose_rollout``. It reads the window geometry, denoiser
+  sizes and noise scale from one checkpoint, rolls one reference clip into a
+  long generated series in chunks of ``window - past - 1`` frames, and writes a
+  ``generated``/``control`` motion pair plus a JSON record of per-chunk
+  diagnostics. The generated file takes its body channels from the recorded
+  clip rows for the same absolute frames, because the 68-channel window carries
+  no root translation. Generation is open loop: no simulator and no robot is
+  involved. See ``docs/plans/x2_joint_pose_flow_rollout_eval_plan.md``.
+
 - Added the opt-in raw X2 joint-pose collector at
   ``scripts/experiments/joint_pose_collection/collect.py``. It rolls out the
   frozen multi-motion PPO teacher on explicit reference clips and writes
