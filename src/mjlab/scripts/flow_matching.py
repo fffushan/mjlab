@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 if TYPE_CHECKING:
+  from mjlab.tasks.tracking.diffusion.model import DenoiserSettings
   from mjlab.tasks.tracking.flow_matching.process import LinearNoiseProcess
 
 DEFAULT_CONTRACT_PATH = Path(
@@ -80,6 +81,24 @@ def _split_dataset(
   return dataset, prepared.path
 
 
+def _build_denoiser(settings: "DenoiserSettings", *, final_norm: bool):
+  """Build the shared denoiser, or the final-norm ablation variant.
+
+  The variant adds one LayerNorm between the encoder and the output projection.
+  It is opt-in because it changes the parameter shapes, so a checkpoint of one
+  kind cannot be loaded into the other without conversion.
+  """
+  from mjlab.tasks.tracking.diffusion.model import StateLatentTransformer
+
+  if not final_norm:
+    return StateLatentTransformer(settings)
+  from mjlab.tasks.tracking.diffusion.model_final_norm import (
+    StateLatentTransformerFinalNorm,
+  )
+
+  return StateLatentTransformerFinalNorm(settings)
+
+
 def _checkpoint_process(path: Path) -> "LinearNoiseProcess":
   """Read the linear process a flow checkpoint records before model construction.
 
@@ -127,7 +146,6 @@ def _command_train(args: argparse.Namespace) -> int:
     from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
     from mjlab.tasks.tracking.diffusion.model import (
       DenoiserSettings,
-      StateLatentTransformer,
     )
     from mjlab.tasks.tracking.diffusion.trainer import _set_seed
     from mjlab.tasks.tracking.diffusion.window_dataset import (
@@ -188,7 +206,7 @@ def _command_train(args: argparse.Namespace) -> int:
 
     settings = DenoiserSettings.from_contract(contract, training_k=process.max_level)
     _set_seed(config.training.seed)
-    model = StateLatentTransformer(settings)
+    model = _build_denoiser(settings, final_norm=bool(args.final_norm))
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
       raise RuntimeError("CUDA device requested but CUDA is unavailable")
@@ -261,7 +279,6 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     from mjlab.tasks.tracking.diffusion.contract import DiffusionContract
     from mjlab.tasks.tracking.diffusion.model import (
       DenoiserSettings,
-      StateLatentTransformer,
     )
     from mjlab.tasks.tracking.diffusion.trainer import ExponentialMovingAverage
     from mjlab.tasks.tracking.diffusion.window_dataset import (
@@ -289,7 +306,9 @@ def _command_evaluate_offline(args: argparse.Namespace) -> int:
     contract = DiffusionContract.from_yaml(args.contract)
     process = _checkpoint_process(checkpoint_path)
     settings = DenoiserSettings.from_contract(contract, training_k=process.max_level)
-    model = StateLatentTransformer(settings)
+    model = _build_denoiser(
+      settings, final_norm=bool(getattr(args, "final_norm", False))
+    )
     ema = ExponentialMovingAverage(model)
     device = torch.device(args.device)
     state = load_flow_checkpoint(
@@ -389,6 +408,11 @@ def build_parser() -> argparse.ArgumentParser:
   budget.add_argument("--epochs", type=int)
   train.add_argument("--resume", type=Path)
   train.add_argument("--allow-long-run", action="store_true")
+  train.add_argument(
+    "--final-norm",
+    action="store_true",
+    help="add a LayerNorm between the encoder and the output projection",
+  )
   train.add_argument("--json", type=Path)
   train.set_defaults(handler=_command_train)
 
