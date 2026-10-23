@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 
 from ..diffusion.contract import DiffusionContract
 from ..diffusion.noising import clean_mask
-from ..diffusion.state import state_field_channels
+from ..diffusion.state import HYBRID_STATE, state_field_channels
 from ..diffusion.trainer import (
   ExponentialMovingAverage,
   _as_tokens,
@@ -62,6 +62,7 @@ from .checkpoint import (
   model_identity,
   save_flow_checkpoint,
 )
+from .diagnostics import FlowDiagnostics, channel_groups, gradient_norms_by_block
 from .process import (
   LinearNoiseProcess,
   add_linear_noise,
@@ -166,6 +167,7 @@ class FlowTrainer:
     self.device = torch.device(device)
     if self.device.type == "cuda" and not torch.cuda.is_available():
       raise FlowTrainerError("CUDA device requested but CUDA is unavailable")
+    self.diagnostics = self._build_diagnostics()
     self.model.to(self.device)
     self.ema = ExponentialMovingAverage(
       self.model,
@@ -393,6 +395,28 @@ class FlowTrainer:
       generator=self.sampler_generator,
     )
 
+  def _build_diagnostics(self) -> FlowDiagnostics | None:
+    """Return a sidecar recorder, or ``None`` when it is not requested.
+
+    The recorder reads its own environment variable, so an ordinary run takes
+    the ``None`` path and pays no cost.  Diagnostics stay out of the training
+    config on purpose: the config hash is part of the resume identity, and a new
+    field there would reject every existing checkpoint.
+    """
+    state_dimension = int(self.contract.projected_state_dimension)
+    layout = HYBRID_STATE.slices if state_dimension == HYBRID_STATE.dimension else {}
+    return FlowDiagnostics.from_environment(
+      state_dimension=state_dimension,
+      token_dimension=int(self.contract.token_dimension),
+      window_steps=int(self.contract.window_steps),
+      level_max=int(self.process.max_level),
+      groups=channel_groups(
+        layout,
+        state_dimension=state_dimension,
+        token_dimension=int(self.contract.token_dimension),
+      ),
+    )
+
   def _loader(self) -> DataLoader[Any]:
     sampler = self._sampler()
     # Window reads are small and scattered in a multi-gigabyte cache.  On a
@@ -521,7 +545,7 @@ class FlowTrainer:
     )
 
   def _optimizer_update(
-    self, pending: Sequence[Mapping[str, float]], *, update_index: int
+    self, pending: Sequence[Mapping[str, float]], *, update_index: int, epoch: int = 0
   ) -> dict[str, float]:
     if not pending:
       raise FlowTrainerError("optimizer update has no accumulated micro-batches")
@@ -543,6 +567,10 @@ class FlowTrainer:
       learning_rate=self.training.learning_rate,
       warmup_updates=self.training.warmup_updates,
     )
+    # The per-block norms must be read before ``zero_grad`` clears them.
+    block_norms = (
+      gradient_norms_by_block(self.model) if self.diagnostics is not None else None
+    )
     for group in self.optimizer.param_groups:
       group["lr"] = learning_rate
     self.optimizer.step()
@@ -558,6 +586,24 @@ class FlowTrainer:
     result["global_step"] = float(self.global_step)
     result["gradient_norm"] = float(gradient_norm)
     self._last_train_loss = result["loss"]
+    if self.diagnostics is not None:
+      trigger = self.diagnostics.end_update(
+        update_index=self.global_step,
+        learning_rate=learning_rate,
+        loss=result["loss"],
+        gradient_norm=float(gradient_norm),
+        model=self.model,
+        blocks=block_norms,
+      )
+      if trigger is not None:
+        # A capture alone cannot be replayed without the weights that produced
+        # it, so a trigger also saves the step as its own checkpoint.
+        self._save(
+          f"checkpoint-trigger-{self.global_step:07d}.pt",
+          epoch=epoch,
+          best_validation_loss=self.best_validation_loss,
+        )
+        self.diagnostics.dump(update_index=self.global_step, reason="loss_trigger")
     return result
 
   def _save(self, name: str, *, epoch: int, best_validation_loss: float | None) -> Path:
@@ -609,6 +655,13 @@ class FlowTrainer:
             window_steps=self.contract.window_steps,
             token_dimension=self.contract.token_dimension,
           )
+          if self.diagnostics is not None:
+            indices = batch[2] if len(batch) > 2 else None
+            self.diagnostics.begin_batch(
+              update_index=self.global_step,
+              window_indices=indices,
+              generator=self.noise_generator,
+            )
           (
             loss,
             prediction,
@@ -638,11 +691,22 @@ class FlowTrainer:
           metrics["history_state_dropout_fraction"] = (
             float(dropout_windows) / float(total_windows) if total_windows else 0.0
           )
+          if self.diagnostics is not None:
+            self.diagnostics.observe_batch(
+              prediction=prediction,
+              target=target,
+              state_levels=state_levels,
+              latent_levels=latent_levels,
+              history_dropout=history_dropout,
+              state_mask=state_mask_flags,
+            )
           pending.append(metrics)
           loss.backward()
           is_last_batch = batch_index + 1 == len(loader)
           if len(pending) >= self.training.gradient_accumulation_steps or is_last_batch:
-            update = self._optimizer_update(pending, update_index=self.global_step)
+            update = self._optimizer_update(
+              pending, update_index=self.global_step, epoch=epoch
+            )
             epoch_updates.append(update)
             metrics_file.write(
               json.dumps({"kind": "update", "epoch": epoch, **update}, sort_keys=True)
@@ -659,7 +723,9 @@ class FlowTrainer:
               )
               self._next_periodic = (self.global_step // every + 1) * every
         if pending:
-          update = self._optimizer_update(pending, update_index=self.global_step)
+          update = self._optimizer_update(
+            pending, update_index=self.global_step, epoch=epoch
+          )
           epoch_updates.append(update)
           metrics_file.write(
             json.dumps({"kind": "update", "epoch": epoch, **update}, sort_keys=True)
