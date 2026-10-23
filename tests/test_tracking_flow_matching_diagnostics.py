@@ -139,7 +139,9 @@ def test_trigger_writes_a_capture_and_a_checkpoint(
   payload = np.load(captures[0])
   assert payload["window_indices"].size > 0
   assert payload["state_levels"].shape[1] == 41
-  assert payload["generator_state"].size > 0
+  assert payload["generator_state"].ndim == 2
+  assert payload["generator_state"].shape[0] == payload["microbatch_rows"].size
+  assert int(payload["microbatch_rows"].sum()) == payload["window_indices"].size
   assert payload["window_loss"].size == payload["window_indices"].size
   assert sorted(p.name for p in (tmp_path / "run").glob("checkpoint-trigger-*.pt"))
   sidecar = json.loads(captures[0].with_suffix(".json").read_text())

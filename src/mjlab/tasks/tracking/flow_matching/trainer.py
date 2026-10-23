@@ -484,6 +484,10 @@ class FlowTrainer:
         torch.full_like(latent_levels[:, : self.contract.current_index], full_level),
         latent_levels[:, : self.contract.current_index],
       )
+    if self.diagnostics is not None:
+      # The level draws already advanced this generator, so the noise state is
+      # recorded here, immediately before the only draw the replay must repeat.
+      self.diagnostics.note_noise_state(self.noise_generator)
     noised = add_linear_noise(
       clean[..., : self.contract.projected_state_dimension],
       clean[..., self.contract.projected_state_dimension :],
@@ -658,9 +662,7 @@ class FlowTrainer:
           if self.diagnostics is not None:
             indices = batch[2] if len(batch) > 2 else None
             self.diagnostics.begin_batch(
-              update_index=self.global_step,
-              window_indices=indices,
-              generator=self.noise_generator,
+              update_index=self.global_step, window_indices=indices
             )
           (
             loss,
@@ -913,6 +915,10 @@ class FlowTrainer:
       process=self.process,
       generator=generator,
     )
+    if self.diagnostics is not None:
+      # The level draws already advanced this generator, so the noise state is
+      # recorded here, immediately before the only draw the replay must repeat.
+      self.diagnostics.note_noise_state(self.noise_generator)
     noised = add_linear_noise(
       clean[..., : self.contract.projected_state_dimension],
       clean[..., self.contract.projected_state_dimension :],

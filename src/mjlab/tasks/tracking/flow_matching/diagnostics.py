@@ -256,16 +256,8 @@ class FlowDiagnostics:
       level_bins=_env_int(ENV_LEVEL_BINS, _DEFAULT_LEVEL_BINS, minimum=1),
     )
 
-  def begin_batch(
-    self, *, update_index: int, window_indices: Tensor | None, generator: Any
-  ) -> None:
-    """Record what the next forward pass is about to consume.
-
-    The generator state is taken before the noise draw, so the analyzer can
-    reproduce the same noise without the trainer storing a 56 MB tensor per
-    micro-batch.
-    """
-    state = generator.get_state()
+  def begin_batch(self, *, update_index: int, window_indices: Tensor | None) -> None:
+    """Record what the next forward pass is about to consume."""
     self._pending = _BatchCapture(
       update_index=int(update_index),
       window_indices=(
@@ -278,11 +270,23 @@ class FlowDiagnostics:
       history_dropout=np.zeros((0,), dtype=bool),
       state_mask=np.zeros((0,), dtype=bool),
       window_loss=np.zeros((0,), dtype=np.float32),
-      generator_state=(
-        state.detach().to("cpu").numpy().copy()
-        if isinstance(state, Tensor)
-        else np.frombuffer(state, dtype=np.uint8).copy()
-      ),
+      generator_state=np.zeros((0,), dtype=np.uint8),
+    )
+
+  def note_noise_state(self, generator: Any) -> None:
+    """Record the generator state at the exact point the noise draw starts.
+
+    The level draws consume this generator first, so a state taken before the
+    forward pass would replay a different Gaussian draw.  Taking it here is what
+    makes the offline rebuild bit-exact without storing the noise tensor.
+    """
+    if self._pending is None:
+      return
+    state = generator.get_state()
+    self._pending.generator_state = (
+      state.detach().to("cpu").numpy().copy()
+      if isinstance(state, Tensor)
+      else np.frombuffer(state, dtype=np.uint8).copy()
     )
 
   def observe_batch(
@@ -423,6 +427,9 @@ class FlowDiagnostics:
       "state_dimension": np.asarray([self.state_dimension], dtype=np.int64),
       "token_dimension": np.asarray([self.token_dimension], dtype=np.int64),
     }
+    # Row-indexed fields concatenate.  The generator state and the row count
+    # stay per micro-batch, because the replay must redraw each batch from its
+    # own state or it cannot reproduce the same noise.
     for field in (
       "window_indices",
       "state_levels",
@@ -430,13 +437,17 @@ class FlowDiagnostics:
       "history_dropout",
       "state_mask",
       "window_loss",
-      "generator_state",
     ):
-      values = [getattr(item, field) for item in self._ring]
-      if len(values) == 1:
-        payload[field] = values[0]
-      else:
-        payload[field] = np.concatenate(values, axis=0)
+      payload[field] = np.concatenate(
+        [getattr(item, field) for item in self._ring], axis=0
+      )
+    payload["generator_state"] = np.stack([item.generator_state for item in self._ring])
+    payload["microbatch_rows"] = np.asarray(
+      [len(item.window_indices) for item in self._ring], dtype=np.int64
+    )
+    payload["microbatch_update_index"] = np.asarray(
+      [item.update_index for item in self._ring], dtype=np.int64
+    )
     np.savez_compressed(path, **payload)
     (self.directory / "captures" / f"capture-{int(update_index):07d}.json").write_text(
       json.dumps(
