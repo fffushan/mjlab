@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -343,6 +344,22 @@ def test_resume_restores_fp32_check_state(tmp_path) -> None:
     resume=first.checkpoint_paths["last"],
   )
   assert resumed._fp32_checked is True
+
+
+def test_update_metrics_report_the_pre_clip_gradient_norm(tmp_path: Path) -> None:
+  # Same gate as the flow trainer: a tiny clip threshold proves the logged
+  # value is the pre-clip norm.
+  trainer = _trainer(tmp_path, config=_config(max_grad_norm=1e-6))
+  trainer.train()
+  updates = [
+    json.loads(line)
+    for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+    if json.loads(line)["kind"] == "update"
+  ]
+  assert len(updates) == 2
+  for row in updates:
+    assert row["gradient_norm"] > 1e-6
+    assert math.isfinite(row["gradient_norm"])
 
 
 def test_nan_or_inf_aborts_without_writing_checkpoint(tmp_path) -> None:

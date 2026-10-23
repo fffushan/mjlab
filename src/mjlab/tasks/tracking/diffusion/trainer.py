@@ -801,6 +801,9 @@ class DiffusionTrainer:
     result["ema_decay"] = decay
     result["accumulated_microbatches"] = float(len(pending))
     result["global_step"] = float(self.global_step)
+    # ``clip_grad_norm_`` returns the norm before clipping, so a value above
+    # ``max_grad_norm`` records that this update was scaled down.
+    result["gradient_norm"] = float(gradient_norm)
     self._last_train_loss = result["loss"]
     return result
 

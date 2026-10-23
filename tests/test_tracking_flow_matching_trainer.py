@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -380,6 +381,22 @@ def test_history_dropout_fraction_is_reported(tmp_path: Path) -> None:
   assert epochs[0]["global_step"] == 2
   assert epochs[0]["history_state_dropout_fraction"] == 1.0
   assert epochs[0]["history_state_total_windows"] == 8
+
+
+def test_update_metrics_report_the_pre_clip_gradient_norm(tmp_path: Path) -> None:
+  # A tiny clip threshold makes every step clip, which proves the logged value
+  # is the norm measured before ``clip_grad_norm_`` rescales the gradients.
+  trainer = _trainer(tmp_path, config=_config(max_grad_norm=1e-6))
+  trainer.train()
+  updates = [
+    json.loads(line)
+    for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+    if json.loads(line)["kind"] == "update"
+  ]
+  assert len(updates) == 2
+  for row in updates:
+    assert row["gradient_norm"] > 1e-6
+    assert math.isfinite(row["gradient_norm"])
 
 
 def test_nan_aborts_without_writing_a_checkpoint(tmp_path: Path) -> None:

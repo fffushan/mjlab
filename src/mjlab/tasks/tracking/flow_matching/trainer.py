@@ -530,6 +530,9 @@ class FlowTrainer:
       if parameter.grad is not None:
         parameter.grad.div_(divisor)
         _finite_tensor(parameter.grad, "gradient")
+    # ``clip_grad_norm_`` returns the total norm measured BEFORE it rescales
+    # the gradients, so this value also shows clipping: a value above
+    # ``max_grad_norm`` means the step was scaled down.
     gradient_norm = torch.nn.utils.clip_grad_norm_(
       self.model.parameters(), self.training.max_grad_norm
     )
@@ -553,6 +556,7 @@ class FlowTrainer:
     result["ema_decay"] = decay
     result["accumulated_microbatches"] = float(len(pending))
     result["global_step"] = float(self.global_step)
+    result["gradient_norm"] = float(gradient_norm)
     self._last_train_loss = result["loss"]
     return result
 
