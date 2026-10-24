@@ -1375,8 +1375,55 @@ def _require_same_resources(
       )
 
 
+def _require_live_common(
+  stored_common: Mapping[str, Any],
+  cohort: CohortContract,
+  *,
+  ignore: Sequence[str] = (),
+) -> None:
+  """Compare a stored common contract with the live manifest, field by field.
+
+  ``semantic_overrides`` records private environment overrides applied by the
+  builder; they are not derivable from the manifest, so the env_config digest
+  checked by the caller is what attests them here.  ``ignore`` names fields the
+  caller has deliberately relaxed, which is how an opt-in foreign reference keeps
+  every interface field checked while dropping the cohort's own name.
+  """
+  live_common = CohortCommon.from_contract(cohort).as_dict()
+  stored = dict(stored_common)
+  stored.pop("semantic_overrides", None)
+  live_common.pop("semantic_overrides", None)
+  skipped = set(ignore)
+  for name, value in live_common.items():
+    if name in skipped:
+      continue
+    if stored.get(name) != value:
+      raise _differ(f"common contract {name}", stored.get(name), value)
+
+
+def require_foreign_reference(identity: CohortIdentity, cohort: CohortContract) -> None:
+  """Accept a live cohort whose reference is not one of the identity's members.
+
+  This is the opt-in relaxation for playing or evaluating a saved student on a
+  reference clip that its cohort never contained.  Everything that decides
+  whether the student's tensors can be applied is still checked: joint order,
+  action scales and offset, control rate and timestep, decimation, observation
+  names and widths, anchor body, tracked bodies, reference fps and lookahead.
+  Only the cohort's own ``name`` is ignored, because a wider manifest that
+  carries extra teachers necessarily has a different name.
+
+  The saved identity is *not* rewritten: the caller keeps it as provenance and
+  records that the pinned reference is outside it.
+  """
+  _require_live_common(identity.common.as_dict(), cohort, ignore=("name",))
+
+
 def require_member_matches(
-  identity: CohortIdentity, cohort: CohortContract, teacher_id: str
+  identity: CohortIdentity,
+  cohort: CohortContract,
+  teacher_id: str,
+  *,
+  allow_contract_name_mismatch: bool = False,
 ) -> CohortMember:
   """Check one requested member of a saved cohort against the live manifest.
 
@@ -1421,16 +1468,11 @@ def require_member_matches(
     raise _differ(
       f"member {teacher_id!r} reference fps", member.fps, teacher.reference.fps
     )
-  stored_common = identity.common.as_dict()
-  live_common = CohortCommon.from_contract(cohort).as_dict()
-  # ``semantic_overrides`` records private environment overrides applied by the
-  # builder; they are not derivable from the manifest, so the env_config digest
-  # checked above is what attests them here.
-  stored_common.pop("semantic_overrides", None)
-  live_common.pop("semantic_overrides", None)
-  for name, value in live_common.items():
-    if stored_common.get(name) != value:
-      raise _differ(f"common contract {name}", stored_common.get(name), value)
+  _require_live_common(
+    identity.common.as_dict(),
+    cohort,
+    ignore=("name",) if allow_contract_name_mismatch else (),
+  )
   return member
 
 
@@ -1452,6 +1494,7 @@ __all__ = [
   "canonical_json",
   "cohort_identity_from_adapter",
   "reset_provenance_from_adapter",
+  "require_foreign_reference",
   "require_same_cohort",
   "require_same_replay_policy",
 ]

@@ -218,6 +218,38 @@ separate student is created for the second motion.
      --repo-root . --teacher-id tennis_001 \
      --checkpoint logs/distillation/m4-smoke/checkpoint-final.pt --seed 7
 
+   # Play the same student on a reference clip its cohort never contained.
+   # The interface contract is still validated.
+   uv run distill play \
+     --manifest configs/distillation/x2_tennis_vendor_gains_dr_waist_kd4_v3.yaml \
+     --repo-root . --teacher-id vgk020 \
+     --checkpoint logs/distillation/vae-cov-10k-20261008T154401Z/vae-vgk8-cov-on/output/checkpoint-final.pt \
+     --seed 0
+
+Reference clips outside the trained cohort
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A cohort checkpoint records the clips its student trained on, but ``play`` and
+``evaluate`` do **not** require ``--teacher-id`` to be one of them. By default the
+requested clip may come from any manifest, so a saved student can be exercised on
+a motion it never saw. Pass ``--allow-foreign-reference False`` to restore the
+strict member-only selection.
+
+Everything that decides whether the student's tensors can be applied is still
+checked against the live manifest: joint order, action scales and offset, control
+rate and timestep, decimation, observation names and widths, anchor body, tracked
+bodies, reference fps, and lookahead. The cohort's own ``name`` is ignored,
+because a manifest that carries extra teachers necessarily has a different one.
+The stored cohort identity is kept as provenance, the run prints that the
+reference is outside the cohort, and a report records
+``reference_in_saved_cohort: false`` with empty ``motion_id``, ``teacher_code``
+and ``artifact_hashes``.
+
+This is a playback and evaluation relaxation. Training, resume, and
+``evaluate-cohort`` keep the strict identity binding, and the library function
+``load_cohort_member_inference`` keeps ``allow_foreign_reference=False`` so an
+internal caller must opt in explicitly.
+
 Selection syntax
 ^^^^^^^^^^^^^^^^
 

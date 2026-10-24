@@ -1664,6 +1664,79 @@ def test_cohort_member_inference_refuses_unknown_members_and_changed_artifacts(
     )
 
 
+def test_cohort_member_inference_allows_a_foreign_reference_only_when_asked(
+  real_cohort: CohortContract,
+  plan: MultiMotionPlan,
+  schema: Any,
+  body_selection: BodySelection,
+  tmp_path: Path,
+) -> None:
+  """A wider manifest may play a student on a clip the cohort never contained.
+
+  The opt-in relaxation drops only the membership requirement and the cohort's
+  own name; every interface field is still compared, and the saved identity stays
+  the reported provenance.
+  """
+  trainer, identity = make_cohort_trainer(
+    schema, plan, body_selection, real_cohort, updates=1
+  )
+  path = tmp_path / "cohort.pt"
+  save_cohort_checkpoint(path, trainer, trainer.replay, cohort=identity)
+
+  # A wider cohort: the same interface contract, a different name, one extra clip.
+  extra = replace(
+    real_cohort.teachers[0],
+    entry=replace(real_cohort.teachers[0].entry, id="foreign_clip"),
+  )
+  foreign = replace(
+    real_cohort,
+    manifest=replace(real_cohort.manifest, name="x2-tennis-wider"),
+    teachers=(*real_cohort.teachers, extra),
+  )
+
+  # Default behaviour is unchanged: the membership requirement still refuses.
+  with pytest.raises(CheckpointValidationError, match="has no member 'foreign_clip'"):
+    load_cohort_member_inference(path, foreign, "foreign_clip")
+
+  # Opted in: accepted, with the empty member fields and the kept provenance.
+  loaded = load_cohort_member_inference(
+    path, foreign, "foreign_clip", allow_foreign_reference=True
+  )
+  assert loaded.reference_in_saved_cohort is False
+  assert loaded.member is None
+  assert loaded.motion_id is None and loaded.teacher_code is None
+  assert loaded.artifact_hashes == {}
+  assert loaded.relocated_artifact_roles == ()
+  assert loaded.cohort == identity
+  assert loaded.requested_teacher_id == "foreign_clip"
+  assert not loaded.model.training
+  for left, right in zip(
+    loaded.model.parameters(), trainer.model.parameters(), strict=True
+  ):
+    torch.testing.assert_close(left, right)
+
+  # A trained member keeps its full checks; only the contract name is relaxed.
+  member = load_cohort_member_inference(
+    path, foreign, "tennis_000", allow_foreign_reference=True
+  )
+  assert member.reference_in_saved_cohort is True
+  assert member.motion_id == 0 and member.teacher_code == 0
+  assert member.artifact_hashes == identity.member("tennis_000").hashes
+
+  # An interface change is still refused, so the relaxation cannot mis-pack.
+  bad = replace(
+    foreign,
+    actions=replace(
+      foreign.actions,
+      joint_scales=tuple(value * 1.5 for value in foreign.actions.joint_scales),
+    ),
+  )
+  with pytest.raises(CheckpointValidationError, match="common contract action_scales"):
+    load_cohort_member_inference(
+      path, bad, "foreign_clip", allow_foreign_reference=True
+    )
+
+
 def test_cohort_member_inference_accepts_relocation_but_resume_stays_strict(
   real_cohort: CohortContract,
   plan: MultiMotionPlan,

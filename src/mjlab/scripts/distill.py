@@ -354,6 +354,7 @@ def _load_member_inference(
   device: str,
   expected_schema=None,
   reset_profile: str | None = None,
+  allow_foreign_reference: bool = False,
 ):
   """Load one checked member of a saved M4 cohort for inference only.
 
@@ -361,7 +362,9 @@ def _load_member_inference(
   extent, saved reference digest, and common action/control/observation
   contract must match the live manifest.  The stored cohort identity is kept as
   provenance, so a pinned report never loses the identity of the shared
-  student it evaluated.
+  student it evaluated.  ``allow_foreign_reference`` relaxes only the
+  membership requirement and the cohort name, for playback or evaluation on a
+  reference clip the cohort never contained.
   """
   return load_cohort_member_inference(
     checkpoint,
@@ -370,6 +373,7 @@ def _load_member_inference(
     device=device,
     expected_schema=expected_schema,
     reset_profile=reset_profile,
+    allow_foreign_reference=allow_foreign_reference,
   )
 
 
@@ -380,6 +384,7 @@ def _load_student_inference(
   *,
   device: str,
   expected_schema=None,
+  allow_foreign_reference: bool = False,
 ):
   """Dispatch to the version-1 or version-2 model-only loader by envelope.
 
@@ -394,6 +399,7 @@ def _load_student_inference(
       teacher_id,
       device=device,
       expected_schema=expected_schema,
+      allow_foreign_reference=allow_foreign_reference,
     )
   return load_inference_checkpoint(
     checkpoint,
@@ -952,6 +958,7 @@ def _member_inference_report(inference) -> dict[str, Any] | None:
     "trained_teacher_ids": list(inference.cohort.teacher_ids),
     "mapping_digest": inference.cohort.mapping_digest,
     "requested_teacher_id": inference.requested_teacher_id,
+    "reference_in_saved_cohort": inference.reference_in_saved_cohort,
     "motion_id": inference.motion_id,
     "teacher_code": inference.teacher_code,
     "artifact_hashes": dict(inference.artifact_hashes),
@@ -2665,6 +2672,7 @@ def _evaluate(
   reset_profile: ResetProfile | None = None,
   reset_perturbations: ResetPerturbations = "configured",
   rollout_latent: RolloutLatent = "mean",
+  allow_foreign_reference: bool = True,
   report: Path | None = None,
 ) -> int:
   """Evaluate one teacher or a checkpointed student without mutation/training.
@@ -2686,7 +2694,11 @@ def _evaluate(
   manifest, and the report keeps the full stored cohort identity next to the
   pinned member.  The environment is still one pinned single-motion simulator,
   so this command evaluates a member; use ``evaluate-cohort`` to pin every
-  selected motion in one bounded run.
+  selected motion in one bounded run.  The membership requirement is **off by
+  default**, so the same student can be measured on any reference clip in the
+  manifest; the interface contract is still checked and the report records
+  ``reference_in_saved_cohort: false``.  ``--allow-foreign-reference False``
+  restores the strict member-only selection.
   """
   adapter = None
   try:
@@ -2728,7 +2740,12 @@ def _evaluate(
         # A v2 member is loaded before the simulator because its saved schema is
         # what the live packing must be built from.
         member = _load_member_inference(
-          checkpoint, cohort, teacher_id, device=device, reset_profile=reset_profile
+          checkpoint,
+          cohort,
+          teacher_id,
+          device=device,
+          reset_profile=reset_profile,
+          allow_foreign_reference=allow_foreign_reference,
         )
     adapter = (
       make_multi_teacher_distillation_adapter(
@@ -2781,6 +2798,7 @@ def _evaluate(
           teacher_id,
           device=device,
           expected_schema=adapter.schema,
+          allow_foreign_reference=allow_foreign_reference,
         )
         if member is None
         else member
@@ -3453,6 +3471,8 @@ def _playback_checkpoint_manager(
   teacher_id: str,
   adapter,
   device: str,
+  *,
+  allow_foreign_reference: bool = True,
 ):
   """Build a Viser checkpoint manager that discovers and validates swaps.
 
@@ -3490,6 +3510,7 @@ def _playback_checkpoint_manager(
       teacher_id,
       device=device,
       expected_schema=expected_schema,
+      allow_foreign_reference=allow_foreign_reference,
     )
     return DistillationPlayPolicy(inference.model)
 
@@ -3512,6 +3533,7 @@ def _play(
   sampling_mode: SamplingMode = "start",
   viewer: PlayViewer = "viser",
   frame_rate: float = 60.0,
+  allow_foreign_reference: bool = True,
 ) -> int:
   """Play a checkpointed student interactively in the shared viewers.
 
@@ -3528,7 +3550,12 @@ def _play(
   selection: ``--teacher-id`` must name a member of the saved cohort, its
   artifacts and common contract are validated against the live manifest, and
   the pinned member is played in a single-motion environment of that member's
-  clip.  Hot swaps use the same version-dispatched validation, so a version-1
+  clip.  The membership requirement is **off by default**, so a student can be
+  played on any reference clip in the manifest; the interface contract (joint
+  order, action scales, control rate, observation layout, anchor, tracked bodies,
+  fps) is still validated, and the run prints that the reference is outside the
+  trained cohort.  ``--allow-foreign-reference False`` restores the strict
+  member-only selection.  Hot swaps use the same version-dispatched validation, so a version-1
   and a version-2 artifact in one directory can both be inspected.
 
   The checkpoint is loaded *before* the simulator is built, so a missing or
@@ -3555,7 +3582,13 @@ def _play(
     # control contract, and yields the SAVED schema the live packing must
     # reproduce (the saved settings imply the trained architecture, not a
     # default one).
-    inference = _load_student_inference(checkpoint, cohort, teacher_id, device=device)
+    inference = _load_student_inference(
+      checkpoint,
+      cohort,
+      teacher_id,
+      device=device,
+      allow_foreign_reference=allow_foreign_reference,
+    )
     # The adapter re-checks the live joint order, teacher sensors/action, and
     # timing against the saved contract; passing the saved schema is what makes
     # an anchor/gravity_anchor checkpoint pack correctly instead of being
@@ -3581,7 +3614,12 @@ def _play(
     env = DistillationPlayEnvironment(adapter)
     policy = DistillationPlayPolicy(inference.model)
     checkpoint_manager = _playback_checkpoint_manager(
-      checkpoint, cohort, teacher_id, adapter, device
+      checkpoint,
+      cohort,
+      teacher_id,
+      adapter,
+      device,
+      allow_foreign_reference=allow_foreign_reference,
     )
     resolved_viewer = _resolve_play_viewer(viewer)
     print(
@@ -3591,6 +3629,14 @@ def _play(
       file=sys.stderr,
       flush=True,
     )
+    if not inference.reference_in_saved_cohort:
+      print(
+        f"[WARN]: {teacher_id!r} is not a member of the trained cohort "
+        f"{list(inference.cohort.teacher_ids)}; the reference is outside the "
+        f"cohort and the interface contract was checked instead",
+        file=sys.stderr,
+        flush=True,
+      )
     if resolved_viewer == "native":
       from mjlab.viewer import NativeMujocoViewer
 

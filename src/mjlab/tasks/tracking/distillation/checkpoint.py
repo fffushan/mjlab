@@ -46,6 +46,7 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
   CohortMember,
   ReplayPolicy,
   ResetProvenance,
+  require_foreign_reference,
   require_member_matches,
   require_same_cohort,
   require_same_replay_policy,
@@ -155,13 +156,19 @@ class CohortMemberInference:
   one member.  ``relocated_artifact_roles`` names the artifact roles whose
   stored path differs from the live manifest: each of them was accepted only
   because its content digest matched.
+
+  ``member`` is ``None`` for an opt-in foreign reference, that is a request that
+  played or evaluated a clip the trained cohort never contained.  In that case
+  ``reference_in_saved_cohort`` is false, ``cohort`` still records the trained
+  identity, and the artifact fields that only describe a saved member
+  (``motion_id``, ``teacher_code``, ``artifact_hashes``) are empty.
   """
 
   model: ConditionalVAE
   schema: VaeSchema
   settings: ModelSettings
   cohort: CohortIdentity
-  member: CohortMember
+  member: CohortMember | None
   requested_teacher_id: str
   counters: dict[str, int]
   schedule: dict[str, Any]
@@ -171,6 +178,7 @@ class CohortMemberInference:
   evaluation_reset_profile: str | None = None
   coverage_policy_identity: str | None = None
   coverage_parity_evidence_sha256: str | None = None
+  reference_in_saved_cohort: bool = True
 
   @property
   def teacher_ids(self) -> tuple[str, ...]:
@@ -178,17 +186,17 @@ class CohortMemberInference:
     return self.cohort.teacher_ids
 
   @property
-  def motion_id(self) -> int:
-    return self.member.motion_id
+  def motion_id(self) -> int | None:
+    return None if self.member is None else self.member.motion_id
 
   @property
-  def teacher_code(self) -> int:
-    return self.member.teacher_code
+  def teacher_code(self) -> int | None:
+    return None if self.member is None else self.member.teacher_code
 
   @property
   def artifact_hashes(self) -> dict[str, str]:
     """Content digests the member selection verified, keyed by artifact role."""
-    return dict(self.member.hashes)
+    return {} if self.member is None else dict(self.member.hashes)
 
 
 def _plain(value: Any, name: str) -> Any:
@@ -1448,16 +1456,25 @@ def load_cohort_member_inference(
   device: str | torch.device = "cpu",
   expected_schema: VaeSchema | Mapping[str, Any] | None = None,
   reset_profile: str | None = None,
+  allow_foreign_reference: bool = False,
 ) -> CohortMemberInference:
   """Load one checked member of a saved version-2 cohort for inference only.
 
-  The requested member must exist in the stored cohort; its artifact digests,
-  clip extent, saved reference digest, and the common action/control/
+  By default the requested member must exist in the stored cohort; its artifact
+  digests, clip extent, saved reference digest, and the common action/control/
   observation contract must match the live manifest; and the stored cohort
   digest must match its own record.  A byte-identical *relocated* artifact is
   accepted by its content digest and reported in ``relocated_artifact_roles``,
   while every changed artifact fails on its digest.  Strict resume is untouched
   by this relaxation.
+
+  ``allow_foreign_reference`` is the opt-in playback/evaluation relaxation: a
+  requested teacher that the trained cohort never contained is accepted as long
+  as the live manifest's interface contract (joint order, action scales, control
+  rate, observation layout, anchor, tracked bodies, fps, lookahead) matches the
+  saved one.  Only the cohort's own name is then ignored, and the result records
+  ``reference_in_saved_cohort = False`` so a report cannot mistake the pinned
+  clip for a trained member.
 
   Only the saved schema, model settings, weights, and normalizers are restored:
   no optimizer, replay buffer, trainer, or simulator is constructed, and the
@@ -1547,10 +1564,31 @@ def load_cohort_member_inference(
       raise CheckpointValidationError(
         f"checkpoint reset provenance is invalid: {exc}"
       ) from exc
-  try:
-    member = require_member_matches(stored, cohort, teacher_id)
-  except CohortContractError as exc:
-    raise CheckpointValidationError(f"cohort member selection refused: {exc}") from exc
+  member: CohortMember | None = None
+  if teacher_id in stored.teacher_ids:
+    try:
+      member = require_member_matches(
+        stored,
+        cohort,
+        teacher_id,
+        allow_contract_name_mismatch=allow_foreign_reference,
+      )
+    except CohortContractError as exc:
+      raise CheckpointValidationError(
+        f"cohort member selection refused: {exc}"
+      ) from exc
+  elif allow_foreign_reference:
+    try:
+      require_foreign_reference(stored, cohort)
+    except CohortContractError as exc:
+      raise CheckpointValidationError(f"foreign reference refused: {exc}") from exc
+  else:
+    try:
+      stored.member(teacher_id)
+    except CohortContractError as exc:
+      raise CheckpointValidationError(
+        f"cohort member selection refused: {exc}"
+      ) from exc
   model, schema, settings = _build_inference_model(
     payload, device=device, expected_schema=expected_schema
   )
@@ -1558,12 +1596,14 @@ def load_cohort_member_inference(
     raise CheckpointValidationError(
       "checkpoint schema joint order disagrees with its cohort contract"
     )
-  live_paths = cohort.teacher(teacher_id).entry.paths()
-  relocated = tuple(
-    role
-    for role in COHORT_ARTIFACT_ROLES
-    if str(live_paths[role]) != member.artifacts.get(role)
-  )
+  relocated: tuple[str, ...] = ()
+  if member is not None:
+    live_paths = cohort.teacher(teacher_id).entry.paths()
+    relocated = tuple(
+      role
+      for role in COHORT_ARTIFACT_ROLES
+      if str(live_paths[role]) != member.artifacts.get(role)
+    )
   counters = _mapping(payload.get("counters", {}), "checkpoint counters")
   if any(
     not isinstance(value, int) or isinstance(value, bool) for value in counters.values()
@@ -1631,6 +1671,7 @@ def load_cohort_member_inference(
     evaluation_reset_profile=reset_profile,
     coverage_policy_identity=coverage_identity,
     coverage_parity_evidence_sha256=coverage_evidence_sha256,
+    reference_in_saved_cohort=member is not None,
   )
 
 
