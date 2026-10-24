@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -391,6 +392,8 @@ def build_distillation_environment(
   device: str = "cpu",
   render_mode: str | None = None,
   seed: int | None = None,
+  motion_file: Path | str | None = None,
+  disable_terminations: bool = False,
 ) -> ManagerBasedRlEnv:
   """Build one selected-teacher environment from a registered task factory.
 
@@ -398,6 +401,16 @@ def build_distillation_environment(
   used by M1 for validation and never supplies constructors or callables.
   Resource overrides (``num_envs``, ``device``, and ``render_mode``) are
   intentionally explicit and are not semantic contract overrides.
+
+  ``motion_file`` replaces the teacher's own clip for a reference-only playback
+  of a motion the cohort never contained.  The teacher then supplies only the
+  saved observation timing and the validation contract; its clip identity is not
+  used.  The override is recorded as a semantic override so a report shows it.
+
+  ``disable_terminations`` clears every termination term, so a fall, a large
+  reference deviation, and the episode time limit no longer reset the scene and
+  playback keeps running.  It is a playback aid: no reset means the episode
+  counters and any reset-derived evidence describe one unbroken episode.
   """
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.tasks.registry import load_env_cfg
@@ -423,7 +436,17 @@ def build_distillation_environment(
   if not isinstance(motion_cfg, MotionCommandCfg):
     raise ValueError(f"registered task {selected_task!r} has no motion command")
   motion_cfg = make_segment_motion_cfg(motion_cfg)
-  motion_cfg.motion_file = str(teacher.entry.motion)
+  if motion_file is None:
+    motion_cfg.motion_file = str(teacher.entry.motion)
+  else:
+    override = Path(motion_file)
+    if not override.is_file():
+      raise ValueError(f"motion override is not a file: {override}")
+    motion_cfg.motion_file = str(override)
+    semantic_overrides.append(
+      "private reference override: commands.motion.motion_file: "
+      f"{teacher.entry.motion!s} -> {override!s}"
+    )
   # The cohort's preview is not the base task's business.  Every member of a cohort
   # shares one ``lookahead_s`` and the saved teacher exports were produced with it, so a
   # pinned single-motion environment must produce that same sample.  Without this the
@@ -439,6 +462,12 @@ def build_distillation_environment(
       f"{lookahead_from_base!r} -> {cohort.lookahead_s!r}"
     )
   cfg.commands["motion"] = motion_cfg
+  if disable_terminations:
+    disabled = tuple(cfg.terminations)
+    cfg.terminations = {}
+    semantic_overrides.append(
+      "private playback override: terminations disabled: " + ", ".join(disabled)
+    )
   env = ManagerBasedRlEnv(cfg, device=device, render_mode=render_mode)
   env.cfg.__dict__["_distillation_semantic_overrides"] = semantic_overrides
   env.cfg.__dict__["_distillation_seed_provenance"] = RuntimeSeedProvenance(

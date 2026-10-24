@@ -250,6 +250,55 @@ This is a playback and evaluation relaxation. Training, resume, and
 ``load_cohort_member_inference`` keeps ``allow_foreign_reference=False`` so an
 internal caller must opt in explicitly.
 
+Playback without a teacher entry
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A manifest is the only way to name a clip, and every entry pairs that clip with a
+teacher checkpoint. ``distill play --motion FILE`` removes that pairing: any
+tracking NPZ can be played by the loaded student, including a motion that no
+manifest lists and no teacher was trained on.
+
+.. code-block:: bash
+
+   # A clip that is in neither the 36-clip nor the 144-clip cohort.
+   uv run distill play \
+     --manifest configs/distillation/x2_tennis_vendor_gains_dr_waist_kd4_v3.yaml \
+     --repo-root . \
+     --checkpoint <student checkpoint-final.pt> \
+     --motion data/tennis/single_105_zhanghongyu_agibot_x2_tracking.npz
+
+With ``--motion`` the ``--teacher-id`` no longer selects the clip. It only names
+the cohort member whose saved observation timing supplies the environment, so it
+defaults to the first member when the requested id is not in the cohort. The
+environment is still built from the registered task, and the live contract is
+still audited: joint order, action scales, control rate, decimation, observation
+layout, anchor, tracked bodies, and FPS must match. Only the clip-identity check
+and the ONNX embedded-reference comparison are skipped, because the teacher ONNX
+is never executed in playback.
+
+``--motion`` is playback-only. No teacher label is produced for such a clip, so
+``evaluate`` does not accept it; a report cannot be built from a teacher that
+never saw the motion.
+
+Watching a failure without a reset
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The playback environment keeps the trained termination terms, so a fall, a large
+reference deviation, or the episode time limit resets the scene. Pass
+``--no-terminations True`` to clear them and keep one unbroken episode:
+
+.. code-block:: bash
+
+   uv run distill play --manifest <manifest> --repo-root . \
+     --checkpoint <student checkpoint-final.pt> --teacher-id vgk020 \
+     --no-terminations True
+
+Measured on the vgk36 student with zero actions: with terminations on, the scene
+terminated at step 14 and produced four termination steps in 150; with the flag
+on, zero terminations in 150 steps. The override is recorded as a private
+semantic override, and reset-derived evidence describes one continuous episode,
+so it is a viewing aid rather than a measurement mode.
+
 Selection syntax
 ^^^^^^^^^^^^^^^^
 

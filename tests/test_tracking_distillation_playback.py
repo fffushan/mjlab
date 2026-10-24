@@ -317,6 +317,121 @@ def test_play_help_lists_checkpoint_viewer_and_shows_environment_defaults(
   assert inspect.signature(distill._play).parameters["viewer"].default == "viser"
 
 
+def test_play_motion_override_needs_a_checkpoint_and_never_builds_an_env(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  calls: list[dict] = []
+  adapters: list[_FakeAdapter] = []
+  _install_fake_adapter(monkeypatch, calls, adapters)
+  clip = tmp_path / "clip.npz"
+  clip.write_bytes(b"not read: the argument check comes first")
+
+  # Both refusals precede the manifest read, so neither path builds anything.
+  for extra in (["--motion", str(clip)], ["--motion", str(tmp_path / "missing.npz")]):
+    code = invoke(
+      monkeypatch,
+      [
+        "distill",
+        "play",
+        "--manifest",
+        str(tmp_path / "does-not-exist.yaml"),
+        "--repo-root",
+        str(tmp_path),
+        "--checkpoint",
+        str(tmp_path / "checkpoint.pt"),
+        *extra,
+      ]
+      if extra[1].endswith("missing.npz")
+      else [
+        "distill",
+        "play",
+        "--manifest",
+        str(tmp_path / "does-not-exist.yaml"),
+        "--repo-root",
+        str(tmp_path),
+        *extra,
+      ],
+    )
+    capsys.readouterr()
+    assert code == 1
+  assert calls == []
+  assert adapters == []
+
+
+def test_play_motion_override_names_the_clip_and_borrows_a_cohort_member(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  calls: list[dict] = []
+  adapters: list[_FakeAdapter] = []
+  _install_fake_adapter(monkeypatch, calls, adapters)
+  _install_fake_viewers(monkeypatch)
+  resolved = _resolved_cohort(tmp_path)
+  checkpoint = tmp_path / "checkpoint-final.pt"
+  _write_train_shaped_checkpoint(checkpoint, resolved)
+  clip = tmp_path / "single_999.npz"
+  clip.write_bytes(b"unused: the fake adapter never reads the clip")
+
+  code = invoke(
+    monkeypatch,
+    [
+      "distill",
+      "play",
+      "--manifest",
+      str(tmp_path / "configs" / "tiny_teachers.yaml"),
+      "--repo-root",
+      str(tmp_path),
+      "--teacher-id",
+      "not-a-member",
+      "--checkpoint",
+      str(checkpoint),
+      "--motion",
+      str(clip),
+      "--num-envs",
+      "1",
+    ],
+  )
+
+  captured = capsys.readouterr()
+  assert code == 0
+  # The clip is decoupled from the teacher: the factory receives it verbatim, and
+  # a real cohort member supplies the saved observation timing.
+  assert calls[0]["motion_file"] == clip
+  assert calls[0]["teacher_id"] == DEFAULT_TEACHER_IDS[0]
+  assert "borrows the environment settings" in captured.err
+  assert str(clip) in captured.err
+  assert "no teacher label is valid" in captured.err
+
+
+def test_play_no_terminations_reaches_the_environment_builder(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+  calls: list[dict] = []
+  adapters: list[_FakeAdapter] = []
+  _install_fake_adapter(monkeypatch, calls, adapters)
+  _install_fake_viewers(monkeypatch)
+  resolved = _resolved_cohort(tmp_path)
+  checkpoint = tmp_path / "checkpoint-final.pt"
+  _write_train_shaped_checkpoint(checkpoint, resolved)
+
+  # Off by default, so the audited evaluate contract is unchanged.
+  code = invoke(monkeypatch, _play_argv(tmp_path, checkpoint, "--num-envs", "1"))
+  captured = capsys.readouterr()
+  assert code == 0
+  assert calls[0]["disable_terminations"] is False
+  assert "terminations disabled" not in captured.err
+
+  # Opted in: the flag reaches the builder and the run says so.
+  calls.clear()
+  code = invoke(
+    monkeypatch,
+    _play_argv(tmp_path, checkpoint, "--num-envs", "1", "--no-terminations", "True"),
+  )
+  captured = capsys.readouterr()
+  assert code == 0
+  assert calls[0]["disable_terminations"] is True
+  assert "terminations disabled" in captured.err
+
+
 def test_play_requires_checkpoint_before_building_the_environment(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -18,6 +18,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import IntEnum
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -1040,8 +1041,16 @@ def validate_live_contract(
   *,
   task_id: str | None = None,
   compare_reference_arrays: bool = True,
+  reference_overridden: bool = False,
 ) -> LiveContractAudit:
-  """Reject semantic saved/live mismatches before collecting any labels."""
+  """Reject semantic saved/live mismatches before collecting any labels.
+
+  ``reference_overridden`` marks a reference-only playback, where the live clip
+  is deliberately not the teacher's own.  Only the clip-identity checks are then
+  skipped: the FPS agreement, the observation contract, the action term, the
+  control parameters, and the audited body frames all still apply, because they
+  decide whether the student's tensors can be applied at all.
+  """
   teacher = cohort.teacher(teacher_id)
   selected_task = task_id or cohort.manifest.base_task
   if selected_task is None:
@@ -1068,13 +1077,18 @@ def validate_live_contract(
     )
   if abs(float(command.motion.fps) - teacher.reference.fps) > 1e-5:
     raise DistillationError("live motion FPS disagrees with saved teacher")
-  if str(command.cfg.motion_file) != str(teacher.entry.motion):
+  if not reference_overridden and str(command.cfg.motion_file) != str(
+    teacher.entry.motion
+  ):
     raise DistillationError("live motion file differs from selected teacher artifact")
 
   action_term = env.action_manager.get_term(teacher.actions.term)
   _validate_live_action_term(teacher, action_term)
   asset = audit_live_asset(
-    env, cohort, teacher_id, compare_reference_arrays=compare_reference_arrays
+    env,
+    cohort,
+    teacher_id,
+    compare_reference_arrays=compare_reference_arrays and not reference_overridden,
   )
   _validate_live_control_parameters(env, cohort, teacher_id, action_term)
   return LiveContractAudit(
@@ -1632,8 +1646,22 @@ def make_distillation_adapter(
   render_mode: str | None = None,
   schema: VaeSchema | None = None,
   seed: int | None = None,
+  motion_file: Path | str | None = None,
+  disable_terminations: bool = False,
 ) -> DistillationEnvironmentAdapter:
-  """Resolve one teacher, build the trusted opt-in env, validate, and adapt it."""
+  """Resolve one teacher, build the trusted opt-in env, validate, and adapt it.
+
+  ``motion_file`` plays a reference clip the selected teacher never described.
+  The teacher still supplies the saved observation timing and the interface
+  contract, but its clip-identity check is skipped and the reference arrays
+  embedded in its ONNX are not compared, because the student is the only policy
+  that runs.  Teacher labels for such a clip are not valid, which is why only
+  playback exposes this.
+
+  ``disable_terminations`` keeps the scene alive through a fall, a large
+  reference deviation, and the episode time limit, so playback can be watched
+  instead of restarting.  ``terminated`` then stays false for every step.
+  """
   env = build_distillation_environment(
     cohort,
     teacher_id,
@@ -1642,9 +1670,17 @@ def make_distillation_adapter(
     device=device,
     render_mode=render_mode,
     seed=seed,
+    motion_file=motion_file,
+    disable_terminations=disable_terminations,
   )
   try:
-    audit = validate_live_contract(env, cohort, teacher_id, task_id=task_id)
+    audit = validate_live_contract(
+      env,
+      cohort,
+      teacher_id,
+      task_id=task_id,
+      reference_overridden=motion_file is not None,
+    )
     return DistillationEnvironmentAdapter.from_artifacts(
       env, cohort, teacher_id, schema=schema, audit=audit
     )

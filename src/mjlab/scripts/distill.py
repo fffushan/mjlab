@@ -3534,6 +3534,8 @@ def _play(
   viewer: PlayViewer = "viser",
   frame_rate: float = 60.0,
   allow_foreign_reference: bool = True,
+  motion: Path | None = None,
+  no_terminations: bool = False,
 ) -> int:
   """Play a checkpointed student interactively in the shared viewers.
 
@@ -3555,7 +3557,20 @@ def _play(
   order, action scales, control rate, observation layout, anchor, tracked bodies,
   fps) is still validated, and the run prints that the reference is outside the
   trained cohort.  ``--allow-foreign-reference False`` restores the strict
-  member-only selection.  Hot swaps use the same version-dispatched validation, so a version-1
+  member-only selection.
+
+  ``--motion`` decouples the clip from the manifest entirely: any tracking NPZ can
+  be played by the loaded student, so a motion with no teacher artifact is
+  playable.  ``--teacher-id`` then names only the cohort member whose saved
+  observation timing supplies the environment; it is not required to be a member
+  and defaults to the first one.  The clip-identity check and the ONNX reference
+  comparison are skipped, the FPS must still match, and no teacher labels are
+  produced, so this is playback only.
+
+  ``--no-terminations`` clears every termination term, so a fall, a large
+  reference deviation, and the episode time limit no longer reset the scene.  The
+  scene then runs as one unbroken episode, which is what makes a failure mode
+  watchable instead of a restart.  Hot swaps use the same version-dispatched validation, so a version-1
   and a version-2 artifact in one directory can both be inspected.
 
   The checkpoint is loaded *before* the simulator is built, so a missing or
@@ -3577,7 +3592,23 @@ def _play(
       raise ValueError("num_envs must be a positive integer")
     if not math.isfinite(frame_rate) or frame_rate <= 0.0:
       raise ValueError("frame_rate must be finite and positive")
+    if motion is not None:
+      if checkpoint is None:
+        raise ValueError("--motion playback requires --checkpoint")
+      if not Path(motion).is_file():
+        raise ValueError(f"motion file does not exist: {motion}")
     cohort = _resolve(manifest, repo_root)
+    if motion is not None and teacher_id not in cohort.teacher_ids:
+      # The clip no longer comes from the teacher, so any member can supply the
+      # saved observation timing the student was trained with.
+      provider = cohort.teacher_ids[0]
+      print(
+        f"[INFO]: --motion playback borrows the environment settings of "
+        f"{provider!r} instead of {teacher_id!r}",
+        file=sys.stderr,
+        flush=True,
+      )
+      teacher_id = provider
     # Early model-only load: cheap, validates teacher/cohort identity and the
     # control contract, and yields the SAVED schema the live packing must
     # reproduce (the saved settings imply the trained architecture, not a
@@ -3601,13 +3632,15 @@ def _play(
       device=device,
       schema=inference.schema,
       seed=seed,
+      motion_file=motion,
+      disable_terminations=no_terminations,
     )
     seed_audit = _seed_audit(adapter)
     _require_requested_seed_applied(seed, seed_audit)
     # Playback-only sampling override on the private command copy; the live
     # contract was already validated against the saved teacher.
-    motion = adapter.env.command_manager.get_term("motion")
-    motion.cfg.sampling_mode = sampling_mode
+    motion_term = adapter.env.command_manager.get_term("motion")
+    motion_term.cfg.sampling_mode = sampling_mode
     # One audited seeded reset after the sampling override and before the first
     # viewer action, so the first policy action reads reset state.
     adapter.reset(seed=seed)
@@ -3622,14 +3655,35 @@ def _play(
       allow_foreign_reference=allow_foreign_reference,
     )
     resolved_viewer = _resolve_play_viewer(viewer)
+    played = (
+      str(motion)
+      if motion is not None
+      else str(cohort.teacher(teacher_id).entry.motion)
+    )
     print(
-      f"[INFO]: Playing {checkpoint.name} as {teacher_id} on {resolved_viewer} "
-      f"(device={device}, num_envs={num_envs}, sampling_mode={sampling_mode}, "
-      f"mean latent)",
+      f"[INFO]: Playing {checkpoint.name} on {played} as {teacher_id} on "
+      f"{resolved_viewer} (device={device}, num_envs={num_envs}, "
+      f"sampling_mode={sampling_mode}, mean latent)",
       file=sys.stderr,
       flush=True,
     )
-    if not inference.reference_in_saved_cohort:
+    if motion is not None:
+      print(
+        "[WARN]: reference-only playback: the clip is not the selected teacher's "
+        "own, so no teacher label is valid for it",
+        file=sys.stderr,
+        flush=True,
+      )
+    if no_terminations:
+      print(
+        "[INFO]: terminations disabled: a fall, a large reference deviation, and "
+        "the time limit will not reset the scene",
+        file=sys.stderr,
+        flush=True,
+      )
+    # A version-1 single-teacher artifact has no cohort record, so it is never a
+    # foreign reference.
+    if not getattr(inference, "reference_in_saved_cohort", True):
       print(
         f"[WARN]: {teacher_id!r} is not a member of the trained cohort "
         f"{list(inference.cohort.teacher_ids)}; the reference is outside the "
