@@ -98,6 +98,24 @@ def _mean_tensor_or_zero(value: Tensor) -> Tensor:
   return value.mean().float()
 
 
+def _lr_horizon_from_environment() -> int | None:
+  """Read MJLAB_FLOW_LR_HORIZON_UPDATES, or return None for the run budget."""
+  raw = os.environ.get("MJLAB_FLOW_LR_HORIZON_UPDATES", "")
+  if raw == "":
+    return None
+  try:
+    value = int(raw)
+  except ValueError as exc:
+    raise FlowTrainerError(
+      f"MJLAB_FLOW_LR_HORIZON_UPDATES must be an integer, got {raw!r}"
+    ) from exc
+  if value < 1:
+    raise FlowTrainerError(
+      f"MJLAB_FLOW_LR_HORIZON_UPDATES must be positive, got {value}"
+    )
+  return value
+
+
 def _rng_state_tensor(value: Any) -> Tensor:
   """Return one serialized RNG state as the CPU ByteTensor the APIs expect.
 
@@ -183,6 +201,7 @@ class FlowTrainer:
     if self.device.type == "cuda" and not torch.cuda.is_available():
       raise FlowTrainerError("CUDA device requested but CUDA is unavailable")
     self.diagnostics = self._build_diagnostics()
+    self._lr_horizon_env = _lr_horizon_from_environment()
     self.model.to(self.device)
     self.ema = ExponentialMovingAverage(
       self.model,
@@ -416,6 +435,19 @@ class FlowTrainer:
       generator=self.sampler_generator,
     )
 
+  @property
+  def _lr_horizon(self) -> int:
+    """Number of updates over which cosine decays to zero.
+
+    It defaults to the run budget, so ordinary runs are unchanged.  An operator
+    may shorten it with MJLAB_FLOW_LR_HORIZON_UPDATES to finish the anneal
+    before the stop condition, which separates "the schedule annealed at the
+    right time" from "the run simply ended early".
+    """
+    if self._lr_horizon_env is None:
+      return int(self._resolved_updates)
+    return min(self._lr_horizon_env, int(self._resolved_updates))
+
   def _build_diagnostics(self) -> FlowDiagnostics | None:
     """Return a sidecar recorder, or ``None`` when it is not requested.
 
@@ -588,7 +620,7 @@ class FlowTrainer:
     _finite_tensor(torch.as_tensor(gradient_norm), "clipped gradient norm")
     learning_rate = warmup_cosine_learning_rate(
       update_index,
-      total_updates=self._resolved_updates,
+      total_updates=self._lr_horizon,
       learning_rate=self.training.learning_rate,
       warmup_updates=self.training.warmup_updates,
     )
@@ -630,6 +662,7 @@ class FlowTrainer:
     result["accumulated_microbatches"] = float(len(pending))
     result["global_step"] = float(self.global_step)
     result["gradient_norm"] = float(gradient_norm)
+    result["lr_horizon_updates"] = float(self._lr_horizon)
     self._last_train_loss = result["loss"]
     if self.diagnostics is not None:
       self.diagnostics.end_update(
