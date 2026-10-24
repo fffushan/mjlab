@@ -81,6 +81,36 @@ def _split_dataset(
   return dataset, prepared.path
 
 
+def _settings_from_environment(settings: "DenoiserSettings") -> "DenoiserSettings":
+  """Apply optional width, depth and FFN overrides for a capacity ablation.
+
+  The frozen default shape is left alone; only a run that sets one of these
+  variables builds a different model, and the override is recorded in the model
+  identity, so a checkpoint names the shape that produced it.
+  """
+  from dataclasses import replace
+
+  raw = {
+    "width": os.environ.get("MJLAB_FLOW_WIDTH", ""),
+    "layers": os.environ.get("MJLAB_FLOW_LAYERS", ""),
+    "ffn_width": os.environ.get("MJLAB_FLOW_FFN", ""),
+  }
+  if not any(raw.values()):
+    return settings
+  values: dict[str, int] = {}
+  for name, value in raw.items():
+    if value == "":
+      continue
+    try:
+      parsed = int(value)
+    except ValueError as exc:
+      raise SystemExit(f"{name} override must be an integer, got {value!r}") from exc
+    if parsed < 1:
+      raise SystemExit(f"{name} override must be positive, got {parsed}")
+    values[name] = parsed
+  return replace(settings, **values)
+
+
 def _build_denoiser(settings: "DenoiserSettings", *, final_norm: bool):
   """Build the shared denoiser, or the final-norm ablation variant.
 
@@ -90,6 +120,7 @@ def _build_denoiser(settings: "DenoiserSettings", *, final_norm: bool):
   """
   from mjlab.tasks.tracking.diffusion.model import StateLatentTransformer
 
+  settings = _settings_from_environment(settings)
   if not final_norm:
     return StateLatentTransformer(settings)
   from mjlab.tasks.tracking.diffusion.model_final_norm import (
