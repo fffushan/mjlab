@@ -9,6 +9,11 @@ papers.
 This record contains evidence only. It does not authorize a data purge, a diverged-run
 restart, DDP work, or a commit to the main checkout.
 
+**Superseded for status, kept as the dated record of the first four arms.** The
+follow-on results, including the seed sweep, the 1 M schedule batch, the refutation of
+the final-LayerNorm hypothesis and the checkpoint-selection problem, are in
+`x2_joint_pose_flow_divergence_findings.md`.
+
 ## 1. Implementation status
 
 | Item | State |
