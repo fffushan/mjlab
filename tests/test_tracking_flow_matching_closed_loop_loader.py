@@ -23,6 +23,9 @@ from mjlab.tasks.tracking.diffusion.model import (
   DenoiserSettings,
   StateLatentTransformer,
 )
+from mjlab.tasks.tracking.diffusion.model_final_norm import (
+  StateLatentTransformerFinalNorm,
+)
 from mjlab.tasks.tracking.diffusion.projection import (
   ProjectionBundle,
   StateLatentNormalizer,
@@ -82,6 +85,7 @@ def _save_flow(
   dataset_identity: dict[str, object],
   process: LinearNoiseProcess | None = None,
   ema: ExponentialMovingAverage | None | _AutoEma = _AUTO_EMA,
+  model: StateLatentTransformer | None = None,
 ) -> ExponentialMovingAverage | None:
   """Write a synthetic flow checkpoint and return the EMA that was saved.
 
@@ -89,7 +93,8 @@ def _save_flow(
   store a checkpoint that carries no EMA shadow.
   """
   process = process if process is not None else LinearNoiseProcess()
-  model = _build_model(process)
+  if model is None:
+    model = _build_model(process)
   if isinstance(ema, _AutoEma):
     ema = ExponentialMovingAverage(model)
   save_flow_checkpoint(
@@ -337,3 +342,100 @@ def test_flow_loader_fails_closed_on_a_normalizer_hash_mismatch(tmp_path) -> Non
   _save_flow(good, dataset_identity=_identity(other))
   loaded = ri.load_flow_denoiser(good, contract=DEFAULT_CONTRACT, normalizer=other)
   assert loaded.projection_hashes == {"statistics": other.statistics_sha256}
+
+
+def _ablation_model(process: LinearNoiseProcess) -> StateLatentTransformer:
+  """A checkpoint whose architecture departs from the frozen default shape."""
+  settings = dataclass_replace(
+    DenoiserSettings.from_contract(DEFAULT_CONTRACT, training_k=process.max_level),
+    width=256,
+    layers=2,
+    attention_heads=4,
+    ffn_width=512,
+  )
+  return StateLatentTransformer(settings)
+
+
+def test_flow_loader_builds_the_recorded_ablation_shape(tmp_path) -> None:
+  normalizer = _normalizer()
+  process = LinearNoiseProcess()
+  model = _ablation_model(process)
+  checkpoint = tmp_path / "flow-ablation.pt"
+  _save_flow(
+    checkpoint,
+    dataset_identity=_identity(normalizer),
+    process=process,
+    model=model,
+  )
+
+  loaded = ri.load_flow_denoiser(
+    checkpoint, contract=DEFAULT_CONTRACT, normalizer=normalizer
+  )
+
+  # The loader reads the shape from the artifact, not from the hard-coded default.
+  assert loaded.model.settings.width == 256
+  assert loaded.model.settings.layers == 2
+  assert loaded.model.settings.ffn_width == 512
+  assert loaded.model.parameter_count() == model.parameter_count()
+  assert loaded.model.parameter_count() < 20_132_007
+  assert type(loaded.model).__qualname__ == "StateLatentTransformer"
+
+
+def test_flow_loader_builds_the_recorded_final_norm_variant(tmp_path) -> None:
+  normalizer = _normalizer()
+  process = LinearNoiseProcess()
+  model = StateLatentTransformerFinalNorm(
+    DenoiserSettings.from_contract(DEFAULT_CONTRACT, training_k=process.max_level)
+  )
+  checkpoint = tmp_path / "flow-final-norm.pt"
+  _save_flow(
+    checkpoint,
+    dataset_identity=_identity(normalizer),
+    process=process,
+    model=model,
+  )
+
+  loaded = ri.load_flow_denoiser(
+    checkpoint, contract=DEFAULT_CONTRACT, normalizer=normalizer
+  )
+
+  assert type(loaded.model).__qualname__ == "StateLatentTransformerFinalNorm"
+  assert hasattr(loaded.model, "final_norm")
+  assert loaded.model.parameter_count() == model.parameter_count() == 20_133_031
+  assert all(not p.requires_grad for p in loaded.model.parameters())
+
+
+def test_flow_loader_rejects_a_recorded_shape_outside_the_contract(tmp_path) -> None:
+  normalizer = _normalizer()
+  process = LinearNoiseProcess()
+  model = StateLatentTransformer(
+    dataclass_replace(
+      DenoiserSettings.from_contract(DEFAULT_CONTRACT, training_k=process.max_level),
+      token_dimension=DEFAULT_CONTRACT.token_dimension - 6,
+    )
+  )
+  checkpoint = tmp_path / "flow-bad-token.pt"
+  _save_flow(
+    checkpoint,
+    dataset_identity=_identity(normalizer),
+    process=process,
+    model=model,
+  )
+
+  with pytest.raises(
+    ri.ReplayError, match="token shape disagrees with the active contract"
+  ):
+    ri.load_flow_denoiser(checkpoint, contract=DEFAULT_CONTRACT, normalizer=normalizer)
+
+
+def test_flow_loader_rejects_an_unknown_recorded_model_type(tmp_path) -> None:
+  normalizer = _normalizer()
+  checkpoint = tmp_path / "flow.pt"
+  _save_flow(checkpoint, dataset_identity=_identity(normalizer))
+
+  payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+  payload["model_identity"]["type"] = "SomeOtherDenoiser"
+  torch.save(payload, checkpoint)
+
+  with pytest.raises(ri.ReplayError, match="unsupported model type"):
+    ri.load_flow_denoiser(checkpoint, contract=DEFAULT_CONTRACT, normalizer=normalizer)

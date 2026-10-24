@@ -21,7 +21,7 @@ import argparse
 import hashlib
 import json
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, cast
 
@@ -284,13 +284,71 @@ def load_denoiser(
   )
 
 
-def _read_flow_process(path: str | Path) -> LinearNoiseProcess:
-  """Read the linear process a flow checkpoint records before model construction.
+_FLOW_DENOISER_TYPES: dict[str, Any] = {}
 
-  ``load_flow_checkpoint`` restores state into a caller-built model, so the
-  model's level-embedding width must be known first.  The checkpoint is read
+
+def _flow_denoiser_type(name: object) -> type[StateLatentTransformer]:
+  """Resolve a recorded model type name to the class that must be built.
+
+  The checkpoint already names the class that produced it, so the loader reads
+  the architecture from the artifact instead of assuming the frozen default
+  shape.  Unknown names fail closed.
+  """
+  if not _FLOW_DENOISER_TYPES:
+    from .model import StateLatentTransformer as base
+    from .model_final_norm import StateLatentTransformerFinalNorm as variant
+
+    _FLOW_DENOISER_TYPES[base.__qualname__] = base
+    _FLOW_DENOISER_TYPES[variant.__qualname__] = variant
+  if not isinstance(name, str) or name not in _FLOW_DENOISER_TYPES:
+    raise ReplayError(
+      "flow checkpoint records an unsupported model type: "
+      f"{name!r}; known types are {sorted(_FLOW_DENOISER_TYPES)}"
+    )
+  return _FLOW_DENOISER_TYPES[name]
+
+
+def _settings_from_recorded_identity(
+  identity: Mapping[str, Any], *, training_k: int
+) -> DenoiserSettings:
+  """Rebuild the exact ``DenoiserSettings`` a checkpoint recorded.
+
+  Width, depth, feed-forward width, head count, token width, sequence length
+  and embedding count come from the artifact, so an ablation shape survives the
+  round trip.  A checkpoint that records no settings is rejected rather than
+  silently loaded into the default shape.
+  """
+  recorded = identity.get("settings") if isinstance(identity, Mapping) else None
+  if not isinstance(recorded, Mapping):
+    raise ReplayError("flow checkpoint records no model settings")
+  known = {field.name for field in fields(DenoiserSettings) if field.init}
+  unknown = sorted(set(map(str, recorded)) - known)
+  if unknown:
+    raise ReplayError(
+      f"flow checkpoint records unknown model settings {unknown}; "
+      f"this loader knows {sorted(known)}"
+    )
+  values = dict(recorded)
+  if "embedding_count" in values and int(values["embedding_count"]) != training_k + 1:
+    raise ReplayError(
+      "flow checkpoint embedding count does not match its own level count: "
+      f"{values['embedding_count']} != {training_k + 1}"
+    )
+  try:
+    return DenoiserSettings(**values)
+  except (TypeError, ValueError) as exc:
+    raise ReplayError(f"flow checkpoint model settings are not usable: {exc}") from exc
+
+
+def _read_flow_process(
+  path: str | Path,
+) -> tuple[LinearNoiseProcess, Mapping[str, Any]]:
+  """Read the process and model identity a flow checkpoint records.
+
+  ``load_flow_checkpoint`` restores state into a caller-built model, so both the
+  level grid and the architecture must be known first.  The checkpoint is read
   once for this identity; :func:`load_flow_checkpoint` then revalidates the
-  same process mapping, so a tampered process cannot reach the runtime.
+  same process and model identity, so a tampered file cannot reach the runtime.
   """
   try:
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
@@ -302,9 +360,14 @@ def _read_flow_process(path: str | Path) -> LinearNoiseProcess:
     raise ReplayError(
       f"flow checkpoint {path} is unsupported or malformed for the flow family"
     )
+  model_identity = payload.get("model_identity")
+  if not isinstance(model_identity, Mapping):
+    raise ReplayError(
+      f"flow checkpoint {path} records no model identity for model construction"
+    )
   try:
     raw = _restore_process(payload)
-    return LinearNoiseProcess(int(raw["max_level"]))
+    return LinearNoiseProcess(int(raw["max_level"])), model_identity
   except (FlowCheckpointError, KeyError, TypeError, ValueError) as exc:
     raise ReplayError(
       f"flow checkpoint {path} records no valid linear process: {exc}"
@@ -416,10 +479,20 @@ def load_flow_denoiser(
     raise ReplayError(
       f"active diffusion contract has no usable model layout: {exc}"
     ) from exc
-  process = _read_flow_process(checkpoint_path)
-  model = StateLatentTransformer(
-    DenoiserSettings.from_contract(contract, training_k=process.max_level)
+  process, recorded_identity = _read_flow_process(checkpoint_path)
+  settings = _settings_from_recorded_identity(
+    recorded_identity, training_k=process.max_level
   )
+  if (
+    settings.token_dimension != dimensions.token_dimension
+    or settings.sequence_length != dimensions.window_steps
+  ):
+    raise ReplayError(
+      "flow checkpoint token shape disagrees with the active contract: "
+      f"checkpoint {settings.token_dimension}x{settings.sequence_length}, "
+      f"contract {dimensions.token_dimension}x{dimensions.window_steps}"
+    )
+  model = _flow_denoiser_type(recorded_identity.get("type"))(settings)
   try:
     state = load_flow_checkpoint(
       checkpoint_path,
