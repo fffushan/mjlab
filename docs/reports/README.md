@@ -34,6 +34,7 @@ Moving them requires a separate, explicitly authorized change that updates all o
 | `x2_joint_pose_trackability_and_modes.md` | measurement + tool note | trackability pass 1, mode coverage, and the survey tooling | pass 1 measured; no data removed |
 | `x2_joint_pose_flow_training_runs.md` | experiment + diagnosis | four-arm 400k flow-training status, divergence signature, reference-paper comparison | checked 2026-10-23; 1 arm stable, 3 diverged; fixes only proposed |
 | `x2_joint_pose_flow_divergence_findings.md` | experiment + diagnosis | 20 arms: seed dependence of the divergence, the accumulated-learning-rate threshold, the final-norm refutation, schedule and checkpoint-selection consequences | checked 2026-10-24; training loss only; mechanism and held-out quality unmeasured |
+| `gpu-container-storage-nas-and-nvme.md` | operational note + measurement | managed-container storage: NAS versus local NVMe, measured throughput, sizes, rules and failure modes | checked 2026-10-24; throughput measured on two dates, per-stream ceiling unknown |
 | `x2_flow_matching_divergence_ablation_20261023.md` | experiment | closed-loop failure against a 13-arm batch, lr, seed and level ablation; the remaining preview-term candidate | measured; divergence reproduced in 11 of 11 arms |
 | `tracking_footstep_experiments.md` | experiment log | G1 29DOF mode-15 footstep tracking experiments | 2026-09-11 record; not revalidated |
 | `ACCEPTANCE-20261007.md` | acceptance | difficult-state coverage integration acceptance | supersedes the removed `PARENT-ACCEPTANCE.md` |
