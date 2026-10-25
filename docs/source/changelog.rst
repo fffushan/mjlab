@@ -582,6 +582,15 @@ Changed
   denoiser wrapper copies the final-normalisation ablation and refuses to drop a
   tensor the checkpoint records.
 
+- Changed the exported deployment contract to declare ``schema.lookahead_s`` for
+  a version-2 (``motion_lookahead``) reference layout. The value is read from the
+  member's saved environment config, so a hand patch is no longer required to
+  load a 130-wide bundle; a version-1 contract declares no horizon. A
+  version-2 member whose saved config has no ``lookahead_s``, or whose
+  ``ceil(lookahead_s * reference_fps)`` is not positive, is refused. The
+  checkpoint compatibility metadata is unchanged, so existing checkpoints still
+  load.
+
 - Changed the X2 collection and closed-loop startup reference path to accept
   both frozen gravity VAE layouts. Version 1 keeps reference 68 / conditioning
   99 / latent 32 / action 31. Version 2 adds one 62-wide q/dq preview at

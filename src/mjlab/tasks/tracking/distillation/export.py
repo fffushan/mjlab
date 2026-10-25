@@ -43,12 +43,17 @@ from mjlab.tasks.tracking.distillation.cohort_contract import (
 )
 from mjlab.tasks.tracking.distillation.config import (
   CohortContract,
+  ResolvedTeacher,
   load_manifest,
   resolve_cohort,
   sha256_file,
 )
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
-from mjlab.tasks.tracking.distillation.vae_config import DecoderMode, VaeSchema
+from mjlab.tasks.tracking.distillation.vae_config import (
+  REFERENCE_PREVIEW_FIELD,
+  DecoderMode,
+  VaeSchema,
+)
 
 BUNDLE_VERSION = 2
 COHORT_BUNDLE_VERSION = 3
@@ -525,6 +530,76 @@ def _graph_interfaces(schema: VaeSchema) -> dict[str, Any]:
   }
 
 
+def _carries_motion_lookahead(schema: VaeSchema) -> bool:
+  """Return whether the saved reference layout ends in ``motion_lookahead``."""
+  return bool(schema.reference_fields) and (
+    schema.reference_fields[-1].name == REFERENCE_PREVIEW_FIELD
+  )
+
+
+def _member_lookahead_s(teacher: ResolvedTeacher) -> float:
+  """Read the lookahead horizon one member's saved environment config declares.
+
+  ``ResolvedTeacher.env_config`` is the saved ``params/env.yaml`` parsed by
+  ``load_saved_yaml``, so its ``!!python/tuple`` tags are already readable.  A
+  missing key is refused instead of defaulted: a layout that carries
+  ``motion_lookahead`` needs this horizon to place that block, and a guessed
+  offset is as wrong as zero padding.
+  """
+  commands = teacher.env_config.get("commands")
+  motion = commands.get("motion") if isinstance(commands, Mapping) else None
+  if not isinstance(motion, Mapping) or "lookahead_s" not in motion:
+    raise ExportValidationError(
+      f"member {teacher.id!r} declares no env.commands.motion.lookahead_s in its "
+      f"saved environment config {teacher.entry.env_config}, so the "
+      f"{REFERENCE_PREVIEW_FIELD!r} horizon of the reference layout cannot be sourced"
+    )
+  lookahead_s = _finite_float(
+    motion["lookahead_s"], f"{teacher.id} env.commands.motion.lookahead_s"
+  )
+  if lookahead_s < 0.0:
+    raise ExportValidationError(
+      f"member {teacher.id!r} declares negative env.commands.motion.lookahead_s "
+      f"{lookahead_s!r} in its saved environment config {teacher.entry.env_config}"
+    )
+  return lookahead_s
+
+
+def _contract_schema(
+  schema: VaeSchema, teacher: ResolvedTeacher
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+  """Return the contract ``schema`` block plus the horizon record behind it.
+
+  ``lookahead_s`` is deployment information, not checkpoint identity:
+  ``VaeSchema.assert_compatible`` compares ``compatibility_metadata()`` exactly,
+  so the horizon is injected into the contract copy and never into the metadata
+  itself.  Only a reference layout that ends in ``motion_lookahead`` (schema
+  version 2) declares it; the version-1 layout has no such field and carries no
+  horizon.  The frame count the horizon reaches is recorded so a value in the
+  wrong unit is visible in the export report.
+  """
+  block = schema.compatibility_metadata()
+  if not _carries_motion_lookahead(schema):
+    return block, None
+  lookahead_s = _member_lookahead_s(teacher)
+  frames = math.ceil(lookahead_s * teacher.reference.fps)
+  if frames <= 0:
+    raise ExportValidationError(
+      f"member {teacher.id!r} declares lookahead_s {lookahead_s!r} at "
+      f"{teacher.reference.fps} fps, so ceil(lookahead_s * reference_fps) is "
+      f"{frames}; a {REFERENCE_PREVIEW_FIELD!r} reference layout needs at least "
+      "one frame of horizon"
+    )
+  block["lookahead_s"] = lookahead_s
+  return block, {
+    "teacher_id": teacher.id,
+    "env_config": str(teacher.entry.env_config),
+    "lookahead_s": lookahead_s,
+    "reference_fps": float(teacher.reference.fps),
+    "lookahead_frames": frames,
+  }
+
+
 def _parity_probe(schema: VaeSchema) -> tuple[torch.Tensor, torch.Tensor]:
   """Build the fixed float32 parity inputs from the saved schema widths."""
   reference = torch.linspace(-1.0, 1.0, schema.reference_dim, dtype=torch.float32)
@@ -711,13 +786,14 @@ def export_bundle(
   with tempfile.TemporaryDirectory(prefix="vae-export-", dir=directory) as temp:
     staging = Path(temp)
     encoder, decoder = _write_graphs(model, staging)
+    contract_schema, lookahead_record = _contract_schema(inference.schema, teacher)
     contract_semantics: dict[str, Any] = {
       "format": "mjlab-vae-contract",
       "version": 2,
       "family": "vae_tracking",
       "teacher_id": teacher_id,
       "model_id": model_id,
-      "schema": inference.schema.compatibility_metadata(),
+      "schema": contract_schema,
       "model_settings": inference.settings.to_metadata(),
       "normalizers": {
         "reference": _normalizer_metadata(model.reference_normalizer),
@@ -785,6 +861,8 @@ def export_bundle(
       "files": descriptor["files"],
       "parity": "pending",
     }
+    if lookahead_record is not None:
+      report["lookahead"] = lookahead_record
     staging_result = ExportResult(
       descriptor=descriptor_path,
       contract=staging / "contract.json",
@@ -1050,6 +1128,8 @@ def export_cohort_bundle(
     encoder, decoder = _write_graphs(model, shared)
 
     common_semantics: dict[str, Any] = {
+      # The shared student identity.  Each member contract below replaces this block
+      # with its own, which also declares that member's lookahead horizon.
       "schema": schema.compatibility_metadata(),
       "model_settings": member_zero.settings.to_metadata(),
       "normalizers": {
@@ -1080,9 +1160,16 @@ def export_cohort_bundle(
     # unchanged), each carrying the shared student model id and its own
     # contract id.
     member_contract_ids: list[str] = []
+    lookahead_records: list[dict[str, Any]] = []
     for member in members:
       teacher = member["teacher"]
       teacher_id = member["teacher_id"]
+      # The shared schema identity is cohort-common, but the horizon is read from
+      # this member's own saved environment config, so a missing one is refused
+      # against the member and the file that should carry it.
+      contract_schema, lookahead_record = _contract_schema(schema, teacher)
+      if lookahead_record is not None:
+        lookahead_records.append(lookahead_record)
       semantics = {
         "format": "mjlab-vae-contract",
         "version": 2,
@@ -1090,6 +1177,7 @@ def export_cohort_bundle(
         "teacher_id": teacher_id,
         "model_id": model_id,
         **common_semantics,
+        "schema": contract_schema,
         "provenance": {
           "checkpoint_sha256": checkpoint_sha,
           "teacher_artifacts": dict(teacher.hashes),
@@ -1247,6 +1335,8 @@ def export_cohort_bundle(
         "members": member_parity,
       },
     }
+    if lookahead_records:
+      report["lookahead"] = lookahead_records
     os.replace(staging, final)
 
   # Publish the store-level descriptor: written to a temporary sibling and

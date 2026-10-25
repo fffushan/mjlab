@@ -24,6 +24,16 @@ Bundle layout
 and 130 for version 2.  Every declared width in ``contract.json`` and in the
 graph input/output shapes comes from that schema, not from a fixed value.
 
+A version-2 reference layout ends in ``motion_lookahead`` and travels that many
+frames ahead of the current reference frame, so its contract also declares
+``schema.lookahead_s``, in seconds.  The exporter reads that value from the
+member's saved environment config (``env.commands.motion.lookahead_s``) and
+refuses a version-2 member that does not declare it; no default exists.  It also
+checks that ``ceil(lookahead_s * reference_fps)`` is at least one frame and
+records that frame count in the export report.  The field belongs to the
+deployment contract only, not to the checkpoint schema identity.  A version-1
+contract declares no horizon.
+
 ``vae-tennis_000.yaml`` has ``format: mjlab-vae-tracking``, ``version: 2``,
 ``family: vae_tracking``, matching ``model_id`` and ``contract_id``, and a
 ``files`` object.  Every path is a contained relative path and every referenced

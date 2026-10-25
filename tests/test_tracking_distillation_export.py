@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -102,13 +103,22 @@ def _checkpoint(
   )
 
 
-def _fixture(tmp_path: Path, *, preview: bool = False):
+def _fixture(
+  tmp_path: Path,
+  *,
+  preview: bool = False,
+  lookahead_s: float = 0.0,
+):
   names = (
     *(f"hip_{i:02d}_hip_joint" for i in range(30)),
     "waist_joint",
   )
   cohort = build_tiny_cohort(
-    tmp_path, teacher_ids=("tiny_000",), joint_names=names, frames=4
+    tmp_path,
+    teacher_ids=("tiny_000",),
+    joint_names=names,
+    frames=4,
+    lookahead_s=lookahead_s,
   )
   teacher = cohort.teachers[0]
   frames = 4
@@ -305,7 +315,7 @@ def test_export_declares_the_schema_widths_of_a_version_two_reference(
   tmp_path: Path,
 ) -> None:
   """A preview-schema checkpoint renders 130-wide interfaces, not a literal 68."""
-  cohort, schema, model, checkpoint = _fixture(tmp_path, preview=True)
+  cohort, schema, model, checkpoint = _fixture(tmp_path, preview=True, lookahead_s=0.2)
   assert (schema.version, schema.reference_dim) == (2, 130)
   result = export_bundle(
     checkpoint,
@@ -331,6 +341,88 @@ def test_export_declares_the_schema_widths_of_a_version_two_reference(
   assert parity["latent_max_abs_error"] <= 1e-5
   assert parity["action_max_abs_error"] <= 1e-5
   assert [item.name for item in onnx.load(result.decoder).graph.output] == ["action"]
+
+
+def test_contract_schema_declares_the_saved_lookahead_horizon(
+  tmp_path: Path,
+) -> None:
+  """A version-2 contract declares the saved horizon; a version-1 contract none."""
+  version_two = tmp_path / "version-two"
+  cohort, schema, _, checkpoint = _fixture(version_two, preview=True, lookahead_s=0.2)
+  result = export_bundle(
+    checkpoint,
+    cohort.manifest,
+    "tiny_000",
+    version_two / "rl_model",
+    repo_root=version_two,
+    asset_audit=_audit(schema.joint_order),
+  )
+  contract = json.loads(result.contract.read_text())
+  horizon = result.report["lookahead"]
+  assert contract["schema"]["lookahead_s"] == 0.2
+  assert horizon["teacher_id"] == "tiny_000"
+  assert horizon["env_config"].endswith("runs/tiny_000/params/env.yaml")
+  assert horizon["lookahead_s"] == 0.2
+  assert horizon["reference_fps"] == 50.0
+  assert horizon["lookahead_frames"] == 10
+  # The horizon belongs to the deployment contract, never to the checkpoint
+  # identity: an exact metadata comparison must still accept every checkpoint.
+  assert "lookahead_s" not in schema.compatibility_metadata()
+  assert contract["provenance"]["source_schema"] == schema.compatibility_metadata()
+
+  version_one = tmp_path / "version-one"
+  cohort, schema, _, checkpoint = _fixture(version_one)
+  result = export_bundle(
+    checkpoint,
+    cohort.manifest,
+    "tiny_000",
+    version_one / "rl_model",
+    repo_root=version_one,
+    asset_audit=_audit(schema.joint_order),
+  )
+  contract = json.loads(result.contract.read_text())
+  assert contract["schema"]["schema_version"] == 1
+  assert "lookahead_s" not in contract["schema"]
+  assert "lookahead" not in result.report
+
+
+def test_contract_refuses_a_version_two_member_without_a_saved_lookahead(
+  tmp_path: Path,
+) -> None:
+  """No default and no fallback: an absent or zero horizon is refused."""
+  cohort, schema, _, _ = _fixture(tmp_path / "absent", preview=True)
+  resolved = resolve_cohort(load_manifest(cohort.manifest, tmp_path / "absent"))
+  teacher = resolved.teacher("tiny_000")
+  commands = teacher.env_config["commands"]
+  without_horizon = {
+    **teacher.env_config,
+    "commands": {
+      **commands,
+      "motion": {
+        key: value for key, value in commands["motion"].items() if key != "lookahead_s"
+      },
+    },
+  }
+  # A saved config whose preview term keeps the trained width is refused earlier, by
+  # ``resolve_cohort``; the exporter guard is asserted at its own seam.
+  with pytest.raises(ExportValidationError, match="lookahead_s") as refused:
+    export_module._contract_schema(schema, replace(teacher, env_config=without_horizon))
+  message = str(refused.value)
+  assert "tiny_000" in message
+  assert "runs/tiny_000/params/env.yaml" in message
+
+  # A saved horizon of zero reaches the same cross-check through the whole export.
+  zero = tmp_path / "zero"
+  cohort, schema, _, checkpoint = _fixture(zero, preview=True, lookahead_s=0.0)
+  with pytest.raises(ExportValidationError, match="one frame of horizon"):
+    export_bundle(
+      checkpoint,
+      cohort.manifest,
+      "tiny_000",
+      zero / "rl_model",
+      repo_root=zero,
+      asset_audit=_audit(schema.joint_order),
+    )
 
 
 def test_export_refuses_unverified_provenance_wrong_binding_and_non_gravity_schema(
