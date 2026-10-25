@@ -457,6 +457,7 @@ class DiffusionTrainer:
     pure_dtype = denoiser_dtype(self.config.mixed_precision)
     if pure_dtype is not None:
       self.model.to(pure_dtype)
+    self.model_dtype = next(self.model.parameters()).dtype
     self.ema = ExponentialMovingAverage(
       self.model,
       power=self.config.ema_power,
@@ -691,7 +692,7 @@ class DiffusionTrainer:
     and its state-dict keys keep their names.
     """
     if not self._perf.compiled_forward:
-      return self.model(tokens, step_ids)
+      return self.model(tokens.to(self.model_dtype), step_ids)
     if self._compiled_model is None:
       model = self.model
       self._compiled_model = torch.compile(lambda t, s: model(t, s), dynamic=False)
@@ -1146,7 +1147,9 @@ class DiffusionTrainer:
       self._alpha_bars,
       generator=generator,
     )
-    prediction = self.model(noised.tokens, torch.stack((k_state, k_latent), dim=-1))
+    prediction = self.model(
+      noised.tokens.to(self.model_dtype), torch.stack((k_state, k_latent), dim=-1)
+    )
     target = x0_target(clean)
     loss = F.mse_loss(prediction.float(), target, reduction="mean")
     return loss, prediction.float(), target, k_state, k_latent

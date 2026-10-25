@@ -591,6 +591,13 @@ def test_bf16_pure_builds_a_bf16_model_and_skips_autocast(tmp_path: Path) -> Non
   from contextlib import nullcontext
   assert isinstance(trainer._autocast(), nullcontext)
 
+  # A fp32 batch must still run: nothing casts the forward input under this
+  # mode, and without the cast in the trainer the call raises
+  # "mat1 and mat2 must have the same dtype".
+  loss, prediction, *_ = trainer._forward_loss(_clean())
+  assert torch.isfinite(loss)
+  assert prediction.dtype == torch.float32
+
 
 def test_clip_helper_matches_torch_and_reports_the_preclip_norm() -> None:
   """The shared clip helper must keep torch's semantics on bf16 gradients."""

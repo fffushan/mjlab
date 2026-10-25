@@ -215,6 +215,10 @@ class FlowTrainer:
     pure_dtype = denoiser_dtype(self.training.mixed_precision)
     if pure_dtype is not None:
       self.model.to(pure_dtype)
+    # The forward input must follow the parameter dtype.  Under autocast the
+    # region casts it; under bf16-pure nothing does, and a fp32 input against
+    # bf16 weights raises "mat1 and mat2 must have the same dtype".
+    self.model_dtype = next(self.model.parameters()).dtype
     self.ema = ExponentialMovingAverage(
       self.model,
       power=self.training.ema_power,
@@ -595,13 +599,14 @@ class FlowTrainer:
       )
       noised = replace(noised, tokens=tokens_override)
     step_ids = torch.stack((noised.state_levels, noised.latent_levels), dim=-1)
+    tokens = noised.tokens.to(self.model_dtype)
     if not self._fp32_checked:
-      prediction = self.model(noised.tokens, step_ids)
+      prediction = self.model(tokens, step_ids)
       _finite_tensor(prediction, "FP32 denoiser output")
       self._fp32_checked = True
     else:
       with self._autocast():
-        prediction = self.model(noised.tokens, step_ids)
+        prediction = self.model(tokens, step_ids)
       _finite_tensor(prediction, "denoiser output")
     target = clean
     error = (prediction.float() - target) ** 2
@@ -1021,7 +1026,7 @@ class FlowTrainer:
       generator=generator,
     )
     step_ids = torch.stack((noised.state_levels, noised.latent_levels), dim=-1)
-    prediction = self.model(noised.tokens, step_ids)
+    prediction = self.model(noised.tokens.to(self.model_dtype), step_ids)
     target = clean
     loss = F.mse_loss(prediction.float(), target, reduction="mean")
     return loss, prediction.float(), target, noised.state_levels, noised.latent_levels
