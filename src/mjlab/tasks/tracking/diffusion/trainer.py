@@ -17,6 +17,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 
+from ..tensorboard_logging import open_for
 from .checkpoint import (
   CheckpointError,
   CheckpointState,
@@ -856,7 +857,16 @@ class DiffusionTrainer:
     epochs_completed = self.start_epoch
     mode_before = self.model.training
     self.model.train(True)
+    tensorboard = open_for(self.output_dir)
     with metrics_path.open("a", encoding="utf-8") as metrics_file:
+
+      def emit(row: Mapping[str, Any]) -> None:
+        """Append a metric row and mirror it to TensorBoard when enabled."""
+        metrics_file.write(json.dumps(row, sort_keys=True) + "\n")
+        metrics_file.flush()
+        if tensorboard is not None:
+          tensorboard.write_row(row, fallback_step=self.global_step)
+
       stop = False
       epoch = self.start_epoch
       while self.global_step < self._resolved_updates and epoch < self.config.epochs:
@@ -908,11 +918,7 @@ class DiffusionTrainer:
           if len(pending) >= self.config.gradient_accumulation_steps or is_last_batch:
             update = self._optimizer_update(pending, update_index=self.global_step)
             epoch_updates.append(update)
-            metrics_file.write(
-              json.dumps({"kind": "update", "epoch": epoch, **update}, sort_keys=True)
-              + "\n"
-            )
-            metrics_file.flush()
+            emit({"kind": "update", "epoch": epoch, **update})
             pending = []
             every = self.config.checkpoint_every
             if every is not None and self.global_step >= self._next_periodic:
@@ -929,11 +935,7 @@ class DiffusionTrainer:
           # reports an inconsistent length.
           update = self._optimizer_update(pending, update_index=self.global_step)
           epoch_updates.append(update)
-          metrics_file.write(
-            json.dumps({"kind": "update", "epoch": epoch, **update}, sort_keys=True)
-            + "\n"
-          )
-          metrics_file.flush()
+          emit({"kind": "update", "epoch": epoch, **update})
         if stop:
           break
         epochs_completed = epoch + 1
@@ -978,7 +980,7 @@ class DiffusionTrainer:
                 epoch=epochs_completed,
                 best_validation_loss=self.best_validation_loss,
               )
-        metrics_file.write(json.dumps(epoch_metrics, sort_keys=True) + "\n")
+        emit(epoch_metrics)
         metrics_file.flush()
         checkpoint_paths["last"] = self._save(
           "checkpoint-last.pt",
@@ -993,6 +995,8 @@ class DiffusionTrainer:
           best_validation_loss=self.best_validation_loss,
         )
     self.model.train(mode_before)
+    if tensorboard is not None:
+      tensorboard.close()
     summary = {
       "global_step": self.global_step,
       "epochs_completed": epochs_completed,
