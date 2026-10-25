@@ -10,8 +10,9 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
+from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.terrain_utils import terrain_normal_from_sensors
-from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_mul
 from mjlab.utils.lab_api.string import (
   resolve_matching_names_values,
 )
@@ -464,3 +465,159 @@ class variable_posture:
     error_squared = torch.square(current_joint_pos - desired_joint_pos)
 
     return torch.exp(-torch.mean(error_squared / (std**2), dim=1))
+
+
+##
+# Tennis ball on the bat.
+#
+
+
+def ball_centred(
+  env: ManagerBasedRlEnv,
+  plateau: float,
+  sigma: float,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  r"""Reward the ball being near the middle of the plate.
+
+  .. math:: r = \exp(-(\max(0, d - plateau) / sigma)^2)
+
+  where ``d`` is the ball's horizontal distance from the plate centre. The
+  plateau keeps the gradient zero inside the tolerance, so the ball-position
+  observation noise cannot turn into reward noise where the ball usually sits.
+
+  Args:
+    plateau: Radius inside which the reward is exactly 1, in metres.
+    sigma: Falloff distance beyond the plateau, in metres.
+    plate_cfg: Racket body; the plate frame is defined by it.
+    ball_cfg: Ball entity.
+
+  Returns:
+    Shape ``(num_envs,)``, between 0 and 1.
+  """
+  position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
+  distance = torch.linalg.norm(position[:, :2], dim=1)
+  outside = torch.clamp(distance - plateau, min=0.0)
+  return torch.exp(-torch.square(outside / sigma))
+
+
+def ball_height(
+  env: ManagerBasedRlEnv,
+  limit: float,
+  sigma: float,
+  ball_radius: float,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Reward the ball being on the strings or up to ``limit`` above them.
+
+  Full credit from the string plane (negative heights included, because a
+  compliant contact lets the ball sink slightly) up to ``limit``, then a Gaussian
+  falloff with ``sigma``. A ball below the plate is not this term's business: it
+  is a termination, see ``ball_below_plate``.
+
+  Without this term "throw the ball straight up and keep it centred" would pay as
+  well as holding it still.
+  """
+  position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
+  height = position[:, 2] - ball_radius
+  above = torch.clamp(height - limit, min=0.0)
+  return torch.exp(-torch.square(above / sigma))
+
+
+def ball_in_camera_fov(
+  env: ManagerBasedRlEnv,
+  plateau: float,
+  sigma: float,
+  mount_xyz: tuple[float, float, float],
+  mount_quat: tuple[float, float, float, float],
+  half_angle_x: float,
+  half_angle_y: float,
+  head_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  r"""Reward the ball being inside the head camera's field of view.
+
+  The ball position on hardware comes from the head stereo pair, so a ball outside
+  the frame is a lost ball however well it is balanced. This is a **soft safety
+  term**: the ball sits at about a quarter of the half-frame while it is carried, so
+  the reward is normally 1 and only falls when the ball leaves the hand or the arm
+  swings out of view.
+
+  The camera frame is the head body frame transformed by a constant mount. Its axes
+  follow the ROS optical convention, +x right, +y down, **+z forward**; MuJoCo's own
+  camera convention is the opposite along z, and getting that sign wrong puts the
+  ball behind the camera.
+
+  Angles are converted to an image radius with the **equidistant** model of the live
+  fisheye calibration, so an image edge lies at :math:`r/f` and not at
+  :math:`\arctan(r/f)`. The normalised offset is the larger of the two per-axis
+  ratios, which is a rectangular frame test:
+
+  .. math:: s = \max(|\theta_x| / \text{half\_angle\_x},\ |\theta_y| / \text{half\_angle\_y})
+
+  Args:
+    plateau: Normalised image radius that still earns full credit.
+    sigma: Falloff beyond the plateau; the reward reaches zero at ``s = plateau + ~2 sigma``.
+    mount_xyz: Camera position in the head frame, metres.
+    mount_quat: Camera orientation in the head frame, wxyz.
+    half_angle_x: Angle from the optical axis to the image edge, horizontal, radians.
+    half_angle_y: The same, vertical.
+    head_cfg: The head body the camera is mounted on. Must resolve to one body.
+    ball_cfg: Ball entity.
+
+  Returns:
+    Shape ``(num_envs,)``, between 0 and 1. A ball at or behind the camera plane
+    scores 0.
+  """
+  head: Entity = env.scene[head_cfg.name]
+  ball: Entity = env.scene[ball_cfg.name]
+  ids = head_cfg.body_ids
+  if isinstance(ids, slice) or len(ids) != 1:
+    raise ValueError(f"head_cfg must resolve to exactly one head body, got {ids}")
+  body_id = ids[0]
+
+  head_pos_w = head.data.body_link_pos_w[:, body_id]
+  head_quat_w = head.data.body_link_quat_w[:, body_id]
+  mount_xyz_t = torch.tensor(
+    mount_xyz, dtype=head_pos_w.dtype, device=head_pos_w.device
+  )
+  mount_quat_t = torch.tensor(
+    mount_quat, dtype=head_quat_w.dtype, device=head_quat_w.device
+  )
+
+  cam_pos_w = head_pos_w + quat_apply(head_quat_w, mount_xyz_t.expand_as(head_pos_w))
+  cam_quat_w = quat_mul(head_quat_w, mount_quat_t.expand_as(head_quat_w))
+  delta_cam = quat_apply_inverse(cam_quat_w, ball.data.root_link_pos_w - cam_pos_w)
+
+  # Optical frame: +z forward. Anything at or behind the camera plane is out.
+  forward = delta_cam[:, 2]
+  in_front = forward > 1e-6
+  safe_forward = torch.where(in_front, forward, torch.ones_like(forward))
+  theta_x = torch.atan2(delta_cam[:, 0], safe_forward)
+  theta_y = torch.atan2(delta_cam[:, 1], safe_forward)
+  radius = torch.maximum(
+    torch.abs(theta_x) / half_angle_x, torch.abs(theta_y) / half_angle_y
+  )
+  outside = torch.clamp(radius - plateau, min=0.0)
+  reward = torch.exp(-torch.square(outside / sigma))
+  return torch.where(in_front, reward, torch.zeros_like(reward))
+
+
+def head_joint_motion(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalise head joint velocity, summed over the joints in ``asset_cfg``.
+
+  The head joints are policy outputs, so the field-of-view reward gives the policy a
+  reason to hunt with them. Chasing a ball that perception measures with millimetres
+  of noise is not useful motion: it costs actuator travel, it smears the frames
+  perception needs, and it sets the ball's image moving.
+
+  This penalises **velocity**, not position, so the head can still be aimed
+  deliberately and then held.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)

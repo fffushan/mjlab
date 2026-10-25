@@ -9,7 +9,7 @@ Added
   scene. The racket assembly (white wrist connector, clamp, racket) is rigid
   tooling on the robot: it replaces the right hand and rides
   ``right_wrist_roll_link`` as two fixed bodies, adding 0.37 kg and no joints or
-  actuators. The 0.057 kg tennis ball is a separate floating entity spawned 1 mm
+  actuators. The 0.0560 kg tennis ball is a separate floating entity spawned 1 mm
   above the string bed. Meshes are byte-identical to the ``x2_references``
   tennis snapshot, with SHA-256 pins.
 
@@ -19,7 +19,7 @@ Added
   re-enables it after that pass zeroes unmatched geoms. The bed's negative
   ``solref`` is a 1 ms calibration, so the task runs at 1 ms with 20 substeps
   (50 Hz control) instead of 5 ms with 4; at 5 ms a 0.30 m drop rebounds to
-  1.19 m instead of 0.23 m. The robot and ball resets are pinned so the ball
+  0.635 m instead of 0.23 m. The robot and ball resets are pinned so the ball
   stays on the bed. The four recorded rebounds reproduce within 20 mm at 1 ms
   with zero lateral drift.
 
@@ -43,6 +43,74 @@ Added
   X2-specific DR wiring moved into ``apply_x2_tracking_robot_randomization`` so
   both tasks call one definition, and the tracking tasks' events are unchanged
   by that extraction. Terms are pinned against the tracking task by test.
+
+  Two head-related terms were added for the perception chain. ``ball_in_fov``
+  (+0.2) pays for the ball staying inside the head stereo pair's field of view,
+  which is where its position comes from on hardware; ``head_joint_motion``
+  (−0.05) penalises squared head joint velocity so the field-of-view reward cannot
+  pay the policy to hunt with its head. The camera geometry is approximate on
+  purpose: the reference snapshot's robot-162 mount, a ROS optical frame (+z
+  forward, not MuJoCo's −z), and equidistant half-angles of 85.4° × 64.0° from the
+  live stereo-left calibration. Measured, the ball sits at 24° off the optical axis
+  while carried and stays in frame through a metre of lateral travel, so
+  ``ball_in_fov`` is a safety term rather than a shaping term.
+
+  The tennis task now has its own training procedure. The base task's command
+  curriculum is replaced by this task's stages: 0.3 m/s from the start, 0.6 m/s at
+  iteration 2000 and 1.0 m/s at iteration 5000 (the base task's own stage 0).
+  **The difficulty advances on the step count, not on performance.** Two
+  performance-gated designs were measured and rejected: with a stand-still first
+  stage the ball simply parks on the plate and every environment times out at 20 s
+  together, and without it an untrained policy already survives 9 s at 0.3 m/s and
+  16 s at 0.6 m/s while managing 1 s at 1.0 m/s, so any survivability threshold in
+  the easy regime is cleared with no skill at all. Performance is therefore used
+  only as a veto: a stage is entered on its scheduled step only if the median
+  length of the last 100 finished episodes is at least 8 s.
+  Losing the ball no longer ends the episode immediately: the ball counts as lost
+  at the same 20 mm below the plate, but the episode ends only after it has stayed
+  lost for 25 control steps (0.5 s), counted consecutively and restarted if the
+  ball comes back. Episodes go from 0.55 s to about 1.05 s, against a 20 s
+  allowance.
+
+  The tennis task now teaches the ball. The policy observes ``ball_pos`` and
+  ``ball_vel``, two 3-vectors in the plate frame (actor 102 -> 108, critic
+  117 -> 123; a new experiment name, ``agibot_x2_velocity_tennis_ball_centre``,
+  because the observation normalizer width changed). It is paid to keep the ball
+  within a 20 mm plateau of the plate centre with a 40 mm Gaussian tail, and it
+  gets a small term against throwing the ball more than 100 mm above the strings.
+  The episode ends when the ball drops 20 mm below the plate. Each of the six
+  ball-observation dimensions is randomized independently with its own uniform
+  half-width (±5, ±5, ±8 mm; ±0.15, ±0.15, ±0.20 m/s), because the perception
+  program's depth error and its differenced-velocity error are not alike. Ball
+  velocity is
+  measured against the plate's material point at the ball, not the racket body
+  origin, so a still ball on a turning wrist reads zero; the ``v + ω × r`` form is
+  checked against MuJoCo's ``site_vel_w`` to 1e-5.
+
+  The bed–ball contact is now six-dimensional. ``CONTACT_CONDIM = 6`` adds
+  torsional (spin) friction and two rolling dimensions to the three the contact
+  had before; ``condim=3`` carries no rotation at all, which is why a ball
+  rolling on the level bed kept exactly the same speed forever. Friction is now
+  the documented triple (sliding 0.44, spin 0.005, rolling 1.7185e-03): the
+  sliding value is **measured** for a tennis ball on a string bed and replaces
+  the old ball-on-court 0.6, the spin value is a carried-over provisional number
+  that is only now active, and the rolling value is **fitted** to a measured
+  slope run of the real ball on the real racket. That run — 0.245 m in 0.834 s
+  from rest at 0.129 rad — gives a dimensionless rolling resistance of 0.0174,
+  which is a 0.045 m coast for a 0.10 m/s release on a level bed, which in turn
+  is what ``scripts/experiments/x2_tennis_roll_friction_calibrate.py`` inverts
+  to 1.7185e-03. The ball's moment of inertia sets that conversion and cannot be
+  separated from it by the slope run: a solid sphere would imply 0.025 m and a
+  thin shell 0.096 m. The ball body therefore carries its inertia explicitly, at
+  the shell ratio I/(m R²) = 0.549 against the 0.400 of a uniform solid sphere,
+  with its geom mass set to zero so no kilogram is counted twice. The ball is
+  sized to the ITF lower limit, 65.4 mm and 56.0 g, because the operator could
+  not measure the real ball's diameter, mass or inertia to better than a ruler. The normal direction (``solref``, ``solimp``) and the 1 ms step are
+  untouched on purpose, so the four recorded rebounds still reproduce and the
+  simulated coefficient of restitution moves by less than 0.003 at every drop
+  height. Measured in an isolated level-bed fixture, a ball released rolling
+  without slipping at 0.10 m/s keeps 0.56 of its speed after one second, and
+  1.00 of it with the rolling coefficient zeroed.
 
 - Added the offline joint-pose rollout tool at
   ``mjlab.scripts.joint_pose_rollout``. It reads the window geometry, denoiser

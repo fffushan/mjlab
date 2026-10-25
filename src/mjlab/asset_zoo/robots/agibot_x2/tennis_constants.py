@@ -16,6 +16,14 @@ geometric estimates, not measurements: the white connector mass is an estimate
 and the clamp/racket inertia come from CAD geometry. Only the ball rebound was
 fitted, to user drop measurements (see :data:`BED_SOLREF`).
 
+The tangential contact parameters are the exception: they no longer come from
+that snapshot. :data:`SLIDING_FRICTION` is measured on a tennis string bed,
+:data:`BALL_DIAGINERTIA` is measured on a tennis ball, and
+:data:`ROLLING_FRICTION` is fitted in simulation to a coast distance derived
+from a measured slope run
+because no source gives a usable rolling-resistance coefficient at these
+speeds. See ``docs/reports/x2_tennis_ball_bat_contact_models.md``.
+
 Two properties of this file are load-bearing and easy to break:
 
 * The string bed is named ``string_bed``, **not** ``*_collision``. The shipped
@@ -28,7 +36,9 @@ Two properties of this file are load-bearing and easy to break:
   stiffness/damping parameterisation. It was fitted at a 1 ms physics step.
   ``tests/test_x2_tennis_ball_task.py`` re-runs the drop test and shows that at
   mjlab's default 5 ms step the same parameters inject energy (a 0.3 m drop
-  rebounds to 1.19 m). The tennis task therefore runs at 1 ms.
+  rebounds to 0.635 m). Above that the fit stops discriminating: 1.0, 2.0 and
+  2.5 ms are all within the test tolerance, so 1 ms is kept for calibration
+  provenance and margin, not because the fit demands it.
 """
 
 from __future__ import annotations
@@ -136,14 +146,134 @@ FACE_SITE_POS = (BED_CENTER_X, 0.0, BED_HALF_THICKNESS)
 # Ball.
 ##
 
-BALL_MASS = 0.057
-BALL_RADIUS = 0.0335
-BALL_FRICTION = (0.6, 0.005, 0.0001)
+# The ITF lower limits of the Type 2 regulation ball: 65.4 mm diameter and 56.0 g.
+#
+# Both are **deliberately conservative estimates, not measurements of the ball in
+# hand.** The operator measured roughly 65 mm with a ruler against blocks and has
+# no caliper, scale or inertia rig, so the lower limit of the published range is
+# used instead of the midpoint that was here before (67 mm, 57 g). The real ball
+# is somewhere in 65.4-68.6 mm and 56.0-59.4 g, so the shipped values are at most
+# 5% small in diameter and 6% small in mass.
+#
+# The conservative choice costs nothing in the contact fit: with MuJoCo's direct
+# ``solref``/``solimp`` form the contact response is mass-normalised, so the four
+# calibrated drop rebounds are identical for 40 g and 57 g at either radius
+# (measured: 0.159/0.237/0.335/0.394 m in all cases). Mass and radius therefore
+# only enter through the rolling calibration below, and only through I/(m R^2).
+BALL_MASS = 0.0560
+BALL_RADIUS = 0.0327
+
+# Moment of inertia about a diameter through the centre of mass. Cross ("Oblique
+# impact on strings") measured 3.41e-05 kg m^2 for a 57 g ball at 33 mm, i.e.
+# I/(m R^2) = 0.549. That ratio is a **shape** property -- how hollow the ball is
+# -- so it is carried over unchanged and the inertia is re-derived at the shipped
+# mass and radius: I = 0.549 * 0.0560 * 0.0327^2 = 3.2874e-05 kg m^2.
+#
+# This is the weakest number in this file. The ball's real wall thickness is
+# unknown, and I/(m R^2) runs from 0.400 (solid) through 0.549 (Cross) to 0.667
+# (infinitely thin shell). Unlike mass and radius it is **not** free: it enters
+# the rolling-resistance conversion and does not cancel, so if the ball is ever
+# measured properly this constant and ``ROLLING_FRICTION`` must move together.
+# See the note on that constant for the size of the effect.
+BALL_DIAGINERTIA = (3.2874e-05, 3.2874e-05, 3.2874e-05)
+
 # Positive solref here (normalised time constant / damping ratio): the ball is
 # the *softer* of the pair, but ``priority`` below makes the bed's parameters
 # win on every bed contact, so this only governs ball-vs-robot/ground contacts.
 BALL_SOLREF = (0.004, 0.35)
 BALL_RGBA = (0.75, 0.95, 0.08, 1.0)
+
+##
+# Contact parameters, one row shared by the bed and the ball.
+#
+# ``CONTACT_CONDIM = 6`` gives each contact three dimensions carrying the normal
+# force plus two sliding directions, a fourth for torsional (spin) friction
+# about the contact normal, and two more for rolling friction about the two
+# tangent axes. ``condim=3``, used before, has **no rotation of any kind**: a
+# ball could not lose angular momentum to the bed, so a ball rolling on the
+# level bed kept exactly the same speed forever.
+#
+# MuJoCo geom friction is exactly three numbers, in the order
+# (sliding, spin, rolling), and they are not the same kind of quantity: the
+# sliding one is dimensionless and the other two carry length units. With
+# ``priority=1`` on the bed geom, the bed's row governs every bed-ball contact;
+# the ball's identical row only applies to ball-vs-robot and ball-vs-ground
+# pairs, which keeps the two rows deliberately equal so no contact pair in the
+# scene silently falls back to a different tangential law.
+##
+
+# Measured for a tennis ball on a string bed: 0.43 +- 0.02 (Cross, "Oblique
+# impact on strings"). The previous 0.6 is the ball-on-court value (0.6 on a
+# fast court to 0.8 on a slow one) and does not apply to strings.
+SLIDING_FRICTION = 0.44
+
+# Provisional, and only active at ``CONTACT_CONDIM >= 4``. The previous 0.005
+# sat in this slot but was inert: at ``condim=3`` MuJoCo never reads it. No
+# measurement exists for the spin coefficient; this keeps the snapshot's value
+# as a placeholder that is at least now exercised.
+SPIN_FRICTION = 0.005
+
+# Derived from the operator's slope measurement, 2026-10-25. The physical
+# quantity is the dimensionless rolling resistance
+#
+#   mu_r = (sin(theta) - (1 + k) a / g) / cos(theta)
+#
+# with theta = 0.129 rad (7.39 deg), a = 2 L / t^2 = 0.705 m/s^2 from a 0.245 m
+# run in 0.834 s (a repeat run gave 0.833 s, so the timing spread is negligible),
+# and k = I/(m R^2) = 0.549 for this ball. That gives mu_r = 0.0174. On a level
+# bed the same ball then decelerates by ``mu_r g / (1 + k) = 0.110 m/s^2``, so a
+# 0.10 m/s release coasts 0.045 m -- 54% of the ball's usable travel across the
+# plate, so a nudge still settles well inside the bed.
+#
+# 0.045 m is the **target** handed to
+# ``scripts/experiments/x2_tennis_roll_friction_calibrate.py --target-coast-m
+# 0.0453 --release-speed 0.10``, which returns 1.7185e-03. Fit against the ball
+# this file now describes: the same target returns 1.7515e-03 against the 67 mm
+# ball that was here before, so refitting after a ball change is not optional. MuJoCo does not derive
+# this coefficient from a dimensionless rolling-resistance ratio, so it is not
+# mu_r and cannot be read off literature; the translation goes through the coast
+# distance, which is a quantity both the measurement and the fixture can express.
+#
+# The run is 25 frames of 30 fps video, so t carries about +-0.017 s (2 frames of
+# start/end ambiguity), worth +-0.0004 in mu_r and +-0.001 m of coast.
+#
+# **The largest remaining uncertainty is k, not the measurement.** k enters twice
+# and does not cancel, so the same slope run implies different coasts:
+#
+#   k = 0.400 (uniform solid sphere)   -> coast 0.025 m
+#   k = 0.549 (this ball, Cross)       -> coast 0.045 m
+#   k = 0.600 (60 mm ball, 3.5 mm wall)-> coast 0.059 m
+#   k = 0.667 (infinitely thin shell)  -> coast 0.096 m
+#
+# The slope measurement alone cannot separate k from mu_r: every value above
+# reproduces the measured 0.705 m/s^2 equally well. 0.549 is the only one backed
+# by a real measurement of a real tennis ball, so it is the choice; if the ball is
+# ever weighed and rolled in a bowl, re-derive both constants together.
+#
+# The slope run has one known bias: the ball rolls into the raised racket frame
+# at the end of the measured travel, and the last two frames show it already
+# deflected. ``a = 2 L / t^2`` then slightly over-states the free acceleration,
+# which over-states mu_r, which under-states the coast. Fitting the per-frame
+# positions instead gives a = 0.73 m/s^2 over the same span, i.e. a 0.039 m
+# coast for k = 0.549, so the true value is a little above 0.045 m.
+#
+# Any re-fit must use this script. The coast distance moves by up to 12% with the
+# release convention alone (exact contact versus a millimetre of clearance), so a
+# freshly written fixture will not reproduce this number; changing ``SETTLE_TIME``
+# without re-fitting is the same mistake.
+#
+# ``CONTACT_CONDIM`` must stay 6. ``condim=4`` adds torsional friction only, which
+# a rolling ball never exercises: measured, it coasts exactly like ``condim=3``.
+#
+# Residual bias that is deliberately not removed: a ball this soft sinks into the
+# string bed and has to climb out of its own crater, which the slope test counts
+# as rolling resistance. MuJoCo's mesh-sphere contact reproduces part of that
+# geometrically, so the lumped value is what we want to match, not the "pure"
+# rolling resistance of a rigid ball on a rigid plane.
+ROLLING_FRICTION = 1.7185e-03
+
+CONTACT_FRICTION = (SLIDING_FRICTION, SPIN_FRICTION, ROLLING_FRICTION)
+CONTACT_CONDIM = 6
 
 ##
 # String-bed contact. Fitted to the user's drop measurements (rebound 0.17, 0.23,
@@ -152,10 +282,10 @@ BALL_RGBA = (0.75, 0.95, 0.08, 1.0)
 # only valid near the 1 ms step it was fitted at.
 ##
 
-BED_FRICTION = (0.6, 0.005, 0.0001)
 BED_SOLREF = (-100000.0, -22.0)
 BED_SOLIMP = (0.95, 0.95, 0.001, 0.5, 2.0)
-BED_CONDIM = 3
+# The bed's ``priority=1`` is what makes the bed's contact row -- including
+# :data:`CONTACT_FRICTION` -- govern every bed-ball pair.
 BED_PRIORITY = 1
 
 ##
@@ -172,9 +302,9 @@ TENNIS_BED_COLLISION = CollisionCfg(
   geom_names_expr=(rf"^{BED_GEOM}$",),
   contype=1,
   conaffinity=1,
-  condim=BED_CONDIM,
+  condim=CONTACT_CONDIM,
   priority=BED_PRIORITY,
-  friction=BED_FRICTION,
+  friction=CONTACT_FRICTION,
   solref=BED_SOLREF,
   solimp=BED_SOLIMP,
   disable_other_geoms=False,
@@ -340,11 +470,11 @@ def attach_tennis_assembly(spec: mujoco.MjSpec) -> mujoco.MjSpec:
     meshname="string_bed_mesh",
     contype=1,
     conaffinity=1,
-    condim=BED_CONDIM,
+    condim=CONTACT_CONDIM,
     priority=BED_PRIORITY,
     mass=0.0,
     group=3,
-    friction=list(BED_FRICTION),
+    friction=list(CONTACT_FRICTION),
     solref=list(BED_SOLREF),
     solimp=list(BED_SOLIMP),
     rgba=[0.8, 0.8, 0.8, 0.15],
@@ -362,22 +492,32 @@ def get_tennis_spec() -> mujoco.MjSpec:
 def get_tennis_ball_spec() -> mujoco.MjSpec:
   """Free-floating tennis ball.
 
-  ``condim=3`` with the bed's ``priority=1`` means the bed's friction and
-  solver parameters govern bed contacts; this geom's own values only apply to
-  ball-vs-robot and ball-vs-ground pairs.
+  ``CONTACT_CONDIM=6`` with the bed's ``priority=1`` means the bed's friction
+  and solver parameters govern bed contacts; this geom's own values only apply
+  to ball-vs-robot and ball-vs-ground pairs. The ball body carries its inertia
+  explicitly (a tennis ball is a shell, not a solid sphere).
   """
   spec = mujoco.MjSpec()
   body = spec.worldbody.add_body(name="ball")
   body.add_freejoint(name="ball_free")
+  _set_explicit_inertial(
+    body,
+    mass=BALL_MASS,
+    ipos=(0.0, 0.0, 0.0),
+    iquat=(1.0, 0.0, 0.0, 0.0),
+    inertia=BALL_DIAGINERTIA,
+  )
   body.add_geom(
     name="ball_collision",
     type=mujoco.mjtGeom.mjGEOM_SPHERE,
     size=[BALL_RADIUS, 0.0, 0.0],
-    mass=BALL_MASS,
+    # The body's explicit inertial already carries every kilogram, so the geom
+    # must contribute none or the mass would be counted twice.
+    mass=0.0,
     contype=1,
     conaffinity=1,
-    condim=3,
-    friction=list(BALL_FRICTION),
+    condim=CONTACT_CONDIM,
+    friction=list(CONTACT_FRICTION),
     solref=list(BALL_SOLREF),
     rgba=list(BALL_RGBA),
   )
@@ -444,13 +584,246 @@ BAT_CARRY_GROUND_CLEARANCE = 0.002
 # at ``BAT_CARRY_BASE_HEIGHT`` with zero yaw: the face centre plus the face
 # normal times (radius + 1 mm). Measured.
 BALL_SPAWN_LOCAL_POS = (
-  0.5600012287607482,
-  -0.024057310128549662,
-  1.15388480278694,
+  0.560001221763507,
+  -0.02405731523163448,
+  1.1530848027869869,
 )
 
 # Clearance between the ball's lowest point and the bed's top surface at spawn.
 BALL_SPAWN_CLEARANCE = 0.001
+
+##
+# Ball-holding task definition: what the policy observes, what it is paid for, and
+# when the episode ends.
+#
+# The policy has to hold the ball near the middle of the plate while the robot
+# walks. All distances here are measured in the **plate frame**, whose origin is
+# the centre of the plate's top surface (``FACE_SITE_POS``), x along the shaft, y
+# across it, z along the plate normal.
+##
+
+# Centring reward: full credit inside a plateau, then a Gaussian falloff.
+#
+#   reward = exp(-((d - plateau) / sigma)^2)   for d > plateau, else 1
+#
+# where d is the ball's horizontal distance from the plate centre. The plateau is
+# there because of the observation noise: with +-5 mm of ball-position error, a
+# plain kernel has a slope right where the ball spends most of its time, so
+# measurement error would become reward noise. Inside the plateau the gradient is
+# exactly zero and noise cannot reach the reward. 20 mm is about a quarter of the
+# ball's usable travel towards the plate's short edge.
+BALL_CENTRE_PLATEAU = 0.020
+BALL_CENTRE_SIGMA = 0.040
+
+# Height band. The ball is wanted on or just above the strings and not thrown up:
+# anything from the string plane to 10 cm above it earns full credit, and a ball
+# higher than that decays with the same sigma as the centring term. A ball below
+# the plate is not penalised but **fatal**, see ``BALL_FALL_THRESHOLD``.
+BALL_HEIGHT_LIMIT = 0.10
+BALL_HEIGHT_SIGMA = 0.040
+
+# The ball's centre below this height above the plate surface counts as lost.
+# Negative, so the small penetration a compliant contact allows does not fire it;
+# a ball that rolls off the edge reaches it about 65 ms after leaving the plate.
+BALL_FALL_THRESHOLD = -0.020
+
+# How long the ball may stay lost before the episode actually ends.
+#
+# This is a curriculum for patience, not a physics choice: an untrained policy
+# loses the ball within 20 control steps, so terminating on the first lost step
+# gives episodes of 0.4 s out of a 20 s allowance and almost nothing to learn from.
+# The reward already reads zero while the ball is gone, so the extra time is spent
+# with an honest signal, and a policy that recovers gets to continue.
+BALL_DROP_GRACE_S = 0.5
+
+# Reward weights. Centring is the task, so it carries the same order of magnitude
+# as the base task's velocity terms (2.0 each). The height term exists only to
+# stop "throw the ball straight up and stay centred" from being a cheap strategy;
+# it is small on purpose.
+BALL_CENTRE_WEIGHT = 1.0
+BALL_HEIGHT_WEIGHT = 0.1
+
+# Ball-state observation randomization. The real ball position comes from an
+# external perception program, not from the simulator, so the observation must be
+# as wrong as that program is. These are **six independent magnitudes**, one per
+# dimension, because the errors are not alike: a camera measures the two lateral
+# axes better than the depth axis, and a velocity obtained by differentiating
+# position is far worse than either.
+#
+# Units and frame: the plate frame, so x is along the shaft, y across it, z along
+# the plate normal. Each entry is a half-width of a symmetric **uniform**
+# distribution, matching the rest of mjlab: every other observation term in the
+# velocity task uses ``Unoise``, not Gaussian. A uniform half-width ``m`` has a
+# standard deviation of ``m/sqrt(3)``.
+#
+# How the numbers were chosen, so they can be replaced with the real ones:
+#
+# * Position: +-5 mm along the two lateral axes and +-8 mm along the normal. The
+#   normal axis is the one least well observed, which is why it is the odd one out.
+# * Velocity: a position error of +-5 mm differenced over one perception frame at
+#   30 Hz is a worst case of ``2 * 5 mm / 33 ms = 0.3 m/s``, so +-0.15 m/s lateral
+#   and +-0.20 m/s along the normal is a moderate reading of the same arithmetic.
+#
+# **These are placeholders for the perception program's real error, not
+# measurements.** They are also the reason the centring reward has a plateau:
+# +-5 mm of position error on a plain Gaussian reward would show up as reward noise
+# exactly where the ball spends most of its time.
+#
+# Consequence worth knowing: at this magnitude the velocity observation cannot
+# distinguish a held ball (true relative speed ~0) from one sliding at 0.15 m/s, so
+# the policy must get its sense of motion from ``ball_pos`` changing over time. The
+# terms are still worth supplying: this policy is feed-forward and sees one frame.
+BALL_POSITION_NOISE_M = (0.005, 0.005, 0.008)
+BALL_VELOCITY_NOISE_M = (0.150, 0.150, 0.200)
+
+##
+# Command curriculum.
+#
+# Balancing a ball and walking are two separate skills, and the base velocity task
+# asks for the second one from iteration 0 with commands of up to 1 m/s. This task
+# widens the commands in stages instead.
+#
+# **Why the stages advance on a step-count schedule and not on performance.**
+# Three designs were tried on this task:
+#
+# 1. A performance gate on typical episode length, starting with the robot standing
+#    still. Rejected: with the robot commanded to stand, the ball simply sits on
+#    the plate, nothing terminates for the full 20 s episode, and the gate read
+#    that as mastery. In a 4096-environment run it promoted straight to the
+#    hardest stage in one call.
+# 2. The same gate without the stand-still stage. Rejected for the same reason one
+#    level down: an untrained policy already keeps the ball for 9.1 s at 0.3 m/s
+#    and 15.7 s at 0.6 m/s, so any survivability threshold placed below those
+#    values is cleared with no skill at all, while at 1.0 m/s the same policy
+#    manages 1.05 s. Every survivability observable saturates in the easy regime,
+#    so no absolute threshold there can separate "doing nothing" from "doing it
+#    well".
+# 3. A step-count schedule carrying the difficulty, with performance only able to
+#    **block** an advance it cannot justify. This is the design below, and it is
+#    also what the base task does for the same reason.
+#
+# The schedule is expressed in environment steps, matching
+# ``env.common_step_counter``. With 24 control steps per iteration,
+# ``iterations * 24`` converts. The two points below are iteration 2000 and
+# iteration 5000; the second is the base task's own first widening point.
+#
+# The floor is a **permission check, not a trigger**: the stage advances on the
+# schedule only if the typical episode at the current stage is at least
+# ``BALL_COMMAND_MASTERY_FLOOR_S``. Measured on this task, a failing policy runs
+# about 1.05 s episodes and a comfortable one several seconds, so 8 s means "the
+# ball is not being lost immediately". Without it a policy that is failing at the
+# current stage would still be pushed faster by the clock.
+
+BALL_COMMAND_STAGES: tuple[dict, ...] = (
+  {
+    "min_step": 0,
+    "description": "creep",
+    "lin_vel_x": (-0.3, 0.3),
+    "lin_vel_y": (-0.3, 0.3),
+    "ang_vel_z": (-0.15, 0.15),
+  },
+  {
+    "min_step": 2000 * 24,
+    "description": "walk",
+    "lin_vel_x": (-0.6, 0.6),
+    "lin_vel_y": (-0.6, 0.6),
+    "ang_vel_z": (-0.3, 0.3),
+  },
+  {
+    "min_step": 5000 * 24,
+    "description": "the base task's stage 0",
+    "lin_vel_x": (-1.0, 1.0),
+    "lin_vel_y": (-1.0, 1.0),
+    "ang_vel_z": (-0.5, 0.5),
+  },
+)
+
+BALL_COMMAND_MASTERY_FLOOR_S = 8.0
+"""Typical episode length the current stage must sustain before advancing."""
+
+##
+# Camera field of view.
+#
+# The policy has to keep the ball where perception can see it: on hardware the ball
+# position comes from the head stereo pair, and a ball outside the frame is a lost
+# ball however well it is balanced.
+#
+# **This is deliberately approximate.** The operator's plan is that perception and
+# ball estimation are handled by a separate process, and that the camera calibration
+# is refined later, so the geometry here only has to be good enough to shape
+# behaviour, not to predict pixels.
+#
+# Geometry:
+#
+# * The mount is the reference snapshot's ``camera_mount_162.json``
+#   (``x2_references/x2_tennis/parameters``). The reference README warns that this
+#   is robot 162's vendor transform, not a calibration of another robot. The live
+#   robot's TF agrees with it in the same ballpark, which is all this term needs.
+# * That mount produces a **ROS optical frame**: +z forward along the optical axis,
+#   +x right, +y down. MuJoCo's own camera convention is the opposite along z, so
+#   the sign matters: using -z here would put the ball behind the camera.
+# * Intrinsics are the live stereo left eye, 2048x1536 with the **equidistant**
+#   model, so the angle to an image edge is ``r / f`` and the half-angles are
+#   ``cx / fx`` and ``cy / fy`` rather than ``atan(cx / fx)``.
+#
+# Measured at the ball-carry pose, the ball sits 24 deg off the optical axis, i.e.
+# 27 % of the horizontal half-frame. So the term is a **safety term**: it sits near
+# 1.0 while the ball is on the racket and only bites when the ball leaves the hand
+# or the arm swings out of view.
+##
+
+CAMERA_MOUNT_XYZ = (0.05058, 0.03013, 0.032504)
+"""Camera position in the ``head_pitch_link`` frame, from the reference snapshot."""
+
+CAMERA_MOUNT_QUAT = (0.497273, -0.5026607, 0.5070336, -0.4929186)
+"""Camera orientation in ``head_pitch_link``, wxyz, from the same reference.
+
+Pre-computed from ``Rotation.from_euler('xyz', (-1.5903, 0.0087267, -1.5709))`` so
+the runtime needs no scipy. The local axes are +x right, +y down, +z forward.
+"""
+
+CAMERA_HALF_ANGLE_X = 1.4907
+CAMERA_HALF_ANGLE_Y = 1.1168
+"""Angle from the optical axis to the image edge, radians.
+
+``cx / fx`` and ``cy / fy`` from the live stereo-left calibration
+(1024.451 / 687.245 and 767.497 / 687.245), i.e. 85.4 and 64.0 deg. The fisheye's
+true corner angle is larger; the per-axis edge angle is what a rectangular frame
+test needs.
+"""
+
+BALL_FOV_PLATEAU = 0.60
+"""Normalised image radius that still earns full credit.
+
+0.6 of the half-frame both ways. The ball at rest is at 0.27, so normal carrying is
+free and the term only bites when the ball drifts towards the frame edge.
+"""
+
+BALL_FOV_SIGMA = 0.25
+"""Falloff beyond the plateau, in the same normalised units. Zero at the edge."""
+
+BALL_FOV_WEIGHT = 0.2
+"""Soft: this is a perception constraint, not the task objective."""
+
+##
+# Head steadying.
+#
+# The head joints are policy outputs, so the field-of-view reward gives the policy a
+# reason to hunt with them. Dithering two joints to chase a ball that perception
+# measures with 5 mm of noise is not useful motion: on hardware it costs actuator
+# travel, it smears the very frames perception needs, and it puts the ball's image
+# in motion. This penalises head joint **velocity**, not position, so the head can
+# still be aimed deliberately and then held.
+##
+
+HEAD_JOINT_NAMES = ("head_yaw_joint", "head_pitch_joint")
+
+HEAD_MOTION_WEIGHT = -0.05
+"""Penalty weight on squared head joint velocity, summed over the two joints."""
+
+BALL_COMMAND_WINDOW = 100
+"""Finished episodes the promotion gate waits for before deciding."""
+
 
 # Lowest foot contact point may be this far below z=0 before the pose counts as
 # penetrating the ground.

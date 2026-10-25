@@ -13,7 +13,11 @@ requirements rather than tuning choices:
 *The physics step is 1 ms with 20 substeps per control step (50 Hz).* The string
 bed uses a negative ``solref`` -- MuJoCo's direct stiffness/damping form -- fitted
 to drop measurements at 1 ms. At mjlab's default 5 ms step the same numbers inject
-energy: a 0.30 m drop rebounds to 1.19 m instead of 0.23 m. See
+energy: a 0.30 m drop rebounds to 0.635 m instead of 0.23 m. The fit also
+stops discriminating below that: 1.0, 2.0 and 2.5 ms all land within the test
+tolerance of the four recorded rebounds, so 1 ms is kept for calibration
+provenance and margin above the 3.5 ms failure boundary, not because the fit
+requires it. See
 ``tests/test_x2_tennis_ball_task.py``, which re-runs the drop test.
 
 *The robot and ball resets are pinned.* The ball's spawn pose is a fixed offset
@@ -51,14 +55,41 @@ from __future__ import annotations
 from copy import deepcopy
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_CENTRE_PLATEAU,
+  BALL_CENTRE_SIGMA,
+  BALL_CENTRE_WEIGHT,
+  BALL_COMMAND_MASTERY_FLOOR_S,
+  BALL_COMMAND_STAGES,
+  BALL_COMMAND_WINDOW,
+  BALL_DROP_GRACE_S,
+  BALL_FALL_THRESHOLD,
+  BALL_FOV_PLATEAU,
+  BALL_FOV_SIGMA,
+  BALL_FOV_WEIGHT,
+  BALL_HEIGHT_LIMIT,
+  BALL_HEIGHT_SIGMA,
+  BALL_HEIGHT_WEIGHT,
+  BALL_POSITION_NOISE_M,
+  BALL_RADIUS,
+  BALL_VELOCITY_NOISE_M,
+  CAMERA_HALF_ANGLE_X,
+  CAMERA_HALF_ANGLE_Y,
+  CAMERA_MOUNT_QUAT,
+  CAMERA_MOUNT_XYZ,
+  HEAD_JOINT_NAMES,
+  HEAD_MOTION_WEIGHT,
   RACKET_BODY,
   get_tennis_ball_cfg,
   get_x2_tennis_robot_cfg,
 )
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.config.agibot_x2.env_cfgs import (
   apply_x2_tracking_robot_randomization,
@@ -72,6 +103,7 @@ from mjlab.tasks.velocity.config.agibot_x2.env_cfgs import (
   add_velocity_foot_sites,
   agibot_x2_flat_velocity_env_cfg,
 )
+from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 TENNIS_PHYSICS_TIMESTEP = 0.001
 """Physics step tied to the string-bed contact calibration. Do not raise."""
@@ -169,6 +201,14 @@ def _make_ball_sensor() -> ContactSensorCfg:
   )
 
 
+def _write_command_ranges(cfg: ManagerBasedRlEnvCfg, stage: dict) -> None:
+  """Set the twist command's ranges from one curriculum stage."""
+  ranges = cfg.commands["twist"].ranges
+  for field_name in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
+    if field_name in stage:
+      setattr(ranges, field_name, tuple(stage[field_name]))
+
+
 def agibot_x2_tennis_ball_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
@@ -247,6 +287,147 @@ def agibot_x2_tennis_ball_env_cfg(
       "velocity_range": {},
     },
   )
+
+  ##
+  # Ball observation. The policy cannot balance a ball it cannot see, so both
+  # groups get the ball's pose and velocity relative to the plate. The critic gets
+  # the same numbers **without** corruption, like the rest of its privileged set.
+  #
+  # Corruption is the perception budget, not physics: on hardware the ball
+  # position comes from an external perception program. Both terms are in the
+  # plate frame, so a ball carried along with the bat reads zero velocity. Each
+  # dimension of each term is randomized independently; see the constants file for
+  # the six magnitudes and how they were derived.
+  ##
+
+  plate_cfg = SceneEntityCfg("robot", body_names=(RACKET_BODY,))
+  ball_state_params = {"plate_cfg": plate_cfg, "ball_cfg": ball_cfg}
+
+  # Six independent randomization magnitudes, one per dimension. ``Unoise`` takes
+  # per-dimension bounds (`NoiseParam = float | tuple[float, ...]`), so one term
+  # can be randomized differently along the plate's shaft, width and normal.
+  # Each entry is a half-width: the distribution is symmetric uniform.
+  cfg.observations["actor"].terms["ball_pos"] = ObservationTermCfg(
+    func=mdp.ball_position_in_plate,
+    params=dict(ball_state_params),
+    noise=Unoise(
+      n_min=tuple(-m for m in BALL_POSITION_NOISE_M),
+      n_max=BALL_POSITION_NOISE_M,
+    ),
+  )
+  cfg.observations["actor"].terms["ball_vel"] = ObservationTermCfg(
+    func=mdp.ball_velocity_in_plate,
+    params=dict(ball_state_params),
+    noise=Unoise(
+      n_min=tuple(-m for m in BALL_VELOCITY_NOISE_M),
+      n_max=BALL_VELOCITY_NOISE_M,
+    ),
+  )
+  cfg.observations["critic"].terms["ball_pos"] = ObservationTermCfg(
+    func=mdp.ball_position_in_plate,
+    params=dict(ball_state_params),
+  )
+  cfg.observations["critic"].terms["ball_vel"] = ObservationTermCfg(
+    func=mdp.ball_velocity_in_plate,
+    params=dict(ball_state_params),
+  )
+
+  ##
+  # Ball-holding reward and the fatal drop. Centring is the task; the height term
+  # only removes the "throw it up and stay centred" loophole, so it is small.
+  ##
+
+  cfg.rewards["ball_centred"] = RewardTermCfg(
+    func=mdp.ball_centred,
+    weight=BALL_CENTRE_WEIGHT,
+    params={
+      "plateau": BALL_CENTRE_PLATEAU,
+      "sigma": BALL_CENTRE_SIGMA,
+      **ball_state_params,
+    },
+  )
+  cfg.rewards["ball_height"] = RewardTermCfg(
+    func=mdp.ball_height,
+    weight=BALL_HEIGHT_WEIGHT,
+    params={
+      "limit": BALL_HEIGHT_LIMIT,
+      "sigma": BALL_HEIGHT_SIGMA,
+      "ball_radius": BALL_RADIUS,
+      **ball_state_params,
+    },
+  )
+
+  # Grace, not a weaker threshold: the ball is lost at the same height as before,
+  # but the episode only ends once it has stayed lost. Without this an untrained
+  # policy gets 0.4 s episodes out of a 20 s allowance.
+  step_dt = cfg.sim.mujoco.timestep * cfg.decimation
+  grace_steps = round(BALL_DROP_GRACE_S / step_dt)
+  # The head camera, as a soft constraint: the ball has to stay where perception can
+  # see it. Geometry is approximate on purpose, see the constants file.
+  head_cfg = SceneEntityCfg("robot", body_names=("head_pitch_link",))
+  cfg.rewards["ball_in_fov"] = RewardTermCfg(
+    func=mdp.ball_in_camera_fov,
+    weight=BALL_FOV_WEIGHT,
+    params={
+      "plateau": BALL_FOV_PLATEAU,
+      "sigma": BALL_FOV_SIGMA,
+      "mount_xyz": CAMERA_MOUNT_XYZ,
+      "mount_quat": CAMERA_MOUNT_QUAT,
+      "half_angle_x": CAMERA_HALF_ANGLE_X,
+      "half_angle_y": CAMERA_HALF_ANGLE_Y,
+      "head_cfg": head_cfg,
+      "ball_cfg": ball_cfg,
+    },
+  )
+  # And the head must not hunt. The field-of-view term would otherwise pay for
+  # dithering the two head joints.
+  cfg.rewards["head_joint_motion"] = RewardTermCfg(
+    func=mdp.head_joint_motion,
+    weight=HEAD_MOTION_WEIGHT,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES),
+    },
+  )
+
+  cfg.terminations["ball_dropped"] = TerminationTermCfg(
+    func=mdp.ball_lost,
+    params={
+      "threshold": BALL_FALL_THRESHOLD,
+      "ball_radius": BALL_RADIUS,
+      "grace_steps": grace_steps,
+      **ball_state_params,
+    },
+  )
+
+  ##
+  # Command curriculum. Balancing the ball and walking are separate skills, so the
+  # robot starts standing still and the commands widen only once the ball survives.
+  #
+  # This replaces the base task's ``command_vel`` term, which would otherwise write
+  # the same ranges at the same time. It keeps that term's step-count schedule,
+  # because on this task a performance gate cannot work: every survivability
+  # observable saturates while the robot is barely moving. Performance is used only
+  # to withhold an advance the policy cannot justify.
+  ##
+
+  cfg.curriculum.pop("command_vel", None)
+  if play:
+    # No ramp during evaluation: a trained policy belongs at the last stage, and
+    # the base task's play overrides widen the ranges for a different purpose.
+    _write_command_ranges(cfg, BALL_COMMAND_STAGES[-1])
+  else:
+    # Write stage 0 now as well, so the config tells the truth before the first
+    # reset. The curriculum term keeps it up to date from then on.
+    _write_command_ranges(cfg, BALL_COMMAND_STAGES[0])
+    cfg.curriculum["ball_command_ramp"] = CurriculumTermCfg(
+      func=mdp.ball_command_ramp,
+      params={
+        "command_name": "twist",
+        "stages": BALL_COMMAND_STAGES,
+        "mastery_floor_s": BALL_COMMAND_MASTERY_FLOOR_S,
+        "window": BALL_COMMAND_WINDOW,
+      },
+    )
 
   return cfg
 

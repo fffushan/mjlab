@@ -29,8 +29,11 @@ register_mjlab_task(
   task_id="Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Balance",
   env_cfg=agibot_x2_tennis_ball_env_cfg(),
   play_env_cfg=agibot_x2_tennis_ball_env_cfg(play=True),
+  # The ball observation widens the actor from 102 to 108 and the critic from 117
+  # to 123, so the observation normalizer has a different width. Runs made before
+  # the ball was observed cannot be resumed, hence a separate experiment name.
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
-    experiment_name="agibot_x2_velocity_tennis_ball_balance"
+    experiment_name="agibot_x2_velocity_tennis_ball_centre"
   ),
   runner_cls=VelocityOnPolicyRunner,
 )

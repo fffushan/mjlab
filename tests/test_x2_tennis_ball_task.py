@@ -32,16 +32,24 @@ import numpy as np
 import pytest
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_COMMAND_STAGES,
+  BALL_COMMAND_WINDOW,
+  BALL_DIAGINERTIA,
+  BALL_DROP_GRACE_S,
+  BALL_FALL_THRESHOLD,
+  BALL_MASS,
+  BALL_POSITION_NOISE_M,
   BALL_RADIUS,
   BALL_SPAWN_CLEARANCE,
   BALL_SPAWN_LOCAL_POS,
+  BALL_VELOCITY_NOISE_M,
   BAT_CARRY_BASE_HEIGHT,
   BAT_CARRY_POSE,
   BED_CENTER_X,
-  BED_CONDIM,
-  BED_FRICTION,
   BED_GEOM,
+  BED_HALF_LENGTH,
   BED_HALF_THICKNESS,
+  BED_HALF_WIDTH,
   BED_PRIORITY,
   BED_SOLIMP,
   BED_SOLREF,
@@ -50,16 +58,22 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   CLAMP_MASS,
   CONNECTOR_DIAGINERTIA,
   CONNECTOR_MASS,
+  CONTACT_CONDIM,
+  CONTACT_FRICTION,
   FACE_SITE,
   FACE_SITE_POS,
   RACKET_BODY,
   RACKET_DIAGINERTIA,
   RACKET_MASS,
+  ROLLING_FRICTION,
+  SLIDING_FRICTION,
+  SPIN_FRICTION,
   TENNIS_BED_COLLISION,
   TENNIS_MESH_DIR,
   TENNIS_MESH_SHA256,
   WRIST_BODY,
   get_tennis_ball_cfg,
+  get_tennis_ball_spec,
   get_tennis_spec,
   get_x2_tennis_robot_cfg,
   measure_bat_carry_state,
@@ -72,6 +86,7 @@ from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.registry import list_tasks, load_env_cfg
+from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.config.agibot_x2.env_cfgs import (
   agibot_x2_flat_velocity_env_cfg,
 )
@@ -95,14 +110,25 @@ REBOUND_TOLERANCE = 0.03
 
 
 ##
-# Isolated drop fixture: one stationary horizontal string bed plus one ball.
-# Built from the shipped constants so a parameter change that is not re-fitted
-# fails the test instead of silently changing contact behaviour.
+# Isolated fixtures: one stationary horizontal string bed plus one ball.
+# Built from the shipped constants (and the shipped ball spec) so a parameter
+# change that is not re-fitted fails the test instead of silently changing
+# contact behaviour.
 ##
 
 
-def _bed_fixture_spec(timestep: float) -> mujoco.MjSpec:
-  spec = mujoco.MjSpec()
+def _bed_fixture_spec(
+  timestep: float, rolling_friction: float | None = None
+) -> mujoco.MjSpec:
+  """Isolated level bed plus the shipped ball.
+
+  ``rolling_friction`` overrides the third friction number on **both** geoms so
+  the behavioural test can run the identical setup with rolling friction off.
+  Both rows are changed because the shipped rows are deliberately identical;
+  only the bed's ``priority=1`` makes it the row that governs. ``None`` keeps
+  the shipped :data:`CONTACT_FRICTION`.
+  """
+  spec = get_tennis_ball_spec()
   spec.option.timestep = timestep
   spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
   spec.option.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
@@ -112,12 +138,17 @@ def _bed_fixture_spec(timestep: float) -> mujoco.MjSpec:
   spec.option.ls_iterations = 50
   spec.option.ls_tolerance = 0.01
 
+  friction = list(CONTACT_FRICTION)
+  if rolling_friction is not None:
+    friction[2] = rolling_friction
+    spec.geom("ball_collision").friction = friction
+
   angle = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
   vertices = np.concatenate(
     [
       np.c_[
-        0.157 * np.cos(angle),
-        0.117 * np.sin(angle),
+        BED_HALF_LENGTH * np.cos(angle),
+        BED_HALF_WIDTH * np.sin(angle),
         np.full(32, z),
       ]
       for z in (-BED_HALF_THICKNESS, BED_HALF_THICKNESS)
@@ -131,36 +162,43 @@ def _bed_fixture_spec(timestep: float) -> mujoco.MjSpec:
     meshname="bed_mesh",
     contype=1,
     conaffinity=1,
-    condim=BED_CONDIM,
+    condim=CONTACT_CONDIM,
     priority=BED_PRIORITY,
     mass=0.0,
-    friction=list(BED_FRICTION),
+    friction=friction,
     solref=list(BED_SOLREF),
     solimp=list(BED_SOLIMP),
   )
-
-  ball = spec.worldbody.add_body(name="ball")
-  ball.add_freejoint(name="ball_free")
-  ball.add_geom(
-    name="ball_collision",
-    type=mujoco.mjtGeom.mjGEOM_SPHERE,
-    size=[BALL_RADIUS, 0.0, 0.0],
-    mass=0.057,
-    contype=1,
-    conaffinity=1,
-    condim=3,
-  )
   return spec
+
+
+def _ball_qpos_and_dof(model: mujoco.MjModel) -> tuple[int, int]:
+  joint = model.joint("ball_free")
+  return int(np.ravel(joint.qposadr)[0]), int(np.ravel(joint.dofadr)[0])
+
+
+def _settle_ball(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+  """Put the ball on the bed and let the compliant contact take its weight."""
+  qadr, _ = _ball_qpos_and_dof(model)
+  data.qpos[:] = 0.0
+  data.qpos[qadr + 3] = 1.0
+  data.qpos[qadr + 2] = BED_HALF_THICKNESS + BALL_RADIUS
+  mujoco.mj_forward(model, data)
+  for _ in range(round(0.1 / model.opt.timestep)):
+    mujoco.mj_step(model, data)
+  assert data.ncon, "the ball never settled on the bed"
 
 
 def _drop_and_measure(timestep: float, drop: float) -> tuple[float, float, float]:
   """Apex height, maximum lateral speed, and lowest point for a dropped ball."""
   model = _bed_fixture_spec(timestep).compile()
   data = mujoco.MjData(model)
+  qadr, vadr = _ball_qpos_and_dof(model)
   data.qpos[:] = 0.0
+  data.qpos[qadr + 3] = 1.0
   # Bed top surface is at +BED_HALF_THICKNESS; the ball starts resting on it plus
   # ``drop`` metres.
-  data.qpos[2] = BED_HALF_THICKNESS + BALL_RADIUS + drop
+  data.qpos[qadr + 2] = BED_HALF_THICKNESS + BALL_RADIUS + drop
   mujoco.mj_forward(model, data)
 
   trace: list[float] = []
@@ -169,16 +207,48 @@ def _drop_and_measure(timestep: float, drop: float) -> tuple[float, float, float
   first_contact = None
   for step in range(int(1.0 / timestep)):
     mujoco.mj_step(model, data)
-    trace.append(float(data.qpos[2]))
+    trace.append(float(data.qpos[qadr + 2]))
     if data.ncon and first_contact is None:
       first_contact = step
-    min_bottom = min(min_bottom, data.qpos[2] - BALL_RADIUS)
-    max_lateral = max(max_lateral, float(abs(data.qvel[0])), float(abs(data.qvel[1])))
+    min_bottom = min(min_bottom, float(data.qpos[qadr + 2]) - BALL_RADIUS)
+    max_lateral = max(
+      max_lateral,
+      float(abs(data.qvel[vadr + 0])),
+      float(abs(data.qvel[vadr + 1])),
+    )
   assert first_contact is not None, "the ball never touched the bed"
   # The rebound apex is reached in free flight, after the contact has ended, so
   # it cannot be sampled only on contact steps.
   apex = max(trace[first_contact:])
   return apex - BED_HALF_THICKNESS - BALL_RADIUS, max_lateral, min_bottom
+
+
+def _roll_and_measure(
+  timestep: float,
+  rolling_friction: float | None,
+  release_speed: float,
+  duration: float = 1.0,
+) -> tuple[float, float, float]:
+  """Release the ball rolling without slipping; return speeds and travel.
+
+  ``omega_y = v / R`` is the zero-slip relation for travel along +x: the
+  contact point sits at ``-R z`` from the centre, so ``v - omega R = 0``. The
+  first returned speed is sampled immediately after the release, the second one
+  ``duration`` seconds later, and the third is the distance travelled.
+  """
+  model = _bed_fixture_spec(timestep, rolling_friction=rolling_friction).compile()
+  data = mujoco.MjData(model)
+  qadr, vadr = _ball_qpos_and_dof(model)
+  _settle_ball(model, data)
+  release_x = float(data.qpos[qadr])
+
+  data.qvel[vadr + 0] = release_speed
+  data.qvel[vadr + 4] = release_speed / BALL_RADIUS
+  mujoco.mj_forward(model, data)
+  start = float(data.qvel[vadr + 0])
+  for _ in range(round(duration / timestep)):
+    mujoco.mj_step(model, data)
+  return start, float(data.qvel[vadr + 0]), float(data.qpos[qadr]) - release_x
 
 
 ##
@@ -266,9 +336,9 @@ def test_bed_survives_the_shipped_collision_policy() -> None:
   geom_id = int(np.ravel(model.geom(BED_GEOM).id)[0])
   assert model.geom_contype[geom_id] == 1
   assert model.geom_conaffinity[geom_id] == 1
-  assert model.geom_condim[geom_id] == BED_CONDIM
+  assert model.geom_condim[geom_id] == CONTACT_CONDIM
   assert model.geom_priority[geom_id] == BED_PRIORITY
-  assert tuple(model.geom_friction[geom_id]) == pytest.approx(BED_FRICTION)
+  assert tuple(model.geom_friction[geom_id]) == pytest.approx(CONTACT_FRICTION)
   assert tuple(model.geom_solref[geom_id]) == pytest.approx(BED_SOLREF)
   assert tuple(model.geom_solimp[geom_id]) == pytest.approx(BED_SOLIMP)
   # The repair pass must not disturb the robot's own collision story: the
@@ -286,6 +356,64 @@ def test_bed_collision_config_is_the_last_word() -> None:
   """The repair config must not disable geoms the shipped policy enabled."""
   assert TENNIS_BED_COLLISION.disable_other_geoms is False
   assert TENNIS_BED_COLLISION.geom_names_expr == (rf"^{BED_GEOM}$",)
+
+
+def test_contact_is_six_dimensional_with_the_declared_friction() -> None:
+  """``condim=6`` is what lets a rolling ball lose energy to the bed.
+
+  ``condim=3`` carries a normal direction and two sliding directions and no
+  rotation at all, so spin and rolling friction cannot act: a ball rolling on
+  the level bed kept exactly the same speed forever. The bed's ``priority=1``
+  makes its row the one that governs every bed contact, which is why both rows
+  are declared identical rather than merely similar.
+  """
+  assert CONTACT_CONDIM == 6
+  assert CONTACT_FRICTION == (SLIDING_FRICTION, SPIN_FRICTION, ROLLING_FRICTION)
+  # MuJoCo geom friction is exactly three numbers: sliding, spin, rolling.
+  assert len(CONTACT_FRICTION) == 3
+  assert SLIDING_FRICTION == pytest.approx(0.44)
+
+  robot = Entity(get_x2_tennis_robot_cfg()).spec.compile()
+  bed = int(np.ravel(robot.geom(BED_GEOM).id)[0])
+  assert robot.geom_condim[bed] == 6
+  assert tuple(robot.geom_friction[bed]) == pytest.approx(CONTACT_FRICTION)
+  assert robot.geom_priority[bed] == 1
+
+  ball = get_tennis_ball_cfg().spec_fn().compile()
+  ball_geom = int(np.ravel(ball.geom("ball_collision").id)[0])
+  assert ball.geom_condim[ball_geom] == 6
+  assert tuple(ball.geom_friction[ball_geom]) == pytest.approx(CONTACT_FRICTION)
+  # Lower priority than the bed, so the bed's row is the one that acts.
+  assert ball.geom_priority[ball_geom] == 0
+
+
+def test_ball_inertia_is_the_measured_shell_value() -> None:
+  """A tennis ball is a thin shell; MuJoCo's sphere default is a solid lump."""
+  model = get_tennis_ball_cfg().spec_fn().compile()
+  body = int(np.ravel(model.body("ball").id)[0])
+  mass = float(model.body_mass[body])
+  inertia = np.asarray(model.body_inertia[body], dtype=float)
+
+  # One kilogram, once: the geom carries no mass of its own.
+  assert tuple(inertia) == pytest.approx(BALL_DIAGINERTIA, rel=1e-9)
+  assert mass == pytest.approx(BALL_MASS)
+
+  # The ball is the ITF lower limit, a conservative estimate rather than a
+  # measurement of the ball in hand. If someone substitutes a regulation midpoint
+  # ball this test is meant to stop and make them re-check the rolling fit, which
+  # depends on I/(m R^2).
+  assert mass == pytest.approx(0.0560, abs=1e-9)
+  assert 2 * BALL_RADIUS == pytest.approx(0.0654, abs=1e-6)
+
+  ratio = inertia[0] / (mass * BALL_RADIUS**2)
+  # 0.400 would be a uniform solid sphere, which is what MuJoCo would compute.
+  # Tolerance matches the five significant figures the constant is stored at.
+  assert ratio == pytest.approx(0.549, rel=1e-4), ratio
+  assert ratio > 1.3 * 0.400
+  # Cross measured 3.41e-05 kg m^2 for a 57 g ball at 33 mm, i.e. this ratio.
+  # The inertia is re-derived at the shipped mass and radius, so the ratio is
+  # preserved and the absolute value is not.
+  assert inertia[0] == pytest.approx(0.549 * 0.0560 * 0.0327**2, rel=1e-4)
 
 
 def test_carry_pose_constants_are_current() -> None:
@@ -350,6 +478,40 @@ def test_bed_reproduces_the_measured_rebound_at_one_millisecond(
   assert apex == pytest.approx(MEASURED_REBOUND[drop], abs=REBOUND_TOLERANCE)
   # A calibrated normal-impact fixture must not create tangential motion.
   assert max_lateral < 1e-3
+
+
+def test_a_rolling_ball_slows_down_and_does_not_stop_instantly() -> None:
+  """A level-bed roll must decay, and must not be arrested on the spot.
+
+  The bounds are deliberately loose in absolute terms, because the coefficient
+  itself is provisional and will change when the real racket is measured. What
+  the test pins is the *shape*: rotation must let the bed take energy, and the
+  ball must not be brought to a halt within a tenth of a second, which a badly
+  over-large coefficient would do.
+
+  ``condim=3`` fails the decay bound: the speed never changed at all.
+  """
+  start, after, travel = _roll_and_measure(1e-3, None, 0.10)
+  assert start == pytest.approx(0.10, abs=1e-6)
+  ratio = after / start
+  assert 0.05 <= ratio <= 0.95, (
+    f"speed after 1 s is {ratio:.3f} of the release (travel {travel:.3f} m)"
+  )
+  early, _, _ = _roll_and_measure(1e-3, None, 0.10, duration=0.1)
+  assert early / start > 0.5, f"arrested within 0.1 s: {early / start:.3f} of release"
+
+
+def test_zero_rolling_friction_does_not_slow_the_ball() -> None:
+  """The same setup with the rolling coefficient removed must coast.
+
+  This is the control: it shows the slowdown above is caused by the rolling
+  dimension of the friction triple, not by the sliding coefficient or by the
+  solver. MuJoCo clamps the coefficient to ``mjMINMU`` = 1e-5, so a little decay
+  remains -- far less than the shipped value produces.
+  """
+  start, after, travel = _roll_and_measure(1e-3, 0.0, 0.10)
+  assert after / start > 0.99
+  assert travel > 0.09
 
 
 def test_bed_parameters_are_unstable_at_the_default_timestep() -> None:
@@ -582,17 +744,50 @@ def test_sim_to_real_terms_act_on_the_x2_geometry(name: str) -> None:
     assert term.params["ranges"][".*_hip_pitch_joint"] == (0.0, 0.03)
 
 
-def test_task_keeps_the_base_action_and_observation_widths() -> None:
+def test_task_adds_exactly_the_ball_terms_to_the_base_task() -> None:
+  """The base terms must be untouched; only the ball may be added."""
   base = agibot_x2_flat_velocity_env_cfg()
   tennis = load_env_cfg(TASK_ID)
   assert tennis.actions.keys() == base.actions.keys()
   for group in ("actor", "critic"):
-    assert tennis.observations[group].terms.keys() == (
-      base.observations[group].terms.keys()
-    )
-  assert tennis.rewards.keys() == base.rewards.keys()
-  assert tennis.terminations.keys() == base.terminations.keys()
+    added = set(tennis.observations[group].terms) - set(base.observations[group].terms)
+    assert added == {"ball_pos", "ball_vel"}, group
+    assert set(base.observations[group].terms) <= set(tennis.observations[group].terms)
+  # Rewards and terminations keep every base term and add the ball's.
+  assert set(base.rewards.keys()) <= set(tennis.rewards.keys())
+  assert set(tennis.rewards.keys()) - set(base.rewards.keys()) == {
+    "ball_centred",
+    "ball_height",
+    "ball_in_fov",
+    "head_joint_motion",
+  }
+  assert set(tennis.terminations.keys()) - set(base.terminations.keys()) == {
+    "ball_dropped"
+  }
+  assert set(base.terminations.keys()) <= set(tennis.terminations.keys())
   assert tennis.commands.keys() == base.commands.keys()
+
+
+def test_ball_observation_widens_the_actor_by_six() -> None:
+  """The ball adds a 3-vector position and a 3-vector velocity to both groups.
+
+  Widths are read off a built environment, because the term shape depends on the
+  asset, not on the config text. A checkpoint of the base task cannot be resumed
+  here: the observation normalizer has the wrong width. That is why the ball task
+  has its own experiment name.
+  """
+  env = _build_env(num_envs=1)
+  try:
+    om = env.observation_manager
+    for group in ("actor", "critic"):
+      names = om._group_obs_term_names[group]
+      dims = om._group_obs_term_dim[group]
+      widths = dict(zip(names, (int(np.prod(d)) for d in dims), strict=True))
+      assert widths["ball_pos"] == 3
+      assert widths["ball_vel"] == 3
+      assert sum(widths.values()) == int(np.prod(om._group_obs_dim[group]))
+  finally:
+    env.close()
 
 
 def test_resets_are_pinned_so_the_ball_lands_on_the_bed() -> None:
@@ -629,6 +824,86 @@ def test_play_config_also_loads() -> None:
   assert set(play_cfg.scene.entities) == {"robot", BALL_ENTITY}
 
 
+def _build_env(num_envs: int = 1, steps: int = 1):
+  """A live environment with the ball settled on the strings.
+
+  ``steps`` control steps are run so the contact and the entity states are the
+  stepped ones, which is what the reward and termination terms read at runtime.
+  ``steps=0`` reads the pure reset state: the ball is exactly where the resetter
+  put it. That matters because the reset also draws a random PD-gain scale, so
+  after a step the bat has already begun to sag by a seed-dependent amount.
+  The ball-drop termination ignores the first few steps after a reset, so tests
+  that expect it to fire need ``steps >= 4``.
+  """
+  import torch
+
+  cfg = load_env_cfg(TASK_ID)
+  env = ManagerBasedRlEnv(cfg, device="cpu", num_envs=num_envs)
+  env.reset()
+  action = torch.zeros(env.num_envs, env.action_manager.total_action_dim)
+  for _ in range(steps):
+    env.step(action)
+  return env
+
+
+def _place_ball(env, offset_plate_frame) -> None:
+  """Put the ball at ``offset`` from the plate's top-surface centre.
+
+  ``offset_plate_frame`` is ``(x along shaft, y across it, z along the normal)``,
+  in the plate frame. A resting ball is ``(0, 0, BALL_RADIUS)``.
+  """
+  import torch
+
+  from mjlab.utils.lab_api.math import quat_apply
+
+  racket = env.scene["robot"]
+  body_id = _racket_body_id(env)
+  plate_pos = racket.data.body_link_pos_w[:, body_id]
+  plate_quat = racket.data.body_link_quat_w[:, body_id]
+  local = torch.tensor(
+    [offset_plate_frame], dtype=plate_pos.dtype, device=plate_pos.device
+  )
+  local = local + torch.tensor(FACE_SITE_POS, dtype=local.dtype, device=local.device)
+  world = plate_pos + quat_apply(plate_quat, local)
+  ball = env.scene[BALL_ENTITY]
+  ball.write_root_link_pose_to_sim(
+    torch.cat([world, ball.data.root_link_quat_w], dim=-1)
+  )
+  # Kill any residual velocity so the measurement is of the placed state only.
+  ball.write_root_link_velocity_to_sim(torch.zeros_like(ball.data.root_link_vel_w))
+  env.sim.forward()
+
+
+def _racket_body_id(env) -> int:
+  for name, cfglist in zip(
+    env.reward_manager._term_names, env.reward_manager._term_cfgs, strict=True
+  ):
+    if name == "ball_centred":
+      cfg = cfglist if not isinstance(cfglist, list) else cfglist[0]
+      ids = cfg.params["plate_cfg"].body_ids
+      assert len(ids) == 1
+      return ids[0]
+  raise AssertionError("ball_centred reward is not configured")
+
+
+def _ball_term(env, kind: str, name: str):
+  """The resolved reward, termination or curriculum config for a ball term.
+
+  For class-based terms ``func`` has been replaced by the instance, so the returned
+  config's ``func`` is callable as ``func(env, env_ids, **params)`` for curricula and
+  ``func(env, **params)`` for the others.
+  """
+  manager = {
+    "reward": env.reward_manager,
+    "termination": env.termination_manager,
+    "curriculum": env.curriculum_manager,
+  }[kind]
+  for term_name, cfglist in zip(manager._term_names, manager._term_cfgs, strict=True):
+    if term_name == name:
+      return cfglist if not isinstance(cfglist, list) else cfglist[0]
+  raise AssertionError(f"{name} is not configured")
+
+
 @pytest.mark.slow
 def test_environment_builds_and_steps() -> None:
   """One real build: the scene must compile and step without overflow."""
@@ -649,3 +924,488 @@ def test_environment_builds_and_steps() -> None:
   # an unsupported ball is at most ~18 mm of free fall.
   assert np.linalg.norm(after - before) < 0.05
   env.close()
+
+
+##
+# Ball-holding task: observation, reward and termination.
+##
+
+
+@pytest.mark.slow
+def test_the_ball_observation_is_the_plate_relative_pose() -> None:
+  """Position is the ball centre from the plate's top-surface centre, and a ball
+  moving with the plate reads zero velocity.
+
+  The velocity check uses MuJoCo's own site velocity as the oracle, so it does not
+  re-use the formula under test. The wrist is given a real joint velocity first,
+  because the face centre is 0.515 m from the racket body origin: a ball carried
+  by a turning wrist must still read zero, which is only true if the plate-point
+  velocity (``v + omega x r``) is subtracted, not just the body origin's velocity.
+  """
+  import torch
+
+  # No steps: the pose assertions are about the reset state, and one step would
+  # already include a seed-dependent PD sag.
+  env = _build_env(steps=0)
+  try:
+    plate_cfg = _ball_term(env, "reward", "ball_centred").params["plate_cfg"]
+    ball_cfg = _ball_term(env, "reward", "ball_centred").params["ball_cfg"]
+    robot = env.scene["robot"]
+    ball = env.scene[BALL_ENTITY]
+
+    ## Position, at rest on the strings.
+    position, _ = mdp.plate_relative_ball_state(env, plate_cfg, ball_cfg)
+    pos = position[0].cpu().numpy()
+    assert pos[0] == pytest.approx(0.0, abs=2e-3)
+    assert pos[1] == pytest.approx(0.0, abs=2e-3)
+    assert pos[2] == pytest.approx(BALL_RADIUS + BALL_SPAWN_CLEARANCE, abs=3e-3), (
+      "a ball resting on the strings must read z = radius"
+    )
+
+    ## Velocity, with the arm turning.
+    #
+    # Step 1 validates the plate-point formula against MuJoCo itself: at the face
+    # site, ``v + omega x r`` must reproduce mjlab's ``site_vel_w``, which comes
+    # from MuJoCo's own subtrees. Step 2 then applies that validated formula at the
+    # ball's position. Dropping the ``omega x r`` term changes the answer by
+    # ``omega x r``, which is ~0.23 m/s at 3 rad/s, far above the tolerance.
+    joint_id = robot.find_joints("right_elbow_joint")
+    joints = joint_id[0] if isinstance(joint_id, tuple) else joint_id
+    joint_vel = torch.zeros(env.num_envs, len(joints))
+    joint_vel[:, 0] = 3.0  # rad/s
+    robot.write_joint_velocity_to_sim(joint_vel, joint_ids=joints)
+    env.sim.forward()
+
+    body_id = _racket_body_id(env)
+    body_pos = robot.data.body_link_pos_w[:, body_id]
+    body_vel = robot.data.body_link_lin_vel_w[:, body_id]
+    body_omega = robot.data.body_link_ang_vel_w[:, body_id]
+    site_ids = robot.find_sites(FACE_SITE)[0]
+    site_pos = robot.data.site_pos_w[:, site_ids].squeeze(1)
+    site_vel = robot.data.site_vel_w[:, site_ids, :3].squeeze(1)
+    formula_at_site = body_vel + torch.cross(body_omega, site_pos - body_pos, dim=1)
+    assert (formula_at_site - site_vel).abs().max() < 1e-5, "formula vs MuJoCo"
+
+    # Ball at rest in the world, plate turning.
+    ball.write_root_link_velocity_to_sim(torch.zeros(env.num_envs, 6))
+    env.sim.forward()
+    ball_pos = ball.data.root_link_pos_w
+    point_vel = body_vel + torch.cross(body_omega, ball_pos - body_pos, dim=1)
+    assert (point_vel - body_vel).norm() > 0.2, "the rotation must matter"
+
+    plate_quat = robot.data.body_link_quat_w[:, body_id]
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    expected = quat_apply_inverse(plate_quat, -point_vel)
+    _, relative = mdp.plate_relative_ball_state(env, plate_cfg, ball_cfg)
+    assert (relative - expected).abs().max() < 5e-3, (relative[0], expected[0])
+
+    # And a ball moving exactly with the plate reads zero: "held" means zero here.
+    ball.write_root_link_velocity_to_sim(
+      torch.cat([point_vel, torch.zeros_like(point_vel)], dim=-1)
+    )
+    env.sim.forward()
+    _, relative = mdp.plate_relative_ball_state(env, plate_cfg, ball_cfg)
+    assert relative[0].abs().max() < 2e-3, relative[0].tolist()
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_centring_reward_follows_the_plateau_then_decays() -> None:
+  env = _build_env()
+  try:
+    term = _ball_term(env, "reward", "ball_centred")
+    for dy, expected in (
+      (0.000, 1.0),  # on the centre
+      (0.010, 1.0),  # inside the plateau: no gradient, so no reward noise
+      (0.020, 1.0),  # the plateau edge is still full credit
+      (0.050, np.exp(-(((0.050 - 0.020) / 0.040) ** 2))),
+      (0.084, np.exp(-(((0.084 - 0.020) / 0.040) ** 2))),
+    ):
+      _place_ball(env, (0.0, dy, BALL_RADIUS))
+      got = float(term.func(env, **term.params)[0])
+      assert got == pytest.approx(expected, abs=3e-3), (dy, got, expected)
+    # The long axis reaches further, so the same offset costs less there.
+    _place_ball(env, (0.084, 0.0, BALL_RADIUS))
+    along = float(term.func(env, **term.params)[0])
+    _place_ball(env, (0.0, 0.084, BALL_RADIUS))
+    across = float(term.func(env, **term.params)[0])
+    assert along == pytest.approx(across, abs=1e-6), "in-plane distance only"
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_height_reward_is_full_on_the_strings_and_decays_above() -> None:
+  env = _build_env()
+  try:
+    term = _ball_term(env, "reward", "ball_height")
+    for dz, expected in (
+      (BALL_RADIUS, 1.0),  # resting on the strings
+      (BALL_RADIUS - 0.005, 1.0),  # sunk in: compliant contact
+      (BALL_RADIUS + 0.05, 1.0),  # inside the 100 mm band
+      (BALL_RADIUS + 0.10, 1.0),  # the band's edge
+      (BALL_RADIUS + 0.20, np.exp(-((0.10 / 0.040) ** 2))),
+    ):
+      _place_ball(env, (0.0, 0.0, dz))
+      got = float(term.func(env, **term.params)[0])
+      assert got == pytest.approx(expected, abs=3e-3), (dz, got, expected)
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_losing_the_ball_ends_the_episode_and_a_bounce_does_not() -> None:
+  # Four steps: the drop term deliberately ignores the first three after a reset,
+  # so that a stale ball state cannot end a fresh episode.
+  env = _build_env(steps=4)
+  try:
+    term = _ball_term(env, "termination", "ball_dropped")
+    # A ball on the strings, and one thrown a hand's width up, are both fine.
+    for dz in (BALL_RADIUS, BALL_RADIUS + 0.15):
+      _place_ball(env, (0.0, 0.0, dz))
+      assert not bool(term.func(env, **term.params)[0]), dz
+    # A ball below the plate is fatal once the grace has elapsed.
+    term.func.reset(env_ids=slice(None))
+    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.05))
+    grace = int(term.params["grace_steps"])
+    for _ in range(grace):
+      fired = bool(term.func(env, **term.params)[0])
+    assert fired
+    # Just above the threshold it must not fire at all: a sinking contact is not
+    # a drop, however long it lasts.
+    term.func.reset(env_ids=slice(None))
+    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.010))
+    for _ in range(grace + 5):
+      assert not bool(term.func(env, **term.params)[0])
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_each_ball_observation_dimension_is_randomized_independently() -> None:
+  """Six independent magnitudes, not one shared scale.
+
+  The actor must see a randomized ball with a **different** spread on each of the
+  three axes of each term; the critic must see the true ball. A single shared
+  magnitude would fail the "different on each axis" assertions.
+  """
+  import numpy as np
+
+  env = _build_env()
+  try:
+    om = env.observation_manager
+    wanted = {"ball_pos": BALL_POSITION_NOISE_M, "ball_vel": BALL_VELOCITY_NOISE_M}
+    spread = {}
+    for group in ("actor", "critic"):
+      samples = {name: [] for name in wanted}
+      for _ in range(400):
+        obs = om.compute_group(group)
+        names = om._group_obs_term_names[group]
+        dims = om._group_obs_term_dim[group]
+        idx = 0
+        for name, dim in zip(names, dims, strict=True):
+          n = int(np.prod(dim))
+          if name in samples:
+            samples[name].append(obs[0, idx : idx + n].cpu().numpy().copy())
+          idx += n
+      spread[group] = {k: np.asarray(v) for k, v in samples.items()}
+
+    for name, magnitudes in wanted.items():
+      actor = spread["actor"][name]
+      std = actor.std(axis=0)
+      # Uniform half-width m has standard deviation m / sqrt(3).
+      expected = np.asarray(magnitudes) / np.sqrt(3.0)
+      assert std == pytest.approx(expected, rel=0.12), (name, std, expected)
+      # The axes must not share one magnitude: the constants differ, so the
+      # measured spread must too.
+      assert not np.allclose(std, std[0], rtol=0.05), (name, std)
+      # And the critic must be clean.
+      assert np.abs(spread["critic"][name].std(axis=0)).max() < 1e-6, name
+  finally:
+    env.close()
+
+
+##
+# Training-procedure curriculum: patience on a lost ball, and a command ramp.
+##
+
+
+def test_the_task_starts_at_the_easiest_real_difficulty() -> None:
+  """Stage 0 is slow walking, the base task's step-based ramp is gone, and there is
+  no stand-still stage.
+
+  A stand-still stage was tried and removed: with the robot commanded to stand the
+  ball simply sits on the plate, nothing terminates for the full 20 s episode, and
+  the performance gate read that as mastery and promoted to the hardest stage at
+  once. Episode length only says something about ball handling when the robot is
+  asked to move.
+  """
+  cfg = load_env_cfg(TASK_ID)
+  ranges = cfg.commands["twist"].ranges
+  assert ranges.lin_vel_x == BALL_COMMAND_STAGES[0]["lin_vel_x"]
+  assert ranges.lin_vel_x == (-0.3, 0.3)
+  assert ranges.lin_vel_x != (0.0, 0.0), "no stand-still stage"
+  assert "command_vel" not in cfg.curriculum
+  assert list(cfg.curriculum) == ["ball_command_ramp"]
+
+
+def test_play_mode_uses_the_final_stage_and_does_not_ramp() -> None:
+  """An evaluation must be commanded to walk, and must not start at a standstill."""
+  cfg = load_env_cfg(TASK_ID, play=True)
+  ranges = cfg.commands["twist"].ranges
+  assert ranges.lin_vel_x == BALL_COMMAND_STAGES[-1]["lin_vel_x"]
+  assert ranges.ang_vel_z == BALL_COMMAND_STAGES[-1]["ang_vel_z"]
+  assert list(cfg.curriculum) == []
+
+
+def test_the_drop_termination_is_a_grace_not_a_weaker_threshold() -> None:
+  """The lost height is unchanged; only the time before the episode ends is new."""
+  cfg = load_env_cfg(TASK_ID)
+  term = cfg.terminations["ball_dropped"]
+  assert term.func is mdp.ball_lost
+  assert term.params["threshold"] == BALL_FALL_THRESHOLD
+  assert term.params["grace_steps"] == round(
+    BALL_DROP_GRACE_S / (cfg.sim.mujoco.timestep * cfg.decimation)
+  )
+  assert term.params["grace_steps"] > 1
+
+
+@pytest.mark.slow
+def test_a_lost_ball_ends_the_episode_only_after_the_grace() -> None:
+  """Count consecutive lost steps; a recovering ball restarts the count."""
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "termination", "ball_dropped")
+    grace = int(term.params["grace_steps"])
+    term.func.reset(env_ids=slice(None))
+
+    # Ball well below the plate: the first grace-1 steps must not fire.
+    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.05))
+    for step in range(grace - 1):
+      assert not bool(term.func(env, **term.params)[0]), step
+    assert bool(term.func(env, **term.params)[0]), "must fire when the grace runs out"
+
+    # Back above the plate: the count restarts, so it does not fire.
+    _place_ball(env, (0.0, 0.0, BALL_RADIUS))
+    assert not bool(term.func(env, **term.params)[0])
+    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.05))
+    assert not bool(term.func(env, **term.params)[0]), "count must have restarted"
+
+    # A reset clears it too.
+    for _ in range(grace):
+      term.func(env, **term.params)
+    assert bool(term.func(env, **term.params)[0])
+    term.func.reset(env_ids=slice(None))
+    assert not bool(term.func(env, **term.params)[0])
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_command_ramp_needs_both_the_schedule_and_the_floor() -> None:
+  """The clock carries the difficulty; performance can only withhold an advance.
+
+  Three failure modes this pins, all observed on real runs before the redesign:
+  promoting without any skill because the easy stage saturates, promoting several
+  stages on one batch, and demoting after a bad batch.
+
+  The gate reads a window of finished episodes, so each phase feeds enough
+  episodes to flush the previous ones out before it means anything.
+  """
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "curriculum", "ball_command_ramp")
+    ranges = env.command_manager.get_term("twist").cfg.ranges
+    step_dt = env.step_dt
+    floor = float(term.params["mastery_floor_s"])
+    window = BALL_COMMAND_WINDOW
+    last_step = BALL_COMMAND_STAGES[-1]["min_step"]
+
+    def feed(episode_seconds: float, times: int) -> dict:
+      state = None
+      for _ in range(times):
+        env.episode_length_buf[:] = round(episode_seconds / step_dt)
+        state = term.func(env, slice(None), **term.params)
+      return state
+
+    # Phase A: skill, but the clock has not come round. Nothing advances.
+    state = feed(floor + 5.0, window + 5)
+    assert int(state["stage"]) == 0, "a good episode alone must not promote"
+    assert ranges.lin_vel_x == BALL_COMMAND_STAGES[0]["lin_vel_x"]
+
+    # Phase B: open the schedule only *after* flushing phase A's long episodes
+    # out of the window, so the floor is judged on short ones alone.
+    env.common_step_counter = 0
+    state = feed(1.0, window + 5)
+    assert int(state["stage"]) == 0
+    env.common_step_counter = last_step + 1
+    state = feed(1.0, 1)
+    assert int(state["stage"]) == 0, "the floor must withhold the advance"
+    assert float(state["typical_episode_s"]) < floor
+
+    # Phase C: schedule open and skill present. The median flips after half the
+    # window, and that single call may advance exactly one stage.
+    flip = window // 2 + 1
+    state = feed(floor + 5.0, flip)
+    assert int(state["stage"]) == 1, "exactly one stage per call"
+    assert ranges.lin_vel_x == BALL_COMMAND_STAGES[1]["lin_vel_x"]
+
+    # Phase D: a collapse must not demote. It may not advance either once the
+    # window reflects the collapse, but during the flush the stale long episodes
+    # can still justify a promotion, which is fine: the property under test is that
+    # the stage never goes down.
+    stage_before = int(state["stage"])
+    state = feed(0.5, window + 5)
+    assert int(state["stage"]) >= stage_before, "promotion must be one-way"
+    assert ranges.lin_vel_x == BALL_COMMAND_STAGES[int(state["stage"])]["lin_vel_x"]
+
+    # Phase E: keep it up and the last stage is reached.
+    state = feed(floor + 5.0, window + 5)
+    assert int(state["stage"]) == len(BALL_COMMAND_STAGES) - 1
+    assert ranges.lin_vel_x == (-1.0, 1.0)
+    assert ranges.ang_vel_z == (-0.5, 0.5)
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_a_few_lucky_episodes_cannot_promote_the_command_ramp() -> None:
+  """The gate is a median, so outliers cannot outvote the typical episode.
+
+  Regression: with a mean gate this task promoted a stage while the typical
+  episode was still about 1 s long, because a handful of environments whose ball
+  happened to settle survived for many seconds and dragged the mean up.
+  """
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "curriculum", "ball_command_ramp")
+    step_dt = env.step_dt
+
+    def feed(episode_seconds: float) -> dict:
+      env.episode_length_buf[:] = round(episode_seconds / step_dt)
+      return term.func(env, slice(None), **term.params)
+
+    # Open the schedule so that only the median protects the gate.
+    env.common_step_counter = BALL_COMMAND_STAGES[-1]["min_step"] + 1
+    # A typical 1 s episode for most environments.
+    for _ in range(2):
+      feed(1.0)
+    # Now a minority of very long ones fill the rest of the window. With a mean
+    # gate this alone would cross a 6 s threshold.
+    state = feed(19.0)
+    assert float(state["mean_episode_s"]) > float(state["typical_episode_s"])
+    assert int(state["stage"]) == 0, "the median must protect the gate"
+  finally:
+    env.close()
+
+
+##
+# Head camera field of view, and head steadying.
+##
+
+
+def _place_ball_world(env, world_xyz) -> None:
+  """Put the ball at an explicit world position, velocities zeroed."""
+  import torch
+
+  ball = env.scene[BALL_ENTITY]
+  p = torch.tensor(
+    [world_xyz],
+    dtype=ball.data.root_link_pos_w.dtype,
+    device=ball.data.root_link_pos_w.device,
+  )
+  ball.write_root_link_pose_to_sim(torch.cat([p, ball.data.root_link_quat_w], dim=-1))
+  ball.write_root_link_velocity_to_sim(torch.zeros_like(ball.data.root_link_vel_w))
+  env.sim.forward()
+
+
+@pytest.mark.slow
+def test_the_ball_is_in_view_where_it_is_carried() -> None:
+  """At the carry pose the ball must score full credit on the camera term.
+
+  This is the premise of the whole perception chain: if the ball is not in frame
+  while it is being carried, no FOV reward can help.
+  """
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "reward", "ball_in_fov")
+    score = float(term.func(env, **term.params)[0])
+    assert score == pytest.approx(1.0, abs=1e-3), score
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_camera_reward_falls_with_height_and_vanishes_behind_the_head() -> None:
+  """Monotone in the vertical angle, and zero for a ball behind the camera plane."""
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "reward", "ball_in_fov")
+    ball = env.scene[BALL_ENTITY]
+    base = ball.data.root_link_pos_w.clone()
+
+    scores = []
+    for dz in (0.0, 0.3, 0.6, 0.9):
+      target = base.clone()
+      target[0, 2] += dz
+      _place_ball_world(env, target[0].tolist())
+      scores.append(float(term.func(env, **term.params)[0]))
+    assert scores[0] == pytest.approx(1.0, abs=1e-3)
+    assert scores == sorted(scores, reverse=True), scores
+    assert scores[-1] < 0.2, scores
+
+    # A ball behind the head is behind the camera plane: no credit at all.
+    robot = env.scene["robot"]
+    head_id = robot.find_bodies("head_pitch_link")[0][0]
+    head_pos = robot.data.body_link_pos_w[:, head_id]
+    behind = head_pos.clone()
+    behind[0, 0] -= 0.6
+    _place_ball_world(env, behind[0].tolist())
+    assert float(term.func(env, **term.params)[0]) == 0.0
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_head_motion_penalty_is_zero_at_rest_and_square_in_velocity() -> None:
+  """The penalty must be a velocity cost, not a position cost.
+
+  A position cost would fight the field-of-view reward, which needs the head to be
+  able to aim. Velocity is what "the head must not hunt" means.
+  """
+  import torch
+
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "reward", "head_joint_motion")
+    robot = env.scene["robot"]
+    joints = term.params["asset_cfg"].joint_ids
+
+    assert float(term.func(env, **term.params)[0]) == pytest.approx(0.0, abs=1e-9)
+
+    # Move only the head joints and check the quadratic form.
+    vel = torch.zeros(env.num_envs, len(joints))
+    vel[:, 0] = 0.5
+    vel[:, 1] = -1.0
+    robot.write_joint_velocity_to_sim(vel, joint_ids=joints)
+    env.sim.forward()
+    got = float(term.func(env, **term.params)[0])
+    assert got == pytest.approx(0.5**2 + 1.0**2, rel=1e-3), got
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_head_terms_are_wired_with_the_expected_signs() -> None:
+  """FOV pays, head motion costs, and the FOV term is soft."""
+  cfg = load_env_cfg(TASK_ID)
+  fov = cfg.rewards["ball_in_fov"]
+  head = cfg.rewards["head_joint_motion"]
+  assert fov.func is mdp.ball_in_camera_fov
+  assert head.func is mdp.head_joint_motion
+  assert fov.weight > 0
+  assert head.weight < 0
+  # Soft: the FOV term must not outbid the centring term, which is the task.
+  assert fov.weight < cfg.rewards["ball_centred"].weight

@@ -5,8 +5,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from mjlab.entity import Entity
+from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactSensor
+from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -100,3 +103,84 @@ def terrain_edge_reached(
   at_edge &= env.episode_length_buf > 2
 
   return at_edge
+
+
+class ball_lost(ManagerTermBase):
+  """End the episode when the ball has stayed below the plate for a while.
+
+  A stateless "ball is below the plate" check would end an untrained policy's
+  episode within 20 control steps, because that is how long an uncontrolled ball
+  takes to roll off. This term instead counts **consecutive** steps with the ball
+  below the threshold and fires only once the count reaches ``grace_steps``, so the
+  policy gets time to react to a ball that has left the plate.
+
+  The count is per environment and is zeroed on every reset, so a stale ball state
+  cannot end a fresh episode, and a ball that comes back above the threshold
+  restarts the count.
+
+  Args:
+    threshold: Height above the plate's top surface below which the ball counts as
+      lost, in metres. Negative, so the fraction of a millimetre a compliant
+      contact allows does not start the count.
+    ball_radius: The ball's radius; the stored height is to its centre.
+    grace_steps: Consecutive control steps the ball may stay lost. ``0`` fires on
+      the first lost step.
+    plate_cfg: Racket body; the plate frame is defined by it.
+    ball_cfg: Ball entity.
+  """
+
+  def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._lost_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    threshold: float,
+    ball_radius: float,
+    grace_steps: int,
+    plate_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+  ) -> torch.Tensor:
+    position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
+    height = position[:, 2] - ball_radius
+    lost = height < threshold
+    self._lost_steps = torch.where(
+      lost, self._lost_steps + 1, torch.zeros_like(self._lost_steps)
+    )
+    return self._lost_steps >= max(int(grace_steps), 1)
+
+  def reset(self, env_ids: torch.Tensor | slice | None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._lost_steps[env_ids] = 0
+
+
+def ball_below_plate(
+  env: ManagerBasedRlEnv,
+  threshold: float,
+  ball_radius: float,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """End the episode when the ball has dropped below the plate.
+
+  Args:
+    threshold: Height above the plate's top surface below which the episode
+      ends, in metres. Negative, so the small penetration a compliant contact
+      allows does not fire it. A ball rolling off the edge reaches -20 mm about
+      65 ms after leaving the plate.
+    ball_radius: The ball's radius; the stored height is to its centre.
+    plate_cfg: Racket body; the plate frame is defined by it.
+    ball_cfg: Ball entity.
+
+  Returns:
+    Boolean tensor of shape ``(num_envs,)``.
+  """
+  position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
+  height = position[:, 2] - ball_radius
+  below = height < threshold
+  # Don't fire on the first steps after a reset, when the ball's state may still
+  # be the one the resetter wrote rather than a stepped one.
+  below &= env.episode_length_buf > 2
+  return below

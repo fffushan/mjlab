@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict, cast
+from collections import deque
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
+import numpy as np
 import torch
 
 from mjlab.entity import Entity
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
+from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from .velocity_command import UniformVelocityCommandCfg
@@ -114,3 +119,95 @@ def commands_vel(
     "ang_vel_z_min": torch.tensor(cfg.ranges.ang_vel_z[0]),
     "ang_vel_z_max": torch.tensor(cfg.ranges.ang_vel_z[1]),
   }
+
+
+##
+# Tennis ball on the bat.
+##
+
+
+class ball_command_ramp(ManagerTermBase):
+  """Widen the walking command on a schedule, blocked when the policy is failing.
+
+  The difficulty advances on a step count, not on a measurement. Measured on this
+  task, every survivability observable saturates while the robot is barely moving:
+  an untrained policy keeps the ball for 9 s at 0.3 m/s and 15 s at 0.6 m/s, and
+  1 s at 1.0 m/s. A performance threshold placed in the easy regime is therefore
+  cleared with no skill at all, and a greedy gate promoted this task to its hardest
+  stage within two iterations, twice, by two different routes.
+
+  So the clock carries the difficulty, and performance can only **withhold** an
+  advance: a stage is entered on its scheduled step only if the typical episode at
+  the current stage is at least ``mastery_floor_s``. That keeps a failing policy
+  from being pushed faster while leaving the progression predictable.
+
+  Advancement is one stage per call and one-way. The stage, the typical episode and
+  the next stage's scheduled step are returned for the training log.
+
+  Args:
+    command_name: The velocity command term whose ranges are written.
+    stages: Sequence of dicts, each with ``min_step`` and any of ``lin_vel_x``,
+      ``lin_vel_y``, ``ang_vel_z``. ``min_step`` is compared against
+      ``env.common_step_counter``.
+    mastery_floor_s: Typical episode length, in seconds, the current stage must
+      sustain before the next one may be entered.
+    window: Number of finished episodes the typical length is measured over.
+  """
+
+  def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._stage = 0
+    self._lengths: deque[float] = deque(maxlen=int(cfg.params["window"]))
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | slice | None,
+    command_name: str,
+    stages: Sequence[Mapping[str, Any]],
+    mastery_floor_s: float,
+    window: int,
+  ) -> dict[str, torch.Tensor]:
+    window = int(window)
+    if env_ids is None:
+      env_ids = slice(None)
+
+    # ``env.episode_length_buf`` still holds the length of the episode that just
+    # ended: the environment zeroes it only after every manager's reset.
+    lengths = env.episode_length_buf[env_ids]
+    if lengths.numel():
+      self._lengths.extend(lengths.detach().cpu().tolist())
+
+    # A partial window is not evidence, so the floor is not evaluated yet.
+    complete = len(self._lengths) >= window
+    typical_seconds = float(np.median(self._lengths)) * env.step_dt if complete else 0.0
+    mean_seconds = float(np.mean(self._lengths)) * env.step_dt if self._lengths else 0.0
+
+    promoted = False
+    if complete and self._stage + 1 < len(stages):
+      next_stage = stages[self._stage + 1]
+      scheduled = env.common_step_counter >= int(next_stage["min_step"])
+      mastered = typical_seconds >= mastery_floor_s
+      if scheduled and mastered:
+        self._stage += 1
+        promoted = True
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None
+    ranges = cast(UniformVelocityCommandCfg, command_term.cfg).ranges
+    active = stages[self._stage]
+    for field_name in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
+      if field_name in active:
+        setattr(ranges, field_name, tuple(active[field_name]))
+
+    next_index = min(self._stage + 1, len(stages) - 1)
+    return {
+      "stage": torch.tensor(self._stage),
+      "promoted": torch.tensor(float(promoted)),
+      "typical_episode_s": torch.tensor(typical_seconds),
+      "mean_episode_s": torch.tensor(mean_seconds),
+      "mastery_floor_s": torch.tensor(float(mastery_floor_s)),
+      "next_stage_step": torch.tensor(float(stages[next_index]["min_step"])),
+      "lin_vel_x_max": torch.tensor(float(ranges.lin_vel_x[1])),
+      "ang_vel_z_max": torch.tensor(float(ranges.ang_vel_z[1])),
+    }
