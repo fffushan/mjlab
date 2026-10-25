@@ -70,6 +70,7 @@ Table of Contents
    source/events
    source/randomization
    source/sim2real_domain_randomization
+   source/x2_tennis_ball_balance
    source/x2_tennis_recovery
    source/x2_tennis_distillation
    source/x2_diffusion_training

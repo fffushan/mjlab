@@ -121,6 +121,74 @@ def _select_imu_source(
         terms[term_name].params["sensor_name"] = sensor_name
 
 
+def apply_x2_tracking_robot_randomization(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Point the tracking sim-to-real DR terms at the X2's own geometry.
+
+  The generic tracking events are robot-agnostic, so three of them need X2
+  values, and the wrist needs a group-specific effort term besides the
+  whole-robot one:
+
+  * ``foot_friction`` and ``randomize_foot_size`` act on the 12 collision
+    spheres per foot, not on the mesh hull of the ankle-roll link.
+  * ``base_com`` acts on ``torso_link``.
+  * ``randomize_joint_damping`` gets :data:`X2_DAMPING_RANGES`, i.e. ranges
+    scaled to each group's torque class instead of one absolute range calibrated
+    on a 120 N.m leg joint.
+  * ``randomize_effort_limits_wrist`` re-derates the wrist group after the
+    whole-robot pass. Both write the same fields and only the last writer takes
+    effect, so this term must come later in ``events``; the ordering is asserted.
+
+  Every step is conditional on the corresponding event existing, so a caller that
+  selects a subset of axes (``MJLAB_DR_AXES``) or adds these terms itself gets a
+  no-op for the missing ones. Called from the tracking task and from the tennis
+  ball task, which runs the same sim-to-real set.
+  """
+  if "foot_friction" in cfg.events:
+    cfg.events["foot_friction"].params["asset_cfg"].geom_names = _FOOT_GEOMS
+  if "base_com" in cfg.events:
+    cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
+  if "randomize_foot_size" in cfg.events:
+    cfg.events["randomize_foot_size"].params["asset_cfg"].geom_names = _FOOT_GEOMS
+
+  # Replace the robot-agnostic absolute joint-damping range with one scaled to
+  # each group's torque class (see X2_DAMPING_RANGES). The ranges are replaced on
+  # the generic event rather than added as a second one, so there is no ordering
+  # dependency between the two.
+  if "randomize_joint_damping" in cfg.events:
+    cfg.events["randomize_joint_damping"].params["ranges"] = X2_DAMPING_RANGES
+
+  # Wrist-specific effort derating. The vendor simulator clamps the wrist
+  # pitch/roll motors to 2.2 N.m where the vendor URDF allows 4.8, and the wrists
+  # are end-effector bodies in the termination set, so this term used to train
+  # against a 0.45-1.0x weaker wrist. The tracking task's sim-to-real ranges are
+  # now capped at 5%, which leaves it a near no-op: modelling the clamp now means
+  # changing the wrist's *nominal* effort limit to 2.2 N.m and dropping this term
+  # (open item 5.6 of docs/source/x2_gain_provenance.md). Kept as the 5% residual
+  # so the axis wiring and its ordering assertion stay in place.
+  # Must come after the whole-robot effort term: both write the same fields and
+  # only the last writer takes effect.
+  if "randomize_effort_limits" in cfg.events:
+    wrist_group = X2_ACTUATOR_GROUPS["wrist_pitch_roll"]
+    assert wrist_group.effort_limit == 4.8, wrist_group.effort_limit
+    assert wrist_group.target_names_expr == (
+      ".*_wrist_pitch_joint",
+      ".*_wrist_roll_joint",
+    ), wrist_group.target_names_expr
+    cfg.events["randomize_effort_limits_wrist"] = EventTermCfg(
+      mode="startup",
+      func=dr.effort_limits,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", actuator_ids=[_WRIST_ACTUATOR_ID]),
+        "effort_limit_range": (0.95, 1.0),
+        "operation": "scale",
+      },
+    )
+    event_order = list(cfg.events)
+    assert event_order.index("randomize_effort_limits_wrist") > event_order.index(
+      "randomize_effort_limits"
+    )
+
+
 def agibot_x2_flat_tracking_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
@@ -222,49 +290,7 @@ def agibot_x2_flat_tracking_env_cfg(
   ):
     cfg.rewards[reward_name].params["body_weights"] = body_weights
 
-  cfg.events["foot_friction"].params["asset_cfg"].geom_names = _FOOT_GEOMS
-  cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
-
-  if "randomize_foot_size" in cfg.events:
-    cfg.events["randomize_foot_size"].params["asset_cfg"].geom_names = _FOOT_GEOMS
-
-  # Replace the robot-agnostic absolute joint-damping range with one scaled to
-  # each group's torque class (see X2_DAMPING_RANGES). The ranges are replaced on
-  # the generic event rather than added as a second one, so there is no ordering
-  # dependency between the two.
-  if "randomize_joint_damping" in cfg.events:
-    cfg.events["randomize_joint_damping"].params["ranges"] = X2_DAMPING_RANGES
-
-  # Wrist-specific effort derating. The vendor simulator clamps the wrist
-  # pitch/roll motors to 2.2 N.m where the vendor URDF allows 4.8, and the wrists
-  # are end-effector bodies in the termination set, so this term used to train
-  # against a 0.45-1.0x weaker wrist. The tracking task's sim-to-real ranges are
-  # now capped at 5%, which leaves it a near no-op: modelling the clamp now means
-  # changing the wrist's *nominal* effort limit to 2.2 N.m and dropping this term
-  # (open item 5.6 of docs/source/x2_gain_provenance.md). Kept as the 5% residual
-  # so the axis wiring and its ordering assertion stay in place.
-  # Must come after the whole-robot effort term: both write the same fields and
-  # only the last writer takes effect.
-  wrist_group = X2_ACTUATOR_GROUPS["wrist_pitch_roll"]
-  assert wrist_group.effort_limit == 4.8, wrist_group.effort_limit
-  assert wrist_group.target_names_expr == (
-    ".*_wrist_pitch_joint",
-    ".*_wrist_roll_joint",
-  ), wrist_group.target_names_expr
-  if "randomize_effort_limits" in cfg.events:
-    cfg.events["randomize_effort_limits_wrist"] = EventTermCfg(
-      mode="startup",
-      func=dr.effort_limits,
-      params={
-        "asset_cfg": SceneEntityCfg("robot", actuator_ids=[_WRIST_ACTUATOR_ID]),
-        "effort_limit_range": (0.95, 1.0),
-        "operation": "scale",
-      },
-    )
-    event_order = list(cfg.events)
-    assert event_order.index("randomize_effort_limits_wrist") > event_order.index(
-      "randomize_effort_limits"
-    )
+  apply_x2_tracking_robot_randomization(cfg)
 
   cfg.terminations["ee_body_pos"].params["body_names"] = (
     "left_ankle_roll_link",

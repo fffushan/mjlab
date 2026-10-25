@@ -162,9 +162,15 @@ def _apply_imu_source(
     )
 
 
-def _x2_velocity_spec_fn() -> mujoco.MjSpec:
-  """Load the X2 spec and add the foot sites the velocity task needs."""
-  spec = get_spec()
+def add_velocity_foot_sites(spec: mujoco.MjSpec) -> mujoco.MjSpec:
+  """Add the per-foot sites the velocity task scans and rewards.
+
+  The vendored XML carries no foot sites, so the velocity config injects them at
+  spec-build time and the XML file stays byte-identical. Exposed so a variant
+  that supplies its own ``spec_fn`` (e.g. the tennis task, whose robot also
+  carries the racket) layers the same sites on instead of re-declaring the
+  position.
+  """
   for side in ("left", "right"):
     body = spec.body(f"{side}_ankle_roll_link")
     body.add_site(
@@ -174,6 +180,11 @@ def _x2_velocity_spec_fn() -> mujoco.MjSpec:
       type=mujoco.mjtGeom.mjGEOM_SPHERE,
     )
   return spec
+
+
+def _x2_velocity_spec_fn() -> mujoco.MjSpec:
+  """Load the X2 spec and add the foot sites the velocity task needs."""
+  return add_velocity_foot_sites(get_spec())
 
 
 def agibot_x2_flat_velocity_env_cfg(

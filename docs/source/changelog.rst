@@ -4,6 +4,46 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Balance``,
+  the X2 no-state-estimation velocity task with the tennis equipment in the
+  scene. The racket assembly (white wrist connector, clamp, racket) is rigid
+  tooling on the robot: it replaces the right hand and rides
+  ``right_wrist_roll_link`` as two fixed bodies, adding 0.37 kg and no joints or
+  actuators. The 0.057 kg tennis ball is a separate floating entity spawned 1 mm
+  above the string bed. Meshes are byte-identical to the ``x2_references``
+  tennis snapshot, with SHA-256 pins.
+
+  Three properties are load-bearing and each is tested. The string bed is named
+  ``string_bed`` so it escapes ``FULL_COLLISION``'s ``condim=1``, ``priority=0``
+  catch-all, and a second ``CollisionCfg`` with ``disable_other_geoms=False``
+  re-enables it after that pass zeroes unmatched geoms. The bed's negative
+  ``solref`` is a 1 ms calibration, so the task runs at 1 ms with 20 substeps
+  (50 Hz control) instead of 5 ms with 4; at 5 ms a 0.30 m drop rebounds to
+  1.19 m instead of 0.23 m. The robot and ball resets are pinned so the ball
+  stays on the bed. The four recorded rebounds reproduce within 20 mm at 1 ms
+  with zero lateral drift.
+
+  The ball is **not observed and not rewarded** yet; observations and the
+  holding reward are a separate change because they alter the actor input
+  width. In-environment retention is therefore **not tested**: open-loop PD
+  cannot hold the bat-carry pose, so a trained policy is required. CPU tests and
+  one real environment build pass. See ``docs/source/x2_tennis_ball_balance.rst``.
+
+  The task runs the multi-motion tracking task's servo and sim-to-real
+  configuration rather than the velocity task's. ``apply_vendor_rl_gains``
+  installs the vendor reference-policy kp/kd; joint ranges, effort limits,
+  armature, friction loss and action scale were already identical between the two
+  tasks. In the bat-carry pose that cuts the static string-bed tilt from the
+  bat's weight from **19.1 to 12.9 deg** and raises the shoulder-pitch damping
+  ratio from 0.19 to 0.44 — the underdamped shoulder was ringing after a ball
+  impact. The six tracking physics DR axes (inertia, armature, effort limits,
+  joint friction, joint damping, foot size), the wrist-only effort derating and
+  a shared per-environment PD-gain scale are adopted too; observation delay is
+  not, because it changes the actor's input timing contract. The tracking task's
+  X2-specific DR wiring moved into ``apply_x2_tracking_robot_randomization`` so
+  both tasks call one definition, and the tracking tasks' events are unchanged
+  by that extraction. Terms are pinned against the tracking task by test.
+
 - Added the offline joint-pose rollout tool at
   ``mjlab.scripts.joint_pose_rollout``. It reads the window geometry, denoiser
   sizes and noise scale from one checkpoint, rolls one reference clip into a

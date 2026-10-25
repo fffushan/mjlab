@@ -6,6 +6,7 @@ from mjlab.tasks.velocity.rl import (
 
 from .env_cfgs import agibot_x2_flat_velocity_env_cfg
 from .rl_cfg import agibot_x2_velocity_ppo_runner_cfg
+from .tennis_ball_env_cfg import agibot_x2_tennis_ball_env_cfg
 from .tennis_recovery_env_cfg import agibot_x2_tennis_recovery_env_cfg
 from .tennis_recovery_rl_cfg import agibot_x2_tennis_recovery_ppo_runner_cfg
 
@@ -14,6 +15,23 @@ register_mjlab_task(
   env_cfg=agibot_x2_flat_velocity_env_cfg(),
   play_env_cfg=agibot_x2_flat_velocity_env_cfg(play=True),
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Tennis-ball-on-the-bat velocity task. The base no-state-estimation velocity
+# task plus the tennis equipment: the racket assembly rigidly attached to the
+# right wrist and a floating tennis ball spawned on the string bed. Physics runs
+# at 1 ms so the calibrated negative-solref bed contact stays stable, and the
+# robot/ball resets are pinned so the ball starts on the bed in every env. The
+# ball is not yet observed or rewarded; that is the next step and it changes the
+# actor input width. See docs/source/x2_tennis_ball_balance.rst.
+register_mjlab_task(
+  task_id="Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Balance",
+  env_cfg=agibot_x2_tennis_ball_env_cfg(),
+  play_env_cfg=agibot_x2_tennis_ball_env_cfg(play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_balance"
+  ),
   runner_cls=VelocityOnPolicyRunner,
 )
 
