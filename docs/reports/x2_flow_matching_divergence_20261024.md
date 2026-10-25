@@ -23,6 +23,7 @@ batch size, dataset and objective.
 | Does the final-norm variant cause it? | No | Trigger timing moves by 8 percent |
 | Does early annealing prevent it? | Yes | One arm stayed flat past the onset |
 | Does validation loss rank closed-loop quality? | No | Lowest loss arm scored the worst rate |
+| Is the rise a generalisation gap? | No | Training loss rises with validation loss |
 
 The single closed-loop outlier (`18.85 %`) came from seed 1. A seed-0 twin of the same
 recipe scored `31.88 %`. Single-seed closed-loop numbers in this setup differ by about
@@ -203,12 +204,63 @@ checked 2026-10-24 16:00).
 That mechanism is consistent with this study. Early annealing removes learning-rate area
 that the remaining updates can no longer accumulate, which is another way to say the arm
 never reaches the threshold. `lrh-120k-b512` stops at step `120 000` and stays flat.
-`lrh-160k-b512` keeps a longer schedule, drifts, and freezes. The full-schedule arms keep
+`lrh-160k-b512` keeps a longer schedule, drifts, and then holds still. The full-schedule arms keep
 their rate high and break near `145 000` updates.
 
 This study did not measure the accumulated rate directly. The threshold value from the
 joint-pose workstream does not transfer. Compute it again for the state-latent trainer, its
 data volume and its batch size.
+
+### 5.8 The training loss rises as well
+
+The rise is not a generalisation gap. The training loss turns upward at the same time as
+the validation loss, and the gap between them stays near `0.001` to `0.002`.
+
+The training value is the median per-update `loss` over one epoch on freshly sampled
+batches. The validation value is `eval_model.loss` at the same epoch. Source: the local
+metric copies in `logs/diagnostics/remote-metrics-20261024/`.
+
+`fn-2048-400k`:
+
+| Epoch | Train | Validation |
+| ---: | ---: | ---: |
+| 70 | `0.024` | `0.025` |
+| 80 | `0.023` | `0.025` |
+| 90 | `0.028` | `0.030` |
+| 100 | `0.086` | `0.091` |
+| 110 | `0.128` | `0.219` |
+| 200 | `0.254` | `0.245` |
+
+`cap-6x384-w384`:
+
+| Epoch | Train | Validation |
+| ---: | ---: | ---: |
+| 20 | `0.030` | `0.031` |
+| 30 | `0.474` | `0.621` |
+| 40 | `0.849` | `1 236` |
+| 60 | `5.297` | `1.305` |
+
+`lrh-160k-b512`:
+
+| Epoch | Train | Validation |
+| ---: | ---: | ---: |
+| 30 | `0.021` | `0.022` |
+| 40 | `0.034` | `0.029` |
+| 50 | `0.040` | `0.036` |
+
+Three consequences follow.
+
+1. The model stops fitting its own training data. A larger dataset does not fix this, and
+   a held-out split does not explain it.
+2. Overfit is excluded. An overfit run shows a falling training loss and a rising
+   validation loss. Here both rise.
+3. A frozen learning rate helps for the same reason. If unseen inputs caused the damage,
+   a frozen rate would not stop it.
+
+One caution. A diverged model gives a wide spread of losses across batches, so the median
+over an epoch is noisy, and in `cap-6x384-w384` the training value leads the validation
+value by a factor of 4 at epoch 60. The direction of both curves is the signal, not the
+exact ratio.
 
 ## 6. Findings
 
@@ -218,6 +270,7 @@ data volume and its batch size.
 | Peak learning rate too high | Ruled out | `1e-4`, `2e-4` both diverge |
 | Model too large | Ruled out | `11.6 M`, `13.8 M`, `20.1 M` all diverge |
 | Too little data | Not supported | `9 160 010` unique rollout frames, `2 322 881` windows |
+| Overfitting or validation drift | Ruled out | training loss rises with validation loss; the gap stays near `0.001` |
 | Dataset is reference replay only | Corrected | The store holds policy rollouts with OU noise |
 | Final norm is protective | Ruled out | Trigger timing shifts by 8 percent |
 | Long budget makes it recover | Ruled out | `1 000 k` arms diverge at the usual count |
