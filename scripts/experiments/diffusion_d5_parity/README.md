@@ -8,7 +8,7 @@ The gate loads one explicit artifact set:
 - the `167`-channel diffusion checkpoint;
 - the statistics-only state/latent normalizer;
 - the active `135 + 32` contract;
-- one frozen `68/99/32/31` VAE cohort member.
+- one frozen VAE cohort member whose widths come from its own saved schema.
 
 It then:
 
@@ -16,9 +16,10 @@ It then:
    round trips;
 2. checks the `8`-history plus current-state clean mask;
 3. runs the frozen `20`-update DDIM sampler and an independent DDIM oracle;
-4. exports the denoiser and VAE decoder to ONNX;
-5. reloads both graphs with CPU ONNX Runtime;
-6. compares denoiser trajectory and decoder action outputs; and
+4. exports the denoiser and the VAE encoder and decoder to ONNX;
+5. reloads all three graphs with CPU ONNX Runtime;
+6. compares the denoiser trajectory and the encoder latent and decoder action
+   outputs; and
 7. stamps and verifies contract and artifact identities in the ONNX metadata.
 
 The active loader uses only `state_mean`, `state_std`, `latent_mean` and
@@ -46,8 +47,10 @@ uv run --no-sync python scripts/experiments/diffusion_d5_parity/validate.py \
   587550f26345a278f14c350404be11843dca379d708c2a3c418f0aa8340f9b2d
 ```
 
-The command writes `REPORT.json`, `denoiser.onnx` and `vae_decoder.onnx` to
-the output directory. The `logs/` directory is ignored by Git. The report
+The command writes `REPORT.json`, `denoiser.onnx`, `encoder.onnx` and
+`vae_decoder.onnx` to the output directory.  The decoder output is named
+`action` and the encoder output `latent`, which are the names the controller
+lane requires. The `logs/` directory is ignored by Git. The report
 contains the source and generated-artifact SHA-256 values.
 
 The frozen diffusion checkpoint predates the D5 semantic-identity loader change.

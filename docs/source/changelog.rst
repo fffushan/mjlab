@@ -505,6 +505,15 @@ Fixed
 Changed
 ^^^^^^^
 
+- Changed the distillation VAE export to take every declared tensor width from
+  the checkpoint's own schema instead of fixed 68/99/32/31 values. A version-2
+  preview checkpoint now exports an encoder input of ``[1, 130]``; a version-1
+  checkpoint keeps ``[1, 68]``. The decoder ONNX output and its contract entry
+  are renamed from ``actions`` to ``action``, which is the name the deployed
+  controller requires. The D5 parity gate also exports the VAE encoder, and its
+  denoiser wrapper copies the final-normalisation ablation and refuses to drop a
+  tensor the checkpoint records.
+
 - Changed the X2 collection and closed-loop startup reference path to accept
   both frozen gravity VAE layouts. Version 1 keeps reference 68 / conditioning
   99 / latent 32 / action 31. Version 2 adds one 62-wide q/dq preview at

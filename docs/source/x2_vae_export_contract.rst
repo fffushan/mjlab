@@ -17,8 +17,12 @@ Bundle layout
     contract.json     # semantic contract and provenance
     motion.json                 # frame-major float32 q/dq/anchor table
     parity.json                # deterministic ORT/PyTorch inputs and expected outputs
-    encoder.onnx      # reference [1,68] -> latent [1,32]
-    decoder.onnx      # latent [1,32], conditioning [1,99] -> actions [1,31]
+    encoder.onnx      # reference [1,R] -> latent [1,32]
+    decoder.onnx      # latent [1,32], conditioning [1,99] -> action [1,31]
+
+``R`` is the reference width of the checkpoint's own schema: 68 for version 1
+and 130 for version 2.  Every declared width in ``contract.json`` and in the
+graph input/output shapes comes from that schema, not from a fixed value.
 
 ``vae-tennis_000.yaml`` has ``format: mjlab-vae-tracking``, ``version: 2``,
 ``family: vae_tracking``, matching ``model_id`` and ``contract_id``, and a
@@ -41,10 +45,11 @@ posterior mean ``latent`` (32), not a sampled latent.  The decoder accepts that
 latent and the gravity conditioning vector ordered as ``projected_gravity`` (3),
 ``gyro`` (3), ``relative_joint_q`` (31), ``joint_dq`` (31), and
 ``previous_action`` (31), then emits the raw normalized joint-position action
-(31).  The learned reference and conditioning normalizers are inside their
-respective graphs exactly once.  Their float32 epsilon, count, mean, M2,
-population-variance convention, cold-start identity behavior, and frozen state
-are recorded in ``contract.json``.
+(31) under the graph output name ``action``.  The learned reference and
+conditioning normalizers are inside their respective graphs exactly once.
+Their float32 epsilon, count, mean, M2, population-variance convention,
+cold-start identity behavior, and frozen state are recorded in
+``contract.json``.
 
 Contract and provenance
 -----------------------

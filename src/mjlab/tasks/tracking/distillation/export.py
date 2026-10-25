@@ -48,7 +48,7 @@ from mjlab.tasks.tracking.distillation.config import (
   sha256_file,
 )
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
-from mjlab.tasks.tracking.distillation.vae_config import DecoderMode
+from mjlab.tasks.tracking.distillation.vae_config import DecoderMode, VaeSchema
 
 BUNDLE_VERSION = 2
 COHORT_BUNDLE_VERSION = 3
@@ -502,6 +502,39 @@ def _normalizer_metadata(normalizer) -> dict[str, Any]:
   }
 
 
+def _graph_interfaces(schema: VaeSchema) -> dict[str, Any]:
+  """Return the declared ONNX interface widths for one saved schema.
+
+  Every width comes from ``schema``, which the checkpoint itself records, so a
+  version-1 reference and the wider version-2 reference render the same code.
+  The decoder output is named ``action`` because the deployed controller
+  requires that exact name.
+  """
+  return {
+    "encoder": {
+      "inputs": {"reference": [1, schema.reference_dim]},
+      "outputs": {"latent": [1, schema.latent_dim]},
+    },
+    "decoder": {
+      "inputs": {
+        "latent": [1, schema.latent_dim],
+        "conditioning": [1, schema.conditioning_dim],
+      },
+      "outputs": {"action": [1, schema.action_dim]},
+    },
+  }
+
+
+def _parity_probe(schema: VaeSchema) -> tuple[torch.Tensor, torch.Tensor]:
+  """Build the fixed float32 parity inputs from the saved schema widths."""
+  reference = torch.linspace(-1.0, 1.0, schema.reference_dim, dtype=torch.float32)
+  conditioning = torch.linspace(-1.0, 1.0, schema.conditioning_dim, dtype=torch.float32)
+  return (
+    reference.reshape(1, schema.reference_dim),
+    conditioning.reshape(1, schema.conditioning_dim),
+  )
+
+
 def _write_graphs(model: ConditionalVAE, directory: Path) -> tuple[Path, Path]:
   model.eval()
   encoder_path = directory / "encoder.onnx"
@@ -525,7 +558,7 @@ def _write_graphs(model: ConditionalVAE, directory: Path) -> tuple[Path, Path]:
       ),
       decoder_path,
       input_names=["latent", "conditioning"],
-      output_names=["actions"],
+      output_names=["action"],
       opset_version=EXPORT_OPSET,
       dynamo=False,
       external_data=False,
@@ -535,7 +568,7 @@ def _write_graphs(model: ConditionalVAE, directory: Path) -> tuple[Path, Path]:
 
     for path, graph, outputs in (
       (encoder_path, "encoder", ["latent"]),
-      (decoder_path, "decoder", ["actions"]),
+      (decoder_path, "decoder", ["action"]),
     ):
       proto = onnx.load(path)
       onnx.checker.check_model(proto)
@@ -690,13 +723,7 @@ def export_bundle(
         "reference": _normalizer_metadata(model.reference_normalizer),
         "conditioning": _normalizer_metadata(model.conditioning_normalizer),
       },
-      "interfaces": {
-        "encoder": {"inputs": {"reference": [1, 68]}, "outputs": {"latent": [1, 32]}},
-        "decoder": {
-          "inputs": {"latent": [1, 32], "conditioning": [1, 99]},
-          "outputs": {"actions": [1, 31]},
-        },
-      },
+      "interfaces": _graph_interfaces(inference.schema),
       "control": {
         "control_period_s": float(teacher.control.control_period_s),
         "control_hz": float(teacher.control.control_hz),
@@ -769,10 +796,7 @@ def export_bundle(
       report=report,
     )
     parity = validate_export_parity(
-      staging_result,
-      model,
-      torch.linspace(-1.0, 1.0, 68, dtype=torch.float32).reshape(1, 68),
-      torch.linspace(-1.0, 1.0, 99, dtype=torch.float32).reshape(1, 99),
+      staging_result, model, *_parity_probe(inference.schema)
     )
     report["parity"] = parity
     parity_path = staging / "parity.json"
@@ -1032,13 +1056,7 @@ def export_cohort_bundle(
         "reference": _normalizer_metadata(model.reference_normalizer),
         "conditioning": _normalizer_metadata(model.conditioning_normalizer),
       },
-      "interfaces": {
-        "encoder": {"inputs": {"reference": [1, 68]}, "outputs": {"latent": [1, 32]}},
-        "decoder": {
-          "inputs": {"latent": [1, 32], "conditioning": [1, 99]},
-          "outputs": {"actions": [1, 31]},
-        },
-      },
+      "interfaces": _graph_interfaces(schema),
       "control": {
         "control_period_s": float(cohort.control.control_period_s),
         "control_hz": float(cohort.control.control_hz),
@@ -1157,8 +1175,7 @@ def export_cohort_bundle(
           report={},
         ),
         model,
-        torch.linspace(-1.0, 1.0, 68, dtype=torch.float32).reshape(1, 68),
-        torch.linspace(-1.0, 1.0, 99, dtype=torch.float32).reshape(1, 99),
+        *_parity_probe(schema),
       )
       parity_path = staging / teacher_id / "parity.json"
       parity_path.write_text(json.dumps(parity, indent=2, sort_keys=True) + "\n")

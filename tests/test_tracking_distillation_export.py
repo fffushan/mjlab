@@ -102,7 +102,7 @@ def _checkpoint(
   )
 
 
-def _fixture(tmp_path: Path):
+def _fixture(tmp_path: Path, *, preview: bool = False):
   names = (
     *(f"hip_{i:02d}_hip_joint" for i in range(30)),
     "waist_joint",
@@ -149,10 +149,10 @@ def _fixture(tmp_path: Path):
   onnx.save(graph, teacher.onnx)
   resolved = resolve_cohort(load_manifest(cohort.manifest, tmp_path))
   resolved_teacher = resolved.teacher("tiny_000")
-  schema = make_schema(joint_order=names)
+  schema = make_schema(joint_order=names, preview=preview)
   model = ConditionalVAE(schema)
-  model.reference_normalizer.update(torch.randn(8, 68))
-  model.conditioning_normalizer.update(torch.randn(8, 99))
+  model.reference_normalizer.update(torch.randn(8, schema.reference_dim))
+  model.conditioning_normalizer.update(torch.randn(8, schema.conditioning_dim))
   model.reference_normalizer.freeze()
   model.conditioning_normalizer.freeze()
   checkpoint = tmp_path / "checkpoint.pt"
@@ -283,6 +283,14 @@ def test_export_emits_hash_bound_graphs_motion_and_ort_parity(tmp_path: Path) ->
   )
   assert parity_fixture["fixture"]["model_id"] == result.model_id
   assert len(parity_fixture["fixture"]["reference"][0]) == 68
+  assert contract["interfaces"] == {
+    "encoder": {"inputs": {"reference": [1, 68]}, "outputs": {"latent": [1, 32]}},
+    "decoder": {
+      "inputs": {"latent": [1, 32], "conditioning": [1, 99]},
+      "outputs": {"action": [1, 31]},
+    },
+  }
+  assert [item.name for item in onnx.load(result.decoder).graph.output] == ["action"]
   assert contract["action"]["kp"][0] == 1.0000001
   assert result.report["parity"]["latent_max_abs_error"] <= 1e-5
   assert result.report["parity"]["action_max_abs_error"] <= 1e-5
@@ -291,6 +299,38 @@ def test_export_emits_hash_bound_graphs_motion_and_ort_parity(tmp_path: Path) ->
   parity = validate_export_parity(result, model, torch.randn(1, 68), torch.randn(1, 99))
   assert parity["latent_max_abs_error"] <= 1e-5
   assert parity["action_max_abs_error"] <= 1e-5
+
+
+def test_export_declares_the_schema_widths_of_a_version_two_reference(
+  tmp_path: Path,
+) -> None:
+  """A preview-schema checkpoint renders 130-wide interfaces, not a literal 68."""
+  cohort, schema, model, checkpoint = _fixture(tmp_path, preview=True)
+  assert (schema.version, schema.reference_dim) == (2, 130)
+  result = export_bundle(
+    checkpoint,
+    cohort.manifest,
+    "tiny_000",
+    tmp_path / "rl_model",
+    repo_root=tmp_path,
+    asset_audit=_audit(schema.joint_order),
+  )
+  contract = json.loads(result.contract.read_text())
+  parity = json.loads(
+    (result.descriptor.parent / "vae-tiny_000" / "parity.json").read_text()
+  )
+  assert contract["interfaces"] == {
+    "encoder": {"inputs": {"reference": [1, 130]}, "outputs": {"latent": [1, 32]}},
+    "decoder": {
+      "inputs": {"latent": [1, 32], "conditioning": [1, 99]},
+      "outputs": {"action": [1, 31]},
+    },
+  }
+  assert len(parity["fixture"]["reference"][0]) == 130
+  assert len(parity["fixture"]["conditioning"][0]) == 99
+  assert parity["latent_max_abs_error"] <= 1e-5
+  assert parity["action_max_abs_error"] <= 1e-5
+  assert [item.name for item in onnx.load(result.decoder).graph.output] == ["action"]
 
 
 def test_export_refuses_unverified_provenance_wrong_binding_and_non_gravity_schema(

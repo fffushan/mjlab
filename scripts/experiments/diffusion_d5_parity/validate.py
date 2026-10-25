@@ -1,12 +1,14 @@
 """Run the active D5 numerical and export parity gate.
 
 This command is a bounded, offline qualification check for one frozen artifact
-set.  It loads the active denoiser, statistics-only normalizer and 68/99/32/31
-VAE member, exports the denoiser and decoder to ONNX, reloads both artifacts
-with ONNX Runtime, and compares fixed CPU probes against the native PyTorch
-path.  The physical-state and token widths are read from the active contract;
-the window geometry, latent width, conditioning width, action width and DDIM
-update count stay frozen.
+set.  It loads the active denoiser, statistics-only normalizer and the VAE
+cohort member, exports the denoiser plus the VAE encoder and decoder to ONNX,
+reloads all three artifacts with ONNX Runtime, and compares fixed CPU probes
+against the native PyTorch path.  The physical-state and token widths are read
+from the active contract; the window geometry, latent width, conditioning width,
+action width and DDIM update count stay frozen.  The VAE member's own widths are
+read from the schema it was saved with, so a version-2 reference exports the same
+way as a version-1 reference.
 
 The controller lane is compiled for one token layout (135 hybrid state plus the
 32 latent, so 167 channels).  When the active contract declares a reduced state
@@ -87,7 +89,15 @@ class DenoiserCallable(Protocol):
 
 
 class DenoiserExport(nn.Module):
-  """ONNX wrapper for the active denoiser interface."""
+  """ONNX wrapper for the active denoiser interface.
+
+  The forward is rebuilt from the submodules so the legacy exporter does not
+  trace the shape and range validation in ``StateLatentTransformer._encode``.
+  Every tensor module that reaches the output must therefore be copied here.
+  The final-normalisation ablation adds one, so it is copied when the loaded
+  model carries it; :func:`_require_export_covers_recorded_state` refuses a
+  wrapper that would drop a tensor the checkpoint records.
+  """
 
   def __init__(self, model: StateLatentTransformer) -> None:
     super().__init__()
@@ -97,13 +107,86 @@ class DenoiserExport(nn.Module):
     self.latent_step_embedding = model.latent_step_embedding
     self.encoder = model.encoder
     self.output_projection = model.output_projection
+    self.final_norm = getattr(model, "final_norm", None)
 
   def forward(self, noisy_tokens: Tensor, step_ids: Tensor) -> Tensor:
     projected = self.input_projection(noisy_tokens)
     projected = projected + self.position_embedding.unsqueeze(0)
     projected = projected + self.state_step_embedding(step_ids[..., 0])
     projected = projected + self.latent_step_embedding(step_ids[..., 1])
-    return self.output_projection(self.encoder(projected))
+    encoded = self.encoder(projected)
+    if self.final_norm is not None:
+      encoded = self.final_norm(encoded)
+    return self.output_projection(encoded)
+
+
+class VaeEncoderExport(nn.Module):
+  """ONNX wrapper for the frozen VAE encoder interface."""
+
+  def __init__(self, model: ConditionalVAE) -> None:
+    super().__init__()
+    # Register only the encoder path, for the same reason as the decoder below.
+    normalizer = cast(StudentNormalizer, model.reference_normalizer)
+    self.register_buffer("reference_mean", normalizer._buffer("mean").detach().clone())
+    self.register_buffer("reference_m2", normalizer._buffer("m2").detach().clone())
+    self.register_buffer(
+      "reference_count", normalizer._buffer("count").detach().clone()
+    )
+    self.register_buffer("reference_eps", normalizer._buffer("_eps").detach().clone())
+    self.encoder = model.encoder
+    self.mu_head = model.mu_head
+
+  def forward(self, reference: Tensor) -> Tensor:
+    # This is the exact encode normalization without Python-only validation.
+    reference_m2 = cast(Tensor, self.reference_m2)
+    reference_count = cast(Tensor, self.reference_count)
+    reference_eps = cast(Tensor, self.reference_eps)
+    reference_mean = cast(Tensor, self.reference_mean)
+    variance = reference_m2 / reference_count.clamp_min(1.0)
+    scale = torch.where(
+      reference_count > 0,
+      torch.sqrt(variance + reference_eps),
+      torch.ones_like(variance),
+    )
+    normalized = (reference - reference_mean) / scale
+    return self.mu_head(self.encoder(normalized))
+
+
+def _require_export_covers_recorded_state(
+  wrapper: nn.Module, recorded: Mapping[str, Any], *, checkpoint: Path
+) -> None:
+  """Refuse an export graph that would silently drop a recorded tensor.
+
+  The wrapper rebuilds the forward from submodules, so a module the checkpoint
+  carries and the wrapper does not copy would vanish from the graph while the
+  exported artifact still claimed to be that checkpoint.  A final LayerNorm that
+  the loader did not build is exactly that failure.
+  """
+  exported = set(dict(wrapper.named_parameters())) | set(dict(wrapper.named_buffers()))
+  dropped = sorted(set(map(str, recorded)) - exported)
+  if dropped:
+    raise ParityError(
+      f"the checkpoint {checkpoint} records tensors that the exported graph "
+      f"would drop: {dropped}; copy every recorded module into the export wrapper"
+    )
+
+
+def _recorded_denoiser_tensors(path: Path) -> dict[str, Any]:
+  """Return the model and EMA tensor names a diffusion checkpoint records."""
+  try:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+  except (OSError, RuntimeError, EOFError, ValueError) as exc:
+    raise ParityError(f"could not read the denoiser checkpoint {path}: {exc}") from exc
+  if not isinstance(payload, Mapping):
+    raise ParityError("denoiser checkpoint is not a mapping")
+  recorded: dict[str, Any] = {}
+  for source in (payload.get("model"), payload.get("ema")):
+    state = source.get("shadow") if isinstance(source, Mapping) else source
+    if isinstance(state, Mapping):
+      recorded.update({str(name): value for name, value in state.items()})
+  if not recorded:
+    raise ParityError("denoiser checkpoint records no model tensors")
+  return recorded
 
 
 class VaeDecoderExport(nn.Module):
@@ -714,15 +797,45 @@ def _lane_adapter_probe(
   }
 
 
+def _onnx_encoder(
+  path: Path, *, reference_dimension: int, latent_dimension: int
+) -> tuple[Callable[[Tensor], Tensor], dict[str, Any]]:
+  session = _session(path)
+  _require_graph_shape(
+    session,
+    inputs={"reference": (-1, reference_dimension)},
+    output_name="latent",
+    output_shape=(-1, latent_dimension),
+  )
+
+  def run(reference: Tensor) -> Tensor:
+    values = session.run(
+      ["latent"], {"reference": reference.detach().cpu().numpy().astype(np.float32)}
+    )
+    return torch.from_numpy(np.asarray(values[0], dtype=np.float32))
+
+  return run, {
+    "inputs": {"reference": [-1, reference_dimension]},
+    "output": ["latent", -1, latent_dimension],
+  }
+
+
 def _onnx_decoder(
   path: Path,
+  *,
+  latent_dimension: int,
+  conditioning_dimension: int,
+  action_dimension: int,
 ) -> tuple[Callable[[Tensor, Tensor], Tensor], dict[str, Any]]:
   session = _session(path)
   _require_graph_shape(
     session,
-    inputs={"latent": (-1, 32), "conditioning": (-1, 99)},
+    inputs={
+      "latent": (-1, latent_dimension),
+      "conditioning": (-1, conditioning_dimension),
+    },
     output_name="action",
-    output_shape=(-1, 31),
+    output_shape=(-1, action_dimension),
   )
 
   def run(latent: Tensor, conditioning: Tensor) -> Tensor:
@@ -736,8 +849,11 @@ def _onnx_decoder(
     return torch.from_numpy(np.asarray(values[0], dtype=np.float32))
 
   return run, {
-    "inputs": {"latent": [-1, 32], "conditioning": [-1, 99]},
-    "output": ["action", -1, 31],
+    "inputs": {
+      "latent": [-1, latent_dimension],
+      "conditioning": [-1, conditioning_dimension],
+    },
+    "output": ["action", -1, action_dimension],
   }
 
 
@@ -832,13 +948,39 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     vae_checkpoint_sha256=contract.vae_sha256,
     device="cpu",
   )
-  if (vae.reference_dim, vae.conditioning_dim, vae.latent_dim, vae.action_dim) != (
-    68,
-    99,
-    32,
-    31,
-  ):
-    raise ParityError("loaded VAE dimensions differ from 68/99/32/31")
+  vae_schema = cast(ConditionalVAE, vae.model).schema
+  loaded_vae_dims = (
+    vae.reference_dim,
+    vae.conditioning_dim,
+    vae.latent_dim,
+    vae.action_dim,
+  )
+  schema_vae_dims = (
+    vae_schema.reference_dim,
+    vae_schema.conditioning_dim,
+    vae_schema.latent_dim,
+    vae_schema.action_dim,
+  )
+  if loaded_vae_dims != schema_vae_dims:
+    raise ParityError(
+      "the loaded VAE dimensions disagree with its own saved schema: "
+      f"{loaded_vae_dims} != {schema_vae_dims}"
+    )
+  lane_vae_dims = (
+    vae.latent_dim,
+    vae.conditioning_dim,
+    vae.action_dim,
+  )
+  lane_declared_dims = (
+    dimensions["latent_dimension"],
+    dimensions["conditioning_dimension"],
+    dimensions["action_dimension"],
+  )
+  if lane_vae_dims != lane_declared_dims:
+    raise ParityError(
+      "the loaded VAE decoder widths disagree with the active lane: "
+      f"{lane_vae_dims} != {lane_declared_dims}"
+    )
 
   clean_tokens, mask, probe_report = _build_probe(
     normalizer,
@@ -956,6 +1098,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
   native_denoiser_path = (
     output / "denoiser_native.onnx" if lane_required else denoiser_path
   )
+  encoder_path = output / "encoder.onnx"
   decoder_path = output / "vae_decoder.onnx"
   denoiser_metadata = {
     **metadata_common,
@@ -963,8 +1106,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     "token_dimension": str(token_dimension),
     "sequence_length": "41",
   }
+  denoiser_export = DenoiserExport(loaded.model)
+  _require_export_covers_recorded_state(
+    denoiser_export,
+    _recorded_denoiser_tensors(diffusion_path),
+    checkpoint=diffusion_path,
+  )
   _export_onnx(
-    DenoiserExport(loaded.model),
+    denoiser_export,
     (clean_tokens, _step_ids(mask, 1000, state_dimension=state_dimension)),
     native_denoiser_path,
     input_names=("noisy_tokens", "step_ids"),
@@ -994,7 +1143,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       dtype=torch.float32,
     ).reshape(args.batch_size, 41, lane["lane_token_dimension"])
     _export_onnx(
-      LaneTokenAdapter(DenoiserExport(loaded.model), contract.state_slices),
+      LaneTokenAdapter(denoiser_export, contract.state_slices),
       (
         lane_probe,
         _step_ids(
@@ -1011,14 +1160,31 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       metadata=lane_denoiser_metadata,
     )
   _export_onnx(
+    VaeEncoderExport(cast(ConditionalVAE, vae.model)),
+    (
+      torch.linspace(
+        -1.0, 1.0, args.batch_size * vae.reference_dim, dtype=torch.float32
+      ).reshape(args.batch_size, vae.reference_dim),
+    ),
+    encoder_path,
+    input_names=("reference",),
+    output_name="latent",
+    metadata={
+      **metadata_common,
+      "artifact_kind": "vae_encoder",
+      "reference_dimension": str(vae.reference_dim),
+      "latent_dimension": str(vae.latent_dim),
+    },
+  )
+  _export_onnx(
     VaeDecoderExport(cast(ConditionalVAE, vae.model)),
     (
-      torch.linspace(-1.0, 1.0, args.batch_size * 32, dtype=torch.float32).reshape(
-        args.batch_size, 32
-      ),
-      torch.linspace(-0.5, 0.5, args.batch_size * 99, dtype=torch.float32).reshape(
-        args.batch_size, 99
-      ),
+      torch.linspace(
+        -1.0, 1.0, args.batch_size * vae.latent_dim, dtype=torch.float32
+      ).reshape(args.batch_size, vae.latent_dim),
+      torch.linspace(
+        -0.5, 0.5, args.batch_size * vae.conditioning_dim, dtype=torch.float32
+      ).reshape(args.batch_size, vae.conditioning_dim),
     ),
     decoder_path,
     input_names=("latent", "conditioning"),
@@ -1026,9 +1192,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     metadata={
       **metadata_common,
       "artifact_kind": "vae_decoder",
-      "latent_dimension": "32",
-      "conditioning_dimension": "99",
-      "action_dimension": "31",
+      "latent_dimension": str(vae.latent_dim),
+      "conditioning_dimension": str(vae.conditioning_dim),
+      "action_dimension": str(vae.action_dim),
     },
   )
   expected_denoiser_metadata = {
@@ -1039,21 +1205,38 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     ),
     "sequence_length": "41",
   }
+  expected_encoder_metadata = {
+    **metadata_common,
+    "artifact_kind": "vae_encoder",
+    "reference_dimension": str(vae.reference_dim),
+    "latent_dimension": str(vae.latent_dim),
+  }
   expected_decoder_metadata = {
     **metadata_common,
     "artifact_kind": "vae_decoder",
-    "latent_dimension": "32",
-    "conditioning_dimension": "99",
-    "action_dimension": "31",
+    "latent_dimension": str(vae.latent_dim),
+    "conditioning_dimension": str(vae.conditioning_dim),
+    "action_dimension": str(vae.action_dim),
   }
   denoiser_metadata_observed = _require_metadata(
     denoiser_path, expected_denoiser_metadata
   )
+  encoder_metadata = _require_metadata(encoder_path, expected_encoder_metadata)
   decoder_metadata = _require_metadata(decoder_path, expected_decoder_metadata)
   onnx_denoiser, denoiser_graph = _onnx_denoiser(
     native_denoiser_path, token_dimension=token_dimension
   )
-  onnx_decoder, decoder_graph = _onnx_decoder(decoder_path)
+  onnx_encoder, encoder_graph = _onnx_encoder(
+    encoder_path,
+    reference_dimension=vae.reference_dim,
+    latent_dimension=vae.latent_dim,
+  )
+  onnx_decoder, decoder_graph = _onnx_decoder(
+    decoder_path,
+    latent_dimension=vae.latent_dim,
+    conditioning_dimension=vae.conditioning_dim,
+    action_dimension=vae.action_dim,
+  )
   onnx_output, onnx_sources, _ = _reference_ddim(
     onnx_denoiser,
     clean_tokens=clean_tokens,
@@ -1091,13 +1274,31 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     }
 
   decoder_latent = torch.linspace(
-    -1.0, 1.0, args.batch_size * 32, dtype=torch.float32
-  ).reshape(args.batch_size, 32)
+    -1.0, 1.0, args.batch_size * vae.latent_dim, dtype=torch.float32
+  ).reshape(args.batch_size, vae.latent_dim)
   decoder_conditioning = torch.linspace(
-    -0.5, 0.5, args.batch_size * 99, dtype=torch.float32
-  ).reshape(args.batch_size, 99)
+    -0.5, 0.5, args.batch_size * vae.conditioning_dim, dtype=torch.float32
+  ).reshape(args.batch_size, vae.conditioning_dim)
   native_action = vae.model.decode(decoder_latent, decoder_conditioning)
   exported_action = onnx_decoder(decoder_latent, decoder_conditioning)
+  encoder_reference = torch.linspace(
+    -1.0, 1.0, args.batch_size * vae.reference_dim, dtype=torch.float32
+  ).reshape(args.batch_size, vae.reference_dim)
+  native_latent, _ = cast(ConditionalVAE, vae.model).encode(encoder_reference)
+  exported_latent = onnx_encoder(encoder_reference)
+  encoder_report = {
+    "member": vae.member_id,
+    "reference_dimension": vae.reference_dim,
+    "latent_dimension": vae.latent_dim,
+    "torch_vs_exported_latent": _close_metrics(
+      "native VAE encoder vs exported encoder",
+      native_latent,
+      exported_latent,
+      warnings=tolerance_warnings,
+    ),
+    "native_latent_finite": bool(torch.isfinite(native_latent).all().item()),
+    "exported_latent_finite": bool(torch.isfinite(exported_latent).all().item()),
+  }
   decoder_report = {
     "member": vae.member_id,
     "reference_dimension": vae.reference_dim,
@@ -1172,6 +1373,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "metadata_keys": sorted(decoder_metadata),
         "graph": decoder_graph,
       },
+      "exported_encoder": {
+        "path": str(encoder_path),
+        "sha256": _canonical_digest(encoder_path),
+        "metadata_keys": sorted(encoder_metadata),
+        "graph": encoder_graph,
+      },
     },
     "checks": {
       "statistics_only": statistics_report,
@@ -1179,6 +1386,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
       "ddim": ddim_report,
       "lane_adapter": lane_report,
       "vae_decoder": decoder_report,
+      "vae_encoder": encoder_report,
     },
   }
   report_path = output / "REPORT.json"
