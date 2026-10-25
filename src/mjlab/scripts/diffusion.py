@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 
+from mjlab.tasks.tracking.diffusion.model import denoiser_dtype
 from mjlab.tasks.tracking.diffusion.runtime import CollectionRequest, RuntimeBundle
 
 DEFAULT_CONTRACT_PATH = Path(
@@ -1436,6 +1437,9 @@ def _command_train(args: argparse.Namespace) -> int:
     )
     settings = DenoiserSettings.from_contract(contract, training_k=schedule.training_k)
     model = _build_seeded_model(settings, config.seed, StateLatentTransformer)
+    pure_dtype = denoiser_dtype(config.mixed_precision)
+    if pure_dtype is not None:
+      model = model.to(pure_dtype)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
       raise RuntimeError("CUDA device requested but CUDA is unavailable")

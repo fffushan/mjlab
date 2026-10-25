@@ -129,6 +129,19 @@ class DenoiserSettings:
     )
 
 
+_MIXED_PRECISION_DTYPES = {"bf16-pure": torch.bfloat16}
+
+
+def denoiser_dtype(mixed_precision: str) -> torch.dtype | None:
+  """Return the parameter dtype a run stores the model in.
+
+  ``None`` means fp32 parameters, which is what both ``fp32`` and plain ``bf16``
+  mode use: the latter casts only inside the forward, so its master weights and
+  optimizer state stay fp32.  ``bf16-pure`` stores everything in bf16.
+  """
+  return _MIXED_PRECISION_DTYPES.get(mixed_precision)
+
+
 class StateLatentTransformer(nn.Module):
   """Bidirectional Transformer that predicts clean state-latent tokens."""
 

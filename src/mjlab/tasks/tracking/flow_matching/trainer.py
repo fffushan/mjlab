@@ -41,6 +41,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 
 from ..diffusion.contract import DiffusionContract
+from ..diffusion.model import denoiser_dtype
 from ..diffusion.noising import clean_mask
 from ..diffusion.state import HYBRID_STATE, state_field_channels
 from ..diffusion.trainer import (
@@ -52,6 +53,7 @@ from ..diffusion.trainer import (
   _generator,
   _history_dropout_mask,
   _set_seed,
+  clip_gradient_norm,
 )
 from ..diffusion.training_config import (
   config_differences,
@@ -207,6 +209,12 @@ class FlowTrainer:
     self.diagnostics = self._build_diagnostics()
     self._lr_horizon_env = _lr_horizon_from_environment()
     self.model.to(self.device)
+    # One owner for the parameter dtype.  A pure-bf16 run stores the model in
+    # bf16, so the EMA shadow and the optimizer state are created from bf16
+    # parameters rather than being cast afterwards.
+    pure_dtype = denoiser_dtype(self.training.mixed_precision)
+    if pure_dtype is not None:
+      self.model.to(pure_dtype)
     self.ema = ExponentialMovingAverage(
       self.model,
       power=self.training.ema_power,
@@ -504,6 +512,9 @@ class FlowTrainer:
     )
 
   def _autocast(self) -> Any:
+    # Only plain ``bf16`` casts inside the forward.  ``bf16-pure`` already holds
+    # bf16 parameters and every operation runs in bf16, so an autocast region
+    # would add a second policy on top of the same dtype.
     if self.training.mixed_precision == "bf16" and self.device.type == "cuda":
       return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
@@ -626,7 +637,7 @@ class FlowTrainer:
     # ``clip_grad_norm_`` returns the total norm measured BEFORE it rescales
     # the gradients, so this value also shows clipping: a value above
     # ``max_grad_norm`` means the step was scaled down.
-    gradient_norm = torch.nn.utils.clip_grad_norm_(
+    gradient_norm = clip_gradient_norm(
       self.model.parameters(), self.training.max_grad_norm
     )
     _finite_tensor(torch.as_tensor(gradient_norm), "clipped gradient norm")

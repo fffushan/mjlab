@@ -25,6 +25,7 @@ from .checkpoint import (
   save_checkpoint,
 )
 from .contract import DiffusionContract
+from .model import denoiser_dtype
 from .noising import add_independent_noise, clean_mask, sample_levels, x0_target
 from .perf_switches import PerfSwitches
 from .profiling import StepProfiler
@@ -53,6 +54,28 @@ class TrainResult:
   checkpoint_paths: dict[str, Path]
 
 
+def clip_gradient_norm(parameters: Any, max_norm: float) -> Tensor:
+  """Clip gradients in place and return the total norm measured before scaling.
+
+  The norm accumulates in fp32 even when the parameters are bf16.  A bf16
+  accumulation loses the small gradients that decide whether clipping fires at
+  all, which would make the recorded norm a function of the dtype rather than of
+  the update.
+  """
+  grads = [p.grad for p in parameters if p.grad is not None]
+  if not grads:
+    return torch.zeros((), dtype=torch.float32)
+  total = torch.zeros((), dtype=torch.float32, device=grads[0].device)
+  for grad in grads:
+    total = total + grad.detach().float().pow(2).sum()
+  norm = total.sqrt()
+  coefficient = min(1.0, float(max_norm) / (float(norm) + 1e-6))
+  if coefficient < 1.0:
+    for grad in grads:
+      grad.mul_(coefficient)
+  return norm
+
+
 class ExponentialMovingAverage:
   """Power-law EMA shadow weights used for evaluation and checkpoints."""
 
@@ -68,8 +91,11 @@ class ExponentialMovingAverage:
     self.power = float(power)
     self.max_decay = float(max_decay)
     self.updates = 0
+    # Shadows stay fp32 even when the model is bf16: the EMA is a checkpoint
+    # artifact and a bf16 average would add its own rounding to it.
     self.shadow = {
-      name: value.detach().clone() for name, value in model.state_dict().items()
+      name: value.detach().float().clone()
+      for name, value in model.state_dict().items()
     }
 
   def update(self, model: nn.Module, *, foreach: bool = False) -> float:
@@ -89,7 +115,7 @@ class ExponentialMovingAverage:
       if foreach:
         float_names = [n for n, v in state.items() if torch.is_floating_point(v)]
         shadows = [self.shadow[n] for n in float_names]
-        sources = [state[n].detach() for n in float_names]
+        sources = [state[n].detach().float() for n in float_names]
         if shadows:
           torch._foreach_mul_(shadows, decay)
           torch._foreach_add_(shadows, sources, alpha=1.0 - decay)
@@ -99,7 +125,7 @@ class ExponentialMovingAverage:
       else:
         for name, value in state.items():
           if torch.is_floating_point(value):
-            self.shadow[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+            self.shadow[name].mul_(decay).add_(value.detach().float(), alpha=1.0 - decay)
           else:
             self.shadow[name].copy_(value.detach())
     return decay
@@ -427,6 +453,10 @@ class DiffusionTrainer:
     if self.device.type == "cuda" and not torch.cuda.is_available():
       raise TrainerError("CUDA device requested but CUDA is unavailable")
     self.model.to(self.device)
+    # One owner for the parameter dtype, as in the flow trainer.
+    pure_dtype = denoiser_dtype(self.config.mixed_precision)
+    if pure_dtype is not None:
+      self.model.to(pure_dtype)
     self.ema = ExponentialMovingAverage(
       self.model,
       power=self.config.ema_power,
@@ -776,7 +806,7 @@ class DiffusionTrainer:
         if parameter.grad is not None:
           parameter.grad.div_(divisor)
           self._finite.check(parameter.grad, "gradient")
-    gradient_norm = torch.nn.utils.clip_grad_norm_(
+    gradient_norm = clip_gradient_norm(
       self.model.parameters(), self.config.max_grad_norm
     )
     self._finite.check(torch.as_tensor(gradient_norm), "clipped gradient norm")

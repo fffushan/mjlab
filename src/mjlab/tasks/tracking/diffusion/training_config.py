@@ -154,8 +154,12 @@ class TrainingConfig:
       raise TrainingConfigError(
         "loss_reduction must be token_mean; D2 requires plain x0 loss"
       )
-    if self.mixed_precision not in {"fp32", "bf16"}:
-      raise TrainingConfigError("mixed_precision must be fp32 or bf16")
+    if self.mixed_precision not in {"fp32", "bf16", "bf16-pure"}:
+      raise TrainingConfigError(
+        "mixed_precision must be fp32, bf16 or bf16-pure; bf16 keeps fp32 "
+        "parameters and casts inside the forward, bf16-pure stores the model "
+        "in bf16 and runs every operation in it"
+      )
     if self.epoch_sample_budget is not None and (
       isinstance(self.epoch_sample_budget, bool)
       or not isinstance(self.epoch_sample_budget, int)

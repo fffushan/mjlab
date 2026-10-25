@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -569,3 +570,47 @@ def test_masked_state_probability_is_validated() -> None:
     _config(masked_state_probability=1.5).validate()
   with pytest.raises(FlowTrainingConfigError):
     _config(masked_state_probability=-0.1).validate()
+
+
+def test_bf16_pure_builds_a_bf16_model_and_skips_autocast(tmp_path: Path) -> None:
+  """The pure mode must own the dtype, not delegate it to autocast."""
+  from mjlab.tasks.tracking.diffusion.model import denoiser_dtype
+
+  assert denoiser_dtype("bf16") is None
+  assert denoiser_dtype("fp32") is None
+  assert denoiser_dtype("bf16-pure") is torch.bfloat16
+
+  config = _config(epochs=1, max_updates=1)
+  pure = FlowTrainingConfig(
+    training=replace(config.training, mixed_precision="bf16-pure"),
+    max_level=config.max_level,
+  )
+  trainer = _trainer(tmp_path / "pure", config=pure)
+  assert next(trainer.model.parameters()).dtype == torch.bfloat16
+  # No autocast region: under pure bf16 the operations already run in bf16.
+  from contextlib import nullcontext
+  assert isinstance(trainer._autocast(), nullcontext)
+
+
+def test_clip_helper_matches_torch_and_reports_the_preclip_norm() -> None:
+  """The shared clip helper must keep torch's semantics on bf16 gradients."""
+  import torch.nn.utils as torch_utils
+
+  from mjlab.tasks.tracking.diffusion.trainer import clip_gradient_norm
+
+  reference = [torch.nn.Parameter(torch.zeros(4)) for _ in range(2)]
+  measured = [
+    torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16)) for _ in range(2)
+  ]
+  for index, (left, right) in enumerate(zip(reference, measured, strict=True)):
+    gradient = torch.full((4,), 0.8 + index)
+    left.grad = gradient.clone()
+    right.grad = gradient.clone().to(torch.bfloat16)
+
+  expected = torch_utils.clip_grad_norm_(reference, 1.0)
+  actual = clip_gradient_norm(measured, 1.0)
+  # bf16 storage rounds 0.8 and 0.9, so the two norms differ by a fraction of
+  # a percent; the clipping decision and the scaling must still agree.
+  assert abs(float(expected) - float(actual)) < 0.01 * float(expected)
+  for left, right in zip(reference, measured, strict=True):
+    assert torch.allclose(left.grad.bfloat16(), right.grad, rtol=1e-2, atol=1e-3)
