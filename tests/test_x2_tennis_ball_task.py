@@ -26,23 +26,31 @@ default pose), so in-environment retention needs a trained policy.
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
+from typing import Any, cast
 
 import mujoco
 import numpy as np
 import pytest
+import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_COMMAND_MAX_TRACK_ERR_FRAC,
   BALL_COMMAND_STAGES,
   BALL_COMMAND_WINDOW,
   BALL_DIAGINERTIA,
   BALL_DROP_GRACE_S,
+  BALL_DROPOUT_HOLD_STEPS,
+  BALL_DROPOUT_PROB,
   BALL_FALL_THRESHOLD,
   BALL_MASS,
+  BALL_OBS_DELAY_MAX_STEPS,
+  BALL_OBS_DELAY_MIN_STEPS,
+  BALL_OBS_UPDATE_PERIOD_STEPS,
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
   BALL_SPAWN_CLEARANCE,
   BALL_SPAWN_LOCAL_POS,
-  BALL_VELOCITY_NOISE_M,
   BAT_CARRY_BASE_HEIGHT,
   BAT_CARRY_POSE,
   BED_CENTER_X,
@@ -85,6 +93,8 @@ from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
 )
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.managers.observation_manager import ObservationTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.config.agibot_x2.env_cfgs import (
@@ -749,9 +759,13 @@ def test_task_adds_exactly_the_ball_terms_to_the_base_task() -> None:
   base = agibot_x2_flat_velocity_env_cfg()
   tennis = load_env_cfg(TASK_ID)
   assert tennis.actions.keys() == base.actions.keys()
-  for group in ("actor", "critic"):
+  # The actor gets the position only; the critic also gets the velocity.
+  for group, ball_terms in (
+    ("actor", {"ball_pos"}),
+    ("critic", {"ball_pos", "ball_vel"}),
+  ):
     added = set(tennis.observations[group].terms) - set(base.observations[group].terms)
-    assert added == {"ball_pos", "ball_vel"}, group
+    assert added == ball_terms, group
     assert set(base.observations[group].terms) <= set(tennis.observations[group].terms)
   # Rewards and terminations keep every base term and add the ball's.
   assert set(base.rewards.keys()) <= set(tennis.rewards.keys())
@@ -768,8 +782,8 @@ def test_task_adds_exactly_the_ball_terms_to_the_base_task() -> None:
   assert tennis.commands.keys() == base.commands.keys()
 
 
-def test_ball_observation_widens_the_actor_by_six() -> None:
-  """The ball adds a 3-vector position and a 3-vector velocity to both groups.
+def test_the_ball_widens_the_actor_by_three_and_the_critic_by_six() -> None:
+  """The ball adds a 3-vector position to both groups and a velocity to the critic.
 
   Widths are read off a built environment, because the term shape depends on the
   asset, not on the config text. A checkpoint of the base task cannot be resumed
@@ -779,15 +793,281 @@ def test_ball_observation_widens_the_actor_by_six() -> None:
   env = _build_env(num_envs=1)
   try:
     om = env.observation_manager
-    for group in ("actor", "critic"):
+    wanted = {"actor": {"ball_pos": 3}, "critic": {"ball_pos": 3, "ball_vel": 3}}
+    for group, ball_widths in wanted.items():
       names = om._group_obs_term_names[group]
       dims = om._group_obs_term_dim[group]
       widths = dict(zip(names, (int(np.prod(d)) for d in dims), strict=True))
-      assert widths["ball_pos"] == 3
-      assert widths["ball_vel"] == 3
+      assert {name: widths[name] for name in ball_widths} == ball_widths, group
       assert sum(widths.values()) == int(np.prod(om._group_obs_dim[group]))
+    # A delay changes timing, not width: the base task's 102 + 3 for the actor and
+    # 117 + 6 for the critic.
+    assert env.obs_buf["actor"].shape[-1] == 105
+    assert env.obs_buf["critic"].shape[-1] == 123
   finally:
     env.close()
+
+
+@pytest.mark.slow
+def test_the_actor_sees_ball_position_only() -> None:
+  """The perception chain has no ball-velocity source, so the actor must not see one.
+
+  The critic keeps the velocity as privileged information, which is why the
+  actor's ball contribution is exactly three elements narrower.
+  """
+  env = _build_env(num_envs=1)
+  try:
+    om = env.observation_manager
+
+    def ball_terms(group: str) -> tuple[tuple[str, ...], int]:
+      names = om._group_obs_term_names[group]
+      dims = om._group_obs_term_dim[group]
+      widths = {
+        name: int(np.prod(dim))
+        for name, dim in zip(names, dims, strict=True)
+        if name.startswith("ball_")
+      }
+      return tuple(widths), sum(widths.values())
+
+    actor_terms, actor_width = ball_terms("actor")
+    critic_terms, critic_width = ball_terms("critic")
+    assert actor_terms == ("ball_pos",)
+    assert critic_terms == ("ball_pos", "ball_vel")
+    assert critic_width - actor_width == 3
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_actor_ball_position_is_delayed_and_the_critic_is_not() -> None:
+  """The actor sees the ball through the real 10 Hz perception chain.
+
+  The camera publishes one frame every five 50 Hz control steps, and a published
+  position is 110 ms (P50) to 141 ms (P95) old, so the actor's lag is sampled
+  from 5 to 9 steps and refreshed once per sensor frame. The critic is
+  privileged, so its ball terms read the simulator state clean.
+  """
+  env = _build_env(num_envs=1)
+  try:
+    om = env.observation_manager
+    actor = om.get_term_cfg("actor", "ball_pos")
+    assert actor.delay_min_lag == BALL_OBS_DELAY_MIN_STEPS == 5
+    assert actor.delay_max_lag == BALL_OBS_DELAY_MAX_STEPS == 9
+    assert actor.delay_update_period == BALL_OBS_UPDATE_PERIOD_STEPS == 5
+    assert actor.delay_per_env is True
+    assert actor.delay_per_env_phase is True
+
+    for term_name in ("ball_pos", "ball_vel"):
+      critic = om.get_term_cfg("critic", term_name)
+      assert critic.delay_min_lag == 0, term_name
+      assert critic.delay_max_lag == 0, term_name
+
+    # No other actor term may be delayed: the change is about the ball alone.
+    delayed = {
+      name
+      for name in om._group_obs_term_names["actor"]
+      if om.get_term_cfg("actor", name).delay_max_lag > 0
+    }
+    assert delayed == {"ball_pos"}
+  finally:
+    env.close()
+
+
+##
+# The actor's ball position is held when the perception chain rejects a frame.
+##
+
+
+class _StubBallEnv:
+  """The two entities ``ball_position_in_plate`` reads, and nothing else.
+
+  Driving the hold model directly keeps these tests off the physics path: the term
+  is a wrapper around the position measurement, so a scripted measurement is
+  enough to test the hold logic exactly, and it is the only way to place a
+  rejection on a chosen step.
+  """
+
+  def __init__(self, positions: torch.Tensor):
+    self.num_envs = positions.shape[0]
+    self.device = str(positions.device)
+    self._face = torch.tensor(FACE_SITE_POS, dtype=positions.dtype)
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=positions.dtype)
+    self.scene = {
+      "robot": SimpleNamespace(
+        data=SimpleNamespace(
+          body_link_pos_w=torch.zeros(self.num_envs, 1, 3),
+          body_link_quat_w=quat.expand(self.num_envs, 1, 4).clone(),
+          body_link_lin_vel_w=torch.zeros(self.num_envs, 1, 3),
+          body_link_ang_vel_w=torch.zeros(self.num_envs, 1, 3),
+        )
+      ),
+      BALL_ENTITY: SimpleNamespace(
+        data=SimpleNamespace(
+          root_link_pos_w=positions + self._face,
+          root_link_quat_w=quat.expand(self.num_envs, 4).clone(),
+          root_link_lin_vel_w=torch.zeros(self.num_envs, 3),
+        )
+      ),
+    }
+
+  def place(self, positions: torch.Tensor) -> None:
+    """Move the ball: the fresh measurement the next call has to see."""
+    self.scene[BALL_ENTITY].data.root_link_pos_w = positions + self._face
+
+
+def _hold_term(env, rejection_prob: float, hold_steps: tuple[int, int]):
+  """The hold term with the parameters the task config gives it.
+
+  Noise and delay are applied by the observation manager *after* the term, so
+  they are deliberately absent here: these tests are about the hold logic only.
+  """
+  params = dict(
+    plate_cfg=SceneEntityCfg("robot", body_ids=[0]),
+    ball_cfg=SceneEntityCfg(BALL_ENTITY),
+    rejection_prob=rejection_prob,
+    hold_steps=hold_steps,
+  )
+  term = mdp.ball_position_hold(
+    ObservationTermCfg(func=mdp.ball_position_hold, params=params), env
+  )
+  return term, params
+
+
+def test_no_rejection_is_the_plain_position_term() -> None:
+  """With no rejection the hold model must be exactly the position term.
+
+  The comparison is exact, not approximate: the wrapper either passes the same
+  numbers through or it does not, so any difference is a bug in the pass-through
+  path. The measurement moves every step so a stale value cannot pass by accident.
+  """
+  positions = torch.tensor(
+    [[0.0, 0.0, BALL_RADIUS], [0.02, -0.01, BALL_RADIUS + 0.001], [-0.3, 0.4, 1.0]]
+  )
+  env = cast(Any, _StubBallEnv(positions))
+  term, params = _hold_term(env, rejection_prob=0.0, hold_steps=(5, 15))
+  for step in range(12):
+    env.place(positions + 0.001 * step)
+    fresh = mdp.ball_position_in_plate(env, params["plate_cfg"], params["ball_cfg"])
+    assert torch.equal(term(env, **params), fresh), step
+
+
+def test_a_rejected_frame_holds_for_exactly_the_configured_steps() -> None:
+  """Every frame rejected, so the sequence is one hold of the configured length.
+
+  The first call has nothing to hold and must pass the measurement through; the
+  next five calls must repeat it; the seventh must deliver the new measurement,
+  because the step after a hold is a refractory fresh frame.
+  """
+  env = cast(Any, _StubBallEnv(torch.zeros(1, 3)))
+  term, params = _hold_term(env, rejection_prob=1.0, hold_steps=(5, 5))
+
+  def fresh_at(step: int) -> torch.Tensor:
+    env.place(torch.tensor([[0.01 * step, 0.0, BALL_RADIUS]]))
+    return mdp.ball_position_in_plate(
+      env, params["plate_cfg"], params["ball_cfg"]
+    ).clone()
+
+  first = fresh_at(1)
+  assert torch.equal(term(env, **params), first), (
+    "the first frame after a reset has nothing older to hold"
+  )
+  for step in range(2, 7):
+    fresh_at(step)  # a new measurement arrives and the hold must ignore it
+    assert torch.equal(term(env, **params), first), f"step {step} must be held"
+  refreshed = fresh_at(7)
+  assert torch.equal(term(env, **params), refreshed), "a hold must end and refresh"
+
+
+def test_a_hold_in_one_environment_does_not_freeze_the_others() -> None:
+  """Each environment holds its own value, or none at all.
+
+  The measurement is distinct per environment and moves every step, so a shared
+  hold flag or a shared stored value shows up as one environment freezing another
+  or as values crossing between rows. The offsets are whole numbers and the steps
+  hundredths, so rounding recovers the step a served value came from.
+  """
+  num_envs = 8
+  env = cast(Any, _StubBallEnv(torch.zeros(num_envs, 3)))
+  term, params = _hold_term(env, rejection_prob=0.3, hold_steps=(3, 3))
+  torch.manual_seed(0)
+
+  rows = torch.arange(num_envs, dtype=torch.float)
+  seen_held = torch.zeros(num_envs, dtype=torch.bool)
+  mixed = False
+  for step in range(1, 41):
+    env.place(
+      torch.stack(
+        [rows + 0.01 * step, 0.5 * rows, torch.full((num_envs,), BALL_RADIUS)], dim=1
+      )
+    )
+    got = term(env, **params)
+    # A row may only serve its own measurements, current or older: another
+    # environment's value would not round to this row's index.
+    assert torch.equal(torch.round(got[:, 0]), rows), step
+    served_from = torch.round((got[:, 0] - rows) / 0.01).long()
+    assert torch.all(served_from <= step), step
+    held = served_from < step
+    seen_held |= held
+    mixed |= bool(held.any()) and not bool(held.all())
+
+  assert mixed, "no step served one environment fresh while another held"
+  assert seen_held.sum() >= 2, "too few environments held to test independence"
+
+
+def test_a_reset_clears_the_held_position() -> None:
+  """A new episode must not repeat the previous episode's ball position.
+
+  Both environments are mid-hold with different values when one is reset. That
+  environment's next frame must be fresh and its new hold must repeat that fresh
+  frame, while the other environment keeps its own held value untouched.
+  """
+  env = cast(Any, _StubBallEnv(torch.zeros(2, 3)))
+  term, params = _hold_term(env, rejection_prob=1.0, hold_steps=(10, 10))
+
+  def fresh_at(step: int) -> torch.Tensor:
+    positions = torch.tensor([[0.01 * step, 0.0, BALL_RADIUS]]).expand(2, 3).clone()
+    positions[:, 0] += torch.arange(2)
+    env.place(positions)
+    return mdp.ball_position_in_plate(
+      env, params["plate_cfg"], params["ball_cfg"]
+    ).clone()
+
+  stored = fresh_at(1)
+  assert torch.equal(term(env, **params), stored), "the first frame is accepted"
+  assert torch.equal(term(env, **params), stored), "the first rejection holds it"
+
+  term.reset(env_ids=torch.tensor([0]))
+  new = fresh_at(4)
+  got = term(env, **params)
+  assert torch.equal(got[0], new[0]), "the reset environment must be fresh"
+  assert torch.equal(got[1], stored[1]), "the other environment must keep holding"
+
+  fresh_at(5)
+  got = term(env, **params)
+  assert torch.equal(got[0], new[0]), "the new hold must repeat the new episode"
+  assert torch.equal(got[1], stored[1])
+
+
+def test_the_actor_ball_position_is_the_hold_term_and_the_critic_is_clean() -> None:
+  """The hold is added to the existing corruption and delay, not instead of it.
+
+  The critic stays privileged: its position term is the plain measurement and it
+  has no hold parameters, so a rejected frame can never reach the critic.
+  """
+  cfg = load_env_cfg(TASK_ID)
+  actor = cfg.observations["actor"].terms["ball_pos"]
+  assert actor.func is mdp.ball_position_hold
+  assert actor.params["rejection_prob"] == BALL_DROPOUT_PROB
+  assert actor.params["hold_steps"] == BALL_DROPOUT_HOLD_STEPS
+  assert actor.noise is not None
+  assert actor.delay_min_lag == BALL_OBS_DELAY_MIN_STEPS
+  assert actor.delay_max_lag == BALL_OBS_DELAY_MAX_STEPS
+  assert actor.delay_update_period == BALL_OBS_UPDATE_PERIOD_STEPS
+
+  for term_name in ("ball_pos", "ball_vel"):
+    critic = cfg.observations["critic"].terms[term_name]
+    assert critic.func is not mdp.ball_position_hold
+    assert "hold_steps" not in critic.params
 
 
 def test_resets_are_pinned_so_the_ball_lands_on_the_bed() -> None:
@@ -1085,21 +1365,22 @@ def test_losing_the_ball_ends_the_episode_and_a_bounce_does_not() -> None:
 
 @pytest.mark.slow
 def test_each_ball_observation_dimension_is_randomized_independently() -> None:
-  """Six independent magnitudes, not one shared scale.
+  """Three independent magnitudes, not one shared scale.
 
-  The actor must see a randomized ball with a **different** spread on each of the
-  three axes of each term; the critic must see the true ball. A single shared
-  magnitude would fail the "different on each axis" assertions.
+  The actor's ball position must have a **different** spread on each of the three
+  axes; the critic must see the true ball position and velocity. A single shared
+  magnitude would fail the "different on each axis" assertion.
   """
   import numpy as np
 
   env = _build_env()
   try:
     om = env.observation_manager
-    wanted = {"ball_pos": BALL_POSITION_NOISE_M, "ball_vel": BALL_VELOCITY_NOISE_M}
+    wanted = ("ball_pos", "ball_vel")
     spread = {}
     for group in ("actor", "critic"):
-      samples = {name: [] for name in wanted}
+      present = om._group_obs_term_names[group]
+      samples = {name: [] for name in wanted if name in present}
       for _ in range(400):
         obs = om.compute_group(group)
         names = om._group_obs_term_names[group]
@@ -1112,16 +1393,17 @@ def test_each_ball_observation_dimension_is_randomized_independently() -> None:
           idx += n
       spread[group] = {k: np.asarray(v) for k, v in samples.items()}
 
-    for name, magnitudes in wanted.items():
-      actor = spread["actor"][name]
-      std = actor.std(axis=0)
-      # Uniform half-width m has standard deviation m / sqrt(3).
-      expected = np.asarray(magnitudes) / np.sqrt(3.0)
-      assert std == pytest.approx(expected, rel=0.12), (name, std, expected)
-      # The axes must not share one magnitude: the constants differ, so the
-      # measured spread must too.
-      assert not np.allclose(std, std[0], rtol=0.05), (name, std)
-      # And the critic must be clean.
+    # Only the actor's position is corrupted, and by a different magnitude on
+    # each axis; the critic reads both ball terms clean.
+    actor = spread["actor"]["ball_pos"]
+    std = actor.std(axis=0)
+    # Uniform half-width m has standard deviation m / sqrt(3).
+    expected = np.asarray(BALL_POSITION_NOISE_M) / np.sqrt(3.0)
+    assert std == pytest.approx(expected, rel=0.12), (std, expected)
+    # The axes must not share one magnitude: the constants differ, so the
+    # measured spread must too.
+    assert not np.allclose(std, std[0], rtol=0.05), std
+    for name in wanted:
       assert np.abs(spread["critic"][name].std(axis=0)).max() < 1e-6, name
   finally:
     env.close()
@@ -1297,6 +1579,155 @@ def test_a_few_lucky_episodes_cannot_promote_the_command_ramp() -> None:
     state = feed(19.0)
     assert float(state["mean_episode_s"]) > float(state["typical_episode_s"])
     assert int(state["stage"]) == 0, "the median must protect the gate"
+  finally:
+    env.close()
+
+
+def _stage_max_lin_speed(stage: dict) -> float:
+  """Fastest linear speed a stage can command; the scale of the error fraction."""
+  return max(abs(v) for v in (*stage["lin_vel_x"], *stage["lin_vel_y"]))
+
+
+def _ramp_feeder(env, term):
+  """Drive one curriculum term with synthetic finished episodes.
+
+  Writes ``error_vel_xy`` the way the command term does: an episode-accumulated
+  sum, each step divided by ``max_command_step``. A term that reports
+  ``track_err_mps`` back is therefore reading the accumulator with the right
+  units.
+  """
+  twist = env.command_manager.get_term("twist")
+  step_dt = env.step_dt
+  max_command_step = twist.cfg.resampling_time_range[1] / step_dt
+
+  def feed(episode_seconds: float, track_err_mps: float, times: int = 1) -> dict:
+    steps = round(episode_seconds / step_dt)
+    state = None
+    for _ in range(times):
+      env.episode_length_buf[:] = steps
+      twist.metrics["error_vel_xy"][:] = track_err_mps * steps / max_command_step
+      state = term.func(env, slice(None), **term.params)
+    assert state is not None
+    return state
+
+  return feed
+
+
+@pytest.mark.slow
+def test_the_command_ramp_promotes_only_when_the_policy_tracks_the_command() -> None:
+  """Long episodes, an open schedule and good tracking together advance the stage.
+
+  The counterpart of the regression test below: the new tracking condition must
+  not have made the gate impossible to pass.
+  """
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "curriculum", "ball_command_ramp")
+    ranges = env.command_manager.get_term("twist").cfg.ranges
+    floor = float(term.params["mastery_floor_s"])
+    feed = _ramp_feeder(env, term)
+
+    # Inside stage 0's limit, so tracking cannot be what withholds the advance.
+    err = (
+      0.5
+      * BALL_COMMAND_MAX_TRACK_ERR_FRAC
+      * _stage_max_lin_speed(BALL_COMMAND_STAGES[0])
+    )
+    # Fill the window while stage 1 is still shut, so nothing can advance yet.
+    env.common_step_counter = 0
+    state = feed(floor + 5.0, err, BALL_COMMAND_WINDOW + 1)
+    assert int(state["stage"]) == 0, "the schedule is shut for stage 1"
+
+    # Open the stage-1 schedule only: this one call may advance one stage.
+    env.common_step_counter = BALL_COMMAND_STAGES[1]["min_step"]
+    state = feed(floor + 5.0, err)
+    assert float(state["typical_episode_s"]) >= floor
+    assert float(state["typical_track_err_mps"]) == pytest.approx(err)
+    assert float(state["typical_track_err_mps"]) <= float(state["track_err_limit_mps"])
+    assert int(state["stage"]) == 1, "good tracking must let the stage advance"
+    assert float(state["promoted"]) == 1.0
+    assert ranges.lin_vel_x == BALL_COMMAND_STAGES[1]["lin_vel_x"]
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_long_episodes_alone_cannot_promote_the_command_ramp() -> None:
+  """Regression: standing still keeps the ball on the plate for the full episode.
+
+  A policy that stands still, or shuffles at 6 mm foot clearance, never loses the
+  ball, so its episodes run the whole 20 s and clear any length floor. Measured,
+  the same policy misses a +-0.3 m/s command by 0.586 m/s. The length gate alone
+  promoted on that; the tracking condition must withhold it.
+  """
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "curriculum", "ball_command_ramp")
+    ranges = env.command_manager.get_term("twist").cfg.ranges
+    floor = float(term.params["mastery_floor_s"])
+    feed = _ramp_feeder(env, term)
+
+    # A full window of long, badly tracked episodes, with the schedule shut.
+    env.common_step_counter = 0
+    state = feed(floor + 5.0, 0.586, BALL_COMMAND_WINDOW + 1)
+    assert int(state["stage"]) == 0
+
+    # Now let the clock speak: only the tracking condition can withhold here.
+    env.common_step_counter = BALL_COMMAND_STAGES[1]["min_step"]
+    state = feed(floor + 5.0, 0.586)
+    assert float(state["typical_episode_s"]) >= floor, "the length gate passes"
+    assert float(state["typical_track_err_mps"]) == pytest.approx(0.586)
+    assert float(state["typical_track_err_mps"]) > float(state["track_err_limit_mps"])
+    assert int(state["stage"]) == 0, "a long episode must not stand in for tracking"
+    assert float(state["promoted"]) == 0.0
+    assert ranges.lin_vel_x == BALL_COMMAND_STAGES[0]["lin_vel_x"]
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
+def test_the_track_error_limit_scales_with_the_stage() -> None:
+  """The limit is a fraction of the stage's speed, so one constant covers all stages.
+
+  An absolute limit would be lax at the fast stages and strict at the slow ones.
+  """
+  env = _build_env(steps=0)
+  try:
+    term = _ball_term(env, "curriculum", "ball_command_ramp")
+    floor = float(term.params["mastery_floor_s"])
+    feed = _ramp_feeder(env, term)
+    # Comfortably inside the tightest limit, which is stage 0's.
+    err = (
+      0.5
+      * BALL_COMMAND_MAX_TRACK_ERR_FRAC
+      * _stage_max_lin_speed(BALL_COMMAND_STAGES[0])
+    )
+
+    # Stage 1 is not scheduled yet, so the reported limit is stage 0's own.
+    env.common_step_counter = 0
+    state = feed(floor + 5.0, err, BALL_COMMAND_WINDOW + 5)
+    assert int(state["stage"]) == 0
+    limit_slow = float(state["track_err_limit_mps"])
+    assert limit_slow == pytest.approx(
+      BALL_COMMAND_MAX_TRACK_ERR_FRAC * _stage_max_lin_speed(BALL_COMMAND_STAGES[0])
+    )
+
+    # Open the stage-1 schedule but not stage 2's, so exactly one advance happens.
+    env.common_step_counter = BALL_COMMAND_STAGES[1]["min_step"]
+    state = feed(floor + 5.0, err)
+    assert int(state["stage"]) == 1
+    state = feed(floor + 5.0, err)
+    assert int(state["stage"]) == 1, "stage 2 is not scheduled yet"
+    limit_fast = float(state["track_err_limit_mps"])
+
+    assert limit_fast == pytest.approx(
+      BALL_COMMAND_MAX_TRACK_ERR_FRAC * _stage_max_lin_speed(BALL_COMMAND_STAGES[1])
+    )
+    assert limit_fast == pytest.approx(
+      limit_slow
+      * _stage_max_lin_speed(BALL_COMMAND_STAGES[1])
+      / _stage_max_lin_speed(BALL_COMMAND_STAGES[0])
+    )
   finally:
     env.close()
 

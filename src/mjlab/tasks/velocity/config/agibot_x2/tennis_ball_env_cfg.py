@@ -59,9 +59,12 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_CENTRE_SIGMA,
   BALL_CENTRE_WEIGHT,
   BALL_COMMAND_MASTERY_FLOOR_S,
+  BALL_COMMAND_MAX_TRACK_ERR_FRAC,
   BALL_COMMAND_STAGES,
   BALL_COMMAND_WINDOW,
   BALL_DROP_GRACE_S,
+  BALL_DROPOUT_HOLD_STEPS,
+  BALL_DROPOUT_PROB,
   BALL_FALL_THRESHOLD,
   BALL_FOV_PLATEAU,
   BALL_FOV_SIGMA,
@@ -69,9 +72,11 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_HEIGHT_LIMIT,
   BALL_HEIGHT_SIGMA,
   BALL_HEIGHT_WEIGHT,
+  BALL_OBS_DELAY_MAX_STEPS,
+  BALL_OBS_DELAY_MIN_STEPS,
+  BALL_OBS_UPDATE_PERIOD_STEPS,
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
-  BALL_VELOCITY_NOISE_M,
   CAMERA_HALF_ANGLE_X,
   CAMERA_HALF_ANGLE_Y,
   CAMERA_MOUNT_QUAT,
@@ -290,14 +295,15 @@ def agibot_x2_tennis_ball_env_cfg(
 
   ##
   # Ball observation. The policy cannot balance a ball it cannot see, so both
-  # groups get the ball's pose and velocity relative to the plate. The critic gets
-  # the same numbers **without** corruption, like the rest of its privileged set.
+  # groups get the ball's position relative to the plate, and the critic alone also
+  # gets its velocity. The critic reads both terms **without** corruption, like the
+  # rest of its privileged set.
   #
   # Corruption is the perception budget, not physics: on hardware the ball
   # position comes from an external perception program. Both terms are in the
   # plate frame, so a ball carried along with the bat reads zero velocity. Each
   # dimension of each term is randomized independently; see the constants file for
-  # the six magnitudes and how they were derived.
+  # the magnitudes and how they were derived.
   ##
 
   plate_cfg = SceneEntityCfg("robot", body_names=(RACKET_BODY,))
@@ -307,22 +313,38 @@ def agibot_x2_tennis_ball_env_cfg(
   # per-dimension bounds (`NoiseParam = float | tuple[float, ...]`), so one term
   # can be randomized differently along the plate's shaft, width and normal.
   # Each entry is a half-width: the distribution is symmetric uniform.
+  #
+  # The actor's position is also delayed, because the real camera publishes at
+  # 10 Hz and a published frame is 110 ms old at the median and 141 ms at P95.
+  # At the 50 Hz control rate that is a lag of 5 to 9 steps, refreshed once per
+  # sensor frame. The critic is deliberately left clean: it is privileged and may
+  # read the simulator's ball state directly.
+  #
+  # The camera also rejects frames, and the stream can break outright, so the actor
+  # additionally sees the last valid position repeated while no new measurement
+  # arrives. The hold is applied first, then the existing noise and delay are
+  # unchanged; the shape is still (num_envs, 3), so the actor width does not change.
   cfg.observations["actor"].terms["ball_pos"] = ObservationTermCfg(
-    func=mdp.ball_position_in_plate,
-    params=dict(ball_state_params),
+    func=mdp.ball_position_hold,
+    params=dict(
+      ball_state_params,
+      rejection_prob=BALL_DROPOUT_PROB,
+      hold_steps=BALL_DROPOUT_HOLD_STEPS,
+    ),
     noise=Unoise(
       n_min=tuple(-m for m in BALL_POSITION_NOISE_M),
       n_max=BALL_POSITION_NOISE_M,
     ),
+    delay_min_lag=BALL_OBS_DELAY_MIN_STEPS,
+    delay_max_lag=BALL_OBS_DELAY_MAX_STEPS,
+    delay_update_period=BALL_OBS_UPDATE_PERIOD_STEPS,
+    delay_per_env=True,
+    delay_per_env_phase=True,
   )
-  cfg.observations["actor"].terms["ball_vel"] = ObservationTermCfg(
-    func=mdp.ball_velocity_in_plate,
-    params=dict(ball_state_params),
-    noise=Unoise(
-      n_min=tuple(-m for m in BALL_VELOCITY_NOISE_M),
-      n_max=BALL_VELOCITY_NOISE_M,
-    ),
-  )
+  # No ball velocity for the actor. Position is the only quantity the perception
+  # chain provides on the real robot: the best available velocity is a finite
+  # difference of a 10 Hz noisy position, which is unusable. Velocity is therefore
+  # critic-only privileged information.
   cfg.observations["critic"].terms["ball_pos"] = ObservationTermCfg(
     func=mdp.ball_position_in_plate,
     params=dict(ball_state_params),
@@ -425,6 +447,7 @@ def agibot_x2_tennis_ball_env_cfg(
         "command_name": "twist",
         "stages": BALL_COMMAND_STAGES,
         "mastery_floor_s": BALL_COMMAND_MASTERY_FLOOR_S,
+        "max_track_err_frac": BALL_COMMAND_MAX_TRACK_ERR_FRAC,
         "window": BALL_COMMAND_WINDOW,
       },
     )

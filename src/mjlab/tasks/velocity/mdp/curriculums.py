@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, cast
 
 import numpy as np
 import torch
@@ -126,6 +126,18 @@ def commands_vel(
 ##
 
 
+class _FinishedEpisode(NamedTuple):
+  """One episode that has ended, as the promotion gate sees it.
+
+  ``length_steps`` is the episode's control-step count. ``track_err_mps`` is the
+  episode's **mean** planar velocity-tracking error, not the accumulated sum the
+  command term keeps.
+  """
+
+  length_steps: int
+  track_err_mps: float
+
+
 class ball_command_ramp(ManagerTermBase):
   """Widen the walking command on a schedule, blocked when the policy is failing.
 
@@ -138,8 +150,16 @@ class ball_command_ramp(ManagerTermBase):
 
   So the clock carries the difficulty, and performance can only **withhold** an
   advance: a stage is entered on its scheduled step only if the typical episode at
-  the current stage is at least ``mastery_floor_s``. That keeps a failing policy
-  from being pushed faster while leaving the progression predictable.
+  the current stage is at least ``mastery_floor_s`` **and** its typical planar
+  velocity-tracking error is at most ``max_track_err_frac`` times the stage's
+  fastest linear command. That keeps a failing policy from being pushed faster
+  while leaving the progression predictable.
+
+  The tracking condition exists because length alone is not evidence of walking. A
+  policy that stands still keeps the ball parked on the plate, so its episodes run
+  the full 20 s and clear every length floor while it misses the command by about
+  twice the commanded speed. Tracking is the skill the walk stages exist to teach,
+  so it is measured rather than inferred from survival.
 
   Advancement is one stage per call and one-way. The stage, the typical episode and
   the next stage's scheduled step are returned for the training log.
@@ -151,13 +171,17 @@ class ball_command_ramp(ManagerTermBase):
       ``env.common_step_counter``.
     mastery_floor_s: Typical episode length, in seconds, the current stage must
       sustain before the next one may be entered.
-    window: Number of finished episodes the typical length is measured over.
+    max_track_err_frac: Largest typical tracking error the current stage may show,
+      as a fraction of its fastest linear command. A fraction rather than a speed
+      so that one constant covers every stage.
+    window: Number of finished episodes the typical length and the typical tracking
+      error are measured over.
   """
 
   def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRlEnv):
     super().__init__(env)
     self._stage = 0
-    self._lengths: deque[float] = deque(maxlen=int(cfg.params["window"]))
+    self._episodes: deque[_FinishedEpisode] = deque(maxlen=int(cfg.params["window"]))
 
   def __call__(
     self,
@@ -166,35 +190,71 @@ class ball_command_ramp(ManagerTermBase):
     command_name: str,
     stages: Sequence[Mapping[str, Any]],
     mastery_floor_s: float,
+    max_track_err_frac: float,
     window: int,
   ) -> dict[str, torch.Tensor]:
     window = int(window)
     if env_ids is None:
       env_ids = slice(None)
 
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None
+    command_cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
+    ranges = command_cfg.ranges
+
+    # ``error_vel_xy`` accumulates the per-step planar error, each step divided by
+    # ``max_command_step`` (see ``UniformVelocityCommand._update_metrics``), and is
+    # zeroed only when the env resets. The episode mean is therefore the
+    # accumulator times that divisor over the episode's own step count.
+    max_command_step = command_cfg.resampling_time_range[1] / env.step_dt
+
     # ``env.episode_length_buf`` still holds the length of the episode that just
     # ended: the environment zeroes it only after every manager's reset.
-    lengths = env.episode_length_buf[env_ids]
-    if lengths.numel():
-      self._lengths.extend(lengths.detach().cpu().tolist())
+    steps = env.episode_length_buf[env_ids]
+    if steps.numel():
+      err_sum = command_term.metrics["error_vel_xy"][env_ids]
+      track_err = err_sum * max_command_step / steps.clamp(min=1)
+      self._episodes.extend(
+        _FinishedEpisode(int(n), float(err))
+        for n, err in zip(
+          steps.detach().cpu().tolist(),
+          track_err.detach().cpu().tolist(),
+          strict=True,
+        )
+      )
 
-    # A partial window is not evidence, so the floor is not evaluated yet.
-    complete = len(self._lengths) >= window
-    typical_seconds = float(np.median(self._lengths)) * env.step_dt if complete else 0.0
-    mean_seconds = float(np.mean(self._lengths)) * env.step_dt if self._lengths else 0.0
+    # A partial window is not evidence, so neither condition is evaluated yet, and
+    # both typical values read 0.0 until it is full.
+    complete = len(self._episodes) >= window
+    typical_seconds = 0.0
+    typical_track_err = 0.0
+    mean_seconds = 0.0
+    if self._episodes:
+      lengths = [episode.length_steps for episode in self._episodes]
+      mean_seconds = float(np.mean(lengths)) * env.step_dt
+      if complete:
+        typical_seconds = float(np.median(lengths)) * env.step_dt
+        typical_track_err = float(
+          np.median([episode.track_err_mps for episode in self._episodes])
+        )
+
+    # Scale-free threshold: a fraction of the fastest linear command the active
+    # stage allows, so one constant holds at every stage. Read before the ranges are
+    # written below, so the gate and the log both report the stage that was judged.
+    max_lin_speed = max(abs(v) for v in (*ranges.lin_vel_x, *ranges.lin_vel_y))
+    track_err_limit = float(max_track_err_frac) * max_lin_speed
 
     promoted = False
     if complete and self._stage + 1 < len(stages):
       next_stage = stages[self._stage + 1]
       scheduled = env.common_step_counter >= int(next_stage["min_step"])
-      mastered = typical_seconds >= mastery_floor_s
+      mastered = (
+        typical_seconds >= mastery_floor_s and typical_track_err <= track_err_limit
+      )
       if scheduled and mastered:
         self._stage += 1
         promoted = True
 
-    command_term = env.command_manager.get_term(command_name)
-    assert command_term is not None
-    ranges = cast(UniformVelocityCommandCfg, command_term.cfg).ranges
     active = stages[self._stage]
     for field_name in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
       if field_name in active:
@@ -206,6 +266,8 @@ class ball_command_ramp(ManagerTermBase):
       "promoted": torch.tensor(float(promoted)),
       "typical_episode_s": torch.tensor(typical_seconds),
       "mean_episode_s": torch.tensor(mean_seconds),
+      "typical_track_err_mps": torch.tensor(typical_track_err),
+      "track_err_limit_mps": torch.tensor(track_err_limit),
       "mastery_floor_s": torch.tensor(float(mastery_floor_s)),
       "next_stage_step": torch.tensor(float(stages[next_index]["min_step"])),
       "lin_vel_x_max": torch.tensor(float(ranges.lin_vel_x[1])),

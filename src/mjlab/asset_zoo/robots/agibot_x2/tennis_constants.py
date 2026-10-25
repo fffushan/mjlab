@@ -645,10 +645,9 @@ BALL_HEIGHT_WEIGHT = 0.1
 
 # Ball-state observation randomization. The real ball position comes from an
 # external perception program, not from the simulator, so the observation must be
-# as wrong as that program is. These are **six independent magnitudes**, one per
+# as wrong as that program is. These are **three independent magnitudes**, one per
 # dimension, because the errors are not alike: a camera measures the two lateral
-# axes better than the depth axis, and a velocity obtained by differentiating
-# position is far worse than either.
+# axes better than the depth axis.
 #
 # Units and frame: the plate frame, so x is along the shaft, y across it, z along
 # the plate normal. Each entry is a half-width of a symmetric **uniform**
@@ -660,21 +659,42 @@ BALL_HEIGHT_WEIGHT = 0.1
 #
 # * Position: +-5 mm along the two lateral axes and +-8 mm along the normal. The
 #   normal axis is the one least well observed, which is why it is the odd one out.
-# * Velocity: a position error of +-5 mm differenced over one perception frame at
-#   30 Hz is a worst case of ``2 * 5 mm / 33 ms = 0.3 m/s``, so +-0.15 m/s lateral
-#   and +-0.20 m/s along the normal is a moderate reading of the same arithmetic.
 #
 # **These are placeholders for the perception program's real error, not
 # measurements.** They are also the reason the centring reward has a plateau:
 # +-5 mm of position error on a plain Gaussian reward would show up as reward noise
 # exactly where the ball spends most of its time.
-#
-# Consequence worth knowing: at this magnitude the velocity observation cannot
-# distinguish a held ball (true relative speed ~0) from one sliding at 0.15 m/s, so
-# the policy must get its sense of motion from ``ball_pos`` changing over time. The
-# terms are still worth supplying: this policy is feed-forward and sees one frame.
 BALL_POSITION_NOISE_M = (0.005, 0.005, 0.008)
-BALL_VELOCITY_NOISE_M = (0.150, 0.150, 0.200)
+
+# Ball-position latency of the real perception chain, measured on the robot. The
+# head camera publishes at 10 Hz, so one frame serves five 50 Hz control steps
+# (``env.step_dt = 0.02 s``: 20 substeps of 1 ms), and a published position is
+# P50 110 ms and P95 141 ms old. In control steps that is 110 / 20 = 5.5 and
+# 141 / 20 = 7.05. The age a frame can have when the policy consumes it spans one
+# sensor period on top of that latency, so lags of 5 to 9 steps cover the usable
+# range, with the P95 age inside it. These are sensor facts, not tuning knobs.
+BALL_OBS_DELAY_MIN_STEPS = 5  # floor(110 ms / 20 ms).
+BALL_OBS_DELAY_MAX_STEPS = 9  # Floor(P50) + one 5-step sensor period - 1 step.
+BALL_OBS_UPDATE_PERIOD_STEPS = 5  # 10 Hz frame against the 50 Hz control rate.
+
+# Frame rejection: the perception chain also publishes **nothing** on some steps.
+# The detector drops a frame when it finds no ball, finds more than one candidate,
+# cannot fit a consistent depth, or when the live calibration differs; on a stream
+# break it publishes nothing at all. A deployed controller therefore repeats the
+# last valid position until a new one arrives, and the policy must see that same
+# behaviour or it will be fitted to a measurement that is always fresh.
+#
+# Chosen rate: one rejection every 50 control steps on average (1 s at 50 Hz),
+# each holding for 5-15 steps (100-300 ms at 50 Hz), so about 20 % of steps are
+# served from a stale value. One draw per environment per step, so rejections are
+# independent across the batch.
+#
+# **This is a placeholder for an unmeasured rejection rate.** The reference
+# perception implementation was only ever measured on a clean static scene
+# (293/293 frames valid), so nothing is known about rejection under motion or
+# occlusion. Replace these with the measured rate when there is one.
+BALL_DROPOUT_PROB = 0.02  # Probability per control step of a rejected frame.
+BALL_DROPOUT_HOLD_STEPS = (5, 15)  # Hold length in control steps: 100-300 ms.
 
 ##
 # Command curriculum.
@@ -740,6 +760,27 @@ BALL_COMMAND_STAGES: tuple[dict, ...] = (
 
 BALL_COMMAND_MASTERY_FLOOR_S = 8.0
 """Typical episode length the current stage must sustain before advancing."""
+
+# Tracking gate. A long episode is not evidence of walking: a policy that stands
+# still, or shuffles with 6 mm of foot clearance, keeps the ball parked on the plate,
+# so its episodes run the full 20 s and clear any length floor. Measured, such a
+# policy misses a +-0.3 m/s command by 0.586 m/s, i.e. about twice the command it was
+# given, while the floor above passes it.
+#
+# The limit is expressed as a **fraction of the fastest linear command of the active
+# stage** rather than in m/s, so one constant covers every stage: 0.075 m/s at the
+# 0.3 m/s stage, 0.15 m/s at 0.6 m/s and 0.25 m/s at 1.0 m/s. An absolute value would
+# have to be re-tuned at each widening, and a value that is reasonable at 0.3 m/s is
+# trivially satisfied at 1.0 m/s.
+#
+# 0.25 is a judgement call, not a measurement: no measurement of a good policy's
+# tracking error on this task exists yet. It rejects the observed failing case with a
+# margin of about 8 (0.075 m/s allowed against 0.586 m/s measured), and it asks a
+# promoted policy to spend no more than a quarter of its top commanded speed on
+# tracking error. Being too strict costs training time only, because this gate can
+# withhold an advance and never force one.
+BALL_COMMAND_MAX_TRACK_ERR_FRAC = 0.25
+"""Typical tracking error allowed before advancing, as a fraction of stage speed."""
 
 ##
 # Camera field of view.

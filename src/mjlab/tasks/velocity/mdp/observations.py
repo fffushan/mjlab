@@ -6,6 +6,8 @@ import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import FACE_SITE_POS
 from mjlab.entity import Entity
+from mjlab.managers.manager_base import ManagerTermBase
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
@@ -159,3 +161,81 @@ def ball_velocity_in_plate(
   """
   _, velocity = plate_relative_ball_state(env, plate_cfg, ball_cfg)
   return velocity
+
+
+class ball_position_hold(ManagerTermBase):
+  """Ball position in the plate frame, with rejected frames served from a hold.
+
+  The real perception chain does not deliver a measurement on every control step:
+  it publishes nothing when the colour detector finds no ball or more than one
+  candidate, when it cannot fit a consistent depth, and nothing at all when the
+  stream breaks. A deployed controller therefore repeats the last valid position
+  until a new one arrives, and the policy must train against that behaviour or it
+  will be fitted to a guaranteed-fresh measurement it never has.
+
+  On each step the term either passes the fresh position through or, with
+  probability ``rejection_prob``, starts a hold that repeats the last accepted
+  value for a number of steps drawn from ``hold_steps``. The held value and the
+  hold counter are per environment, so one rejected frame does not freeze another
+  environment's measurement, and both are cleared on reset so a new episode cannot
+  repeat the previous episode's position.
+
+  The first measurement after a reset is **always** accepted: there is no older
+  value to hold yet, and inventing one would feed the policy a fabricated
+  position. For the same reason the step after a hold always delivers a fresh
+  value. Without that refractory step a rejection probability of 1 would hold one
+  value forever, so the refresh the hold model exists to bound could not happen.
+  The cost is that an unlimited stream break is not representable: the longest
+  stale run is ``hold_steps`` long.
+
+  Args:
+    plate_cfg: The racket body inside the robot entity. Must resolve to one body.
+    ball_cfg: The ball entity.
+    rejection_prob: Probability per control step that a frame is rejected.
+    hold_steps: Inclusive ``(min, max)`` hold length in control steps.
+
+  Returns:
+    Tensor of shape ``(num_envs, 3)``, the same shape and frame as
+    :func:`ball_position_in_plate`.
+  """
+
+  def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._held = torch.zeros(env.num_envs, 3, device=env.device)
+    self._steps_left = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._has_value = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self._just_held = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    plate_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    rejection_prob: float,
+    hold_steps: tuple[int, int],
+  ) -> torch.Tensor:
+    fresh = ball_position_in_plate(env, plate_cfg, ball_cfg)
+    # One draw per environment per step, so a rejection in one environment says
+    # nothing about any other. An environment that is already holding consumes a
+    # draw and ignores it.
+    rejected = torch.rand(self.num_envs, device=fresh.device) < rejection_prob
+    start = rejected & (self._steps_left == 0) & self._has_value & ~self._just_held
+    low, high = hold_steps
+    drawn = torch.randint(int(low), int(high) + 1, (self.num_envs,), device=env.device)
+    self._steps_left = torch.where(start, drawn, self._steps_left)
+
+    holding = self._steps_left > 0
+    self._held = torch.where(holding[:, None], self._held, fresh)
+    self._has_value = self._has_value | ~holding
+    # The step that serves the last held value arms the refractory step.
+    self._just_held = holding & (self._steps_left == 1)
+    self._steps_left = (self._steps_left - 1).clamp(min=0)
+    return torch.where(holding[:, None], self._held, fresh)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._held[env_ids] = 0.0
+    self._steps_left[env_ids] = 0
+    self._has_value[env_ids] = False
+    self._just_held[env_ids] = False

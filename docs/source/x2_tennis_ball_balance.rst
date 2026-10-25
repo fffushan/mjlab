@@ -375,8 +375,9 @@ The policy has to hold the ball near the middle of the plate while the robot
 walks. Three things make that a well-posed problem: the ball must be observable,
 it must be paid for, and losing it must end the episode.
 
-**Observation.** Two 3-vectors are appended to both groups, taking the actor from
-102 to 108 and the critic from 117 to 123:
+**Observation.** A 3-vector position is appended to both groups and a 3-vector
+velocity to the critic alone, taking the actor from 102 to 105 and the critic from
+117 to 123:
 
 .. list-table:: Ball observation terms
    :header-rows: 1
@@ -384,7 +385,7 @@ it must be paid for, and losing it must end the episode.
    * - term
      - content
      - frame
-     - randomization (actor only, half-widths)
+     - actor randomization (half-widths)
    * - ``ball_pos``
      - ball centre relative to the plate's top-surface centre
      - plate
@@ -392,7 +393,7 @@ it must be paid for, and losing it must end the episode.
    * - ``ball_vel``
      - ball velocity relative to the plate
      - plate
-     - ±0.15, ±0.15, ±0.20 m/s along x, y, z
+     - none: critic only, uncorrupted
 
 The plate frame is the racket body frame translated to ``FACE_SITE_POS``: x along
 the shaft, y across it, z along the plate normal. A ball resting on the strings
@@ -406,15 +407,12 @@ subtracting only the origin's velocity would report a perfectly still ball as
 moving whenever the wrist turns. ``tests/test_x2_tennis_ball_task.py`` checks the
 ``v + ω × r`` form against MuJoCo's own ``site_vel_w`` to 1e-5.
 
-**The six dimensions are randomized independently.** Every other observation term
-in the velocity task uses ``Unoise``, a symmetric uniform distribution, and these
-two follow the same idiom: each of the six numbers above is a half-width, so the
-standard deviation along that axis is the half-width over √3. They are unequal
-because the errors are unequal — a camera measures the two lateral axes better
-than the depth axis, and a velocity obtained by differentiating position is far
-worse than either. A position error of ±5 mm differenced over one 30 Hz perception
-frame is a worst case of 0.3 m/s, which is where the velocity half-widths come
-from.
+**The three position dimensions are randomized independently.** Every other
+observation term in the velocity task uses ``Unoise``, a symmetric uniform
+distribution, and this term follows the same idiom: each of the three numbers above
+is a half-width, so the standard deviation along that axis is the half-width over
+√3. They are unequal because the errors are unequal — a camera measures the two
+lateral axes better than the depth axis.
 
 Both terms are tunable without code changes, like every other noise term:
 
@@ -434,11 +432,27 @@ position error on a plain Gaussian reward shows up as reward noise exactly where
 the ball spends most of its time. The critic sees the same two terms uncorrupted,
 like the rest of its privileged set.
 
-At these magnitudes the velocity observation cannot distinguish a held ball (true
-relative speed ~0) from one sliding at 0.15 m/s. That is deliberate: it is the
-honest description of what a differenced position can deliver. The policy must
-therefore infer motion from ``ball_pos`` changing between the frames it sees; the
-terms stay because this actor is feed-forward and sees a single frame.
+The actor has no ball-velocity term: on the real robot the only available velocity
+would be a finite difference of the 10 Hz position, which is unusable. It must
+therefore infer motion from ``ball_pos`` changing between the frames it sees. The
+critic keeps the velocity as privileged information.
+
+The actor's ``ball_pos`` is **delayed**, because the head stereo pipeline publishes
+at 10 Hz and a published position is 110 ms old at the median and 141 ms at P95.
+One frame covers five 50 Hz control steps, so the actor's lag is sampled from 5 to
+9 steps and resampled once per sensor period; the timing comes from the measured
+pipeline, not from tuning. The critic's ball terms stay undelayed because the critic
+is privileged. Delay changes timing only: the actor stays at 105 and the critic at
+123.
+
+The actor can also see a **stale** position, because the detector rejects frames
+and the stream can break: it publishes nothing when it finds no ball or several
+candidates, cannot fit a consistent depth, or loses the stream. The actor's
+position term therefore holds the last valid value for 100-300 ms when a frame is
+rejected. The rejection rate is a placeholder (``BALL_DROPOUT_PROB``, 2 % per
+control step): the reference implementation was only measured on a clean static
+scene (293/293 frames valid), so nothing is known about rejection under motion or
+occlusion. Holding changes neither the observation frame nor its width.
 
 **Reward.** Two terms, added to the base task's thirteen:
 
@@ -485,8 +499,9 @@ episode.
 
 **A new experiment name.** The observation width changed, so the observation
 normalizer has a different width and runs made before the ball was observed cannot
-be resumed. The task therefore trains under ``agibot_x2_velocity_tennis_ball_centre``
-rather than the previous ``..._balance``.
+be resumed. The task therefore trains under
+``agibot_x2_velocity_tennis_ball_centre_pos_only`` rather than the previous
+``..._balance``.
 
 **Untested: whether it trains.** At the shipped stage 0 the robot is commanded to
 stand still, and an untrained policy keeps the ball for about 0.55 s and then loses
@@ -805,7 +820,7 @@ Running
 
    uv run play Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Balance
 
-The PPO experiment name is ``agibot_x2_velocity_tennis_ball_balance``.
+The PPO experiment name is ``agibot_x2_velocity_tennis_ball_centre_pos_only``.
 
 Tests
 -----
