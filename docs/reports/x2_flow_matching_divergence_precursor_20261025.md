@@ -126,6 +126,9 @@ projections of the runaway layer, and the relative parameter update of those ten
 | Code fix required | `e0b1fa2d5`, the analyzer must read the model type from the checkpoint |
 | Replay check | The same-update rows reproduce within `5%`; the other rows in a 16-update ring belong to earlier weights |
 
+The scripts live under `logs/`, which git ignores. They stay on this laptop and on the
+servers; the report lists them so a rerun does not have to rebuild them.
+
 Two limits of the measurement. The activation pass sees 8 windows of one batch, so the
 statistics are per-batch, not per-run. The logit scale appears as a mean and a maximum. The
 report has no quantiles, so a heavy tail cannot be separated from a broad shift.
