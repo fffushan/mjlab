@@ -243,7 +243,6 @@ def load_checkpoint(
   required = {
     "model",
     "config",
-    "config_hash",
     "contract_identity",
     "schedule_identity",
     "projection_hashes",
@@ -271,12 +270,8 @@ def load_checkpoint(
   config = _require_mapping(payload, "config")
   projection_hashes_raw = _require_mapping(payload, "projection_hashes")
   dataset_identity = _require_mapping(payload, "dataset_identity")
-  config_hash = str(payload["config_hash"])
-  calculated_config_hash = hashlib.sha256(
-    json.dumps(dict(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
-  ).hexdigest()
-  if config_hash != calculated_config_hash:
-    raise CheckpointError("checkpoint config hash mismatch")
+  # Recorded, not policed, for the same reason as the flow family.
+  config_hash = str(payload.get("config_hash", ""))
   try:
     global_step = int(payload["global_step"])
     epoch = int(payload["epoch"])

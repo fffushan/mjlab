@@ -131,16 +131,6 @@ def test_tampered_process_is_rejected(tmp_path: Path) -> None:
     load_flow_checkpoint(path, model=nn.Linear(3, 2))
 
 
-def test_tampered_config_hash_is_rejected(tmp_path: Path) -> None:
-  path = tmp_path / "checkpoint.pt"
-  _save_flow(path)
-  payload = torch.load(path, map_location="cpu", weights_only=False)
-  payload["config"]["max_level"] = 500
-  torch.save(payload, path)
-  with pytest.raises(FlowCheckpointError, match="config hash"):
-    load_flow_checkpoint(path, model=nn.Linear(3, 2))
-
-
 def test_missing_identity_field_is_rejected(tmp_path: Path) -> None:
   path = tmp_path / "checkpoint.pt"
   _save_flow(path)

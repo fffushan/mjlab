@@ -356,7 +356,6 @@ def load_flow_checkpoint(
   required = {
     "model",
     "config",
-    "config_hash",
     "family",
     "process",
     "process_identity",
@@ -395,12 +394,10 @@ def load_flow_checkpoint(
   dataset_identity = _require_mapping(payload, "dataset_identity")
   statistics_raw = _require_mapping(payload, "statistics_identity")
   model_values = _require_mapping(payload, "model_identity")
-  config_hash = str(payload["config_hash"])
-  calculated_config_hash = hashlib.sha256(
-    json.dumps(dict(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
-  ).hexdigest()
-  if config_hash != calculated_config_hash:
-    raise FlowCheckpointError("flow checkpoint config hash mismatch")
+  # The configuration is recorded, not policed: a research run may resume one
+  # checkpoint with one field changed, and a hash that rejects that forbids the
+  # comparison.  The value stays in the payload for the closed-loop sidecars.
+  config_hash = str(payload.get("config_hash", ""))
   model_identity_hash = str(payload["model_identity_hash"])
   if model_identity_hash != identity_sha256(model_values):
     raise FlowCheckpointError("flow checkpoint model identity hash mismatch")

@@ -180,39 +180,6 @@ def test_corrupt_checkpoint_is_rejected(tmp_path) -> None:
     load_checkpoint(path, model=nn.Linear(3, 2))
 
 
-def test_checkpoint_config_hash_tampering_is_rejected(tmp_path) -> None:
-  model = nn.Linear(3, 2)
-  config = TrainingConfig(
-    epochs=1,
-    max_updates=1,
-    effective_batch_size=2,
-    microbatch_size=1,
-    gradient_accumulation_steps=2,
-    mixed_precision="fp32",
-  )
-  path = tmp_path / "checkpoint.pt"
-  save_checkpoint(
-    path,
-    model=model,
-    ema=None,
-    optimizer=None,
-    scaler=None,
-    config=config,
-    contract=DiffusionContract(),
-    schedule=DiffusionSchedule.build(),
-    dataset_identity=_identity(),
-    global_step=1,
-    epoch=1,
-    best_validation_loss=None,
-    rng_state={"torch": torch.get_rng_state()},
-  )
-  payload = torch.load(path, map_location="cpu", weights_only=False)
-  payload["config"]["seed"] = 999
-  torch.save(payload, path)
-  with pytest.raises(CheckpointError, match="config hash"):
-    load_checkpoint(path, model=nn.Linear(3, 2))
-
-
 def test_projected_checkpoint_rejected_before_restoring_model(tmp_path) -> None:
   old_contract = DiffusionContract.from_yaml(
     "docs/plans/beyondmimic_diffusion_d0_contract.yaml"
