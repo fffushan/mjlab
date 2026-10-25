@@ -42,6 +42,10 @@ from mjlab.tasks.tracking.diffusion.model import (
   DenoiserSettings,
   StateLatentTransformer,
 )
+from mjlab.tasks.tracking.diffusion.replay_integration import (
+  ReplayError,
+  flow_denoiser_type,
+)
 from mjlab.tasks.tracking.diffusion.state import state_field_channels
 from mjlab.tasks.tracking.flow_matching.checkpoint import FLOW_CHECKPOINT_FORMAT
 from mjlab.tasks.tracking.flow_matching.process import (
@@ -100,8 +104,15 @@ def _load_checkpoint(path: Path, device: torch.device):
   payload = torch.load(path, map_location="cpu", weights_only=False)
   if payload.get("format") != FLOW_CHECKPOINT_FORMAT:
     raise SystemExit(f"{path} is not a flow-matching checkpoint")
-  settings = DenoiserSettings(**payload["model_identity"]["settings"])
-  model = StateLatentTransformer(settings)
+  identity = payload.get("model_identity")
+  if not isinstance(identity, Mapping):
+    raise SystemExit(f"{path} records no model identity")
+  settings = DenoiserSettings(**identity["settings"])
+  try:
+    denoiser = flow_denoiser_type(identity.get("type"))
+  except ReplayError as error:
+    raise SystemExit(f"{path}: {error}") from error
+  model = denoiser(settings)
   model.load_state_dict(payload["model"], strict=True)
   model.to(device)
   model.eval()

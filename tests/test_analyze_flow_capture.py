@@ -22,6 +22,10 @@ from mjlab.tasks.tracking.diffusion.model import (
 )
 from mjlab.tasks.tracking.diffusion.training_config import TrainingConfig
 from mjlab.tasks.tracking.flow_matching import FlowTrainer, FlowTrainingConfig
+from mjlab.tasks.tracking.flow_matching.checkpoint import (
+  FLOW_CHECKPOINT_FORMAT,
+  model_identity,
+)
 from mjlab.tasks.tracking.flow_matching.diagnostics import (
   ENV_DIRECTORY,
   ENV_TRIGGER_FACTOR,
@@ -137,3 +141,44 @@ def test_a_capture_replays_to_the_recorded_loss(tmp_path: Path, monkeypatch) -> 
   stats = report["comparison"]["last_vs_trigger"]
   assert 0.0 <= stats["windows_worse"] <= 1.0
   assert (report_path.with_suffix(".md")).exists()
+
+
+def test_the_loader_builds_the_recorded_model_class(tmp_path: Path) -> None:
+  """A final-norm checkpoint must load, because the artifact names its class.
+
+  The closed-loop loader and this analyzer share one registry.  Before that
+  registry existed, both assumed the frozen base class and rejected every
+  final-norm checkpoint, which is how two captured arms became unanalyzable.
+  """
+  from mjlab.scripts.analyze_flow_capture import _load_checkpoint
+  from mjlab.tasks.tracking.diffusion.model_final_norm import (
+    StateLatentTransformerFinalNorm,
+  )
+
+  settings = _settings()
+  model = StateLatentTransformerFinalNorm(settings)
+  payload = {
+    "format": FLOW_CHECKPOINT_FORMAT,
+    "model": model.state_dict(),
+    "model_identity": {
+      "type": StateLatentTransformerFinalNorm.__qualname__,
+      "settings": model_identity(StateLatentTransformerFinalNorm(settings))["settings"],
+    },
+    "process": {"max_level": 100},
+    "global_step": 7,
+  }
+  path = tmp_path / "checkpoint-final-norm.pt"
+  torch.save(payload, path)
+  loaded, process, restored = _load_checkpoint(path, torch.device("cpu"))
+  assert isinstance(loaded, StateLatentTransformerFinalNorm)
+  assert restored["global_step"] == 7
+  assert process.max_level == 100
+
+  payload["model_identity"]["type"] = "NotARecordedDenoiser"
+  torch.save(payload, path)
+  try:
+    _load_checkpoint(path, torch.device("cpu"))
+  except SystemExit as error:
+    assert "unsupported model type" in str(error)
+  else:
+    raise AssertionError("an unknown recorded type must fail closed")

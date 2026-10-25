@@ -287,12 +287,13 @@ def load_denoiser(
 _FLOW_DENOISER_TYPES: dict[str, Any] = {}
 
 
-def _flow_denoiser_type(name: object) -> type[StateLatentTransformer]:
+def flow_denoiser_type(name: object) -> type[StateLatentTransformer]:
   """Resolve a recorded model type name to the class that must be built.
 
   The checkpoint already names the class that produced it, so the loader reads
   the architecture from the artifact instead of assuming the frozen default
-  shape.  Unknown names fail closed.
+  shape.  Unknown names fail closed.  This is the only registry of denoiser
+  classes, shared by the closed-loop loader and the capture analyzer.
   """
   if not _FLOW_DENOISER_TYPES:
     from .model import StateLatentTransformer as base
@@ -492,7 +493,7 @@ def load_flow_denoiser(
       f"checkpoint {settings.token_dimension}x{settings.sequence_length}, "
       f"contract {dimensions.token_dimension}x{dimensions.window_steps}"
     )
-  model = _flow_denoiser_type(recorded_identity.get("type"))(settings)
+  model = flow_denoiser_type(recorded_identity.get("type"))(settings)
   try:
     state = load_flow_checkpoint(
       checkpoint_path,
