@@ -289,14 +289,25 @@ def test_resume_restores_a_checkpoint_whose_rng_states_left_cpu(
   assert resumed.sampler_generator.get_state().dtype == torch.uint8
 
 
-def test_resume_rejects_mismatched_identity(tmp_path: Path) -> None:
+def test_resume_accepts_a_changed_config_and_names_it(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A precision or schedule branch must be able to resume one checkpoint.
+
+  The config hash used to reject any changed field, which blocked every paired
+  branch.  Resume now accepts the change, records the config it ran with, and
+  prints the fields that moved.
+  """
   config = _config(epochs=1, max_updates=2)
   first = _trainer(tmp_path / "first", config=config)
   checkpoint = first._save("checkpoint-probe.pt", epoch=0, best_validation_loss=None)
 
   changed_config = _config(epochs=1, max_updates=2, seed=5)
-  with pytest.raises(FlowTrainerError, match="config identity"):
-    _trainer(tmp_path / "config", config=changed_config, resume=checkpoint)
+  resumed = _trainer(tmp_path / "config", config=changed_config, resume=checkpoint)
+  assert resumed.global_step == first.global_step
+  note = capsys.readouterr().out
+  assert "resume note" in note
+  assert "seed" in note
 
   with pytest.raises(FlowTrainerError, match="process identity"):
     _trainer(

@@ -53,7 +53,10 @@ from ..diffusion.trainer import (
   _history_dropout_mask,
   _set_seed,
 )
-from ..diffusion.training_config import warmup_cosine_learning_rate
+from ..diffusion.training_config import (
+  config_differences,
+  warmup_cosine_learning_rate,
+)
 from ..tensorboard_logging import open_for
 from .checkpoint import (
   FlowCheckpointError,
@@ -333,8 +336,16 @@ class FlowTrainer:
     )
 
   def _validate_resume(self, state: FlowCheckpointState) -> None:
-    if state.config_hash != self.config_hash:
-      raise FlowTrainerError("resume config identity mismatch")
+    # A changed configuration is allowed: the trainer records the config it
+    # actually ran with, and names the fields that moved.  Refusing here made
+    # every precision or schedule branch impossible.
+    changed = config_differences(dict(state.config), self.config.as_dict())
+    if changed:
+      print(
+        f"resume note: {len(changed)} config field(s) differ from the "
+        f"checkpoint: {', '.join(changed[:8])}",
+        flush=True,
+      )
     if state.family != self.process.as_dict()["family"]:
       raise FlowTrainerError("resume flow family mismatch")
     if state.process_identity != self.process_identity:

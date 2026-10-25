@@ -217,7 +217,10 @@ Training writes ``flow-run.json`` (schema ``mjlab-flow-matching-run-v1``),
 ``checkpoint-last.pt``, ``checkpoint-best.pt`` and optional periodic checkpoints.
 The flow checkpoint records the ``max_level`` process identity, the data
 contract identity, the dataset and statistics identities, the model identity and
-the noise and sampler generator states. A resume rejects any identity mismatch.
+the noise and sampler generator states. A resume rejects a process, data or
+dataset identity mismatch. It accepts a changed training configuration, because a
+paired branch needs to resume one checkpoint with one field changed; the trainer
+then records the configuration it ran with and prints the fields that differ.
 
 Step 3: offline generation evaluation
 -------------------------------------

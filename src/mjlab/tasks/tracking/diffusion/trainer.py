@@ -31,6 +31,7 @@ from .profiling import StepProfiler
 from .schedule import DiffusionSchedule
 from .training_config import (
   TrainingConfig,
+  config_differences,
   ema_decay,
   warmup_cosine_learning_rate,
 )
@@ -551,8 +552,15 @@ class DiffusionTrainer:
     )
 
   def _validate_resume(self, state: CheckpointState) -> None:
-    if state.config_hash != self.config_hash:
-      raise TrainerError("resume config identity mismatch")
+    # Same rule as the flow trainer: a changed configuration resumes and is
+    # named in the log, because the artifact records what actually ran.
+    changed = config_differences(dict(state.config), self.config.as_dict())
+    if changed:
+      print(
+        f"resume note: {len(changed)} config field(s) differ from the "
+        f"checkpoint: {', '.join(changed[:8])}",
+        flush=True,
+      )
     if state.contract_identity != self.contract.identity_hash():
       raise TrainerError("resume contract identity mismatch")
     if state.schedule_identity != self.schedule.identity_hash():

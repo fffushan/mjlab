@@ -387,6 +387,33 @@ def _check_frozen_section(
       )
 
 
+def config_differences(
+  previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> list[str]:
+  """Name the configuration fields that differ between two resolved configs.
+
+  Resume accepts a changed configuration on purpose.  A research run often needs
+  one field changed, for example the precision, and an identity gate makes that
+  impossible.  The cost of accepting it is that the difference must be visible,
+  so the trainer prints these names instead of refusing to start.
+  """
+  flat_previous = _flatten_config(previous)
+  flat_current = _flatten_config(current)
+  names = sorted(set(flat_previous) | set(flat_current))
+  return [name for name in names if flat_previous.get(name) != flat_current.get(name)]
+
+
+def _flatten_config(values: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+  flat: dict[str, Any] = {}
+  for key, value in values.items():
+    name = f"{prefix}{key}"
+    if isinstance(value, Mapping):
+      flat.update(_flatten_config(value, f"{name}."))
+    else:
+      flat[name] = value
+  return flat
+
+
 def warmup_cosine_learning_rate(
   update_index: int,
   *,
