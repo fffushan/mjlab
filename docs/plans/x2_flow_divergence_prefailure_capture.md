@@ -1,7 +1,8 @@
 # Plan: reproduce one flow divergence with pre-failure evidence
 
 Date: 2026-10-25 (+08).
-Status: proposal. No job was started. All commands below need operator authorization.
+Status: phase 0 is complete (report `../reports/x2_flow_matching_divergence_precursor_20261025.md`).
+No training job was started. Every command below needs operator authorization.
 Scope: the state-latent flow trainer and its diagnostics sidecar. Training and simulation only.
 Input: `docs/reports/x2_flow_matching_literature_recommendations_20261025.md`.
 
@@ -71,6 +72,23 @@ The stored log still answers one class of question without any new run: it holds
 gradient norm and the 12 block norms at every update from step 1, so the first abnormal
 **gradient** movement can be located offline. What it cannot do is show which internal
 quantity moved first, because activations were never stored.
+
+## 3.1 What phase 0 changed
+
+Phase 0 measured the saved logs and four saved captures. Three results rewrite parts of this
+plan.
+
+| Finding | Consequence for the plan |
+| --- | --- |
+| The gradient and the loss rise on the same update, or within `864` | A gradient trigger captures the event, not a precursor. Add a cadence instrument |
+| One layer's attention logit scale is `100` to `1 000` times the survivor level at the loss minimum | The instrument is the logit scale, not the loss and not the gradient |
+| The best-loss checkpoint already carries the runaway layer | Model selection needs a weight statistic, and the reproduction start state is already abnormal |
+
+The last point is a limit, not a detail. `checkpoint-best` of `cap-6x384` sits at `90 850`
+updates with layer `3` at a mean logit scale of `1 308`, against `43` for the same layer in a
+survivor. The reproduction run therefore measures the **growth rate and the blow-up** from an
+already-abnormal state. It cannot measure the onset. Section 6 adds an optional short arm for
+that question.
 
 ## 4. Reproduction target and design
 
@@ -161,6 +179,8 @@ The existing sidecar already writes 1.5 GB per `400 000` updates. Per-tensor gra
 | Gradient-ratio trigger | factor `3.0`, max `8` events | Captures the first rise, not the blow-up |
 | Capture ring | `32` micro-batches | Reaches `32` updates back from the event |
 | Forced capture | one dump at a fixed update, default `91 000` | Gives a healthy batch at known weights |
+| **Cadence capture** | every `500` updates, only the first `8` windows | Gives a logit-scale curve against the update axis at `8 MB` per 1 000 updates |
+| Cadence retention | keep every 10th cadence capture, delete the rest | Bounds the disk to about `40` files |
 | Stop on event count | `3` events | Bounds the run |
 
 Storage: `3 × 185 MB` rolling plus `8 × 185 MB` trigger plus captures of about `8 × 30 MB`,
@@ -178,6 +198,7 @@ Add to `scripts/analyze_flow_capture.py`. All of it is offline work on a saved c
 | Per-sublayer residual RMS and maximum | Karras-style magnitude drift |
 | LayerNorm learned gain: mean, absolute maximum | A growing gain moves everything downstream |
 | `adamw_eps_fraction` from the checkpoint state | Tests the Wortsman epsilon interaction |
+| Logit scale on the cadence curve | One number per capture, so growth becomes a series |
 | `--diff OTHER.json` | Prints healthy-versus-precursor deltas instead of two separate reports |
 
 ### 5.4 Run record
@@ -192,16 +213,18 @@ from the checkpoint identity and the update rows, but a reader should not have t
 
 | Phase | Work | Gate | Cost |
 | --- | --- | --- | --- |
-| 0a | Mine the existing `updates.jsonl` for the first abnormal gradient movement in four arms | A step index and a block are named, with the loss still near baseline | 1 to 2 h, CPU only |
-| 0b | Run the analyzer now on `capture-0107069.npz` against `checkpoint-trigger-0107069.pt`, and on the pre-crossing `fn-2048` capture at `76 529` | Either a q/k growth signal already appears, or the attention hypothesis loses its cheapest test | 1 h, CPU only |
-| 1 | Implement section 5.1, 5.2 and 5.4, with tests | Unit tests pass; a `200`-update smoke run writes every new field | 3 to 4 h, local |
+| 0a | Mine the existing `updates.jsonl` for the first abnormal gradient movement | **done**: gradient and loss move together; no single learning-rate area separates the arms | complete |
+| 0b | Analyze four saved captures against their own pre-step checkpoints, plus two survivor controls | **done**: one layer runs away, `100` to `1 000` times the survivor level at the loss minimum | complete |
+| 1 | Implement section 5.1, 5.2 and 5.4, with tests, and the cadence capture | Unit tests pass; a `200`-update smoke run writes every new field and two cadence captures | 4 to 5 h, local |
 | 2 | Determinism gate: resume `cap-6x384-w384` from `checkpoint-best.pt` for `200` updates, then diff loss and gradient norm against the stored rows. Dump one healthy capture at a fixed update | Relative difference below `1e-5` on every update, or the branch design is invalid. The dump gives the healthy baseline that no current capture provides | 10 min GPU |
 | 3 | Reproduction run, `90 825` to `112 000`, ratio triggers on | A gradient event is captured, and its capture replays with a replay error near zero | 2.5 h GPU |
 | 4 | Analyzer extensions and the healthy-versus-precursor diff | One table that names the first internal quantity that moved, or states that none did | 2 to 3 h, CPU |
 | 5 | Four paired branches, `5 000` updates each, four GPUs in parallel | Control reproduces the event; each treatment either moves it or does not | 1 h wall clock |
 
-Phase 0 is free and should run first, because it may already name the block and the update,
-which decides where phase 3 sets its ring.
+Optional phase 6, only if the onset matters: a fresh `30 000`-update run of the small model
+with cadence captures from update `1`. Cost is about `3` hours, and it answers a different
+question: at which update does the runaway layer leave the survivor range. Phase 3 cannot
+answer it, because its start state is already outside that range.
 
 ## 7. Decisions that need the operator
 
@@ -211,6 +234,7 @@ which decides where phase 3 sets its ring.
 | Change the trainer trigger | Yes, ratio trigger with 8 events | Keep the loss trigger and accept post-onset captures |
 | QK normalization branch | Retrofit from the pre-failure checkpoint | Fresh architecture test, which needs its own control |
 | Where the run writes | A new group under the existing preview-bulk root | A fresh root, which needs its own contract copy |
+| Selection guardrail | Record the maximum per-layer logit scale in every checkpoint sidecar; refuse to promote a checkpoint above a threshold | Leave selection on validation loss and accept that the best checkpoint is already drifting |
 
 ## 8. Out of scope
 
