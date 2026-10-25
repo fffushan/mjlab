@@ -1119,7 +1119,10 @@ def _validate_audit_cache(
     if isinstance(metadata.get("content_sha256"), str)
     else None,
   )
-  _validate_cache(cache, metadata_path, expected, verify_hash=True)
+  # The audit checks counts and the sample digest; the whole-file digest is an
+  # explicit request through MJLAB_TOKEN_CACHE_FULL_HASH because it costs
+  # about thirty minutes on the 144-motion cache.
+  _validate_cache(cache, metadata_path, expected)
   return {
     "valid": True,
     "window_count": metadata.get("window_count"),

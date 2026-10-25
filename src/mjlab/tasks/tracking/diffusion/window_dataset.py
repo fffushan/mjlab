@@ -38,7 +38,12 @@ from .storage import AppendOnlyShardStore, TrajectoryRow
 
 _SPLITS = ("train", "validation", "test")
 _CACHE_VERSION = "mjlab-x2-diffusion-token-cache-v2"
-_CACHE_NON_IDENTITY_KEYS = frozenset(("created_at", "content_sha256", "file_identity"))
+_CACHE_NON_IDENTITY_KEYS = frozenset(
+  ("created_at", "content_sha256", "sample_sha256", "file_identity")
+)
+FULL_HASH_ENV = "MJLAB_TOKEN_CACHE_FULL_HASH"
+_SAMPLE_SEGMENT_BYTES = 8 * 1024 * 1024
+_SAMPLE_NOTICES: set[str] = set()
 _DEFAULT_MAX_CACHE_GIB = 8.0
 
 
@@ -851,6 +856,42 @@ def _file_identity_matches(path: str | Path, recorded: object) -> bool:
   return all(stored.get(key) == value for key, value in current.items())
 
 
+def _full_hash_requested() -> bool:
+  """Report whether the operator asked for the whole-file digest.
+
+  The full digest costs about thirty minutes for the 144-motion cache over the
+  cluster filesystem.  It is worth paying when a byte flip in the middle of the
+  array is the thing under suspicion, and not on every start.
+  """
+  return os.environ.get(FULL_HASH_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _sample_offsets(size: int) -> list[int]:
+  if size <= _SAMPLE_SEGMENT_BYTES:
+    return [0]
+  middle = max(0, size // 2 - _SAMPLE_SEGMENT_BYTES // 2)
+  return sorted({0, middle, max(0, size - _SAMPLE_SEGMENT_BYTES)})
+
+
+def _sample_sha256(path: str | Path) -> str:
+  """Hash the size and three slices of a large array file.
+
+  A truncation, a partial copy, a short write or a damaged header changes one of
+  these slices, which are the failures this project has actually seen.  A byte
+  flip in the untouched middle is not detected; the full digest and the disk
+  scrubber own that case.
+  """
+  file_path = Path(path)
+  size = file_path.stat().st_size
+  digest = hashlib.sha256()
+  digest.update(str(size).encode("ascii"))
+  with file_path.open("rb") as handle:
+    for offset in _sample_offsets(size):
+      handle.seek(offset)
+      digest.update(handle.read(min(_SAMPLE_SEGMENT_BYTES, size - offset)))
+  return digest.hexdigest()
+
+
 def _validate_cache(
   path: Path,
   metadata_path: Path,
@@ -896,11 +937,25 @@ def _validate_cache(
     raise WindowCacheError(
       "token cache is missing a valid content_sha256; rebuild the cache"
     )
-  if verify_hash or not _file_identity_matches(path, metadata.get("file_identity")):
-    actual_sha256 = _sha256_file(path)
-    if actual_sha256 != content_sha256:
+  if verify_hash or _full_hash_requested():
+    if _sha256_file(path) != content_sha256:
       raise WindowCacheError(
         "token cache content_sha256 does not match the .npy bytes; rebuild the cache"
+      )
+  elif not _file_identity_matches(path, metadata.get("file_identity")):
+    recorded_sample = metadata.get("sample_sha256")
+    if isinstance(recorded_sample, str) and len(recorded_sample) == 64:
+      if _sample_sha256(path) != recorded_sample:
+        raise WindowCacheError(
+          "token cache sample digest does not match the .npy bytes; rebuild the cache"
+        )
+    elif str(path) not in _SAMPLE_NOTICES:
+      _SAMPLE_NOTICES.add(str(path))
+      print(
+        f"token cache {Path(path).name}: integrity limited to size and shape, "
+        f"because the file was not written by this host and records no sample "
+        f"digest; set {FULL_HASH_ENV}=1 to hash the whole file",
+        flush=True,
       )
   return metadata, array
 
@@ -1068,6 +1123,7 @@ def _build_token_cache_unlocked(
 
     metadata = dict(expected)
     metadata["content_sha256"] = content_sha256
+    metadata["sample_sha256"] = _sample_sha256(destination)
     metadata["file_identity"] = file_identity
     metadata["created_at"] = datetime.now(timezone.utc).isoformat()
     with tempfile.NamedTemporaryFile(

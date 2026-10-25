@@ -455,8 +455,14 @@ def test_reused_cache_skips_the_digest_when_the_file_is_unchanged(
   assert digests == []
 
 
-def test_changed_cache_file_is_digest_verified(tmp_path, monkeypatch) -> None:
-  """A later modification invalidates the recorded identity and is verified."""
+def test_changed_cache_file_is_sample_verified(tmp_path, monkeypatch) -> None:
+  """A later modification invalidates the identity and is checked cheaply.
+
+  The whole-file digest costs about thirty minutes on the 144-motion cache over
+  the cluster filesystem, so a changed timestamp triggers the sampled digest
+  instead: first, middle and last slice, which cover a truncation or a partial
+  copy.
+  """
   source = _synthetic_source(
     tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
   )
@@ -464,17 +470,17 @@ def test_changed_cache_file_is_digest_verified(tmp_path, monkeypatch) -> None:
   prepared = prepare_token_cache(source, loaded, "train", jobs=1)
   os.utime(prepared.path, ns=(0, 0))
 
-  digests: list[Path] = []
-  original = window_dataset._sha256_file
+  samples: list[Path] = []
+  original = window_dataset._sample_sha256
 
   def traced(path):
-    digests.append(Path(path))
+    samples.append(Path(path))
     return original(path)
 
-  monkeypatch.setattr(window_dataset, "_sha256_file", traced)
+  monkeypatch.setattr(window_dataset, "_sample_sha256", traced)
   again = prepare_token_cache(source, loaded, "train", jobs=1)
   assert again.cache_status == "reused"
-  assert digests == [prepared.path]
+  assert samples == [prepared.path]
 
 
 def test_fast_path_accepts_in_place_edit_that_restores_mtime(tmp_path) -> None:
@@ -497,3 +503,51 @@ def test_fast_path_accepts_in_place_edit_that_restores_mtime(tmp_path) -> None:
   window_dataset._validate_cache(path, metadata_path, metadata)
   with pytest.raises(WindowCacheError):
     window_dataset._validate_cache(path, metadata_path, metadata, verify_hash=True)
+
+
+def test_sample_digest_detects_a_changed_tail(tmp_path) -> None:
+  """A damaged tail with a moved timestamp is caught by the sampled digest."""
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  prepared = prepare_token_cache(source, loaded, "train", jobs=1)
+  path = prepared.path
+  metadata_path = path.with_suffix(".json")
+  metadata = json.loads(metadata_path.read_text())
+  raw = bytearray(path.read_bytes())
+  raw[-1] ^= 0xFF
+  path.write_bytes(bytes(raw))
+  os.utime(path, ns=(0, 0))
+
+  with pytest.raises(window_dataset.WindowCacheError, match="sample digest"):
+    window_dataset._validate_cache(path, metadata_path, metadata)
+
+
+def test_full_hash_env_restores_the_whole_file_check(tmp_path, monkeypatch) -> None:
+  """The full digest remains available as an explicit request."""
+  source = _synthetic_source(
+    tmp_path, {"group-a": "train"}, {"group-a": 59}, shard_rows=7
+  )
+  loaded = source.load()
+  prepared = prepare_token_cache(source, loaded, "train", jobs=1)
+  path = prepared.path
+  metadata_path = path.with_suffix(".json")
+  metadata = json.loads(metadata_path.read_text())
+
+  calls: list[Path] = []
+  original = window_dataset._sha256_file
+
+  def traced(target):
+    calls.append(Path(target))
+    return original(target)
+
+  monkeypatch.setattr(window_dataset, "_sha256_file", traced)
+  monkeypatch.setenv(window_dataset.FULL_HASH_ENV, "1")
+  window_dataset._validate_cache(path, metadata_path, metadata)
+  assert calls == [path]
+
+  calls.clear()
+  monkeypatch.setenv(window_dataset.FULL_HASH_ENV, "")
+  window_dataset._validate_cache(path, metadata_path, metadata)
+  assert calls == []
