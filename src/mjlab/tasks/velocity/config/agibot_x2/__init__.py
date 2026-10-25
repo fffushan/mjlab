@@ -7,6 +7,7 @@ from mjlab.tasks.velocity.rl import (
 from .env_cfgs import agibot_x2_flat_velocity_env_cfg
 from .rl_cfg import agibot_x2_velocity_ppo_runner_cfg
 from .tennis_ball_env_cfg import agibot_x2_tennis_ball_env_cfg
+from .tennis_juggle_env_cfg import agibot_x2_tennis_juggle_env_cfg
 from .tennis_recovery_env_cfg import agibot_x2_tennis_recovery_env_cfg
 from .tennis_recovery_rl_cfg import agibot_x2_tennis_recovery_ppo_runner_cfg
 
@@ -36,6 +37,24 @@ register_mjlab_task(
   # name.
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
     experiment_name="agibot_x2_velocity_tennis_ball_centre_pos_only"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Juggling variant of the tennis-ball task: the ball bounces on the plate and
+# returns to an apex about 30 cm above it, instead of being carried. Same scene,
+# observations, resets, termination and domain randomization as the balancing
+# task above; the reward set pays per bounce and charges for parking the ball, the
+# twist command is pinned to a standstill band, and there is no command
+# curriculum. The observation contract is unchanged, so the widths are the
+# balancing task's 105/123, but the reward set is not, hence a separate experiment
+# name. See tennis_juggle_env_cfg.py and docs/source/x2_tennis_ball_juggle.rst.
+register_mjlab_task(
+  task_id="Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle",
+  env_cfg=agibot_x2_tennis_juggle_env_cfg(),
+  play_env_cfg=agibot_x2_tennis_juggle_env_cfg(play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle"
   ),
   runner_cls=VelocityOnPolicyRunner,
 )

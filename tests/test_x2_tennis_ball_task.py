@@ -25,6 +25,7 @@ default pose), so in-environment retention needs a trained policy.
 
 from __future__ import annotations
 
+import math
 import re
 from types import SimpleNamespace
 from typing import Any, cast
@@ -70,6 +71,15 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   CONTACT_FRICTION,
   FACE_SITE,
   FACE_SITE_POS,
+  JUGGLE_APEX_MIN_CLEARANCE_M,
+  JUGGLE_APEX_MIN_SPEED_MPS,
+  JUGGLE_APEX_SIGMA_M,
+  JUGGLE_APEX_TARGET_M,
+  JUGGLE_APEX_WEIGHT,
+  JUGGLE_REST_CLEARANCE_M,
+  JUGGLE_REST_GRACE_S,
+  JUGGLE_REST_SPEED_MPS,
+  JUGGLE_REST_WEIGHT,
   RACKET_BODY,
   RACKET_DIAGINERTIA,
   RACKET_MASS,
@@ -94,6 +104,7 @@ from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.observation_manager import ObservationTermCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.velocity import mdp
@@ -1840,3 +1851,323 @@ def test_the_head_terms_are_wired_with_the_expected_signs() -> None:
   assert head.weight < 0
   # Soft: the FOV term must not outbid the centring term, which is the task.
   assert fov.weight < cfg.rewards["ball_centred"].weight
+
+
+##
+# Juggling: a bounce pays once, and parking the ball is charged.
+##
+
+PLATE_ENTITY = "robot"
+GRAVITY = 9.81
+
+# Plate top surface at the carry pose, world z. The same value the juggle
+# constants are written against.
+CARRY_FACE_Z = 1.1194
+
+
+class _StubJuggleEnv:
+  """The plate face and the ball state the juggle terms read, and nothing else.
+
+  Driving the terms directly keeps these tests off the physics path: the apex
+  detector is a filter on (gap, world vertical speed), so a scripted sequence puts a
+  sign crossing on a chosen step, at a chosen gap, with a chosen launch. A MuJoCo
+  bounce cannot be aimed that precisely.
+  """
+
+  def __init__(self, num_envs: int = 1, step_dt: float = 0.02):
+    self.num_envs = num_envs
+    self.device = "cpu"
+    self.step_dt = step_dt
+    # The gap the terms must report for a ball placed by ``drive``. An upright
+    # plate puts its face at this height; a tilted one is set up in its own test.
+    self.face_height = CARRY_FACE_Z
+    self.plate = SimpleNamespace(
+      data=SimpleNamespace(
+        body_link_pos_w=torch.tensor([[0.0, 0.0, CARRY_FACE_Z - FACE_SITE_POS[2]]])
+        .repeat(num_envs, 1, 1)
+        .clone(),
+        body_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        .repeat(num_envs, 1, 1)
+        .clone(),
+      )
+    )
+    self.ball = SimpleNamespace(
+      data=SimpleNamespace(
+        root_link_pos_w=torch.zeros(num_envs, 3),
+        root_link_lin_vel_w=torch.zeros(num_envs, 3),
+      )
+    )
+    self.scene = {PLATE_ENTITY: self.plate, BALL_ENTITY: self.ball}
+
+  def drive(self, gap, vertical_speed) -> None:
+    """Set the gap under the ball and its world vertical speed, one row per env."""
+    gap_t = torch.as_tensor(gap, dtype=torch.float).expand(self.num_envs)
+    speed_t = torch.as_tensor(vertical_speed, dtype=torch.float).expand(self.num_envs)
+    self.ball.data.root_link_pos_w[:, 2] = self.face_height + BALL_RADIUS + gap_t
+    self.ball.data.root_link_lin_vel_w[:, 2] = speed_t
+
+
+def _juggle_params(**overrides) -> dict[str, Any]:
+  plate_cfg = SceneEntityCfg(PLATE_ENTITY, body_ids=[0])
+  ball_cfg = SceneEntityCfg(BALL_ENTITY)
+  apex = dict(
+    plate_cfg=plate_cfg,
+    ball_cfg=ball_cfg,
+    target_height=JUGGLE_APEX_TARGET_M,
+    sigma=JUGGLE_APEX_SIGMA_M,
+    min_clearance=JUGGLE_APEX_MIN_CLEARANCE_M,
+    min_speed=JUGGLE_APEX_MIN_SPEED_MPS,
+  )
+  rest = dict(
+    plate_cfg=plate_cfg,
+    ball_cfg=ball_cfg,
+    max_clearance=JUGGLE_REST_CLEARANCE_M,
+    max_speed=JUGGLE_REST_SPEED_MPS,
+    grace_s=JUGGLE_REST_GRACE_S,
+  )
+  target = rest if overrides.pop("term", "apex") == "rest" else apex
+  target.update(overrides)
+  return target
+
+
+def _apex_term(env, **overrides):
+  params = _juggle_params(term="apex", **overrides)
+  cfg = RewardTermCfg(
+    func=mdp.ball_bounce_apex, weight=JUGGLE_APEX_WEIGHT, params=params
+  )
+  return mdp.ball_bounce_apex(cfg, env), params
+
+
+def _rest_term(env, **overrides):
+  params = _juggle_params(term="rest", **overrides)
+  cfg = RewardTermCfg(func=mdp.ball_at_rest, weight=JUGGLE_REST_WEIGHT, params=params)
+  return mdp.ball_at_rest(cfg, env), params
+
+
+def _toss(launch_speed: float, steps: int, step_dt: float = 0.02):
+  """``(gap, vertical speed)`` of a ball in free flight, one entry per step.
+
+  Ballistic, so the apex is a real one: the launch speed sets both the apex,
+  ``v0^2 / (2 g)``, and the step where the vertical speed changes sign.
+  """
+  profile = []
+  for step in range(steps):
+    t = step_dt * step
+    profile.append(
+      (launch_speed * t - 0.5 * GRAVITY * t * t, launch_speed - GRAVITY * t)
+    )
+  return profile
+
+
+def test_the_apex_reward_peaks_at_the_target_and_is_symmetric() -> None:
+  """A bell that peaked off target would teach the wrong apex height.
+
+  0.20 and 0.40 are equidistant from the 0.30 target, so they must be worth the
+  same. Both must be worth less than an apex at the target itself, which is the
+  only clearance that earns full credit.
+  """
+
+  def apex_reward(gap: float) -> float:
+    env = cast(Any, _StubJuggleEnv())
+    term, params = _apex_term(env)
+    env.drive(gap, 1.0)
+    assert float(term(env, **params)[0]) == 0.0, "rising is not an apex"
+    env.drive(gap, -1.0)
+    return float(term(env, **params)[0])
+
+  assert apex_reward(JUGGLE_APEX_TARGET_M) == pytest.approx(1.0)
+  near, far = apex_reward(0.26), apex_reward(0.34)
+  low, high = apex_reward(0.20), apex_reward(0.40)
+  assert near == pytest.approx(far, abs=1e-5)
+  assert near == pytest.approx(0.7788, abs=1e-4)
+  assert near < 1.0
+  assert low == pytest.approx(high, abs=1e-5), "the bell is symmetric about the target"
+  assert low == pytest.approx(0.2096, abs=1e-4)
+  assert low < near
+
+
+def test_a_ball_at_rest_never_collects_an_apex_reward() -> None:
+  """A parked ball crosses zero on its own, so the gates must reject it.
+
+  Its gap is about zero and its vertical speed wobbles by centimetres per second,
+  at every phase of the wobble. A ball hovering slowly at a paying clearance is the
+  same failure one gate further in, and must also earn nothing.
+  """
+  for phase in range(20):
+    env = cast(Any, _StubJuggleEnv())
+    term, params = _apex_term(env)
+    for step in range(60):
+      env.drive(0.0, 0.02 * math.sin(0.7 * (step + phase)))
+      assert float(term(env, **params)[0]) == 0.0, (phase, step)
+
+  env = cast(Any, _StubJuggleEnv())
+  term, params = _apex_term(env)
+  for step in range(40):
+    env.drive(JUGGLE_APEX_TARGET_M, 0.05 * math.sin(0.7 * step))
+    assert float(term(env, **params)[0]) == 0.0, step
+    assert float(term.last_bounce[0]) == 0.0, step
+
+
+def test_a_real_toss_pays_exactly_once() -> None:
+  """One bounce is one payment, not one on the way up and another on the way down."""
+  env = cast(Any, _StubJuggleEnv())
+  term, params = _apex_term(env)
+  launch = math.sqrt(2.0 * GRAVITY * JUGGLE_APEX_TARGET_M)
+  rewards = []
+  for gap, speed in _toss(launch, steps=40):
+    env.drive(max(gap, 0.0), speed)
+    rewards.append(float(term(env, **params)[0]))
+
+  paid = [step for step, reward in enumerate(rewards) if reward > 0.0]
+  assert len(paid) == 1, paid
+  assert rewards[paid[0]] == pytest.approx(1.0, abs=1e-3)
+  assert sum(rewards[: paid[0]]) == 0.0, "nothing on the way up"
+  assert sum(rewards[paid[0] + 1 :]) == 0.0, "nothing on the way down"
+
+
+def test_an_apex_below_the_minimum_clearance_is_ignored_even_with_high_speed() -> None:
+  """A 2 cm hop with a 3 m/s launch still does not count: the apex is too low."""
+  env = cast(Any, _StubJuggleEnv())
+  term, params = _apex_term(env)
+  low = JUGGLE_APEX_MIN_CLEARANCE_M - 0.01
+  env.drive(low, 3.0)
+  assert float(term(env, **params)[0]) == 0.0
+  env.drive(low, -3.0)
+  assert float(term(env, **params)[0]) == 0.0, "the clearance gate must reject it"
+
+  # The same launch at a paying clearance does pay, so the gate is the clearance
+  # and not the speed.
+  env.drive(JUGGLE_APEX_TARGET_M, 3.0)
+  assert float(term(env, **params)[0]) == 0.0
+  env.drive(JUGGLE_APEX_TARGET_M, -3.0)
+  assert float(term(env, **params)[0]) == pytest.approx(1.0)
+
+
+def test_a_toss_in_one_environment_does_not_award_another() -> None:
+  """One environment bounces, the other is parked, and only the bouncer is paid."""
+  env = cast(Any, _StubJuggleEnv(num_envs=2))
+  term, params = _apex_term(env)
+  launch = math.sqrt(2.0 * GRAVITY * JUGGLE_APEX_TARGET_M)
+  toss = _toss(launch, steps=40)
+  paid = torch.zeros(2)
+  for step, (gap, speed) in enumerate(toss):
+    env.drive([max(gap, 0.0), 0.0], [speed, 0.02 * math.sin(0.7 * step)])
+    got = term(env, **params)
+    assert float(got[1]) == 0.0, step
+    paid += got
+
+  assert float(paid[1]) == 0.0
+  assert float(paid[0]) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_a_reset_clears_the_apex_state() -> None:
+  """A new episode must not read the previous episode's rise as a crossing.
+
+  Both environments are mid-rise with a paying launch when one of them resets and
+  its ball appears already descending at a paying apex. The stale rising speed
+  would turn that first step into an instant payment.
+  """
+  env = cast(Any, _StubJuggleEnv(num_envs=2))
+  term, params = _apex_term(env)
+  env.drive(JUGGLE_APEX_TARGET_M, 2.5)
+  assert float(term(env, **params)[0]) == 0.0
+
+  term.reset(env_ids=torch.tensor([0]))
+  env.drive([JUGGLE_APEX_TARGET_M, JUGGLE_APEX_TARGET_M], [-2.5, -2.5])
+  got = term(env, **params)
+  assert float(got[0]) == 0.0, "the reset environment must not inherit the rise"
+  assert float(got[1]) == pytest.approx(1.0), "the other environment does cross"
+
+  # A genuine new rise in the reset environment still pays exactly once.
+  env.drive([JUGGLE_APEX_TARGET_M, 0.0], [2.5, 0.0])
+  assert float(term(env, **params)[0]) == 0.0
+  env.drive([JUGGLE_APEX_TARGET_M, 0.0], [-2.5, 0.0])
+  assert float(term(env, **params)[0]) == pytest.approx(1.0)
+
+
+def test_ball_at_rest_waits_out_the_grace_period() -> None:
+  """A bounce passes through "low and slow" for a moment; a park stays there."""
+  env = cast(Any, _StubJuggleEnv())
+  term, params = _rest_term(env)
+  grace_steps = round(JUGGLE_REST_GRACE_S / env.step_dt)
+  assert grace_steps == 25
+
+  launch = math.sqrt(2.0 * GRAVITY * JUGGLE_APEX_TARGET_M)
+  for gap, speed in _toss(launch, steps=40):
+    env.drive(max(gap, 0.0), speed)
+    assert float(term(env, **params)[0]) == 0.0, "a bouncing ball is not parked"
+
+  for step in range(grace_steps - 1):
+    env.drive(0.0, 0.01 * (-1) ** step)
+    assert float(term(env, **params)[0]) == 0.0, step
+  env.drive(0.0, 0.0)
+  assert float(term(env, **params)[0]) == 1.0, "the grace period is over"
+
+
+def test_ball_at_rest_returns_to_zero_as_soon_as_the_ball_leaves() -> None:
+  """Leaving breaks the run, so the next park has to serve the whole grace again."""
+  env = cast(Any, _StubJuggleEnv())
+  term, params = _rest_term(env)
+  for _ in range(round(JUGGLE_REST_GRACE_S / env.step_dt)):
+    env.drive(0.0, 0.0)
+    got = float(term(env, **params)[0])
+  assert got == 1.0
+
+  env.drive(0.6, 0.0)
+  assert float(term(env, **params)[0]) == 0.0, "a ball clear of the plate is not parked"
+  env.drive(0.0, 3.0)
+  assert float(term(env, **params)[0]) == 0.0, (
+    "a ball in contact at speed is not parked"
+  )
+  env.drive(0.0, 0.0)
+  assert float(term(env, **params)[0]) == 0.0, "the grace period restarts"
+
+
+def test_the_apex_gap_is_measured_along_the_world_vertical() -> None:
+  """A tilted racket must not move the apex: gravity defines the axis, not the plate.
+
+  The plate is tilted 60 degrees, so 0.30 m along the plate normal is only 0.15 m of
+  world height. A term that measured clearance along the normal would pay in full
+  for the second case and give the first one almost nothing.
+  """
+  from mjlab.utils.lab_api.math import quat_apply
+
+  env = cast(Any, _StubJuggleEnv())
+  angle = math.radians(60.0)
+  tilt = torch.tensor([[math.cos(angle / 2), 0.0, math.sin(angle / 2), 0.0]])
+  env.plate.data.body_link_quat_w = tilt.unsqueeze(1)
+  env.plate.data.body_link_pos_w = torch.tensor([[[0.0, 0.0, CARRY_FACE_Z]]])
+  face_offset = quat_apply(tilt, torch.tensor([FACE_SITE_POS]))
+  env.face_height = CARRY_FACE_Z + float(face_offset[0, 2])
+
+  term, params = _apex_term(env)
+  env.drive(JUGGLE_APEX_TARGET_M, 1.0)
+  assert float(term(env, **params)[0]) == 0.0
+  env.drive(JUGGLE_APEX_TARGET_M, -1.0)
+  assert float(term(env, **params)[0]) == pytest.approx(1.0)
+
+  along_the_normal = JUGGLE_APEX_TARGET_M * math.cos(angle)
+  env.drive(along_the_normal, 1.0)
+  assert float(term(env, **params)[0]) == 0.0
+  env.drive(along_the_normal, -1.0)
+  assert float(term(env, **params)[0]) < 0.05
+
+
+def test_the_bounce_count_reports_the_apex_payments() -> None:
+  """The metrics adapter must count payments, so one toss sums to one bounce."""
+  env = cast(Any, _StubJuggleEnv())
+  term, params = _apex_term(env)
+  env.reward_manager = SimpleNamespace(
+    get_term_cfg=lambda name: SimpleNamespace(func=term)
+  )
+
+  launch = math.sqrt(2.0 * GRAVITY * JUGGLE_APEX_TARGET_M)
+  total = torch.zeros(1)
+  for gap, speed in _toss(launch, steps=40):
+    env.drive(max(gap, 0.0), speed)
+    term(env, **params)
+    counted = mdp.ball_bounce_count(env)
+    assert counted.shape == (1,)
+    total += counted
+
+  assert float(total[0]) == pytest.approx(1.0)

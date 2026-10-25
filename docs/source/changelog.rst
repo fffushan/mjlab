@@ -112,6 +112,49 @@ Added
   without slipping at 0.10 m/s keeps 0.56 of its speed after one second, and
   1.00 of it with the rolling coefficient zeroed.
 
+- Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle``,
+  which asks for a ball that bounces on the plate and returns to an apex about
+  300 mm above it, repeatedly. The task is a **copy** of the carrying task with a
+  different ball objective, so the carrying task is unchanged; the robot, racket,
+  ball, contact model, observations and terminations are its.
+
+  Height cannot be paid per control step. A ball parked at the apex height would
+  collect a per-step height reward for as long as it stayed there, which is the
+  carrying behaviour this task exists to replace, so ``ball_bounce_apex`` pays
+  **once per bounce** - a Gaussian in the apex clearance, centred at 300 mm with an
+  80 mm sigma - at the instant the ball's *world* vertical speed changes sign
+  (gravity defines an apex, not the tilting plate normal). A crossing counts only
+  if the apex clearance is at least 30 mm and the peak rising speed of that rise
+  was at least 0.30 m/s, so a resting ball's jitter cannot pay. Two details are
+  load-bearing. The speed gate uses the **peak** speed of the rise, because the
+  previous control step's speed is capped by ``g * dt`` = 0.196 m/s and a 0.30 gate
+  on it could never open. Clearance is the **gap under the ball**, not the height
+  of its centre, because a resting ball's centre already sits one radius above the
+  plate, so a 30 mm resting threshold measured from the centre would never fire.
+  ``ball_at_rest`` charges a ball parked low and slow for 0.5 s, which removes the
+  "park it and stand still" fallback, and ``ball_centred`` is kept at a reduced
+  weight so the ball must still land on the strings. ``ball_height`` is gone: it
+  was flat to 100 mm and paid for a parked ball.
+
+  Version 1 juggles **standing still**: the twist command is pinned to +-0.10 m/s
+  and +-0.05 rad/s and the command curriculum is absent. Walking while juggling is
+  a later step. ``Episode_Metrics/ball_bounce_count`` is the acceptance metric,
+  because a reward can be gamed and a counter cannot. It reads the reward term's
+  state, so the apex weight must stay non-zero or the count goes stale.
+
+  A 300 mm apex costs almost nothing in field of view: measured on the built task
+  at the carry pose, the ball sits at 0.434 of the camera half-frame against 0.271
+  at rest, and the field-of-view reward stays exactly 1.000. That reward starts to
+  fall just above a 0.41 m gap, so 300 mm is comfortable and 400 mm is about the
+  practical ceiling for full credit.
+
+  In 100 iterations at 4096 environments the bounce count first falls from 1.09 to
+  0.04 and then rises to 1.73 per episode, while the apex quality is still under
+  1 % of a perfect apex, so the height target is not learned yet. **That is not
+  evidence of juggling.** Tests drive the terms with scripted ball states; no
+  physical bounce and no trained policy were validated. See
+  ``docs/source/x2_tennis_ball_juggle.rst``.
+
 - Added the offline joint-pose rollout tool at
   ``mjlab.scripts.joint_pose_rollout``. It reads the window geometry, denoiser
   sizes and noise scale from one checkpoint, rolls one reference clip into a

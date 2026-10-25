@@ -865,6 +865,80 @@ HEAD_MOTION_WEIGHT = -0.05
 BALL_COMMAND_WINDOW = 100
 """Finished episodes the promotion gate waits for before deciding."""
 
+##
+# Juggling task definition: the ball bounces on the plate and comes back to an
+# apex, instead of being carried.
+#
+# The apex reward is paid **once per bounce**, so what matters is the height of a
+# bounce, not the height of the ball on some arbitrary step. All heights below are
+# the **gap under the ball's lowest point**, measured along the world vertical from
+# the centre of the plate's top surface: a ball resting on the strings reads about
+# zero. The world vertical, and not the plate normal, because the plate tilts while
+# juggling and gravity is what turns the ball around.
+##
+
+# Apex gap the bounce reward targets: 300 mm under the ball. The plate top surface at
+# the carry pose is world z 1.1194, so the ball centre reaches 1.1194 + 0.0327 + 0.30
+# = 1.452 m. Measured on the built task at that height, the ball sits at 0.434 of the
+# camera half-frame (27.8 deg against the 64.0 deg vertical half-angle) and the
+# field-of-view reward is still exactly 1.000, because 0.434 is inside the 0.60
+# plateau. At rest the same ball reads 0.271, so the apex costs almost nothing in
+# field of view and the target is inside the frame by construction, not by luck. The
+# falloff begins just above 0.41 m of gap (0.5950 at 0.41, 0.6081 at 0.42).
+#
+# An earlier comment here claimed 0.889. That figure was wrong: it came from a
+# measurement script that built the camera pose from the robot's root link instead of
+# the head body. Do not restore it.
+JUGGLE_APEX_TARGET_M = 0.30
+
+# Gaussian falloff of the apex reward in the apex gap. 80 mm puts 1/e at an apex of
+# 0.22 or 0.38 m, i.e. a bounce 8 cm out is still worth 0.37.
+JUGGLE_APEX_SIGMA_M = 0.08
+
+# Smallest apex gap that can pay. A ball resting on the plate has a gap of about zero
+# and its vertical speed wobbles around zero, so it produces sign crossings of its
+# own; this gate and the speed gate below are what reject them.
+JUGGLE_APEX_MIN_CLEARANCE_M = 0.03
+
+# Smallest peak upward speed of the rise that can pay: 30 cm of apex needs a launch of
+# sqrt(2 * 9.81 * 0.30) = 2.43 m/s, so a real bounce clears this by a factor of eight
+# while contact jitter on a parked ball, a few cm/s, does not. It is applied to the
+# **peak** of the rise: gravity removes 0.20 m/s per 0.02 s control step, so the last
+# sample before the apex is small whatever the launch was.
+JUGGLE_APEX_MIN_SPEED_MPS = 0.30
+
+# Resting test for the parking penalty: a gap below 30 mm and a world vertical speed
+# below 0.20 m/s. The grace period is what keeps the bottom of a real bounce, which
+# passes through this state for about two control steps, from being charged.
+JUGGLE_REST_CLEARANCE_M = 0.03
+JUGGLE_REST_SPEED_MPS = 0.20
+JUGGLE_REST_GRACE_S = 0.50
+
+# Weights. The reward manager scales every term by the same step duration, so the
+# comparison below is between weight values.
+#
+# Centring is charged at a quarter of the ball-holding task's 1.0 because the ball is
+# in the air for most of the cycle and cannot be steered there; the apex payment has
+# to carry the task instead. Over one 0.5 s bounce cycle at 50 Hz, i.e. 25 control
+# steps, carrying the ball earns about 0.25 x 25 = 6 from centring alone. A juggle
+# earns about 6.0 per apex, the same 6 per cycle, plus the same centring while the
+# ball is near the plate, so juggling is worth roughly twice as much as parking the
+# ball at the target height. The rest penalty tips that balance rather than dominating
+# it: a parked ball still collects centring, so parking earns about 6.25 - 2.5 = 3.75
+# per cycle against roughly 12 for juggling.
+#
+# **These are first guesses to be tuned against the bounce count, not measurements.**
+# The ratio is the claim; the absolute values only set the scale of the reward.
+JUGGLE_APEX_WEIGHT = 6.0
+JUGGLE_CENTRE_WEIGHT = 0.25
+JUGGLE_REST_WEIGHT = -0.10
+
+# Command for the first juggling version: the robot juggles standing still, so the
+# twist command is a small jitter around zero instead of the holding task's walking
+# curriculum. Walking while juggling is a later step.
+JUGGLE_COMMAND_LIN_VEL_MPS = 0.10
+JUGGLE_COMMAND_ANG_VEL_RPS = 0.05
+
 
 # Lowest foot contact point may be this far below z=0 before the pose counts as
 # penetrating the ground.

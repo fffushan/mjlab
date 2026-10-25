@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import BALL_RADIUS, FACE_SITE_POS
 from mjlab.entity import Entity
+from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
@@ -621,3 +623,251 @@ def head_joint_motion(
   """
   asset: Entity = env.scene[asset_cfg.name]
   return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1)
+
+
+##
+# Tennis juggling: the ball bounces off the plate and returns to an apex.
+#
+# The holding terms above pay every control step, which cannot express a bounce. A
+# ball parked at the apex height would collect a per-step height reward for as long as
+# the episode lasts, so the height of an apex has to be paid once per bounce instead.
+# These terms do that, and charge for parking the ball.
+##
+
+
+def _ball_gap_and_vertical_speed(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """The gap under the ball, and the ball's world vertical speed.
+
+  The gap is measured along the **world vertical**, from the centre of the plate's
+  top surface down to the ball's **lowest point**: a ball resting on the strings
+  reads about zero, a positive value is clearance under it. The plate's top surface
+  is the racket body pose translated by the rotated ``FACE_SITE_POS``, the same
+  point the ball observations measure from.
+
+  The axis is the world's, not the plate normal, because gravity defines a bounce:
+  the ball turns around where its world vertical speed changes sign, and its highest
+  point is a world-frame fact. The plate tilts while juggling, so its normal is not a
+  fixed direction to measure an apex against.
+
+  Args:
+    plate_cfg: Racket body. Must resolve to exactly one body.
+    ball_cfg: Ball entity.
+
+  Returns:
+    ``(gap, vertical_speed)``, each shape ``(num_envs,)``. Positive
+    ``vertical_speed`` is upward.
+  """
+  plate: Entity = env.scene[plate_cfg.name]
+  ball: Entity = env.scene[ball_cfg.name]
+  body_ids = plate_cfg.body_ids
+  if isinstance(body_ids, slice) or len(body_ids) != 1:
+    raise ValueError(
+      f"plate_cfg must resolve to exactly one racket body, got {body_ids}"
+    )
+  body_id = body_ids[0]
+  plate_pos_w = plate.data.body_link_pos_w[:, body_id]
+  plate_quat_w = plate.data.body_link_quat_w[:, body_id]
+  face_offset = torch.tensor(
+    FACE_SITE_POS, dtype=plate_pos_w.dtype, device=plate_pos_w.device
+  )
+  face_pos_w = plate_pos_w + quat_apply(
+    plate_quat_w, face_offset.expand_as(plate_pos_w)
+  )
+  gap = ball.data.root_link_pos_w[:, 2] - face_pos_w[:, 2] - BALL_RADIUS
+  return gap, ball.data.root_link_lin_vel_w[:, 2]
+
+
+class ball_bounce_apex(ManagerTermBase):
+  r"""Pay once per bounce, when the ball's apex is at the target height.
+
+  .. math:: r = \exp(-((h_\mathrm{apex} - h_\mathrm{target}) / \sigma)^2)
+
+  paid on the apex step and 0 on every other step, where :math:`h_\mathrm{apex}` is
+  the gap under the ball at the top of the bounce, as
+  :func:`_ball_gap_and_vertical_speed` defines it.
+
+  A per-step height reward cannot express a bounce: a ball parked at the target
+  height collects it on every step of the episode, which is exactly the behaviour
+  this term rules out. Paying once per apex leaves bouncing as the only way to earn
+  it again.
+
+  **Apex detection.** An apex is a step where the ball's **world vertical** velocity
+  crosses from positive to negative. Gravity defines that axis, so it is the axis the
+  ball really turns around on; the plate normal is not, because the plate tilts.
+
+  **Rejecting a parked ball.** A ball resting on the plate has a vertical speed that
+  wobbles around zero, so it produces sign crossings of its own. Two gates reject
+  them: the apex gap must reach ``min_clearance``, and the rise's **peak upward
+  speed** must reach ``min_speed``. The peak, and not the previous step's speed:
+  gravity changes the vertical speed by 0.20 m/s over one 0.02 s control step, so the
+  last positive sample before a crossing is at most 0.20 m/s whatever the launch was,
+  and a ``min_speed`` of 0.30 would never open. The peak is the launch speed the ball
+  actually reached.
+
+  With ``min_clearance`` at 3 cm the speed gate is mostly redundant, because a 3 cm
+  rise already implies a 0.77 m/s launch. It stays as a cheap guard against a small
+  crossing produced by contact jitter.
+
+  Args:
+    plate_cfg: Racket body; the plate frame is defined by it.
+    ball_cfg: Ball entity.
+    target_height: Apex gap that earns exactly 1.0, in metres.
+    sigma: Falloff of the Gaussian in the apex gap, in metres.
+    min_clearance: Smallest apex gap that can count, in metres.
+    min_speed: Smallest peak upward speed of the rise that can count, in m/s.
+
+  Returns:
+    Shape ``(num_envs,)``, between 0 and 1, and 0 on every non-apex step.
+
+  Per-environment state, all cleared on reset: the previous step's vertical speed,
+  the peak upward speed of the current rise, a flag that marks the first step of an
+  episode (no crossing can be read against a stale value), and :attr:`last_bounce`.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    del cfg  # No parameters are needed before the first call.
+    super().__init__(env)
+    self._prev_vertical_speed = torch.zeros(env.num_envs, device=env.device)
+    self._peak_rising_speed = torch.zeros(env.num_envs, device=env.device)
+    self._first_step = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    self.last_bounce = torch.zeros(env.num_envs, device=env.device)
+    """Per-step bounce flag: 1.0 on a counted apex, 0.0 otherwise.
+
+    Public because :func:`ball_bounce_count` reports it as a metrics term. It is
+    overwritten on every call, so a metric reads the step the reward manager has
+    just computed.
+    """
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    plate_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    target_height: float,
+    sigma: float,
+    min_clearance: float,
+    min_speed: float,
+  ) -> torch.Tensor:
+    gap, vertical_speed = _ball_gap_and_vertical_speed(env, plate_cfg, ball_cfg)
+    # The peak includes this step, so a bounce that is already past its apex when
+    # the episode starts still carries the speed it rose with.
+    peak = torch.maximum(self._peak_rising_speed, torch.clamp(vertical_speed, min=0.0))
+    crossed = (self._prev_vertical_speed > 0.0) & (vertical_speed <= 0.0)
+    apex = crossed & ~self._first_step
+    counted = apex & (gap >= min_clearance) & (peak >= min_speed)
+    bell = torch.exp(-torch.square((gap - target_height) / sigma))
+    reward = torch.where(counted, bell, torch.zeros_like(bell))
+    # An apex ends the rise, so the next bounce starts its own peak. A crossing the
+    # gates rejected resets it too: resting jitter must not accumulate a launch.
+    self._peak_rising_speed = torch.where(apex, torch.zeros_like(peak), peak)
+    # Cloned: the entity buffer this comes from is refreshed in place.
+    self._prev_vertical_speed = vertical_speed.clone()
+    self._first_step = torch.zeros_like(self._first_step)
+    self.last_bounce = counted.float()
+    return reward
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._prev_vertical_speed[env_ids] = 0.0
+    self._peak_rising_speed[env_ids] = 0.0
+    self._first_step[env_ids] = True
+    self.last_bounce[env_ids] = 0.0
+
+
+def ball_bounce_count(
+  env: ManagerBasedRlEnv,
+  reward_term_name: str = "ball_bounce_apex",
+) -> torch.Tensor:
+  """Per-step bounce count of :class:`ball_bounce_apex`, for a metrics term.
+
+  One counted apex is 1.0 for one step and 0.0 otherwise, so a metrics entry with
+  ``reduce="sum"`` reports bounces per episode::
+
+    metrics = {
+      "ball_bounces": MetricsTermCfg(func=mdp.ball_bounce_count, reduce="sum"),
+    }
+
+  The flag is read from the reward term, which the reward manager computes before
+  the metrics manager on the same step. **Keep the apex reward weight non-zero:**
+  ``RewardManager.compute`` skips terms whose weight is 0, so the flag would go
+  stale and the count would freeze at whatever it last held.
+
+  Args:
+    reward_term_name: Reward manager key of the ``ball_bounce_apex`` term.
+
+  Returns:
+    Shape ``(num_envs,)``, 0.0 or 1.0 per environment per step.
+  """
+  term = env.reward_manager.get_term_cfg(reward_term_name).func
+  if not isinstance(term, ball_bounce_apex):
+    raise TypeError(
+      f"reward term '{reward_term_name}' is not ball_bounce_apex, got "
+      f"{type(term).__name__}"
+    )
+  return term.last_bounce
+
+
+class ball_at_rest(ManagerTermBase):
+  """Indicator that the ball is parked on the plate, for a negative weight.
+
+  Returns 1.0 when the ball has been still on the plate **continuously** for
+  ``grace_s`` seconds, and 0.0 otherwise, so the config can give the term a negative
+  weight. It exists to remove the "park the ball and stand still" solution that a
+  bounce reward otherwise leaves open.
+
+  Still means the gap under the ball is below ``max_clearance`` and its world
+  vertical speed is below ``max_speed``. The grace period is what separates a park
+  from a bounce: at the bottom of every contact the ball passes through the same low,
+  slow state, but only for as long as its speed takes to grow past ``max_speed``
+  (about 40 ms at a 2.4 m/s launch, i.e. two control steps), while a parked ball
+  stays there for the whole episode.
+
+  The counter is per environment, is cleared on reset, and restarts from zero the
+  moment either condition breaks, so one environment cannot hold another above the
+  threshold.
+
+  Args:
+    plate_cfg: Racket body; the plate frame is defined by it.
+    ball_cfg: Ball entity.
+    max_clearance: Largest gap under the ball that still counts as resting, in
+      metres.
+    max_speed: Largest world vertical speed that still counts as resting, in m/s.
+    grace_s: Seconds the conditions must hold without a break.
+
+  Returns:
+    Shape ``(num_envs,)``, 0.0 or 1.0.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    # Whole control steps: the condition is sampled once per step, so a grace
+    # shorter than one step is one step.
+    self._grace_steps = max(1, round(float(cfg.params["grace_s"]) / env.step_dt))
+    self._rest_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    plate_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    max_clearance: float,
+    max_speed: float,
+    grace_s: float,
+  ) -> torch.Tensor:
+    del grace_s  # Resolved to whole control steps in ``__init__``.
+    gap, vertical_speed = _ball_gap_and_vertical_speed(env, plate_cfg, ball_cfg)
+    resting = (gap < max_clearance) & (torch.abs(vertical_speed) < max_speed)
+    self._rest_steps = torch.where(
+      resting, self._rest_steps + 1, torch.zeros_like(self._rest_steps)
+    )
+    return (self._rest_steps >= self._grace_steps).float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._rest_steps[env_ids] = 0
