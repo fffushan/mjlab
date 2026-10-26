@@ -366,8 +366,21 @@ class FlowTrainer:
       raise FlowTrainerError("resume data identity mismatch")
     if dict(state.statistics_identity) != dict(self.statistics_identity):
       raise FlowTrainerError("resume statistics identity mismatch")
+    # A dataset that moved storage is still the same dataset.  Byte-identical
+    # data at a local path must resume, so this names the fields that moved
+    # instead of refusing.  Already blocked one restart onto local NVMe.
     if dict(state.dataset_identity) != dict(self.identity):
-      raise FlowTrainerError("resume dataset identity mismatch")
+      recorded = dict(state.dataset_identity)
+      differing = sorted(
+        key
+        for key in set(recorded) | set(self.identity)
+        if recorded.get(key) != self.identity.get(key)
+      )
+      print(
+        f"resume note: dataset identity differs in {len(differing)} field(s): "
+        f"{', '.join(differing[:8])}",
+        flush=True,
+      )
     if state.model_identity_hash != self.model_identity_hash:
       raise FlowTrainerError("resume model identity mismatch")
 

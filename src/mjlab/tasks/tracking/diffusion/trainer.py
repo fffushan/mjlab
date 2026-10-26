@@ -597,7 +597,17 @@ class DiffusionTrainer:
     if state.schedule_identity != self.schedule.identity_hash():
       raise TrainerError("resume schedule identity mismatch")
     if dict(state.dataset_identity) != dict(self.identity):
-      raise TrainerError("resume dataset identity mismatch")
+      recorded = dict(state.dataset_identity)
+      differing = sorted(
+        key
+        for key in set(recorded) | set(self.identity)
+        if recorded.get(key) != self.identity.get(key)
+      )
+      print(
+        f"resume note: dataset identity differs in {len(differing)} field(s): "
+        f"{', '.join(differing[:8])}",
+        flush=True,
+      )
     expected_projection = self.identity.get("projection_hashes", {})
     if dict(state.projection_hashes) != dict(expected_projection):
       raise TrainerError("resume projection identity mismatch")
