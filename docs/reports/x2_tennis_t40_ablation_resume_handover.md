@@ -67,9 +67,9 @@ The launcher forwards extra arguments, and `ITERS` overrides the iteration count
 
 ```bash
 tmux new-session -d -s t40-A3 \
-  "ITERS=20500 bash /home/fushan/mjlab-tennis40/launch_arm.sh A3 7 \
-     --agent.resume True --agent.load-checkpoint model_9500.pt 2>&1 \
-     | tee -a /home/fushan/logs/t40-A3-resume2.log"
+  "ITERS=13000 bash /home/fushan/mjlab-tennis40/launch_arm.sh A0 4 \
+     --agent.resume True --agent.load-checkpoint model_17000.pt 2>&1 \
+     | tee -a /home/fushan/logs/t40-A0-resume.log"
 ```
 
 The trainer chooses the source run itself: it takes the alphabetically last run directory under
