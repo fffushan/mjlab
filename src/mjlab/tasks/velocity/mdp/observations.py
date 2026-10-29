@@ -188,11 +188,20 @@ class ball_position_hold(ManagerTermBase):
   The cost is that an unlimited stream break is not representable: the longest
   stale run is ``hold_steps`` long.
 
+  ``bias_half_width_m`` adds a **constant** offset per environment per episode,
+  drawn once at reset and applied to every measurement of that episode. It models a
+  biased measurement chain rather than a noisy one: the robot's camera-to-pelvis
+  disagreement is a fixed 24.69 mm / 1.24 deg, which zero-mean noise cannot
+  represent. The default of 0.0 reproduces the unbiased chain exactly, and the
+  offset is drawn per episode so a policy cannot average it out within one.
+
   Args:
     plate_cfg: The racket body inside the robot entity. Must resolve to one body.
     ball_cfg: The ball entity.
     rejection_prob: Probability per control step that a frame is rejected.
     hold_steps: Inclusive ``(min, max)`` hold length in control steps.
+    bias_half_width_m: Half-width of the constant per-episode offset, in metres on
+      each plate axis. 0.0 disables it.
 
   Returns:
     Tensor of shape ``(num_envs, 3)``, the same shape and frame as
@@ -201,6 +210,9 @@ class ball_position_hold(ManagerTermBase):
 
   def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedRlEnv):
     super().__init__(env)
+    half = float(cfg.params.get("bias_half_width_m", 0.0) or 0.0)
+    self._bias_half_width_m = half
+    self._bias = self._draw_bias(env.num_envs, env.device, half)
     self._held = torch.zeros(env.num_envs, 3, device=env.device)
     self._steps_left = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     self._has_value = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -213,8 +225,10 @@ class ball_position_hold(ManagerTermBase):
     ball_cfg: SceneEntityCfg,
     rejection_prob: float,
     hold_steps: tuple[int, int],
+    bias_half_width_m: float = 0.0,
   ) -> torch.Tensor:
-    fresh = ball_position_in_plate(env, plate_cfg, ball_cfg)
+    del bias_half_width_m  # Drawn once per episode in ``reset``/``__init__``.
+    fresh = ball_position_in_plate(env, plate_cfg, ball_cfg) + self._bias
     # One draw per environment per step, so a rejection in one environment says
     # nothing about any other. An environment that is already holding consumes a
     # draw and ignores it.
@@ -239,3 +253,12 @@ class ball_position_hold(ManagerTermBase):
     self._steps_left[env_ids] = 0
     self._has_value[env_ids] = False
     self._just_held[env_ids] = False
+    if self._bias_half_width_m > 0.0:
+      n = self._bias[env_ids].shape[0]
+      self._bias[env_ids] = self._draw_bias(n, self._bias.device, self._bias_half_width_m)
+
+  @staticmethod
+  def _draw_bias(n: int, device, half: float):
+    if half <= 0.0:
+      return torch.zeros(n, 3, device=device)
+    return (torch.rand(n, 3, device=device) * 2.0 - 1.0) * half

@@ -129,6 +129,7 @@ from copy import deepcopy
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_CENTRE_PLATEAU,
   BALL_CENTRE_SIGMA,
+  BALL_POSITION_BIAS_M,
   BALL_DROP_GRACE_S,
   BALL_DROPOUT_HOLD_STEPS,
   BALL_DROPOUT_PROB,
@@ -211,9 +212,13 @@ def _ablation_value(name: str, default: float | None = None) -> float | None:
   returns *default*, so the shipped configuration is unchanged and cannot drift
   from the constants in ``tennis_constants``.
 
-  Only the three weights the sweep varies are readable here. Nothing in the
-  observation, action, termination or physics path may be overridden this way:
-  those have to stay identical across arms or the comparison means nothing.
+  Only the three reward weights and the four ball-perception magnitudes are
+  readable here. Nothing in the observation **layout**, the action, the
+  termination or the physics path may be overridden this way: the actor's width and
+  every non-perception input have to stay identical across arms or the comparison
+  means nothing. A perception magnitude is a distribution parameter, not a layout
+  parameter, so ablating it is the point of an arm and the shape it feeds is
+  unchanged.
   """
   raw = os.environ.get(_ABLATION_ENV_PREFIX + name)
   if raw in (None, ""):
@@ -456,20 +461,38 @@ def agibot_x2_tennis_juggle_env_cfg(
   # additionally sees the last valid position repeated while no new measurement
   # arrives. The hold is applied first, then the existing noise and delay are
   # unchanged; the shape is still (num_envs, 3), so the actor width does not change.
+  # Perception ablation arms. The defaults reproduce the shipped chain exactly; an
+  # arm overrides one magnitude at a time through MJLAB_JUGGLE_BALL_*.
+  #   BALL_DELAY_MIN_STEPS / MAX_STEPS / PERIOD_STEPS: latency model, in control steps.
+  #     18.44 Hz was measured on the real estimator against the 10 Hz camera the
+  #     shipped numbers model, so the "rate18" arm uses period 3 and keeps the lag in
+  #     the same physical range (100-140 ms = 5-7 steps).
+  #   BALL_BIAS_M: constant per-episode offset half-width, for the hand-eye bias.
+  ball_delay_min = int(
+    _ablation_value("BALL_DELAY_MIN_STEPS", BALL_OBS_DELAY_MIN_STEPS)
+  )
+  ball_delay_max = int(
+    _ablation_value("BALL_DELAY_MAX_STEPS", BALL_OBS_DELAY_MAX_STEPS)
+  )
+  ball_delay_period = int(
+    _ablation_value("BALL_DELAY_PERIOD_STEPS", BALL_OBS_UPDATE_PERIOD_STEPS)
+  )
+  ball_bias_half_m = float(_ablation_value("BALL_BIAS_M", BALL_POSITION_BIAS_M) or 0.0)
   cfg.observations["actor"].terms["ball_pos"] = ObservationTermCfg(
     func=mdp.ball_position_hold,
     params=dict(
       ball_state_params,
       rejection_prob=BALL_DROPOUT_PROB,
       hold_steps=BALL_DROPOUT_HOLD_STEPS,
+      bias_half_width_m=ball_bias_half_m,
     ),
     noise=Unoise(
       n_min=tuple(-m for m in BALL_POSITION_NOISE_M),
       n_max=BALL_POSITION_NOISE_M,
     ),
-    delay_min_lag=BALL_OBS_DELAY_MIN_STEPS,
-    delay_max_lag=BALL_OBS_DELAY_MAX_STEPS,
-    delay_update_period=BALL_OBS_UPDATE_PERIOD_STEPS,
+    delay_min_lag=ball_delay_min,
+    delay_max_lag=ball_delay_max,
+    delay_update_period=ball_delay_period,
     delay_per_env=True,
     delay_per_env_phase=True,
   )

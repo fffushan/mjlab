@@ -724,6 +724,17 @@ BALL_HEIGHT_WEIGHT = 0.1
 # exactly where the ball spends most of its time.
 BALL_POSITION_NOISE_M = (0.005, 0.005, 0.008)
 
+# Constant ball-position offset per episode, half-width in metres on each plate axis.
+#
+# Zero by default: the shipped configuration assumes an unbiased measurement chain.
+# The robot does **not** have one. The measured camera-to-pelvis disagreement is a
+# constant 24.69 mm and 1.24 deg, which is a bias, not noise, and zero-mean noise
+# cannot represent it: a policy trained on noise alone averages the offset away and
+# then meets it on the robot. Set this to about 0.025 for the ablation arm that
+# trains against the real hand-eye error. One draw per environment per episode, so
+# a policy cannot average it out within an episode either.
+BALL_POSITION_BIAS_M = 0.0
+
 # Ball-position latency of the real perception chain, measured on the robot. The
 # head camera publishes at 10 Hz, so one frame serves five 50 Hz control steps
 # (``env.step_dt = 0.02 s``: 20 substeps of 1 ms), and a published position is
