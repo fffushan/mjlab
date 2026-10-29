@@ -4,6 +4,41 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF``,
+  the juggling task with the two head joints removed from the action space: 29
+  actions and actor/critic widths of 103/121 instead of 105/123.
+
+  The head is fragile on the real robots and regularly breaks. Measured on two of the
+  three machines we can reach, one head axis does not follow its command at all: on
+  ``.147`` ``head_yaw_joint`` reports ``error_code 1027`` with its position frozen at
+  ``+3.141590118``, and on ``.132`` the same joint accepts 2-7 N.m of command and
+  delivers ~0 N.m, moving 0.057 rad while its target travelled 1.400 rad. Head pitch
+  on ``.132`` tracked its target to 0.014 rad in the same run, so the fault is the
+  joint, not the command path.
+
+  The joints stay in ``joint_pos``/``joint_vel`` because the camera rides on the head
+  and its measured pose feeds the camera-to-plate conversion. Their pose is instead
+  randomized once per episode over the feasible band, and held there for the whole
+  episode, so one policy covers robots that park the head differently: measured
+  offsets from the trained default are -0.349 rad (``.132`` yaw), +0.450 (``.132``
+  pitch) and +0.217 (``.236`` yaw). ``head_joint_motion`` is dropped, because the
+  policy can no longer influence it.
+
+  Three details are load-bearing. Holding the sampled pose needs the **actuator
+  target** written as well as the joint state: the head is outside every action term,
+  so the reset zeroes its target and nothing rewrites it, and a state-only write is
+  undone by the PD within a few steps. The sample is uniform over the *feasible* band
+  rather than an offset about the default followed by a clamp, because the model's
+  soft range for head yaw is narrower than a +-0.5 rad offset and clamping would pile
+  half the environments onto one number. The scale map is keyed by joint-name pattern
+  and every key must match, so the two head entries have to be dropped with the
+  joints or the build fails with "Not all regular expressions are matched".
+
+  The exported ONNX metadata gains ``action_joint_names``: ``joint_names`` is the
+  entity's 31-joint list that the observation refers to, and it no longer equals the
+  action vector, so a consumer must map actions through the new field. See
+  ``docs/source/x2_tennis_ball_juggle.rst``.
+
 - Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Balance``,
   the X2 no-state-estimation velocity task with the tennis equipment in the
   scene. The racket assembly (white wrist connector, clamp, racket) is rigid

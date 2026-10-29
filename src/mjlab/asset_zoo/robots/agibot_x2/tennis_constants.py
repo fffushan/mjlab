@@ -938,6 +938,27 @@ BALL_FOV_WEIGHT = 0.2
 
 HEAD_JOINT_NAMES = ("head_yaw_joint", "head_pitch_joint")
 
+# Head pose randomization half-width, for the 29-DOF family where the policy cannot
+# command the head at all.
+#
+# The head is fragile on the real robots and regularly breaks, so it is removed from
+# the action space and becomes an **exogenous condition** instead. That matters twice
+# over: the two joints are still observation inputs, and the head carries the camera,
+# so its pose also sets the camera-to-plate conversion. A policy trained on one head
+# pose is therefore fitted to one robot.
+#
+# Measured offsets from the trained default (yaw 0.27599528646882693, pitch
+# 0.061799387799999994), radians:
+#   .132  yaw -0.349, pitch +0.450  (yaw axis delivers no torque, pitch is free)
+#   .236  yaw  0.000 to +0.217
+#   .147  yaw +2.866  (frozen at +3.141590118; deliberately outside this range, since
+#         a head turned 180 deg puts the ball behind the camera and no policy can
+#         recover it)
+# +-0.5 rad covers every measured usable configuration with margin. The sample is
+# clamped to the joint's soft limits, so an unreachable pose cannot be requested.
+JUGGLE_HEAD_YAW_RANGE_RAD = 0.5
+JUGGLE_HEAD_PITCH_RANGE_RAD = 0.5
+
 HEAD_MOTION_WEIGHT = -0.05
 """Penalty weight on squared head joint velocity, summed over the two joints."""
 

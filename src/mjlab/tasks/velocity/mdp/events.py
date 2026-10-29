@@ -20,6 +20,7 @@ import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_RADIUS,
+  HEAD_JOINT_NAMES,
   BALL_SPAWN_CLEARANCE,
   BALL_SPAWN_FACE_NORMAL,
   JUGGLE_DROP_EXTRA_TIME_S,
@@ -193,6 +194,66 @@ class reset_ball_release(ManagerTermBase):
       torch.cat([position, orientation, linear_velocity, angular_velocity], dim=-1),
       env_ids=env_ids,
     )
+
+
+def reset_head_pose(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  position_range: tuple[float, float],
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES),
+) -> None:
+  """Put the head at a random pose and make its actuator hold it there.
+
+  For the 29-DOF family the policy cannot command the head, so the head pose is an
+  exogenous condition that differs per robot. Writing the joint **state** alone
+  would not work: the head is outside every action term, nothing rewrites its
+  actuator target during the episode, and the reset zeroes that target to zero
+  radians. The PD would then drag the head to 0 instead of to the sampled pose, and
+  both the ``joint_pos`` observation and the camera-to-plate conversion would see a
+  pose that was never sampled.
+
+  So this term writes the target as well as the state. Because no action term owns
+  these joints, the target survives the whole episode and the head stays where it is
+  put until the next reset.
+
+  Args:
+    env: The environment.
+    env_ids: Environments to reset, or None for all.
+    position_range: Symmetric half-width of the offset about the default pose, in
+      radians, applied to every joint in ``asset_cfg``.
+    asset_cfg: The head joints. Must resolve to the head body's two joints.
+  """
+  env_ids = resolve_env_ids(env, env_ids)
+  asset: Entity = env.scene[asset_cfg.name]
+  default_joint_pos = asset.data.default_joint_pos
+  assert default_joint_pos is not None
+  soft_joint_pos_limits = asset.data.soft_joint_pos_limits
+  assert soft_joint_pos_limits is not None
+
+  default = default_joint_pos[env_ids][:, asset_cfg.joint_ids]
+  limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
+  # Sample uniformly inside the *feasible* band rather than about the default followed
+  # by a clamp. A clamp piles environments onto whichever limit the band ends at, and
+  # this band is narrow: the model allows +-0.366 rad for head yaw while its default
+  # sits at 0.276, so half of a +-0.5 offset would land on the same number. Uniform
+  # over the intersection keeps the poses spread and never oversamples a limit.
+  half = max(abs(position_range[0]), abs(position_range[1]))
+  lo = torch.maximum(limits[..., 0], default - half)
+  hi = torch.minimum(limits[..., 1], default + half)
+  joint_pos = lo + (hi - lo) * torch.rand(default.shape, device=env.device)
+
+  joint_ids = asset_cfg.joint_ids
+  if isinstance(joint_ids, list):
+    joint_ids = torch.tensor(joint_ids, device=env.device)
+
+  asset.write_joint_state_to_sim(
+    joint_pos.view(len(env_ids), -1),
+    torch.zeros_like(joint_pos).view(len(env_ids), -1),
+    env_ids=env_ids,
+    joint_ids=joint_ids,
+  )
+  # The half of this term that makes the pose persist. See the docstring.
+  asset.set_joint_position_target(joint_pos, joint_ids=joint_ids, env_ids=env_ids)
 
 
 def _reset_env_ids(env_ids: torch.Tensor | slice | None) -> torch.Tensor | slice:

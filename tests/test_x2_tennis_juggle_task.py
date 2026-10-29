@@ -355,6 +355,58 @@ def _build_env(
 
 
 @pytest.mark.slow
+def test_the_29dof_variant_drops_head_actions_and_randomizes_head_pose() -> None:
+  """The 29-DOF family: the head leaves the action space but stays an input.
+
+  Two things can silently break here and neither is visible from the config alone.
+
+  The first is the **action/observation asymmetry**: the head must be absent from the
+  action vector and still present in ``joint_pos``, because the camera rides on the
+  head and the camera-to-plate conversion needs its measured pose. A variant that
+  dropped it from both would train a policy that cannot be converted on the robot.
+
+  The second is **the pose actually persisting**. The head is outside every action
+  term, so the reset zeroes its actuator target and nothing rewrites it afterwards; a
+  variant that only wrote the joint state would have the PD drag the head back to zero
+  within a few steps, and the randomization would be gone by the time the ball is
+  released.
+  """
+  cfg = load_env_cfg(f"{TASK_ID}-29DOF")
+  cfg.scene.num_envs = 32
+  env = ManagerBasedRlEnv(cfg, device="cpu", num_envs=cfg.scene.num_envs)
+  try:
+    env.reset()
+    robot = env.scene["robot"]
+    names = list(robot.joint_names)
+    yaw, pitch = names.index("head_yaw_joint"), names.index("head_pitch_joint")
+
+    assert env.action_manager.total_action_dim == 29
+    observations = cast("dict[str, torch.Tensor]", env.obs_buf)
+    assert observations["actor"].shape[-1] == 103
+    assert observations["critic"].shape[-1] == 121
+    action_ids = env.action_manager.get_term("joint_pos").target_ids.tolist()
+    assert yaw not in action_ids and pitch not in action_ids
+
+    # Head still observed: 31 joint_pos entries starting at offset 6.
+    sampled = robot.data.joint_pos[:, [yaw, pitch]]
+    assert torch.unique(sampled[:, 0]).numel() > 8, "head yaw not randomized"
+    assert torch.unique(sampled[:, 1]).numel() > 8, "head pitch not randomized"
+
+    # Held, not dragged to zero: the target survives and the joint stays near it.
+    held = robot.data.joint_pos_target[:, [yaw, pitch]].clone()
+    action = torch.zeros(env.num_envs, env.action_manager.total_action_dim)
+    for _ in range(10):
+      env.step(action)
+    target_after = robot.data.joint_pos_target[:, [yaw, pitch]]
+    unchanged = (target_after - held).abs().max()
+    tracking = (robot.data.joint_pos[:, [yaw, pitch]] - held).abs().max()
+    assert float(unchanged) < 1e-5, "head target was overwritten during the episode"
+    assert float(tracking) < 0.25, "head did not stay near the sampled pose"
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
 def test_the_environment_builds_and_steps() -> None:
   env = _build_env(steps=0)
   try:

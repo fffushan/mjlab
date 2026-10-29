@@ -126,6 +126,9 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import X2_ACTION_SCALE
+from mjlab.envs.mdp.actions import JointPositionActionCfg
+
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_CENTRE_PLATEAU,
   BALL_CENTRE_SIGMA,
@@ -150,6 +153,8 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   FACE_SITE,
   HEAD_JOINT_NAMES,
   HEAD_MOTION_WEIGHT,
+  JUGGLE_HEAD_PITCH_RANGE_RAD,
+  JUGGLE_HEAD_YAW_RANGE_RAD,
   JUGGLE_ARM_RESET_RANGE_RAD,
   JUGGLE_CENTRE_WEIGHT,
   JUGGLE_COMMAND_ANG_VEL_RPS,
@@ -200,6 +205,15 @@ TENNIS_SUBSTEPS = 20
 
 BALL_ENTITY = "ball"
 BAT_BALL_CONTACT_SENSOR = "bat_ball_contact"
+
+_ACTION_PATTERN_WITHOUT_HEAD = r"^(?!head_yaw_joint$|head_pitch_joint$).*$"
+"""Actuator pattern for the 29-DOF family: every joint except the two head axes.
+
+``resolve_matching_names`` applies ``re.fullmatch`` per key, so this negative
+lookahead matches the 29 names that are not exactly a head joint. The excluded
+joints stay in the model, stay in the observation and stay actuated by their own PD;
+they simply stop being something the policy can command.
+"""
 
 _ABLATION_ENV_PREFIX = "MJLAB_JUGGLE_"
 
@@ -321,6 +335,7 @@ def _make_ball_sensor(history_length: int) -> ContactSensorCfg:
 
 def agibot_x2_tennis_juggle_env_cfg(
   play: bool = False,
+  head_actuated: bool = True,
 ) -> ManagerBasedRlEnvCfg:
   """Create the AgiBot X2 tennis-ball juggling velocity environment config.
 
@@ -330,6 +345,13 @@ def agibot_x2_tennis_juggle_env_cfg(
       curriculum) plus the tennis resets below. The standstill command band and
       the juggling reward set are applied in both modes: the base task's play
       ranges describe a walking policy, which is a different task here.
+    head_actuated: If False, the two head joints leave the action space, giving a
+      29-DOF policy. They stay in the ``joint_pos``/``joint_vel`` observations
+      because the camera rides on the head, so its measured pose is needed for the
+      camera-to-plate conversion. Their pose is then randomized per episode instead
+      of being commanded, which is what lets one policy cover robots that park the
+      head differently. ``head_joint_motion`` is dropped in that case: it would
+      charge the policy for motion it cannot cause.
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` with the tennis equipment in the scene, the
@@ -338,6 +360,20 @@ def agibot_x2_tennis_juggle_env_cfg(
     actions and domain randomization are unchanged.
   """
   cfg = agibot_x2_flat_velocity_env_cfg(play=play)
+
+  if not head_actuated:
+    joint_pos_action = cfg.actions["joint_pos"]
+    assert isinstance(joint_pos_action, JointPositionActionCfg)
+    joint_pos_action.actuator_names = _ACTION_PATTERN_WITHOUT_HEAD
+    # The scale map is keyed by joint-name pattern and every key must match at least
+    # one target, so the two head entries have to go with the joints. Leaving them in
+    # raises "Not all regular expressions are matched" at build time, which is the
+    # framework refusing a scale for a joint that is not being commanded.
+    joint_pos_action.scale = {
+      pattern: value
+      for pattern, value in X2_ACTION_SCALE.items()
+      if pattern not in HEAD_JOINT_NAMES
+    }
 
   ##
   # Scene: the bat lives inside the robot entity (rigid attachment), the ball is
@@ -407,6 +443,22 @@ def agibot_x2_tennis_juggle_env_cfg(
   # appended after it, so its sampled offset survives. Legs, the left arm and the
   # head are deliberately absent: perturbing them would move the base, the energy
   # datum or the camera rather than the strike geometry.
+  # The head cannot be commanded in the 29-DOF family, so its pose is drawn per
+  # episode and held by its own PD for the whole episode. Installed before the ball
+  # resets so any forward-kinematics read inside them already sees the final pose.
+  if not head_actuated:
+    cfg.events["reset_head_pose"] = EventTermCfg(
+      mode="reset",
+      func=mdp.reset_head_pose,
+      params={
+        "position_range": (
+          -max(JUGGLE_HEAD_YAW_RANGE_RAD, JUGGLE_HEAD_PITCH_RANGE_RAD),
+          max(JUGGLE_HEAD_YAW_RANGE_RAD, JUGGLE_HEAD_PITCH_RANGE_RAD),
+        ),
+        "asset_cfg": SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES),
+      },
+    )
+
   cfg.events["reset_robot_juggle_joints"] = EventTermCfg(
     mode="reset",
     func=mdp.reset_joints_by_offset,
@@ -604,13 +656,17 @@ def agibot_x2_tennis_juggle_env_cfg(
   )
   # And the head must not hunt. The field-of-view term would otherwise pay for
   # dithering the two head joints.
-  cfg.rewards["head_joint_motion"] = RewardTermCfg(
-    func=mdp.head_joint_motion,
-    weight=HEAD_MOTION_WEIGHT,
-    params={
-      "asset_cfg": SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES),
-    },
-  )
+  if head_actuated:
+    cfg.rewards["head_joint_motion"] = RewardTermCfg(
+      func=mdp.head_joint_motion,
+      weight=HEAD_MOTION_WEIGHT,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES),
+      },
+    )
+  # With the head outside the action space the term is dropped rather than zeroed:
+  # the joint follows a fixed target, so any motion it reports is PD tracking of the
+  # sampled pose, which the policy cannot influence in either direction.
 
   cfg.terminations["ball_dropped"] = TerminationTermCfg(
     func=mdp.ball_lost,

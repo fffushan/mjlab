@@ -59,6 +59,25 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# The same juggling task with the two head joints removed from the action space, so a
+# 29-DOF policy. The head regularly breaks on the real robots, and two of the three
+# machines we can reach already have a head axis that does not follow its command. The
+# joints stay in the observation because the camera rides on the head and its measured
+# pose is needed for the camera-to-plate conversion, and their pose is randomized per
+# episode so one policy covers robots that park the head differently. Widths become
+# 103/121 (105/123 minus the two action channels) with 29 actions.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_env_cfg(head_actuated=False),
+  play_env_cfg=agibot_x2_tennis_juggle_env_cfg(play=True, head_actuated=False),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

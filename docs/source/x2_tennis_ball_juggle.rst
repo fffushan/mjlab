@@ -218,6 +218,61 @@ is a real bounce. The drop-in spawn does not deliver it: the passive rebound mea
 the built environment returns 0.205 m from a 0.20 m drop, because the sagging arm returns
 energy during the fall. The passive peak is therefore about 0.20 m below the target.
 
+The 29-DOF variant
+------------------
+
+``...-Tennis-Ball-Juggle-29DOF`` is this task with the two head joints out of the action
+space: 29 actions, and actor/critic widths of 103/121 against 105/123 here. Everything
+else is the same config, produced by ``head_actuated=False``.
+
+**Why.** The head breaks. Two of the three machines we can reach have one head axis that
+does not follow its command. On ``.147`` ``head_yaw_joint`` reports ``error_code 1027``
+with its position frozen at ``+3.141590118``. On ``.132`` the same joint accepts 2-7 N.m
+and delivers about 0 N.m: it travelled 0.057 rad while its target travelled 1.400 rad,
+while ``head_pitch`` tracked its own target to 0.014 rad in the same run.
+
+**The asymmetry is deliberate.** The joints stay in ``joint_pos`` and ``joint_vel`` and
+leave only the action vector. The camera rides on the head, so its measured pose feeds
+the camera-to-plate conversion; a policy that never received the pose would be
+unconvertible on the robot. What changes is that the pose becomes an *exogenous
+condition* rather than something the policy sets.
+
+**The condition is randomized per episode** over the feasible band of both joints, and
+held for the whole episode. Measured offsets from the trained default (yaw 0.2759953,
+pitch 0.0617994) are -0.349 rad for ``.132`` yaw, +0.450 for ``.132`` pitch and +0.217
+for ``.236`` yaw, so a policy trained on the default alone is fitted to one robot.
+``head_joint_motion`` is dropped rather than zeroed: the policy cannot influence it.
+
+Three implementation details are load-bearing, and each has a silent failure mode.
+The reset writes the **actuator target**, not only the joint state, because the head is
+outside every action term: the reset zeroes that target, nothing rewrites it, and a
+state-only write decays back within a few steps — which would silently remove the
+randomization by the time the ball is released. The sample is uniform over the
+intersection of the soft limits with default +- 0.5 rad, rather than an offset followed
+by a clamp, because the soft range for head yaw is narrower than the offset and clamping
+piles environments onto one limit. The scale map is keyed by joint pattern and every key
+must match, so the two head entries must be dropped along with the joints.
+
+**Measured on the built environment** (64 environments): yaw spans -0.219..+0.325 with
+59 of 64 distinct, pitch -0.343..+0.343 with 61 of 64, and one environment at a limit
+against the 32 that a clamp would have produced. The held target does not change during
+an episode, and ``ball_in_camera_fov`` stays at 0.63-1.00 (mean 0.98) across the sampled
+poses, so the randomization does not fight that reward.
+
+**Known limit, and it needs an operator decision.** The model's joint ranges are
+``-0.366..0.366`` for head yaw and ``-0.3838..0.3838`` for head pitch, and the *soft*
+limits are narrower still at about ``-0.02..0.345``. Both robots measured are outside
+them: ``.132`` reads pitch ``+0.5115`` and ``.236`` reads yaw up to ``+0.493``. So this
+variant cannot represent two of the three measured head configurations, and the sampled
+band covers only the near-default ones. Covering them needs the head range in
+``x2_ultra.xml`` widened from measurement. That is a robot-model change and is not made
+here: it also changes the limits a deployed controller enforces, because the hardware
+config reads ``limits: source: robot_model``.
+
+**Deployment contract.** The exported metadata gains ``action_joint_names``.
+``joint_names`` remains the entity's 31-joint list, which is what the observation refers
+to, so the two no longer agree and a consumer must map actions through the new field.
+
 Acceptance metrics
 ------------------
 

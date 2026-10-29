@@ -156,6 +156,11 @@ def get_base_metadata(
     "observation_terms_sensor_name": observation_term_sensor_name,
     "observation_terms_sensor_site": observation_term_sensor_site,
     "observation_terms_sensor_body": observation_term_sensor_body,
+    # The joints the action vector maps to, in action order. ``joint_names`` above is
+    # the entity's joint list and is what the observation refers to; the two agree
+    # only while every joint is actuated, so a consumer must map actions through this
+    # field rather than by position.
+    "action_joint_names": list(joint_action.target_names),
     "action_scale": joint_action._scale[0].cpu().tolist()
     if isinstance(joint_action._scale, torch.Tensor)
     else joint_action._scale,
