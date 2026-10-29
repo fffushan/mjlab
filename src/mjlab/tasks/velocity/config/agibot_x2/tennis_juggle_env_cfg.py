@@ -3,10 +3,10 @@
 The juggling variant of :mod:`~mjlab.tasks.velocity.config.agibot_x2.
 tennis_ball_env_cfg`. This module is a **copy** of the carrying task rather than a
 wrapper, so the two can be read side by side and diffed by intent. Scene, assets,
-1 ms physics, observations, resets, the ``ball_dropped`` termination, the servo
-gains and the physics domain randomization are the carrying task's, unchanged. The
-ball is meant to **bounce on the plate and return to an apex**, repeatedly:
-juggling, not carrying. Version 1 juggles while standing still.
+1 ms physics, observations, the servo gains and the physics domain randomization are
+the carrying task's, unchanged. The ball is meant to **bounce on the plate and
+return to an apex**, repeatedly: juggling, not carrying. Version 1 juggles while
+standing still.
 
 **What differs from the carrying task, and nothing else does.**
 
@@ -74,13 +74,23 @@ The base task's ``command_vel`` term is removed here as well: it would write the
 base task's wider ranges over the band. With no term left, ``cfg.curriculum`` is
 empty in both train and play mode.
 
-*Five ball metrics.* ``ball_energy`` and ``ball_energy_error`` are registered with
+*Eight ball metrics.* ``ball_energy`` and ``ball_energy_error`` are registered with
 ``reduce="mean"``, so ``Episode_Metrics/ball_energy`` reports the episode mean of
 ``E`` (target ``E*``) and ``Episode_Metrics/ball_energy_error`` the episode mean of
 ``|E - E*|`` in J/kg. Both are recomputed from the current simulation state, so
 they cannot read a stale value: unlike the removed ``ball_bounce_count``, which read
 a reward term's per-step flag and would freeze if that term were not computed, there
 is no term state to go stale.
+
+``ball_start_height_m``, ``ball_start_plate`` and ``ball_first_lift_s`` are the
+stage-1 release-state metrics, also **logging only**. The first is the ball's height
+above its resting state at reset, 0 for a plate start and the sampled drop release
+height otherwise. The second is 1.0 for a plate start and 0.0 for a drop start. The
+third is the first control time at which the ball energy reaches
+``JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG``, or -1.0 if the episode ends first; a drop
+start reads 0.0 because its release energy is already above the threshold. All three
+use ``reduce="last"``: the value is the episode's release fact, not a per-step
+average.
 
 ``ball_impact_count``, ``ball_flight_time`` and ``ball_sustained_contact`` are read
 from the ``bat_ball_contact`` sensor and are **logging only**. They do not enter a
@@ -100,11 +110,13 @@ with ``reduce="max"``.
 The unchanged parts carry the carrying task's reasons, documented in
 :mod:`~mjlab.tasks.velocity.config.agibot_x2.tennis_ball_env_cfg`: the 1 ms step is
 a string-bed contact-calibration requirement (the same ``solref`` injects energy at
-5 ms), the robot and ball resets are pinned so the ball starts above the same bed
-point in every environment, the servo gains are the vendor reference-policy table,
-and the physics randomization is the tracking family's. Observations are the actor's
-delayed and held ball position (the real 10 Hz perception chain) and the critic's
-privileged position and velocity, so the actor width stays 105 and the critic 123.
+5 ms), the robot base reset is pinned so the measured world heights stay valid, the
+servo gains are the vendor reference-policy table, and the physics randomization is
+the tracking family's. The robot joint reset keeps the generic zero-offset term and
+adds a right-arm/waist perturbation; the ball reset samples a plate or drop release
+instead of a fixed drop. Observations are the actor's delayed and held ball position
+(the real 10 Hz perception chain) and the critic's privileged position and velocity,
+so the actor width stays 105 and the critic 123.
 
 See ``docs/source/x2_tennis_ball_juggle.rst``.
 """
@@ -134,8 +146,10 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   CAMERA_HALF_ANGLE_Y,
   CAMERA_MOUNT_QUAT,
   CAMERA_MOUNT_XYZ,
+  FACE_SITE,
   HEAD_JOINT_NAMES,
   HEAD_MOTION_WEIGHT,
+  JUGGLE_ARM_RESET_RANGE_RAD,
   JUGGLE_CENTRE_WEIGHT,
   JUGGLE_COMMAND_ANG_VEL_RPS,
   JUGGLE_COMMAND_LIN_VEL_MPS,
@@ -143,9 +157,12 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_ENERGY_SIGMA_J_PER_KG,
   JUGGLE_ENERGY_TARGET_HEIGHT_M,
   JUGGLE_ENERGY_WEIGHT,
+  JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG,
+  JUGGLE_NO_LIFT_TIMEOUT_S,
   JUGGLE_RACKET_LIFT_DEADBAND_M,
   JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z,
   JUGGLE_RACKET_LIFT_WEIGHT,
+  JUGGLE_RESET_JOINT_NAMES,
   RACKET_BODY,
   get_tennis_ball_cfg,
   get_x2_tennis_robot_cfg,
@@ -202,6 +219,7 @@ def _ablation_value(name: str, default: float | None = None) -> float | None:
   if raw in (None, ""):
     return default
   return float(raw)
+
 
 _ZERO_POSE_RANGE = {
   "x": (0.0, 0.0),
@@ -368,24 +386,42 @@ def agibot_x2_tennis_juggle_env_cfg(
   apply_x2_tracking_robot_randomization(cfg)
 
   ##
-  # Resets. Both entities are pinned so the ball starts on the bed in every
-  # environment. Everything else in the base reset sequence is preserved.
+  # Resets. The base is pinned, so the measured world heights and the ball's drop
+  # point stay valid. The ball draws one of two release states per environment:
+  # 20 % plate start, 80 % drop start. The generic joint reset stays at zero; a
+  # second term perturbs only the right arm and the waist. Both robot joint terms
+  # are inserted before `reset_ball`: the plate release reads the post-reset plate
+  # pose, so it must see the perturbed joint state.
   ##
 
   reset_base = cfg.events["reset_base"]
   reset_base.params["pose_range"] = dict(_ZERO_POSE_RANGE)
 
+  # Right arm and waist only, +-JUGGLE_ARM_RESET_RANGE_RAD. ``reset_robot_joints``
+  # above writes the default pose to every joint with a zero offset; this term is
+  # appended after it, so its sampled offset survives. Legs, the left arm and the
+  # head are deliberately absent: perturbing them would move the base, the energy
+  # datum or the camera rather than the strike geometry.
+  cfg.events["reset_robot_juggle_joints"] = EventTermCfg(
+    mode="reset",
+    func=mdp.reset_joints_by_offset,
+    params={
+      "position_range": (-JUGGLE_ARM_RESET_RANGE_RAD, JUGGLE_ARM_RESET_RANGE_RAD),
+      "velocity_range": (0.0, 0.0),
+      "asset_cfg": SceneEntityCfg("robot", joint_names=JUGGLE_RESET_JOINT_NAMES),
+    },
+  )
+
+  # ``plate_cfg`` resolves the plate's top face; the event reads its live pose
+  # after a forward-kinematics refresh to seat a plate start on the perturbed
+  # plate. It must stay after both robot joint resets.
   ball_cfg = SceneEntityCfg(BALL_ENTITY)
   cfg.events["reset_ball"] = EventTermCfg(
     mode="reset",
-    func=mdp.reset_root_state_uniform,
+    func=mdp.reset_ball_release,
     params={
       "asset_cfg": ball_cfg,
-      "pose_range": dict(_ZERO_POSE_RANGE),
-      # Empty: the ball starts at rest on the bed. A non-empty range would
-      # immediately tip it off, which is a separate scenario (ball reception),
-      # not this one.
-      "velocity_range": {},
+      "plate_cfg": SceneEntityCfg("robot", site_names=(FACE_SITE,)),
     },
   )
 
@@ -563,9 +599,26 @@ def agibot_x2_tennis_juggle_env_cfg(
     },
   )
 
+  # A plate start in which the policy never lifts the ball has no bounce to
+  # sustain and nothing else ends it before the 20 s horizon, so it spends the
+  # episode on a state that teaches nothing. The term fires only after the
+  # control-time timeout AND only if the peak energy since reset stayed below the
+  # lift threshold; a drop start has E = g * h >= 1.4715 J/kg at release, so it
+  # is inert for drop episodes by construction.
+  cfg.terminations["ball_not_lifted"] = TerminationTermCfg(
+    func=mdp.ball_not_lifted,
+    params={
+      "threshold": JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG,
+      "timeout_s": JUGGLE_NO_LIFT_TIMEOUT_S,
+      "ball_cfg": ball_cfg,
+      "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
+    },
+  )
+
   ##
-  # Metrics: two energy means and three contact metrics. All are logging only: they
-  # change no reward, observation, termination or curriculum.
+  # Metrics: two energy means, three release-state facts and three contact
+  # metrics. All are logging only: they change no reward, observation, termination
+  # or curriculum.
   #
   # ``reduce="mean"`` reports the mean of a per-step value over the episode. Both
   # energy functions recompute E from the current simulation state, so neither can
@@ -597,6 +650,33 @@ def agibot_x2_tennis_juggle_env_cfg(
       **ball_state_params,
     },
     reduce="mean",
+  )
+
+  # Release-state metrics: logging only, like the energy and contact metrics.
+  # Each value is constant or first-crossing per episode, so ``reduce="last"``
+  # reports the episode value instead of diluting it over the steps. The start
+  # height and start type are recorded by ``reset_ball`` when it samples the
+  # episode, so they report the sampled release and not a value reconstructed
+  # from a perturbed plate pose. The first-lift time uses the same energy
+  # threshold as ``ball_not_lifted``.
+  cfg.metrics["ball_start_height_m"] = MetricsTermCfg(
+    func=mdp.ball_start_height,
+    params={"release_event": "reset_ball"},
+    reduce="last",
+  )
+  cfg.metrics["ball_start_plate"] = MetricsTermCfg(
+    func=mdp.ball_start_plate,
+    params={"release_event": "reset_ball"},
+    reduce="last",
+  )
+  cfg.metrics["ball_first_lift_s"] = MetricsTermCfg(
+    func=mdp.ball_first_lift_time,
+    params={
+      "threshold": JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG,
+      "ball_cfg": ball_cfg,
+      "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
+    },
+    reduce="last",
   )
 
   # Contact metrics: logging only. The sensor's history buffer holds one control

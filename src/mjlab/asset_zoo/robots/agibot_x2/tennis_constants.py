@@ -1172,6 +1172,137 @@ JUGGLE_REST_WEIGHT = -0.10
 JUGGLE_COMMAND_LIN_VEL_MPS = 0.10
 JUGGLE_COMMAND_ANG_VEL_RPS = 0.05
 
+##
+# Stage-1 release-state randomization.
+#
+# Every episode draws one release type per environment. A **drop** start releases
+# the ball above the bed, so a bounce exists from the first step. A **plate** start
+# places the ball on the strings at rest, so the policy must strike it up itself.
+# The mixture is the curriculum: the easier drop still dominates, but the harder
+# plate start occurs in every batch. Both branches share the bed reference and bed
+# normal that the carrying task already measured.
+#
+# The bed normal is world +z to 6e-6 (see BALL_SPAWN_FACE_NORMAL), so sampling the
+# lateral offset and lateral velocity on the world x/y axes is the same as sampling
+# them in the bed plane to that tolerance. No rotation is built, and the axial drop
+# term uses the measured normal so a future carry-pose change cannot silently tilt
+# it.
+##
+
+JUGGLE_PLATE_START_FRACTION = 0.20
+"""Probability that an episode starts with the ball resting on the plate.
+
+0.20 keeps the drop start, which already supplies a bounce, as the common case
+while every 4096-environment batch still contains about 819 plate starts. A
+plate start has no bounce to sustain, so it is the harder half of the stage and
+must not be rare enough to learn only from a few episodes.
+"""
+
+JUGGLE_PLATE_START_LATERAL_RANGE_M = 0.005
+"""Half-width of the in-plane offset of a plate start, in metres.
+
+5 mm is a quarter of BALL_CENTRE_PLATEAU, so the offset stays inside the flat
+part of the centring reward: it changes the strike point without changing the
+score the reset state deserves. A larger offset would also let the ball start
+near the plate edge, which is a reception scenario, not a strike scenario.
+"""
+
+JUGGLE_DROP_HEIGHT_RANGE_M = (0.15, 0.25)
+"""Release height above the bed for a drop start, in metres, uniform.
+
+The range brackets BALL_SPAWN_DROP_HEIGHT = 0.20 m, so the new drop starts sit
+on both sides of the old fixed release. At 0.15 m the ball arrives at
+sqrt(2 g 0.15) = 1.72 m/s and its reset energy is g * 0.15 = 1.4715 J/kg. That
+minimum is what makes ``ball_not_lifted`` inert for drop episodes: it is 0.4715
+J/kg above JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG. At 0.25 m the arrival speed is
+2.21 m/s.
+"""
+
+JUGGLE_DROP_EXTRA_TIME_S = (0.0, 0.10)
+"""Extra fall time already applied to a drop release, in seconds, uniform.
+
+The position and velocity are advanced together by this time, so the sample is
+exactly the state of a ball released at height h, t seconds earlier::
+
+    z = h - 0.5 g t^2,    v_z = -g t
+
+The extra time changes the arrival speed without changing the height
+distribution: at t = 0.10 s the ball has already fallen 49 mm and is moving at
+0.981 m/s. The range ends at 0.10 s so the lowest effective release height stays
+above 0.10 m and the two release types remain separated by more than the ball
+radius.
+"""
+
+JUGGLE_DROP_LATERAL_RANGE_M = 0.03
+"""Half-width of the in-plane offset of a drop start, in metres.
+
+30 mm is about a quarter of the plate's 117 mm short half-width and close to the
+ball radius. The ball therefore meets a different string point every episode but
+still lands well inside the strings, not on the frame or the edge.
+"""
+
+JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS = 0.02
+"""Half-width of the in-plane release speed of a drop start, in m/s.
+
+20 mm/s is 1 % of the 1.98 m/s arrival speed of a 0.20 m drop. It tilts the
+bounce enough to decorrelate the episodes without turning the release into a
+throw at the plate.
+"""
+
+JUGGLE_ARM_RESET_RANGE_RAD = 0.05
+"""Half-width of the right-arm and waist joint offsets at reset, in radians.
+
+0.05 rad is 2.9 deg, which moves the plate centre by a few centimetres. That is
+enough to sample a different strike geometry every episode, and small enough
+that the reset state is still the measured bat-carry pose. The right arm and the
+waist are the joints that aim the plate; perturbing the legs would move the base
+and change the energy datum, and perturbing the left arm or head would change the
+camera view without changing the strike.
+"""
+
+JUGGLE_RESET_JOINT_NAMES = (
+  "right_shoulder_pitch_joint",
+  "right_shoulder_roll_joint",
+  "right_shoulder_yaw_joint",
+  "right_elbow_joint",
+  "right_wrist_yaw_joint",
+  "right_wrist_pitch_joint",
+  "right_wrist_roll_joint",
+  "waist_yaw_joint",
+  "waist_pitch_joint",
+  "waist_roll_joint",
+)
+"""Joints that receive the reset offset; every other joint stays at its default."""
+
+JUGGLE_NO_LIFT_TIMEOUT_S = 1.5
+"""Control time after reset that must pass before ``ball_not_lifted`` can fire.
+
+1.5 s is 75 control steps at the 50 Hz control rate. A 0.25 m drop reaches the
+strings in sqrt(2 h / g) = 0.226 s, so 1.5 s leaves ample time for a strike or a
+first passive bounce to lift the ball. The limit is short enough that a policy
+which never lifts the ball does not spend the whole 20 s episode on it.
+"""
+
+JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG = 1.0
+"""Ball energy that counts as lifted, in J/kg, shared by the termination and metric.
+
+The energy is ``E = 0.5 * v_z^2 + g * (z - JUGGLE_ENERGY_BALL_REST_Z)``, the same
+formula the reward pays. 1.0 J/kg is 1.41 m/s of vertical speed at the resting
+height, or 102 mm of height with zero speed: a real strike, not contact jitter.
+A drop start has ``E = g * h >= g * 0.15 = 1.4715`` J/kg at release by
+construction, a margin of 0.4715 J/kg above this threshold, so ``ball_not_lifted``
+cannot fire on a drop episode. The term only rejects a plate episode in which the
+policy never lifted the ball.
+
+A plate start is not exactly at ``E = 0``, because the energy datum is a fixed
+world height: the perturbed arm can raise the plate, and ``E = g (z - rest_z)``
+counts that height. Measured over 612 plate samples at
+``JUGGLE_ARM_RESET_RANGE_RAD = 0.05``, first-step plate energy reached 0.741 J/kg,
+only 0.259 J/kg below this threshold. Re-measure that margin whenever
+``JUGGLE_ARM_RESET_RANGE_RAD``, the carry-pose height or
+``JUGGLE_ENERGY_BALL_REST_Z`` changes: this threshold is coupled to the arm range.
+"""
+
 
 # Lowest foot contact point may be this far below z=0 before the pose counts as
 # penetrating the ground.
@@ -1306,13 +1437,23 @@ __all__ = [
   "BED_SOLREF",
   "CLAMP_BODY",
   "FACE_SITE",
+  "JUGGLE_ARM_RESET_RANGE_RAD",
+  "JUGGLE_DROP_EXTRA_TIME_S",
+  "JUGGLE_DROP_HEIGHT_RANGE_M",
+  "JUGGLE_DROP_LATERAL_RANGE_M",
+  "JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS",
   "JUGGLE_ENERGY_BALL_REST_Z",
   "JUGGLE_ENERGY_SIGMA_J_PER_KG",
   "JUGGLE_ENERGY_TARGET_HEIGHT_M",
   "JUGGLE_ENERGY_WEIGHT",
+  "JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG",
+  "JUGGLE_NO_LIFT_TIMEOUT_S",
+  "JUGGLE_PLATE_START_FRACTION",
+  "JUGGLE_PLATE_START_LATERAL_RANGE_M",
   "JUGGLE_RACKET_LIFT_DEADBAND_M",
   "JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z",
   "JUGGLE_RACKET_LIFT_WEIGHT",
+  "JUGGLE_RESET_JOINT_NAMES",
   "RACKET_BODY",
   "TENNIS_BED_COLLISION",
   "WRIST_BODY",

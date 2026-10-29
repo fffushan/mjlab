@@ -702,6 +702,36 @@ def _ball_gap_and_vertical_speed(
   return gap, ball.data.root_link_lin_vel_w[:, 2]
 
 
+def ball_vertical_energy(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  ball_rest_z: float,
+) -> torch.Tensor:
+  r"""The ball's vertical energy per unit mass, in J/kg.
+
+  .. math:: E = \tfrac{1}{2} v_{\mathrm{ball},z}^2 + g \, (z - z_{\mathrm{rest}})
+
+  This is the single definition of :math:`E` for the juggling task's reward, its
+  energy metrics and its ``ball_not_lifted`` termination, so the three cannot
+  drift apart. The velocity is **vertical only** and the datum is a fixed world
+  height, for the anti-loophole reasons in :func:`_ball_energy_and_target`. The
+  racket's own velocity never enters. Gravity is read from the compiled model,
+  the physics that actually runs, not a literal 9.81.
+
+  Args:
+    ball_cfg: Ball entity.
+    ball_rest_z: ``z_rest``, the ball centre's absolute world z when the ball
+      rests on the plate in the carry pose, in metres.
+
+  Returns:
+    Shape ``(num_envs,)``, in J/kg.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  height = ball.data.root_link_pos_w[:, 2] - ball_rest_z
+  gravity = abs(float(env.sim.mj_model.opt.gravity[2]))
+  return 0.5 * torch.square(ball.data.root_link_lin_vel_w[:, 2]) + gravity * height
+
+
 def _ball_energy_and_target(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg,
@@ -763,10 +793,8 @@ def _ball_energy_and_target(
   Returns:
     ``(energy, target)``: shape ``(num_envs,)`` in J/kg, and a scalar in J/kg.
   """
-  ball: Entity = env.scene[ball_cfg.name]
-  height = ball.data.root_link_pos_w[:, 2] - ball_rest_z
+  energy = ball_vertical_energy(env, ball_cfg, ball_rest_z)
   gravity = abs(float(env.sim.mj_model.opt.gravity[2]))
-  energy = 0.5 * torch.square(ball.data.root_link_lin_vel_w[:, 2]) + gravity * height
   return energy, gravity * target_height
 
 

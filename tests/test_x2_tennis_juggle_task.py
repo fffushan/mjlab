@@ -249,6 +249,9 @@ def test_the_energy_metrics_are_means() -> None:
   assert set(cfg.metrics) - {"mean_action_acc"} == {
     "ball_energy",
     "ball_energy_error",
+    "ball_start_height_m",
+    "ball_start_plate",
+    "ball_first_lift_s",
     "ball_impact_count",
     "ball_flight_time",
     "ball_sustained_contact",
@@ -263,6 +266,14 @@ def test_the_energy_metrics_are_means() -> None:
   assert error.reduce == "mean"
   assert error.params["target_height"] == JUGGLE_ENERGY_TARGET_HEIGHT_M
   assert error.params["ball_rest_z"] == JUGGLE_ENERGY_BALL_REST_Z
+  release_metrics = {
+    "ball_start_height_m": mdp.ball_start_height,
+    "ball_start_plate": mdp.ball_start_plate,
+    "ball_first_lift_s": mdp.ball_first_lift_time,
+  }
+  for name, func in release_metrics.items():
+    assert cfg.metrics[name].func is func, name
+    assert cfg.metrics[name].reduce == "last", name
   # It read the removed apex term's per-step flag and would freeze without it.
   assert "ball_bounce_count" not in cfg.metrics
   # The base task's metric is kept.
@@ -317,15 +328,25 @@ def test_only_the_juggle_sensor_keeps_substep_history() -> None:
 
 
 def _build_env(
-  task_id: str = TASK_ID, num_envs: int = 1, steps: int = 1
+  task_id: str = TASK_ID, num_envs: int = 1, steps: int = 1, perturb_arm: bool = False
 ) -> ManagerBasedRlEnv:
   """A live environment, reset and optionally stepped.
 
   ``steps=0`` is the pure reset state, which is what the ball-placement helpers
   below expect: after a step the PD gains have begun to sag the arm by a
   seed-dependent amount.
+
+  ``perturb_arm`` defaults to False, so ``reset_robot_juggle_joints`` keeps the
+  carry pose.  The ball energy is measured against a *fixed world* rest height,
+  not against the plate, so a perturbed arm moves the plate by up to 16 mm and
+  shifts a target-gap energy by about 2 %.  Tests that assert an exact energy
+  therefore pin the arm; the release-mixture test asks for it.
   """
-  env = ManagerBasedRlEnv(load_env_cfg(task_id), device="cpu", num_envs=num_envs)
+  cfg = load_env_cfg(task_id)
+  cfg.scene.num_envs = num_envs
+  if not perturb_arm and "reset_robot_juggle_joints" in cfg.events:
+    cfg.events["reset_robot_juggle_joints"].params["position_range"] = (0.0, 0.0)
+  env = ManagerBasedRlEnv(cfg, device="cpu", num_envs=num_envs)
   env.reset()
   action = torch.zeros(env.num_envs, env.action_manager.total_action_dim)
   for _ in range(steps):
@@ -343,9 +364,11 @@ def test_the_environment_builds_and_steps() -> None:
       env.step(torch.zeros(env.num_envs, env.action_manager.total_action_dim))
     after = ball.data.root_link_pos_w[0].cpu().numpy()
     assert np.all(np.isfinite(after))
-    # Nothing should launch the ball: three 20 ms control steps of an unsupported
-    # ball is at most ~18 mm of free fall.
-    assert np.linalg.norm(after - before) < 0.05
+    # Nothing should launch the ball. A sampled drop release can start at
+    # -g * 0.10 = -0.981 m/s, which is 0.0765 m over 3 x 0.02 s, so 0.09 m leaves
+    # margin. The bound still catches a penetration ejection: 22 J/kg is about
+    # 6.6 m/s, roughly 0.4 m over the same window.
+    assert np.linalg.norm(after - before) < 0.09
     assert {
       "ball_energy",
       "ball_energy_error",
@@ -1176,5 +1199,32 @@ def test_the_carry_task_still_builds_and_still_has_the_height_reward() -> None:
     assert np.all(np.isfinite(ball.data.root_link_pos_w[0].cpu().numpy()))
     observations = cast("dict[str, torch.Tensor]", env.obs_buf)
     assert observations["actor"].shape[-1] == 105
+  finally:
+    env.close()
+
+
+def test_the_release_mixture_survives_a_partial_reset() -> None:
+  """Both release branches are reachable, near the configured fraction, and a
+  subset reset works.
+
+  The subset case is the one that broke training: the plate branch read the site
+  pose for every environment while writing only the reset subset, so the first
+  step where any episode ended raised a size mismatch.  Resetting an explicit
+  subset reproduces that without stepping.
+  """
+  env = _build_env(num_envs=256, steps=0, perturb_arm=True)
+  try:
+    term = env.event_manager.get_term_cfg("reset_ball").func
+    plate = (term.start_plate > 0.5).cpu()
+    heights = term.start_height.cpu()
+    share = float(plate.float().mean())
+    assert 0.12 < share < 0.28, f"plate share {share:.3f} is not near the 0.20 fraction"
+    # Flags and sampled heights agree: a plate start is at rest, a drop start is not.
+    assert float(heights[plate].abs().max()) == 0.0
+    assert float(heights[~plate].min()) > 0.0
+
+    subset = torch.tensor([0, 2, 5, 7, 11], dtype=torch.long)
+    env.reset(env_ids=subset)  # Must not raise.
+    assert torch.equal(term.start_plate[subset].cpu() >= 0.0, torch.ones(5, dtype=torch.bool))
   finally:
     env.close()

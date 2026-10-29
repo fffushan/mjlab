@@ -10,6 +10,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactSensor
 from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
+from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -184,3 +185,66 @@ def ball_below_plate(
   # be the one the resetter wrote rather than a stepped one.
   below &= env.episode_length_buf > 2
   return below
+
+
+class ball_not_lifted(ManagerTermBase):
+  """End an episode whose ball was never lifted within the timeout.
+
+  A plate start has no bounce to sustain: if the policy never strikes the ball,
+  the ball sits on the strings and nothing else ends the episode, so the whole
+  20 s allowance is spent on a state that teaches nothing. This term ends that
+  episode after ``timeout_s`` of control time.
+
+  The test is the **peak** energy since reset, not the current energy, so a ball
+  that was lifted once and fell back does not fire the term. The peak is
+  per-environment and is cleared on every reset, so a stale episode cannot end a
+  fresh one.
+
+  **Drop starts are inert by construction.** Their release energy is
+  ``g * h`` with ``h >= JUGGLE_DROP_HEIGHT_RANGE_M[0] = 0.15`` m, i.e. at least
+  ``9.81 * 0.15 = 1.4715`` J/kg, which is 0.4715 J/kg above
+  :data:`JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG`. The peak therefore exceeds the
+  threshold on the first control step and the term can never fire. It rejects
+  only plate starts where the policy never lifted the ball.
+
+  Timing is elapsed **control** time, counted by this term itself
+  (``_steps * env.step_dt``), not read from ``env.episode_length_buf``: the RL
+  wrapper overwrites that buffer once per run with a random episode length
+  (``init_at_random_ep_len``), so it starts at an arbitrary value up to the time
+  limit and a term that trusted it would fire on the first step. ``ball_lost``
+  in this module counts its own steps for the same reason. ``env.step_dt`` is
+  ``cfg.sim.mujoco.timestep * cfg.decimation``; the physics timestep is 20 times
+  smaller and is not the policy's clock.
+
+  Args:
+    ball_cfg: Ball entity.
+    ball_rest_z: Ball centre's world z when it rests on the plate, in metres.
+    threshold: Peak energy that counts as lifted, in J/kg.
+    timeout_s: Control time after reset before the term may fire, in seconds.
+  """
+
+  def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._step_dt = env.step_dt
+    self._peak_energy = torch.zeros(env.num_envs, device=env.device)
+    self._steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    ball_cfg: SceneEntityCfg,
+    ball_rest_z: float,
+    threshold: float,
+    timeout_s: float,
+  ) -> torch.Tensor:
+    energy = ball_vertical_energy(env, ball_cfg, ball_rest_z)
+    self._peak_energy = torch.maximum(self._peak_energy, energy)
+    elapsed = self._steps.float() * self._step_dt
+    self._steps += 1
+    return (elapsed >= timeout_s) & (self._peak_energy < threshold)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._peak_energy[env_ids] = 0.0
+    self._steps[env_ids] = 0
