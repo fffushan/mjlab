@@ -12,16 +12,53 @@ juggling, not carrying. Version 1 juggles while standing still.
 
 *Reward set.* ``ball_height`` is removed: it is flat out to a 100 mm gap, so it
 pays for a ball parked on the strings, which is the behaviour juggling must not
-reward. Two terms replace it. ``ball_bounce_apex`` pays **once per bounce**, when
-the apex of the bounce is at :data:`JUGGLE_APEX_TARGET_M`; a per-step height
-reward cannot express a bounce, because a ball parked at the target height would
-collect it on every step. ``ball_at_rest`` charges for a ball that has stayed low
-and slow on the plate for :data:`JUGGLE_REST_GRACE_S`, which closes the "park it
-and stand still" solution the reward set would otherwise leave open.
-``ball_centred`` keeps its function and parameters, but its weight drops to
-:data:`JUGGLE_CENTRE_WEIGHT`: the ball is in the air for most of the cycle and
-cannot be steered there, so the apex payment has to carry the task.
-``ball_in_fov`` and ``head_joint_motion`` are unchanged.
+reward. A dense ``ball_energy`` term replaces it. The term compares the ball's
+vertical energy, with the datum at the ball's fixed world rest height, against the
+energy of a bounce to :data:`JUGGLE_ENERGY_TARGET_HEIGHT_M`, and pays every control
+step::
+
+    h   = z_ball - JUGGLE_ENERGY_BALL_REST_Z
+    E   = 0.5 * v_ball_z**2 + g * h,  E* = g * target_height
+    r_E = exp(-((E - E*) / sigma)**2)
+
+The racket is the control input and must not pay itself, so no plate velocity is
+subtracted from the ball's: a descending racket would otherwise manufacture energy
+with the ball untouched. Both datums are **fixed world heights**, not the pelvis:
+with a pelvis datum, lowering the pelvis 0.20 m while the ball stays put raises
+``h`` by 0.20 m and adds ``g * 0.20 = 1.962`` J/kg, half of the 3.924 J/kg target,
+with no work done on the ball. That was free energy, and the lift term could not see
+it because the plate and the pelvis dropped together. A world datum costs gait bob
+in ``E`` (3 cm is 0.29 J/kg, 0.19 sigma), which is the smaller error. The absolute
+heights are valid only because the tennis tasks pin the base reset at the carrying
+task's measured base height with zero yaw; see
+:data:`JUGGLE_ENERGY_BALL_REST_Z`.
+
+A ball parked on the plate has ``h = 0`` and ``E ~ 0``, so parking earns almost
+nothing. **Why this replaced the per-bounce apex bell:** measured on the
+4000-iteration sweep, the bell was worth about 2e-5 of per-step reward at the
+apexes the policies actually reached (0.16-0.24 m against a 0.30 m target with an
+80 mm sigma) - flat, and therefore no gradient - and it paid on one step per bounce
+instead of on every step.
+
+A second dense term, ``racket_lift``, is installed with **negative** weight
+:data:`JUGGLE_RACKET_LIFT_WEIGHT`. ``h`` is measured from the ball's resting state
+on the plate, so a ball resting on a racket raised to the 0.40 m target reads
+``E*``; the lift term charges the plate top's world height above its carry height
+(world, not pelvis-relative, so a lift by the legs is charged like a lift by the
+arm). Its weight follows the **maximum-slope rule**: it is at least as steep as the
+energy Gaussian's steepest slope in lift, 11.2196 per metre at sigma 1.5, so no
+partial lift can farm the pair. The old rule that cancelled the reward at the
+target is not sufficient under the wider sigma. ``ball_centred`` keeps its function
+and parameters at :data:`JUGGLE_CENTRE_WEIGHT`; ``ball_in_fov`` and
+``head_joint_motion`` are unchanged.
+
+The spawn is **not** the target. :data:`BALL_SPAWN_DROP_HEIGHT` is still 0.20 m, so
+the ball starts 0.20 m below the 0.40 m target. At spawn ``E = 1.962`` J/kg against
+``E* = 3.924`` J/kg. At the original sigma of 0.5 J/kg the energy reward there was
+about 2.1e-7, i.e. no usable signal. The operator widened
+:data:`JUGGLE_ENERGY_SIGMA_J_PER_KG` to 1.5 J/kg, so the spawn scores about 0.1807
+and the 0.20 -> 0.40 m climb has a gradient. The passive bounce peak of about
+0.21 m scores about 0.21.
 
 *Command.* The twist command is pinned to a standstill band: ``lin_vel_x`` and
 ``lin_vel_y`` within :data:`JUGGLE_COMMAND_LIN_VEL_MPS`, ``ang_vel_z`` within
@@ -37,19 +74,35 @@ The base task's ``command_vel`` term is removed here as well: it would write the
 base task's wider ranges over the band. With no term left, ``cfg.curriculum`` is
 empty in both train and play mode.
 
-*One metric.* ``ball_bounce_count`` is registered with ``reduce="sum"``, so
-``Episode_Metrics/ball_bounce_count`` reports **bounces per episode**. That is
-this task's acceptance signal: a reward can be collected in unintended ways, a
-counted bounce is behaviour. The adapter reads the apex reward term's per-step
-flag, and ``RewardManager.compute`` skips terms whose weight is 0, so the apex
-weight must stay non-zero or the count goes stale.
+*Five ball metrics.* ``ball_energy`` and ``ball_energy_error`` are registered with
+``reduce="mean"``, so ``Episode_Metrics/ball_energy`` reports the episode mean of
+``E`` (target ``E*``) and ``Episode_Metrics/ball_energy_error`` the episode mean of
+``|E - E*|`` in J/kg. Both are recomputed from the current simulation state, so
+they cannot read a stale value: unlike the removed ``ball_bounce_count``, which read
+a reward term's per-step flag and would freeze if that term were not computed, there
+is no term state to go stale.
+
+``ball_impact_count``, ``ball_flight_time`` and ``ball_sustained_contact`` are read
+from the ``bat_ball_contact`` sensor and are **logging only**. They do not enter a
+reward, an observation, a termination or a curriculum. They are the only evidence
+that can separate juggling from a passive bounce. A racket-ball contact lasts about
+9-10 ms against a 20 ms control step, and the sensor's ``found`` field is one
+instantaneous snapshot per step, so an instantaneous metric misses about half the
+contacts. The sensor therefore keeps one control step of substeps in
+``force_history`` (``history_length`` = ``cfg.decimation``), and the metrics derive
+contact from it. The first counts rising edges of the per-step contact flag with
+``reduce="sum"``; a contact inside one step counts once, and a continuous contact
+spanning several steps also counts once. The second reports a running mean airborne
+time between impacts in seconds with ``reduce="last"``, accumulated in substeps. The
+third reports the longest continuous contact seen in the control step, in seconds,
+with ``reduce="max"``.
 
 The unchanged parts carry the carrying task's reasons, documented in
 :mod:`~mjlab.tasks.velocity.config.agibot_x2.tennis_ball_env_cfg`: the 1 ms step is
 a string-bed contact-calibration requirement (the same ``solref`` injects energy at
-5 ms), the robot and ball resets are pinned so the ball starts on the bed in every
-environment, the servo gains are the vendor reference-policy table, and the
-physics randomization is the tracking family's. Observations are the actor's
+5 ms), the robot and ball resets are pinned so the ball starts above the same bed
+point in every environment, the servo gains are the vendor reference-policy table,
+and the physics randomization is the tracking family's. Observations are the actor's
 delayed and held ball position (the real 10 Hz perception chain) and the critic's
 privileged position and velocity, so the actor width stays 105 and the critic 123.
 
@@ -58,6 +111,7 @@ See ``docs/source/x2_tennis_ball_juggle.rst``.
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
@@ -75,24 +129,23 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_OBS_UPDATE_PERIOD_STEPS,
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
+  BALL_SPAWN_DROP_HEIGHT,
   CAMERA_HALF_ANGLE_X,
   CAMERA_HALF_ANGLE_Y,
   CAMERA_MOUNT_QUAT,
   CAMERA_MOUNT_XYZ,
   HEAD_JOINT_NAMES,
   HEAD_MOTION_WEIGHT,
-  JUGGLE_APEX_MIN_CLEARANCE_M,
-  JUGGLE_APEX_MIN_SPEED_MPS,
-  JUGGLE_APEX_SIGMA_M,
-  JUGGLE_APEX_TARGET_M,
-  JUGGLE_APEX_WEIGHT,
   JUGGLE_CENTRE_WEIGHT,
   JUGGLE_COMMAND_ANG_VEL_RPS,
   JUGGLE_COMMAND_LIN_VEL_MPS,
-  JUGGLE_REST_CLEARANCE_M,
-  JUGGLE_REST_GRACE_S,
-  JUGGLE_REST_SPEED_MPS,
-  JUGGLE_REST_WEIGHT,
+  JUGGLE_ENERGY_BALL_REST_Z,
+  JUGGLE_ENERGY_SIGMA_J_PER_KG,
+  JUGGLE_ENERGY_TARGET_HEIGHT_M,
+  JUGGLE_ENERGY_WEIGHT,
+  JUGGLE_RACKET_LIFT_DEADBAND_M,
+  JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z,
+  JUGGLE_RACKET_LIFT_WEIGHT,
   RACKET_BODY,
   get_tennis_ball_cfg,
   get_x2_tennis_robot_cfg,
@@ -129,6 +182,26 @@ TENNIS_SUBSTEPS = 20
 
 BALL_ENTITY = "ball"
 BAT_BALL_CONTACT_SENSOR = "bat_ball_contact"
+
+_ABLATION_ENV_PREFIX = "MJLAB_JUGGLE_"
+
+
+def _ablation_value(name: str, default: float | None = None) -> float | None:
+  """Read one per-arm reward-weight override from the environment.
+
+  The sweep arms differ only in reward weights, and a run reads this module once,
+  so without this one code tree could launch one arm only. An unset variable
+  returns *default*, so the shipped configuration is unchanged and cannot drift
+  from the constants in ``tennis_constants``.
+
+  Only the three weights the sweep varies are readable here. Nothing in the
+  observation, action, termination or physics path may be overridden this way:
+  those have to stay identical across arms or the comparison means nothing.
+  """
+  raw = os.environ.get(_ABLATION_ENV_PREFIX + name)
+  if raw in (None, ""):
+    return default
+  return float(raw)
 
 _ZERO_POSE_RANGE = {
   "x": (0.0, 0.0),
@@ -200,12 +273,17 @@ def _tennis_robot_cfg() -> EntityCfg:
   return robot_cfg
 
 
-def _make_ball_sensor() -> ContactSensorCfg:
+def _make_ball_sensor(history_length: int) -> ContactSensorCfg:
   """Net normal force between the racket (any geom) and the ball.
 
   ``primary`` is the racket *body*, so this covers the string bed and any other
   racket geom that gains collision in future. The bed carries ``priority=1``, so
   the reported force is the calibrated bed contact, not a mixed pair.
+
+  Args:
+    history_length: Physics substeps kept in ``force_history``. The juggling
+      task passes its decimation, so the buffer covers exactly one control step;
+      ``0`` disables the buffer.
   """
   return ContactSensorCfg(
     name=BAT_BALL_CONTACT_SENSOR,
@@ -214,6 +292,7 @@ def _make_ball_sensor() -> ContactSensorCfg:
     fields=("found", "force"),
     reduce="netforce",
     num_slots=1,
+    history_length=history_length,
   )
 
 
@@ -231,7 +310,7 @@ def agibot_x2_tennis_juggle_env_cfg(
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` with the tennis equipment in the scene, the
-    bouncing-ball reward set, the bounce-count metric and a
+    dense ball-energy reward set, the energy and contact metrics and a
     ``bat_ball_contact`` sensor. The base task's observations, terminations,
     actions and domain randomization are unchanged.
   """
@@ -242,9 +321,13 @@ def agibot_x2_tennis_juggle_env_cfg(
   # its own floating entity.
   ##
 
+  # Dropped in, not placed: a bounce exists from the first control step, so the
+  # policy has something to sustain instead of having to create a bounce from a
+  # ball at rest. Measured at 4000 iterations, the sweep policies never initiated
+  # a bounce on their own.
   cfg.scene.entities = {
     "robot": _tennis_robot_cfg(),
-    BALL_ENTITY: get_tennis_ball_cfg(),
+    BALL_ENTITY: get_tennis_ball_cfg(BALL_SPAWN_DROP_HEIGHT),
   }
 
   ##
@@ -260,9 +343,16 @@ def agibot_x2_tennis_juggle_env_cfg(
 
   ##
   # Sensors.
+  #
+  # One control step of substeps in the rolling buffer. The racket-ball contact
+  # lasts about 9-10 ms while the control step is 20 ms, so the sensor's single
+  # instantaneous ``found`` sample misses about half the contacts. ``decimation``
+  # is the control step over the sim step (0.02 s / 0.001 s = 20), which is
+  # exactly the window ``ball_contact_metric`` reads. Only the juggling task
+  # enables it; the carrying task's sensor keeps the instantaneous field.
   ##
 
-  cfg.scene.sensors = (cfg.scene.sensors or ()) + (_make_ball_sensor(),)
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (_make_ball_sensor(cfg.decimation),)
 
   ##
   # Sim-to-real randomization. The tracking family's physics axes, plus one shared
@@ -365,12 +455,16 @@ def agibot_x2_tennis_juggle_env_cfg(
   #
   # ``ball_height`` is deliberately absent. It is flat out to a 100 mm gap and would
   # pay for a ball parked on the strings, which is the behaviour this task has to
-  # rule out. ``ball_bounce_apex`` pays once per bounce at the target apex instead,
-  # and ``ball_at_rest`` charges for parking. Centring stays -- the ball has to come
-  # back to the plate, not merely be hit -- but at a quarter of the carrying weight,
-  # because the ball is in the air for most of the cycle and cannot be steered there.
-  # The two ball SceneEntityCfgs are shared: all four ball terms measure the same
-  # plate frame and the same ball.
+  # rule out. ``ball_energy`` pays for the ball's energy relative to its resting
+  # state on the plate, on every step instead; a parked ball has h ~ 0 and so earns
+  # almost nothing. Both heights are world z, not pelvis-relative: a crouch must not
+  # move the energy datum. Solving the one remaining park -- holding the resting ball
+  # at the 0.40 m target lift, where h = 0.40 reads E* -- is ``racket_lift``'s job,
+  # with a negative weight, and it is world-relative so the legs cannot do the lift
+  # for free either. Centring stays -- the ball has to come back to the plate, not
+  # merely be hit -- at a quarter of the carrying weight. The two ball
+  # SceneEntityCfgs are shared: all the ball terms measure the same plate frame and
+  # the same ball.
   ##
 
   cfg.rewards["ball_centred"] = RewardTermCfg(
@@ -382,27 +476,50 @@ def agibot_x2_tennis_juggle_env_cfg(
       **ball_state_params,
     },
   )
-  cfg.rewards["ball_bounce_apex"] = RewardTermCfg(
-    func=mdp.ball_bounce_apex,
-    weight=JUGGLE_APEX_WEIGHT,
+  # Sweep arms vary the two weights below. The lift weight is linear in the energy
+  # weight by construction (see ``juggle_racket_lift_weight``), so an arm that
+  # changes the energy weight must scale the lift weight with it; otherwise the arm
+  # silently reopens the parking farm it was derived to close.
+  energy_override = _ablation_value("ENERGY_WEIGHT")
+  energy_weight = JUGGLE_ENERGY_WEIGHT if energy_override is None else energy_override
+  lift_override = _ablation_value("LIFT_WEIGHT")
+  lift_weight = (
+    JUGGLE_RACKET_LIFT_WEIGHT * energy_weight / JUGGLE_ENERGY_WEIGHT
+    if lift_override is None
+    else lift_override
+  )
+  cfg.rewards["ball_energy"] = RewardTermCfg(
+    func=mdp.ball_energy,
+    weight=energy_weight,
     params={
-      "target_height": JUGGLE_APEX_TARGET_M,
-      "sigma": JUGGLE_APEX_SIGMA_M,
-      "min_clearance": JUGGLE_APEX_MIN_CLEARANCE_M,
-      "min_speed": JUGGLE_APEX_MIN_SPEED_MPS,
+      "target_height": JUGGLE_ENERGY_TARGET_HEIGHT_M,
+      "sigma": JUGGLE_ENERGY_SIGMA_J_PER_KG,
+      "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
       **ball_state_params,
     },
   )
-  cfg.rewards["ball_at_rest"] = RewardTermCfg(
-    func=mdp.ball_at_rest,
-    weight=JUGGLE_REST_WEIGHT,
+  # Lifting the plate above its carry height and parking a ball on it reads
+  # h = lift in world, so a lift by the legs is charged like a lift by the arm.
+  # Negative weight: the term returns metres of excess lift.
+  cfg.rewards["racket_lift"] = RewardTermCfg(
+    func=mdp.racket_lift,
+    weight=-lift_weight,
     params={
-      "max_clearance": JUGGLE_REST_CLEARANCE_M,
-      "max_speed": JUGGLE_REST_SPEED_MPS,
-      "grace_s": JUGGLE_REST_GRACE_S,
-      **ball_state_params,
+      "plate_top_rest_z": JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z,
+      "deadband": JUGGLE_RACKET_LIFT_DEADBAND_M,
+      "plate_cfg": plate_cfg,
     },
   )
+
+  # A standing robot with a zero command already earns the ceiling of both tracking
+  # terms, 0.040 per step each, while a perfect juggle earns 0.040 from
+  # ``ball_energy``. The objective is therefore worth half of doing nothing, which
+  # is exactly what one sweep arm tests. Unset leaves the base value alone.
+  track_override = _ablation_value("TRACK_WEIGHT")
+  if track_override is not None:
+    for term in ("track_linear_velocity", "track_angular_velocity"):
+      if term in cfg.rewards:
+        cfg.rewards[term].weight = track_override
 
   # Grace, not a weaker threshold: the ball is lost at the same height as before,
   # but the episode only ends once it has stayed lost. Without this an untrained
@@ -447,18 +564,64 @@ def agibot_x2_tennis_juggle_env_cfg(
   )
 
   ##
-  # Acceptance metric: bounces per episode.
+  # Metrics: two energy means and three contact metrics. All are logging only: they
+  # change no reward, observation, termination or curriculum.
   #
-  # ``reduce="sum"`` accumulates the per-step value over the episode, so a term that
-  # is 1.0 on a counted apex and 0.0 otherwise becomes a bounce count. The adapter
-  # reads the apex reward term's state, so the apex weight must stay non-zero:
-  # ``RewardManager.compute`` skips terms whose weight is 0 and the flag would then go
-  # stale, freezing the count at its last value.
+  # ``reduce="mean"`` reports the mean of a per-step value over the episode. Both
+  # energy functions recompute E from the current simulation state, so neither can
+  # read a stale reward-term flag. The old ``ball_bounce_count`` was removed with the
+  # apex term it read: ``RewardManager.compute`` skips zero-weight terms, so a
+  # counter that reads another term's state freezes when that term stops being
+  # computed.
+  #
+  # The contact metrics read the ``bat_ball_contact`` sensor, which was already in
+  # the scene and unused. The energy metrics still start below the target: the ball
+  # spawns 0.20 m above rest against a 0.40 m target, so at reset they read about
+  # 1.962 J/kg and 1.962 J/kg of error, not 3.924 and 0.
   ##
 
-  cfg.metrics["ball_bounce_count"] = MetricsTermCfg(
-    func=mdp.ball_bounce_count,
+  cfg.metrics["ball_energy"] = MetricsTermCfg(
+    func=mdp.ball_energy_value,
+    params={
+      "target_height": JUGGLE_ENERGY_TARGET_HEIGHT_M,
+      "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
+      **ball_state_params,
+    },
+    reduce="mean",
+  )
+  cfg.metrics["ball_energy_error"] = MetricsTermCfg(
+    func=mdp.ball_energy_error,
+    params={
+      "target_height": JUGGLE_ENERGY_TARGET_HEIGHT_M,
+      "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
+      **ball_state_params,
+    },
+    reduce="mean",
+  )
+
+  # Contact metrics: logging only. The sensor's history buffer holds one control
+  # step of substeps, so these resolve a 9-10 ms contact that a once-per-step
+  # ``found`` sample would miss. ``impact_count`` sums rising edges of the per-step
+  # contact flag, so a continuous contact counts once but an in-step contact counts
+  # at all. ``flight_time`` reports the running mean airborne time between impacts;
+  # ``reduce="last"`` keeps the final mean because the manager's ``mean`` would
+  # divide by every step, not by the number of flights. ``sustained_contact``
+  # reports the longest continuous contact in the step, and ``reduce="max"`` keeps
+  # the longest one of the episode.
+  cfg.metrics["ball_impact_count"] = MetricsTermCfg(
+    func=mdp.ball_contact_metric,
+    params={"sensor_name": BAT_BALL_CONTACT_SENSOR, "mode": "impact_count"},
     reduce="sum",
+  )
+  cfg.metrics["ball_flight_time"] = MetricsTermCfg(
+    func=mdp.ball_contact_metric,
+    params={"sensor_name": BAT_BALL_CONTACT_SENSOR, "mode": "flight_time"},
+    reduce="last",
+  )
+  cfg.metrics["ball_sustained_contact"] = MetricsTermCfg(
+    func=mdp.ball_contact_metric,
+    params={"sensor_name": BAT_BALL_CONTACT_SENSOR, "mode": "sustained_contact"},
+    reduce="max",
   )
 
   ##

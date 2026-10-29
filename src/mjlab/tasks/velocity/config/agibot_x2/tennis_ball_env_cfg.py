@@ -272,8 +272,8 @@ def agibot_x2_tennis_ball_env_cfg(
   apply_x2_tracking_robot_randomization(cfg)
 
   ##
-  # Resets. Both entities are pinned so the ball starts on the bed in every
-  # environment. Everything else in the base reset sequence is preserved.
+  # Resets. Both entities are pinned so the ball is dropped onto the bed from the
+  # same height in every environment.
   ##
 
   reset_base = cfg.events["reset_base"]
@@ -286,9 +286,10 @@ def agibot_x2_tennis_ball_env_cfg(
     params={
       "asset_cfg": ball_cfg,
       "pose_range": dict(_ZERO_POSE_RANGE),
-      # Empty: the ball starts at rest on the bed. A non-empty range would
-      # immediately tip it off, which is a separate scenario (ball reception),
-      # not this one.
+      # Empty: the ball starts at rest at BALL_SPAWN_INIT_POS, BALL_SPAWN_DROP_HEIGHT
+      # above the bed, and falls onto the face. A non-empty range would make the
+      # first impact speed vary between environments, which is a separate scenario
+      # (ball reception), not this one.
       "velocity_range": {},
     },
   )

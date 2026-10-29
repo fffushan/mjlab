@@ -118,3 +118,20 @@ def test_mid_episode_resample_does_not_write_velocity(device):
     torch.zeros_like(robot.data.root_link_lin_vel_b),
     atol=1e-6,
   )
+
+
+def test_joystick_max_slider_bounds_contain_the_axis_maximum() -> None:
+  """Viser asserts ``max >= value >= min`` when a GUI slider is created.
+
+  The joystick's per-axis "Max" slider takes the axis maximum from the task's
+  command ranges as its own initial value. A task that pins a narrow band put that
+  initial value below a hardcoded 0.1 floor and aborted while the GUI was being
+  built - the X2 tennis juggle task pins ``ang_vel_z`` to +/-0.05 rad/s and hit
+  exactly this. Nothing in the physics or the policy was involved.
+  """
+  from mjlab.tasks.velocity.mdp.velocity_command import joystick_max_slider_bounds
+
+  for value in (0.0, 0.01, 0.05, 0.0999, 0.1, 0.5, 2.0, 10.0, 25.0):
+    lo, hi = joystick_max_slider_bounds(value)
+    assert hi >= value >= lo, (value, lo, hi)
+    assert hi >= lo

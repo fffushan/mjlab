@@ -182,6 +182,9 @@ class ball_command_ramp(ManagerTermBase):
     super().__init__(env)
     self._stage = 0
     self._episodes: deque[_FinishedEpisode] = deque(maxlen=int(cfg.params["window"]))
+    # Calls served by this term. The gate refuses a window that fewer calls than
+    # entries could have built; see the priming rule in ``__call__``.
+    self._calls = 0
 
   def __call__(
     self,
@@ -208,10 +211,31 @@ class ball_command_ramp(ManagerTermBase):
     # accumulator times that divisor over the episode's own step count.
     max_command_step = command_cfg.resampling_time_range[1] / env.step_dt
 
+    # A window is not evidence when one reset batch could have filled it, and exactly
+    # that happens at the start of a run. ``scripts/train.py`` passes
+    # ``init_at_random_ep_len=True``, so rsl_rl randomises ``episode_length_buf`` to
+    # desynchronise episode endings; the construction reset then reports those staggers
+    # as finished episodes while the tracking accumulator is still zero, and the
+    # staggered envs time out over the next few steps. The window therefore claims long
+    # episodes with perfect tracking. Measured 2026-10-26: it read 16.67 s while the
+    # mean episode length in the same log block was 17 steps, and the value decayed
+    # 16.67 -> 15.16 -> 9.92 -> 1.42 s as real episodes replaced the fabrications.
+    #
+    # A fresh run is shielded by the schedule, which is closed for the first 2000
+    # iterations. A resumed run is not: ``rl/runner.py`` restores ``common_step_counter``
+    # from the checkpoint, so the schedule is open on the very first call, and on
+    # 2026-10-26 a resumed run was promoted through both stages within two calls. An
+    # elapsed-time rule cannot survive that restore, because restoring the counter *is*
+    # a jump. This term's own call count does survive it, so the rule is: the window
+    # must span at least as many calls as it holds episodes. One batch can never satisfy
+    # that, and real episodes satisfy it within about one window of steps.
+    self._calls += 1
+    first_call = self._calls == 1
+
     # ``env.episode_length_buf`` still holds the length of the episode that just
     # ended: the environment zeroes it only after every manager's reset.
     steps = env.episode_length_buf[env_ids]
-    if steps.numel():
+    if steps.numel() and not first_call:
       err_sum = command_term.metrics["error_vel_xy"][env_ids]
       track_err = err_sum * max_command_step / steps.clamp(min=1)
       self._episodes.extend(
@@ -223,9 +247,15 @@ class ball_command_ramp(ManagerTermBase):
         )
       )
 
-    # A partial window is not evidence, so neither condition is evaluated yet, and
-    # both typical values read 0.0 until it is full.
-    complete = len(self._episodes) >= window
+    # One episode length of calls must have passed before the window can only hold
+    # episodes this run observed. The staggering above lasts at most one episode length,
+    # a term call happens at most once per env step, so by then every staggered episode
+    # has ended and the window has been refreshed many times over. Counting this term's
+    # own calls rather than env steps is deliberate: it cannot be jumped.
+    primed = self._calls > int(env.max_episode_length)
+
+    # A partial window is not evidence either.
+    complete = primed and len(self._episodes) >= window
     typical_seconds = 0.0
     typical_track_err = 0.0
     mean_seconds = 0.0

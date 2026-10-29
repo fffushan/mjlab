@@ -21,6 +21,19 @@ if TYPE_CHECKING:
   from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 
+def joystick_max_slider_bounds(max_val: float) -> tuple[float, float]:
+  """Bounds for the joystick's per-axis "Max" slider.
+
+  That slider's own initial value is the axis maximum from the task's command
+  ranges, and viser asserts ``max >= value >= min`` when it is created.  A task
+  that pins a narrow band therefore falls below a fixed 0.1 floor and aborts
+  while the GUI is being built - the X2 tennis juggle task pins ``ang_vel_z`` to
+  +/-0.05 rad/s and crashed on it.  The floor follows the value, not the reverse.
+  """
+  value = float(max_val)
+  return min(0.1, value), max(10.0, value)
+
+
 class UniformVelocityCommand(CommandTerm):
   cfg: UniformVelocityCommandCfg
 
@@ -164,12 +177,13 @@ class UniformVelocityCommand(CommandTerm):
       enabled = server.gui.add_checkbox("Enable", initial_value=False)
 
       for label, max_val in axes:
+        lo, hi = joystick_max_slider_bounds(max_val)
         max_input = server.gui.add_slider(
           f"Max {label}",
           initial_value=max_val,
           step=0.1,
-          min=0.1,
-          max=10.0,
+          min=lo,
+          max=hi,
         )
         slider = server.gui.add_slider(
           label,

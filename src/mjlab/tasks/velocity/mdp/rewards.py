@@ -7,7 +7,7 @@ import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import BALL_RADIUS, FACE_SITE_POS
 from mjlab.entity import Entity
-from mjlab.managers.manager_base import ManagerTermBase
+from mjlab.managers.manager_base import ManagerTermBase, ManagerTermBaseCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
@@ -626,13 +626,49 @@ def head_joint_motion(
 
 
 ##
-# Tennis juggling: the ball bounces off the plate and returns to an apex.
+# Tennis juggling: the ball bounces off the plate and comes back.
 #
-# The holding terms above pay every control step, which cannot express a bounce. A
-# ball parked at the apex height would collect a per-step height reward for as long as
-# the episode lasts, so the height of an apex has to be paid once per bounce instead.
-# These terms do that, and charge for parking the ball.
+# The task is paid by the ball's **vertical energy relative to its resting height
+# on the plate** matching the energy of a bounce to a target height, on every
+# control step. Energy is the quantity a bounce conserves: a ball at rest on the
+# plate has none, a ball rising to the target after a bounce has the target value at
+# every point of its flight, and a ball hit too hard has too much. See
+# :func:`ball_energy`.
+#
+# :class:`ball_bounce_apex` and :class:`ball_at_rest` below are an earlier design
+# that paid once per bounce and charged for parking the ball. They are kept as
+# library terms with their own tests, but the juggling task no longer installs them:
+# a per-bounce payment is zero on every non-apex step, so it gives no gradient while
+# the ball is in flight, which is most of the cycle.
 ##
+
+
+def _plate_body_id(plate_cfg: SceneEntityCfg) -> int:
+  """The single racket body ``plate_cfg`` resolves to."""
+  body_ids = plate_cfg.body_ids
+  if isinstance(body_ids, slice) or len(body_ids) != 1:
+    raise ValueError(
+      f"plate_cfg must resolve to exactly one racket body, got {body_ids}"
+    )
+  return body_ids[0]
+
+
+def _plate_top_z(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """World z of the centre of the plate's top surface."""
+  plate: Entity = env.scene[plate_cfg.name]
+  body_id = _plate_body_id(plate_cfg)
+  plate_pos_w = plate.data.body_link_pos_w[:, body_id]
+  plate_quat_w = plate.data.body_link_quat_w[:, body_id]
+  face_offset = torch.tensor(
+    FACE_SITE_POS, dtype=plate_pos_w.dtype, device=plate_pos_w.device
+  )
+  face_pos_w = plate_pos_w + quat_apply(
+    plate_quat_w, face_offset.expand_as(plate_pos_w)
+  )
+  return face_pos_w[:, 2]
 
 
 def _ball_gap_and_vertical_speed(
@@ -661,24 +697,210 @@ def _ball_gap_and_vertical_speed(
     ``(gap, vertical_speed)``, each shape ``(num_envs,)``. Positive
     ``vertical_speed`` is upward.
   """
-  plate: Entity = env.scene[plate_cfg.name]
   ball: Entity = env.scene[ball_cfg.name]
-  body_ids = plate_cfg.body_ids
-  if isinstance(body_ids, slice) or len(body_ids) != 1:
-    raise ValueError(
-      f"plate_cfg must resolve to exactly one racket body, got {body_ids}"
-    )
-  body_id = body_ids[0]
-  plate_pos_w = plate.data.body_link_pos_w[:, body_id]
-  plate_quat_w = plate.data.body_link_quat_w[:, body_id]
-  face_offset = torch.tensor(
-    FACE_SITE_POS, dtype=plate_pos_w.dtype, device=plate_pos_w.device
-  )
-  face_pos_w = plate_pos_w + quat_apply(
-    plate_quat_w, face_offset.expand_as(plate_pos_w)
-  )
-  gap = ball.data.root_link_pos_w[:, 2] - face_pos_w[:, 2] - BALL_RADIUS
+  gap = ball.data.root_link_pos_w[:, 2] - _plate_top_z(env, plate_cfg) - BALL_RADIUS
   return gap, ball.data.root_link_lin_vel_w[:, 2]
+
+
+def _ball_energy_and_target(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  target_height: float,
+  ball_rest_z: float,
+) -> tuple[torch.Tensor, float]:
+  r"""The ball's energy per unit mass, and the energy of the target apex.
+
+  .. math::
+
+    h = z_{\mathrm{ball}} - z_{\mathrm{rest}}, \qquad
+    E = \tfrac{1}{2} v_{\mathrm{ball},z}^2 + g \, h, \qquad
+    E^* = g \, h_{\mathrm{target}}
+
+  where ``z_rest`` (``ball_rest_z``) is the ball centre's **absolute world
+  height** when the ball rests on the plate in the carry pose, so ``h`` is the
+  ball's height above that resting state. The juggle spawn is ``h = 0.20`` m with
+  zero vertical speed, i.e. ``E = 1.962`` J/kg against a target of ``E^* = 3.924``
+  J/kg: the spawn is **below** the target, not on it.
+
+  Four rules keep :math:`E` from being reachable without a bounce. Each is an
+  anti-loophole rule, not a stylistic choice:
+
+  * **Vertical only.** With the full speed :math:`\tfrac{1}{2}|\mathbf{v}|^2`, the
+    target :math:`g \cdot 0.40` is reached at a speed of 2.80 m/s with no bounce at
+    all: a robot walking at 2.80 m/s with a ball sitting still on the racket, or a
+    ball rolling across the plate, would earn full credit. The vertical component is
+    zero in both cases, so this formula pays nothing for them.
+  * **No plate velocity anywhere.** The racket is the control input, so it must not
+    be able to pay itself. Subtracting the plate velocity from the ball's would let a
+    **descending** racket manufacture energy with the ball untouched: dropping the arm
+    at 1 m/s under a resting ball gives :math:`\tfrac{1}{2} \cdot 1.0^2 = 0.5`
+    J/kg, 13 % of the target for free, and at about 2.8 m/s it reaches the target
+    with the ball never leaving the strings. The racket's motion enters this formula
+    only through the motion it actually gives the ball.
+  * **The datum is a fixed world height.** With ``h`` measured from the pelvis
+    instead, lowering the pelvis 0.20 m while the ball stays put raises ``h`` by
+    0.20 m and adds :math:`g \cdot 0.20 = 1.962` J/kg, half of :math:`E^*`, with no
+    work done on the ball. The lift term cannot see it, because the plate and the
+    pelvis drop together and its excess stays zero. That is free energy, and leg
+    motion is not a juggling skill. The cost of the world datum is that gait bob
+    moves :math:`E`: 3 cm of bob is :math:`g \cdot 0.03 = 0.29` J/kg, 0.19 sigma.
+    Accepted, because the exploit is free energy under any target.
+  * **Gravity comes from the compiled model**, ``env.sim.mj_model.opt.gravity[2]``,
+    not a literal 9.81. The environment's gravity is the physics that actually runs,
+    so :math:`E^*` has to be computed with it; the absolute value is taken because
+    MuJoCo stores gravity as a vector with a negative z entry.
+
+  A ball resting on the plate and raised by the racket is a separate loophole: its
+  ``h`` equals the world lift, so a 0.40 m lift reads exactly :math:`E^*`.
+  :func:`racket_lift` exists to charge for that motion; see its docstring.
+
+  Args:
+    ball_cfg: Ball entity.
+    target_height: Height of the target apex above the resting state, in metres.
+    ball_rest_z: ``z_rest``, the ball centre's absolute world z when the ball rests
+      on the plate in the carry pose, in metres.
+
+  Returns:
+    ``(energy, target)``: shape ``(num_envs,)`` in J/kg, and a scalar in J/kg.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  height = ball.data.root_link_pos_w[:, 2] - ball_rest_z
+  gravity = abs(float(env.sim.mj_model.opt.gravity[2]))
+  energy = 0.5 * torch.square(ball.data.root_link_lin_vel_w[:, 2]) + gravity * height
+  return energy, gravity * target_height
+
+
+def ball_energy(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+  target_height: float,
+  sigma: float,
+  ball_rest_z: float,
+) -> torch.Tensor:
+  r"""Reward the ball's energy matching a bounce to ``target_height``.
+
+  .. math:: r = \exp(-((E - E^*) / \sigma)^2)
+
+  with :math:`E` and :math:`E^*` as :func:`_ball_energy_and_target` defines them.
+  One for a ball at the top of a bounce of exactly ``target_height``: its energy is
+  then :math:`E^*`. The reset state does **not** earn 1.0: the ball spawns at
+  :math:`h = 0.20` m, below the 0.40 m target. The reward falls off symmetrically
+  in J/kg as the ball carries too little or too much energy.
+
+  **Dense and stateless:** the reward is a function of the current state only, paid
+  on every control step, with no per-episode state and no reset hook. A ball resting
+  on the plate has :math:`h = 0` and :math:`E \approx 0`, far below :math:`E^*`, so
+  parking earns almost nothing; the one way to park at the target is to hold the
+  racket 0.40 m high, which :func:`racket_lift` charges for. A per-bounce apex reward
+  is the opposite: zero on every step except the apex, so it gives no gradient while
+  the ball is in flight.
+
+  Args:
+    plate_cfg: Accepted so the ball terms share one parameter dict; the energy
+      datum is a fixed world height, so this term does not read the robot.
+    ball_cfg: Ball entity.
+    target_height: Height of the target apex above the resting state, in metres.
+    sigma: Falloff of the Gaussian in energy, in J/kg, the same units as ``E``.
+    ball_rest_z: ``z_rest``, the resting ball centre's absolute world z, in metres.
+
+  Returns:
+    Shape ``(num_envs,)``, between 0 and 1.
+  """
+  energy, target = _ball_energy_and_target(env, ball_cfg, target_height, ball_rest_z)
+  return torch.exp(-torch.square((energy - target) / sigma))
+
+
+def ball_energy_value(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+  target_height: float,
+  ball_rest_z: float,
+) -> torch.Tensor:
+  r"""The ball's energy per unit mass :math:`E`, for a metrics term.
+
+  With ``reduce="mean"`` the metric reports the episode mean of :math:`E`, whose
+  target is :math:`E^* = g \, h_{\mathrm{target}}`. The value is recomputed from
+  the current simulation state, exactly like :func:`ball_energy`, so it cannot read
+  a stale flag: there is no reward-term state to go stale.
+
+  Args:
+    plate_cfg: Accepted so the ball terms share one parameter dict; the energy
+      datum is a fixed world height, so this term does not read the robot.
+    ball_cfg: Ball entity.
+    target_height: Height of the target apex above the resting state, in metres.
+    ball_rest_z: ``z_rest``, the resting ball centre's absolute world z, in metres.
+
+  Returns:
+    Shape ``(num_envs,)``, in J/kg.
+  """
+  energy, _ = _ball_energy_and_target(env, ball_cfg, target_height, ball_rest_z)
+  return energy
+
+
+def ball_energy_error(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+  target_height: float,
+  ball_rest_z: float,
+) -> torch.Tensor:
+  """The distance :math:`|E - E^*|` in J/kg, for a metrics term.
+
+  With ``reduce="mean"`` the metric reports the episode mean distance from the
+  target energy, which is the quantity the reward shrinks but cannot report as a
+  physical number. Like :func:`ball_energy`, it is recomputed from the current
+  state, so it cannot go stale.
+
+  Returns:
+    Shape ``(num_envs,)``, in J/kg, zero when the energy is exactly on target.
+  """
+  energy, target = _ball_energy_and_target(env, ball_cfg, target_height, ball_rest_z)
+  return torch.abs(energy - target)
+
+
+def racket_lift(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  plate_top_rest_z: float,
+  deadband: float,
+) -> torch.Tensor:
+  r"""Metres the plate has been lifted above its carry height, for a penalty.
+
+  .. math::
+
+    \max(0, z_{\mathrm{plate}} - z_{\mathrm{rest}} - d)
+
+  where ``plate_top_rest_z`` is the plate top surface's **absolute world height**
+  in the carry pose and ``deadband`` is ``d``.
+
+  This closes the parking loophole that the energy reward leaves open. A ball resting
+  on the plate has ``h`` equal to the plate's world lift above the carry pose, so
+  holding the racket 0.40 m high makes the ball read exactly :math:`E^*` on every
+  step. A term that returned this quantity with weight
+  ``-JUGGLE_RACKET_LIFT_WEIGHT`` makes the net reward non-increasing in lift, so a
+  partial lift cannot farm the energy reward.
+
+  The measurement is in **world z**, like the energy datum, so a lift is charged
+  whether the legs or the arm produce it. A pelvis-relative measurement would miss
+  the leg lift that the world energy datum makes visible: raising the whole robot
+  0.40 m carries the resting ball to :math:`E^*` and must pay for it, or the pair
+  of terms can still be farmed by crouching and standing. The deadband leaves normal
+  jostling uncharged.
+
+  Args:
+    plate_cfg: Racket body; the plate top surface is defined by it.
+    plate_top_rest_z: Absolute world z of the plate top surface in the carry pose,
+      in metres.
+    deadband: Lift that is not charged, in metres.
+
+  Returns:
+    Shape ``(num_envs,)``, non-negative metres. Install it with a **negative**
+    weight; the returned value is the excess lift, not the penalty.
+  """
+  lift = _plate_top_z(env, plate_cfg) - plate_top_rest_z
+  return torch.clamp(lift - deadband, min=0.0)
 
 
 class ball_bounce_apex(ManagerTermBase):
@@ -871,3 +1093,194 @@ class ball_at_rest(ManagerTermBase):
     if env_ids is None:
       env_ids = slice(None)
     self._rest_steps[env_ids] = 0
+
+
+_BALL_CONTACT_MODES = ("impact_count", "flight_time", "sustained_contact")
+
+
+def _ball_contact_substeps(force_history: torch.Tensor) -> torch.Tensor:
+  """Contact flags for every substep in the sensor's force history.
+
+  Args:
+    force_history: ``[B, N, H, 3]`` contact forces, newest substep at index 0.
+
+  Returns:
+    ``[B, H]`` bool, oldest substep first.
+  """
+  force_mag = torch.linalg.vector_norm(force_history, dim=-1)  # [B, N, H]
+  # A non-zero force in any slot is a contact. A zero-force touch has nothing to
+  # see in the force channel and is indistinguishable from no contact here.
+  contact = torch.any(force_mag > 0.0, dim=1)  # [B, H], newest first
+  return contact.flip(-1)
+
+
+def _consecutive_true_runs(
+  mask: torch.Tensor, carry: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Consecutive-True counts over one window of substeps, oldest first.
+
+  Args:
+    mask: ``[B, H]`` bool substeps.
+    carry: ``[B]`` long, consecutive True substeps ending just before the
+      window.
+
+  Returns:
+    ``run``: ``[B, H]``, the run of True substeps ending at each substep.
+    ``end``: ``[B]``, the run ending at the last substep. It is the carry for
+      the next window.
+  """
+  n_envs, h = mask.shape
+  idx = torch.arange(h, device=mask.device)
+  # Position of the last False at or before each substep; -1 if there is none.
+  last_false = torch.where(~mask, idx, -1).cummax(dim=1).values
+  run = torch.where(
+    mask,
+    torch.where(
+      last_false >= 0,
+      idx - last_false,
+      idx + 1 + carry.unsqueeze(1),
+    ),
+    torch.zeros((n_envs, h), dtype=idx.dtype, device=mask.device),
+  )
+  return run, run[:, -1]
+
+
+class ball_contact_metric(ManagerTermBase):
+  """Contact-derived ball metrics, selected by ``mode``, for ``metrics`` entries.
+
+  One class because the three metrics share one input, the racket-ball
+  :class:`~mjlab.sensor.ContactSensor` named by ``sensor_name``, and their
+  per-episode state. Each metrics entry gets its own instance, so the modes do
+  not share counters.
+
+  **Substep resolution.** The racket-ball contact lasts about 9-10 ms while the
+  control step is 20 ms, so one sample of the sensor's ``found`` field per step
+  misses about half of the contacts. When the sensor is configured with
+  ``history_length`` equal to the environment's decimation, ``force_history``
+  holds every physics substep of the control step. ``contact`` for one step is
+  then "any substep in the window had a non-zero contact force in any slot".
+
+  **Modes**
+
+  * ``"impact_count"`` returns 1.0 on a rising edge of the per-step contact flag
+    and 0.0 otherwise. A continuous contact is one impact, however many control
+    steps it lasts, and a contact that starts and ends between two samples now
+    counts once instead of zero. Use ``reduce="sum"`` for impacts per episode.
+  * ``"flight_time"`` keeps a running mean of the airborne time that ends at
+    each substep-level rising edge, in seconds, accumulated in substeps. A
+    contact substep never adds to a flight. The value returned on every step is
+    the running mean. Use ``reduce="last"``: the manager's ``"mean"`` divides by
+    the episode's step count, which is not the number of flights.
+  * ``"sustained_contact"`` returns the longest continuous contact visible in
+    the control step, in seconds, accumulated in substeps. A contact that ends
+    inside the window still reports its length. Use ``reduce="max"`` for the
+    longest single contact of the episode.
+
+  **Limit.** Impact count is a rising edge of the per-control-step flag, so it
+  merges two contacts whenever no control step between them is fully airborne:
+  in particular, two contacts inside one control step count as one impact.
+  Flight time and sustained contact still resolve that gap in substeps.
+
+  **Fallback.** Without ``force_history`` (``history_length == 0``) the metrics
+  read the instantaneous ``found`` field at control-step resolution. That is the
+  pre-history behaviour and can miss a contact that starts and ends between two
+  samples.
+
+  **Reset.** Every counter and the previous contact flag are cleared on episode
+  reset. A contact on the first sampled step after reset counts as a rising edge,
+  because the episode has no earlier state.
+
+  Args:
+    sensor_name: Scene name of the :class:`~mjlab.sensor.ContactSensor`.
+    mode: One of ``"impact_count"``, ``"flight_time"`` and
+      ``"sustained_contact"``.
+
+  Returns:
+    Shape ``(num_envs,)``. The units depend on ``mode``: impacts, seconds, and
+    seconds.
+  """
+
+  def __init__(self, cfg: ManagerTermBaseCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    mode = str(cfg.params["mode"])
+    if mode not in _BALL_CONTACT_MODES:
+      msg = (
+        f"ball_contact_metric mode '{mode}' is unknown. "
+        f"Valid modes are {_BALL_CONTACT_MODES}."
+      )
+      raise ValueError(msg)
+    self._mode = mode
+    self._sensor_name = str(cfg.params["sensor_name"])
+    self._step_dt = env.step_dt
+    self._substep_dt = env.physics_dt
+    sensor: ContactSensor = env.scene[self._sensor_name]
+    decimation = round(self._step_dt / self._substep_dt)
+    history_length = sensor.cfg.history_length
+    if history_length not in (0, decimation):
+      msg = (
+        f"Sensor '{self._sensor_name}' has history_length={history_length}, but "
+        f"ball_contact_metric needs 0 (fallback) or one control step, {decimation}."
+      )
+      raise ValueError(msg)
+    self._prev_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self._air_run = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._contact_run = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    self._flight_sum = torch.zeros(env.num_envs, device=env.device)
+    self._flight_count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self, env: ManagerBasedRlEnv, sensor_name: str, mode: str
+  ) -> torch.Tensor:
+    del sensor_name, mode  # Resolved in ``__init__``.
+    sensor: ContactSensor = env.scene[self._sensor_name]
+    data = sensor.data
+    if data.force_history is not None:
+      # [B, N, H, 3], H = decimation, so the window is this control step.
+      substep_contact = _ball_contact_substeps(data.force_history)
+      substep_dt = self._substep_dt
+    else:
+      assert data.found is not None, (
+        "ball_contact_metric needs the sensor's 'force' history or 'found' field"
+      )
+      # One sample per control step: the pre-history fallback.
+      substep_contact = torch.any(data.found > 0, dim=-1).unsqueeze(-1)
+      substep_dt = self._step_dt
+
+    contact = substep_contact.any(dim=-1)
+    rising = contact & ~self._prev_contact
+    self._prev_contact = contact.clone()
+
+    if self._mode == "impact_count":
+      return rising.float()
+
+    air_carry = self._air_run
+    contact_carry = self._contact_run
+    air_run, air_end = _consecutive_true_runs(~substep_contact, air_carry)
+    contact_run, contact_end = _consecutive_true_runs(substep_contact, contact_carry)
+    self._air_run = air_end
+    self._contact_run = contact_end
+
+    if self._mode == "flight_time":
+      # ``air_run`` at substep i-1 is the airborne run ending just before
+      # substep i; at substep 0 it is the carry from the previous control step.
+      air_before = torch.cat([air_carry.unsqueeze(1), air_run[:, :-1]], dim=1)
+      # A rising edge closes a flight. At episode start the carry is zero, so a
+      # contact on the first sampled substep has no flight before it.
+      rising_substep = substep_contact & (air_before > 0)
+      self._flight_sum = self._flight_sum + (
+        air_before.float() * substep_dt * rising_substep
+      ).sum(dim=-1)
+      self._flight_count = self._flight_count + rising_substep.sum(dim=-1)
+      mean = self._flight_sum / self._flight_count.clamp(min=1).float()
+      return torch.where(self._flight_count > 0, mean, torch.zeros_like(mean))
+
+    return contact_run.max(dim=-1).values.float() * substep_dt
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._prev_contact[env_ids] = False
+    self._air_run[env_ids] = 0
+    self._contact_run[env_ids] = 0
+    self._flight_sum[env_ids] = 0.0
+    self._flight_count[env_ids] = 0

@@ -44,6 +44,7 @@ Two properties of this file are load-bearing and easy to break:
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 
 import mujoco
@@ -276,8 +277,15 @@ CONTACT_FRICTION = (SLIDING_FRICTION, SPIN_FRICTION, ROLLING_FRICTION)
 CONTACT_CONDIM = 6
 
 ##
-# String-bed contact. Fitted to the user's drop measurements (rebound 0.17, 0.23,
-# 0.31, 0.42 m for drops of 0.20, 0.30, 0.40, 0.50 m). Negative solref is
+# String-bed contact. Fitted to the drop measurements recorded in the ``x2_tennis``
+# reference project (rebound 0.17, 0.23, 0.31, 0.42 m for drops of 0.20, 0.30, 0.40,
+# 0.50 m). Those are a colleague's numbers, not operator measurements of the shipped
+# ball and racket.
+#
+# An operator video measurement (30 fps, racket on a board) gives rebound 0.15, 0.23,
+# 0.30, 0.40 m, i.e. energy ratio 0.767 against the reference 0.808 -- a 5% difference,
+# well inside the spread of a hand release, and identical at the 0.30 m drop. The
+# reference fit is therefore kept, not re-fitted. Negative solref is
 # MuJoCo's direct stiffness/damping form, not physical N/m or N*s/m, and it is
 # only valid near the 1 ms step it was fitted at.
 ##
@@ -589,8 +597,58 @@ BALL_SPAWN_LOCAL_POS = (
   1.1530848027869869,
 )
 
-# Clearance between the ball's lowest point and the bed's top surface at spawn.
+# Clearance between the ball's lowest point and the bed's top surface at the
+# on-bed reference point.  The ball does not actually start here: see
+# ``BALL_SPAWN_DROP_HEIGHT``.
 BALL_SPAWN_CLEARANCE = 0.001
+
+# Unit normal of the string bed in the carry pose, measured from the compiled
+# model's ``FACE_SITE`` orientation (``site_xmat[:, 2]``).  It is world +z to
+# 6e-6, i.e. the bed is horizontal to 0.0006 deg at the kinematic carry pose, so a
+# drop along the normal is a vertical drop.  Kept as a measured value rather than
+# assumed, so that changing the carry pose cannot silently tilt the drop.
+BALL_SPAWN_FACE_NORMAL = (8.747e-06, 6.379e-06, 1.0)
+
+# How far above the bed the ball starts, measured along the bed normal.
+#
+# Rationale, not tuning: with the ball resting on the bed the policy never learns
+# to *start* a bounce.  Measured on the 4000-iteration sweep, the ball's apex was
+# p50 47 mm / p90 71 mm and the bouncing collapsed entirely when the observation
+# noise was removed - i.e. the policy was reacting to disturbances, not driving a
+# bounce cycle, because nothing ever taught it to strike a ball upward from rest.
+# Dropping it in gives a real bounce from step zero, which the policy must then
+# sustain and raise.
+#
+# A 0.20 m fall arrives at about 1.98 m/s; with a COR near 0.88 the first passive
+# rebound is about 0.15 m, and the measured rebound on the built environment is
+# about 0.205 m.  Both are below the current 0.40 m energy target, so the spawn no
+# longer matches the target.  The policy still starts with a bounce it must improve
+# rather than one it must create; see JUGGLE_ENERGY_TARGET_HEIGHT_M for the reward
+# consequence of the broken spawn-target pairing.
+BALL_SPAWN_DROP_HEIGHT = 0.20
+
+# Ball centre at reset for a ball dropped in from ``BALL_SPAWN_DROP_HEIGHT``:
+# the on-bed reference raised along the bed normal.  This is the *juggle* start;
+# the carry task keeps spawning on the bed and passes ``drop_height=0.0``.
+BALL_SPAWN_INIT_POS = tuple(
+  p + n * BALL_SPAWN_DROP_HEIGHT
+  for p, n in zip(BALL_SPAWN_LOCAL_POS, BALL_SPAWN_FACE_NORMAL, strict=True)
+)
+
+
+def ball_spawn_init_pos(
+  drop_height: float = 0.0,
+) -> tuple[float, float, float]:
+  """Ball centre at reset, ``drop_height`` above the bed along the bed normal.
+
+  ``drop_height=0.0`` is the on-bed reference and reproduces
+  :data:`BALL_SPAWN_LOCAL_POS`.
+  """
+  return tuple(
+    p + n * drop_height
+    for p, n in zip(BALL_SPAWN_LOCAL_POS, BALL_SPAWN_FACE_NORMAL, strict=True)
+  )
+
 
 ##
 # Ball-holding task definition: what the policy observes, what it is paid for, and
@@ -768,18 +826,28 @@ BALL_COMMAND_MASTERY_FLOOR_S = 8.0
 # given, while the floor above passes it.
 #
 # The limit is expressed as a **fraction of the fastest linear command of the active
-# stage** rather than in m/s, so one constant covers every stage: 0.075 m/s at the
-# 0.3 m/s stage, 0.15 m/s at 0.6 m/s and 0.25 m/s at 1.0 m/s. An absolute value would
+# stage** rather than in m/s, so one constant covers every stage: 0.15 m/s at the
+# 0.3 m/s stage, 0.30 m/s at 0.6 m/s and 0.50 m/s at 1.0 m/s. An absolute value would
 # have to be re-tuned at each widening, and a value that is reasonable at 0.3 m/s is
 # trivially satisfied at 1.0 m/s.
 #
-# 0.25 is a judgement call, not a measurement: no measurement of a good policy's
-# tracking error on this task exists yet. It rejects the observed failing case with a
-# margin of about 8 (0.075 m/s allowed against 0.586 m/s measured), and it asks a
-# promoted policy to spend no more than a quarter of its top commanded speed on
-# tracking error. Being too strict costs training time only, because this gate can
-# withhold an advance and never force one.
-BALL_COMMAND_MAX_TRACK_ERR_FRAC = 0.25
+# 0.5 is set from measurement (2026-10-26), not from taste. The first value, 0.25, was
+# a judgement call and proved unreachable: it sat below the tracking error of the
+# robot's own walking skill, so the gate could never open. A run held at stage 0 for
+# 10 790 iterations moved its tracking error only from 0.2512 to 0.2297 m/s, against a
+# 0.075 m/s gate. Measurements at the 1.0 m/s command range:
+#   - converged 30k-iteration base velocity task, no ball at all: 0.58 m/s (58 %);
+#   - this carry task at 12 939 iterations, same command range: 0.556 m/s (56 %).
+# The ball therefore costs no tracking, and a robot that stood still would score
+# 0.765 of command. So the whole discriminating range is roughly 0.76 down to the
+# skill's own floor near 0.56. 0.5 rejects a policy that does not walk while
+# permitting one that walks about as well as the base skill.
+#
+# Caveat: 0.5 does not ask for good walking, only for walking no worse than the
+# existing base skill. Tighten it only together with a better base policy, and
+# re-measure before changing it. Being too strict costs training time only, because
+# this gate can withhold an advance and never force one.
+BALL_COMMAND_MAX_TRACK_ERR_FRAC = 0.5
 """Typical tracking error allowed before advancing, as a fraction of stage speed."""
 
 ##
@@ -866,18 +934,197 @@ BALL_COMMAND_WINDOW = 100
 """Finished episodes the promotion gate waits for before deciding."""
 
 ##
-# Juggling task definition: the ball bounces on the plate and comes back to an
-# apex, instead of being carried.
+# Juggling task definition: the ball bounces on the plate and comes back, instead
+# of being carried.
 #
-# The apex reward is paid **once per bounce**, so what matters is the height of a
-# bounce, not the height of the ball on some arbitrary step. All heights below are
-# the **gap under the ball's lowest point**, measured along the world vertical from
-# the centre of the plate's top surface: a ball resting on the strings reads about
-# zero. The world vertical, and not the plate normal, because the plate tilts while
-# juggling and gravity is what turns the ball around.
+# The task is paid by the ball's **energy per unit mass**, on every control step:
+#
+#   h     = z_ball - JUGGLE_ENERGY_BALL_REST_Z
+#   E     = 0.5 * v_ball_z**2 + g * h   vertical only, no plate velocity
+#   E*    = g * target_height
+#   r_E   = exp(-((E - E*) / sigma)**2)
+#   r_arm = -JUGGLE_RACKET_LIFT_WEIGHT
+#           * max(0, z_plate_top - JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z - deadband)
+#
+# Both reference heights are **fixed world z**, not offsets from the pelvis. The
+# pelvis datum is exploitable: with h = z_ball - (z_pelvis + K), lowering the pelvis
+# 0.20 m while the ball stays put raises h by 0.20 m and adds g * 0.20 = 1.962
+# J/kg, half of the current 3.924 J/kg target, with no work done on the ball. The
+# lift term cannot see it, because the plate and the pelvis drop together, so its
+# excess stays zero. That is free energy, and leg motion is not a juggling skill.
+# The price of the world datum is that gait bob moves E: 3 cm of bob is g * 0.03 =
+# 0.29 J/kg, 0.19 sigma. Accepted: the bob is small, and the exploit is free
+# energy under any target.
+#
+# **Measured why, not taste.** The previous design paid a Gaussian bell once per
+# bounce, at an apex gap of 0.30 m with an 80 mm sigma. On the 4000-iteration sweep
+# the policies reached apexes of about 0.16-0.24 m, where the bell contributed about
+# 2e-5 of per-step reward: indistinguishable from zero and flat, so it supplied no
+# gradient. It also paid on one step per bounce and nothing on the others, i.e. on
+# about one of every 25 control steps of a 0.5 s bounce cycle. The energy term is
+# dense, so every step carries the gradient that teaches the strike.
+#
+# The ball velocity is **vertical only**: with the full speed, walking at 2.80 m/s
+# with the ball parked on the racket would reach E* without a bounce, and so would a
+# ball rolling across the plate.
+#
+# The racket is the **control input and must not pay itself**, so no plate velocity
+# is subtracted from the ball's. Subtracting it would let a descending racket
+# manufacture energy with the ball untouched: 1 m/s of arm drop is 0.5 J/kg, 13 % of
+# E* for free, and about 2.8 m/s reaches E* with the ball never leaving the strings.
+# For the same reason the energy target is paired with the lift penalty below: a
+# ball resting on the plate and raised by L has h = L in world, so a lift to the
+# 0.40 m target alone would earn r_E = 1.0 forever.
 ##
 
-# Apex gap the bounce reward targets: 300 mm under the ball. The plate top surface at
+# Ball centre's absolute world z when the ball rests on the plate in the carry pose.
+# Measured, not guessed: BALL_SPAWN_LOCAL_POS[2] = 1.1530848... m.
+#
+# At reset the ball is dropped from BALL_SPAWN_DROP_HEIGHT above the bed, so it
+# starts at h = 0.20 m with zero vertical speed. That is 0.20 m BELOW the current
+# 0.40 m target, so the reset state is not E = E*. A test pins the spawn height and
+# the resulting energy deficit, not a target identity. See
+# JUGGLE_ENERGY_TARGET_HEIGHT_M for the consequence.
+#
+# Valid as an absolute height only because the tennis tasks pin the base reset at
+# BAT_CARRY_BASE_HEIGHT with zero yaw (``reset_base`` pose_range is zeroed in
+# ``agibot_x2_tennis_ball_env_cfg``). If that pin were ever removed, the pelvis
+# would move away from this reference and both heights below would be wrong.
+JUGGLE_ENERGY_BALL_REST_Z = BALL_SPAWN_LOCAL_POS[2]
+
+# Apex height the energy reward targets above the ball's resting state: 400 mm.
+# This is the operator's choice, to match the height a human juggles a tennis ball.
+# At the model gravity (9.81 m/s^2) E* = g * 0.40 = 3.924 J/kg. A ball resting on
+# the plate has h = 0 and E ~ 0, so the target needs the ball to be moving up, and
+# a carried or rolling ball scores nothing because only the vertical ball velocity
+# is used.
+#
+# **The spawn is below the target.** BALL_SPAWN_DROP_HEIGHT is still 0.20 m, so
+# the ball starts 0.20 m above its resting height, i.e. 0.20 m BELOW this target.
+# At spawn E = g * 0.20 = 1.962 J/kg against E* = 3.924 J/kg, a deficit of 1.962
+# J/kg. At the original sigma of 0.5 J/kg the reward there was
+# exp(-(1.962 / 0.5)**2) = 2.1e-7, i.e. no usable signal. The operator has now set
+# JUGGLE_ENERGY_SIGMA_J_PER_KG to 1.5 J/kg, so the spawn scores
+# exp(-(1.962 / 1.5)**2) = 0.1807 and the whole 0.20 -> 0.40 m climb has a
+# gradient. The passive bounce peak at about 0.21 m scores about 0.2 under the
+# wider sigma.
+#
+# At 0.40 m the ball is at the edge of the camera's 0.60 field-of-view plateau: the
+# falloff begins just above 0.41 m of gap (0.595 at 0.41, 0.608 at 0.42). The target
+# therefore does not fight the field-of-view term, but it has little margin. A
+# 0.40 m bounce needs a launch of sqrt(2 * 9.81 * 0.40) = 2.80 m/s.
+JUGGLE_ENERGY_TARGET_HEIGHT_M = 0.40
+
+# Gaussian falloff in energy, in J/kg, the same units as E. 1.5 J/kg puts 1/e at
+# E* +/- 1.5 J/kg: at the top of a bounce that is 153 mm of height (1.5 / 9.81 m),
+# and at rest it is a vertical ball speed of sqrt(2 * 1.5) = 1.73 m/s. The reward is
+# therefore neither flat over the bounce nor narrower than the control rate can
+# resolve.
+#
+# 1.5, not the original 0.5: the target is 0.40 m while the ball spawns at 0.20 m,
+# so at sigma 0.5 the spawn scores exp(-(1.962 / 0.5)**2) = 2.1e-7 and the run has
+# no learning signal. At 1.5 the spawn scores exp(-(1.962 / 1.5)**2) = 0.1807, so
+# the whole 0.20 -> 0.40 m climb has a gradient. The operator authorised this
+# change. The wider sigma is also why the lift weight uses the maximum-slope rule
+# below instead of cancelling the reward at the target.
+JUGGLE_ENERGY_SIGMA_J_PER_KG = 1.5
+
+# Weights. The reward manager scales every term by the same step duration, so the
+# comparison below is between weight values.
+#
+# 2.0 is chosen so this term's per-step maximum, weight * 1.0 * dt = 2.0 * 1.0 *
+# 0.02 = 0.040 at the 0.02 s control step, equals ``track_linear_velocity``'s
+# ceiling (2.0 * 1.0 * 0.02). At a smaller weight the velocity-tracking term would
+# outvote the ball, and the policy would buy base-velocity credit instead of the
+# energy it is supposed to learn.
+#
+# Centring stays at a quarter of the ball-holding task's 1.0 because the ball is in
+# the air for most of the cycle and cannot be steered there. The energy term has to
+# carry the task: over one 0.5 s bounce cycle at 50 Hz, i.e. 25 control steps, it
+# can earn at most 2.0 x 25 x 0.02 = 1.0 s of credit, against 0.25 x 25 x 0.02 =
+# 0.125 from centring.
+JUGGLE_ENERGY_WEIGHT = 2.0
+JUGGLE_CENTRE_WEIGHT = 0.25
+
+# Plate top-surface absolute world z in the carry pose: the ball centre minus one
+# radius and the spawn clearance, because the on-bed ball centre is one radius plus
+# the clearance above the face along the bed normal, and that normal is world +z
+# (BALL_SPAWN_FACE_NORMAL z = 1.0). Measured through the ball rest height, so it
+# shares that measurement: 1.1193848... m. The same reset pin applies.
+JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z = (
+  JUGGLE_ENERGY_BALL_REST_Z - BALL_RADIUS - BALL_SPAWN_CLEARANCE
+)
+
+# Lift that is not charged, so normal jostling is free: 30 mm.
+JUGGLE_RACKET_LIFT_DEADBAND_M = 0.03
+
+# Gravity of the compiled tennis model, in m/s^2. The energy reward reads it from
+# ``env.sim.mj_model.opt.gravity``; the lift-weight derivation needs it at import
+# time, so it is repeated here. Change both together.
+_MODEL_GRAVITY_MPS2 = 9.81
+
+
+def juggle_racket_lift_weight(
+  sigma: float = JUGGLE_ENERGY_SIGMA_J_PER_KG,
+  energy_weight: float = JUGGLE_ENERGY_WEIGHT,
+  gravity: float = _MODEL_GRAVITY_MPS2,
+) -> float:
+  r"""Lift weight whose slope blocks every partial-lift farm.
+
+  The energy reward is a Gaussian in lifted height ``L``,
+  ``r_E(L) = exp(-((g * L - g * T) / sigma)**2)``. Its steepest slope in ``L`` is
+
+  .. math:: \sqrt{2} \, (g / \sigma) \, e^{-1/2}
+
+  per metre, attained at ``|g * L - g * T| = sigma / sqrt(2)``. A lift penalty at
+  least that steep makes ``W_E * r_E(L) - W_lift * max(0, L - deadband)``
+  non-increasing above the deadband, so no partial lift can turn the pair
+  positive.
+
+  Args:
+    sigma: Gaussian falloff in energy, in J/kg.
+    energy_weight: Weight of the energy reward.
+    gravity: Gravity of the compiled model, in m/s^2.
+
+  Returns:
+    Weight per metre of excess lift.
+  """
+  return energy_weight * math.sqrt(2.0) * (gravity / sigma) * math.exp(-0.5)
+
+
+# Weight of the lift penalty, per metre of excess lift above the deadband.
+#
+# **Maximum-slope rule.** The energy reward is a Gaussian in lift, so its steepest
+# slope is sqrt(2) * (g / sigma) * exp(-1/2) per metre, attained at
+# |g * L - g * T| = sigma / sqrt(2); :func:`juggle_racket_lift_weight` derives the
+# weight from that. A penalty at least that steep makes the net reward
+# W_E * r_E(L) - W_lift * max(0, L - deadband) non-increasing above the deadband, so
+# a partial lift cannot farm it. With W_E = 2.0, g = 9.81 and sigma = 1.5 the weight
+# is 2.0 * sqrt(2) * (9.81 / 1.5) * exp(-0.5) = 11.2196 per metre.
+#
+# The old rule W_E / (T - deadband) cancelled the parked reward exactly at L = T.
+# It is not sufficient at sigma 1.5: the wider Gaussian makes partial lifts near the
+# target profitable, about +0.09 at L = 0.36 m, which is the farm this term exists
+# to prevent. At the maximum-slope weight the same point is negative.
+#
+# Derived, not hardcoded: a typed 11.2196 would silently stop satisfying the rule if
+# the energy weight, sigma or gravity changed.
+#
+# **The penalty charges sustained lifting, not arm motion.** It is per step, and so
+# is the reward. A 0.10 m strike held for 5 steps costs about
+# 11.2196 * (0.10 - 0.03) * 5 = 3.9 in weight-value units, while one 20-step bounce
+# cycle at the target earns about 2.0 * 20 = 40. The strike is affordable; only
+# parking the ball at the target height is ruled out.
+JUGGLE_RACKET_LIFT_WEIGHT = juggle_racket_lift_weight()
+
+# The two blocks below parameterise the earlier per-bounce design:
+# ``ball_bounce_apex`` and ``ball_at_rest`` in ``rewards.py``. **The juggling task no
+# longer installs those terms.** The constants are kept because
+# ``tests/test_x2_tennis_ball_task.py`` still exercises both library terms with
+# these values; deleting them would break that module, which this change does not
+# touch. Nothing in the juggling task reads them.
+
+# Apex gap the library apex term targets: 300 mm under the ball. The plate top surface at
 # the carry pose is world z 1.1194, so the ball centre reaches 1.1194 + 0.0327 + 0.30
 # = 1.452 m. Measured on the built task at that height, the ball sits at 0.434 of the
 # camera half-frame (27.8 deg against the 64.0 deg vertical half-angle) and the
@@ -891,7 +1138,7 @@ BALL_COMMAND_WINDOW = 100
 # the head body. Do not restore it.
 JUGGLE_APEX_TARGET_M = 0.30
 
-# Gaussian falloff of the apex reward in the apex gap. 80 mm puts 1/e at an apex of
+# Gaussian falloff of the apex term in the apex gap. 80 mm puts 1/e at an apex of
 # 0.22 or 0.38 m, i.e. a bounce 8 cm out is still worth 0.37.
 JUGGLE_APEX_SIGMA_M = 0.08
 
@@ -907,30 +1154,16 @@ JUGGLE_APEX_MIN_CLEARANCE_M = 0.03
 # sample before the apex is small whatever the launch was.
 JUGGLE_APEX_MIN_SPEED_MPS = 0.30
 
-# Resting test for the parking penalty: a gap below 30 mm and a world vertical speed
-# below 0.20 m/s. The grace period is what keeps the bottom of a real bounce, which
-# passes through this state for about two control steps, from being charged.
+# Resting test for the library parking penalty: a gap below 30 mm and a world
+# vertical speed below 0.20 m/s. The grace period is what keeps the bottom of a real
+# bounce, which passes through this state for about two control steps, from being
+# charged.
 JUGGLE_REST_CLEARANCE_M = 0.03
 JUGGLE_REST_SPEED_MPS = 0.20
 JUGGLE_REST_GRACE_S = 0.50
 
-# Weights. The reward manager scales every term by the same step duration, so the
-# comparison below is between weight values.
-#
-# Centring is charged at a quarter of the ball-holding task's 1.0 because the ball is
-# in the air for most of the cycle and cannot be steered there; the apex payment has
-# to carry the task instead. Over one 0.5 s bounce cycle at 50 Hz, i.e. 25 control
-# steps, carrying the ball earns about 0.25 x 25 = 6 from centring alone. A juggle
-# earns about 6.0 per apex, the same 6 per cycle, plus the same centring while the
-# ball is near the plate, so juggling is worth roughly twice as much as parking the
-# ball at the target height. The rest penalty tips that balance rather than dominating
-# it: a parked ball still collects centring, so parking earns about 6.25 - 2.5 = 3.75
-# per cycle against roughly 12 for juggling.
-#
-# **These are first guesses to be tuned against the bounce count, not measurements.**
-# The ratio is the claim; the absolute values only set the scale of the reward.
+# Weights of the library per-bounce terms, unused by the juggling task (see above).
 JUGGLE_APEX_WEIGHT = 6.0
-JUGGLE_CENTRE_WEIGHT = 0.25
 JUGGLE_REST_WEIGHT = -0.10
 
 # Command for the first juggling version: the robot juggles standing still, so the
@@ -947,13 +1180,17 @@ _FOOT_LOW_Z_TOLERANCE = 1e-6
 
 def measure_bat_carry_state(
   base_height: float | None = None,
+  drop_height: float = 0.0,
 ) -> tuple[float, np.ndarray]:
   """Forward-kinematics probe for the bat-carry pose.
 
   Returns ``(base_height, ball_centre)``: the pelvis height at which the lowest
   foot contact point sits :data:`BAT_CARRY_GROUND_CLEARANCE` above z=0, and the
   ball centre that rests on the face centre along the face normal with
-  :data:`BALL_SPAWN_CLEARANCE` of slack.
+  :data:`BALL_SPAWN_CLEARANCE` of slack, raised a further ``drop_height`` along
+  that normal.  ``drop_height=0`` reproduces :data:`BALL_SPAWN_LOCAL_POS`, the
+  on-bed reference; :data:`BALL_SPAWN_DROP_HEIGHT` reproduces
+  :data:`BALL_SPAWN_INIT_POS`, where the ball actually starts.
 
   ``base_height`` is measured, not assumed, when it is ``None``: the leg is
   rigid at fixed joint angles, so the lowest sole point translates with the
@@ -1000,7 +1237,9 @@ def measure_bat_carry_state(
   site_id = model.site(FACE_SITE).id
   face_pos = data.site_xpos[site_id]
   face_normal = data.site_xmat[site_id].reshape(3, 3)[:, 2]
-  ball_center = face_pos + face_normal * (BALL_RADIUS + BALL_SPAWN_CLEARANCE)
+  ball_center = face_pos + face_normal * (
+    BALL_RADIUS + BALL_SPAWN_CLEARANCE + drop_height
+  )
   return float(base_height), np.asarray(ball_center)
 
 
@@ -1029,8 +1268,12 @@ def get_x2_tennis_robot_cfg() -> EntityCfg:
   )
 
 
-def get_tennis_ball_cfg() -> EntityCfg:
-  """Ball entity, spawned on the bat in the bat-carry pose.
+def get_tennis_ball_cfg(drop_height: float = 0.0) -> EntityCfg:
+  """Ball entity, spawned on or above the bat in the bat-carry pose.
+
+  ``drop_height=0.0`` (the default) puts the ball on the bed, which is what the
+  carry task needs.  The juggle task passes :data:`BALL_SPAWN_DROP_HEIGHT` so the
+  ball falls in and a bounce exists from the first step; see that constant.
 
   ``init_state.pos`` is in the environment frame (it is added to
   ``env_origins``), so it only lines up with the bed when the robot's own reset
@@ -1040,7 +1283,7 @@ def get_tennis_ball_cfg() -> EntityCfg:
   """
   return EntityCfg(
     init_state=EntityCfg.InitialStateCfg(
-      pos=BALL_SPAWN_LOCAL_POS,
+      pos=ball_spawn_init_pos(drop_height),
       rot=(1.0, 0.0, 0.0, 0.0),
       lin_vel=(0.0, 0.0, 0.0),
       ang_vel=(0.0, 0.0, 0.0),
@@ -1052,13 +1295,24 @@ def get_tennis_ball_cfg() -> EntityCfg:
 __all__ = [
   "BALL_RADIUS",
   "BALL_SPAWN_CLEARANCE",
+  "BALL_SPAWN_DROP_HEIGHT",
+  "BALL_SPAWN_FACE_NORMAL",
+  "BALL_SPAWN_INIT_POS",
   "BALL_SPAWN_LOCAL_POS",
+  "ball_spawn_init_pos",
   "BAT_CARRY_BASE_HEIGHT",
   "BAT_CARRY_POSE",
   "BED_GEOM",
   "BED_SOLREF",
   "CLAMP_BODY",
   "FACE_SITE",
+  "JUGGLE_ENERGY_BALL_REST_Z",
+  "JUGGLE_ENERGY_SIGMA_J_PER_KG",
+  "JUGGLE_ENERGY_TARGET_HEIGHT_M",
+  "JUGGLE_ENERGY_WEIGHT",
+  "JUGGLE_RACKET_LIFT_DEADBAND_M",
+  "JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z",
+  "JUGGLE_RACKET_LIFT_WEIGHT",
   "RACKET_BODY",
   "TENNIS_BED_COLLISION",
   "WRIST_BODY",
@@ -1067,5 +1321,6 @@ __all__ = [
   "get_tennis_ball_spec",
   "get_tennis_spec",
   "get_x2_tennis_robot_cfg",
+  "juggle_racket_lift_weight",
   "measure_bat_carry_state",
 ]

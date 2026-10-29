@@ -51,6 +51,9 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
   BALL_SPAWN_CLEARANCE,
+  BALL_SPAWN_DROP_HEIGHT,
+  BALL_SPAWN_FACE_NORMAL,
+  BALL_SPAWN_INIT_POS,
   BALL_SPAWN_LOCAL_POS,
   BAT_CARRY_BASE_HEIGHT,
   BAT_CARRY_POSE,
@@ -442,6 +445,53 @@ def test_carry_pose_constants_are_current() -> None:
   height, ball_centre = measure_bat_carry_state()
   assert height == pytest.approx(BAT_CARRY_BASE_HEIGHT, abs=1e-9)
   assert tuple(ball_centre) == pytest.approx(BALL_SPAWN_LOCAL_POS, abs=1e-9)
+
+
+def test_ball_spawns_a_fixed_drop_above_the_bed() -> None:
+  """The ball starts ``BALL_SPAWN_DROP_HEIGHT`` above the bed, along its normal.
+
+  The ball is dropped in rather than placed, so that a bounce exists from step
+  zero. What this test protects is that the drop is *along the bed normal*: if the
+  normal were ever tilted or the drop applied to z alone, the ball would land off
+  the face centre and every episode would start with the same off-axis impact.
+  """
+  normal = np.asarray(BALL_SPAWN_FACE_NORMAL, dtype=float)
+  assert np.linalg.norm(normal) == pytest.approx(1.0, abs=1e-9)
+  # Horizontal to 0.001 deg at the kinematic carry pose, so a drop along the normal
+  # is a vertical drop. Measured, not assumed.
+  assert abs(float(normal[2])) == pytest.approx(1.0, abs=1e-5)
+
+  offset = np.asarray(BALL_SPAWN_INIT_POS) - np.asarray(BALL_SPAWN_LOCAL_POS)
+  assert float(np.linalg.norm(offset)) == pytest.approx(
+    BALL_SPAWN_DROP_HEIGHT, rel=1e-9
+  )
+  assert offset == pytest.approx(normal * BALL_SPAWN_DROP_HEIGHT, rel=1e-9)
+  # Positive: above the bed, not below it.
+  assert BALL_SPAWN_DROP_HEIGHT > 0.0
+
+  # The forward-kinematics probe must reproduce the same point, so the constant
+  # and the measurement cannot drift apart.
+  _, centre = measure_bat_carry_state(drop_height=BALL_SPAWN_DROP_HEIGHT)
+  assert tuple(centre) == pytest.approx(BALL_SPAWN_INIT_POS, abs=1e-9)
+
+  # The entity spawns there when asked, and on the bed by default.
+  assert tuple(
+    get_tennis_ball_cfg(BALL_SPAWN_DROP_HEIGHT).init_state.pos
+  ) == pytest.approx(BALL_SPAWN_INIT_POS, abs=0.0)
+  assert tuple(get_tennis_ball_cfg().init_state.pos) == pytest.approx(
+    BALL_SPAWN_LOCAL_POS, abs=0.0
+  )
+
+  # Only the juggle task drops the ball in. The carry task keeps its trained
+  # spawn, so adding this cannot change an existing experiment.
+  juggle = load_env_cfg(JUGGLE_TASK_ID)
+  assert tuple(juggle.scene.entities["ball"].init_state.pos) == pytest.approx(
+    BALL_SPAWN_INIT_POS, abs=0.0
+  )
+  carry = load_env_cfg(TASK_ID)
+  assert tuple(carry.scene.entities["ball"].init_state.pos) == pytest.approx(
+    BALL_SPAWN_LOCAL_POS, abs=0.0
+  )
 
 
 def test_ball_spawns_one_millimetre_above_the_bed() -> None:
@@ -1098,9 +1148,13 @@ def test_resets_are_pinned_so_the_ball_lands_on_the_bed() -> None:
   assert ball_reset.params["velocity_range"] == {}
 
 
-def test_ball_entity_is_floating_and_starts_on_the_bat() -> None:
+def test_ball_entity_is_floating_and_starts_above_the_bat() -> None:
   cfg = get_tennis_ball_cfg()
+  # The carry task keeps the ball on the bed; the juggle task drops it in.
   assert cfg.init_state.pos == pytest.approx(BALL_SPAWN_LOCAL_POS)
+  assert get_tennis_ball_cfg(BALL_SPAWN_DROP_HEIGHT).init_state.pos == pytest.approx(
+    BALL_SPAWN_INIT_POS
+  )
   model = cfg.spec_fn().compile()
   assert model.nq == 7
   assert model.nv == 6
@@ -1244,7 +1298,8 @@ def test_the_ball_observation_is_the_plate_relative_pose() -> None:
     robot = env.scene["robot"]
     ball = env.scene[BALL_ENTITY]
 
-    ## Position, at rest on the strings.
+    ## Position, at rest on the strings. The carry task still places the ball on
+    ## the bed; only the juggle task drops it in.
     position, _ = mdp.plate_relative_ball_state(env, plate_cfg, ball_cfg)
     pos = position[0].cpu().numpy()
     assert pos[0] == pytest.approx(0.0, abs=2e-3)
@@ -1496,6 +1551,20 @@ def test_a_lost_ball_ends_the_episode_only_after_the_grace() -> None:
     env.close()
 
 
+def _prime_ramp_gate(env, term) -> None:
+  """Serve enough calls that the promotion gate trusts its window.
+
+  The gate refuses to judge a window that one episode length of calls could not have
+  built, because rsl_rl randomises ``episode_length_buf`` at the start of ``learn()``
+  and the construction reset reports those staggers as long, perfectly tracked
+  episodes. The episodes fed here are 1 s long, well under the length floor, so priming
+  can run with the schedule open without being mastery in its own right.
+  """
+  env.episode_length_buf[:] = round(1.0 / env.step_dt)
+  for _ in range(int(env.max_episode_length) + 2):
+    term.func(env, slice(None), **term.params)
+
+
 @pytest.mark.slow
 def test_the_command_ramp_needs_both_the_schedule_and_the_floor() -> None:
   """The clock carries the difficulty; performance can only withhold an advance.
@@ -1511,6 +1580,7 @@ def test_the_command_ramp_needs_both_the_schedule_and_the_floor() -> None:
   try:
     term = _ball_term(env, "curriculum", "ball_command_ramp")
     ranges = env.command_manager.get_term("twist").cfg.ranges
+    _prime_ramp_gate(env, term)
     step_dt = env.step_dt
     floor = float(term.params["mastery_floor_s"])
     window = BALL_COMMAND_WINDOW
@@ -1564,6 +1634,60 @@ def test_the_command_ramp_needs_both_the_schedule_and_the_floor() -> None:
 
 
 @pytest.mark.slow
+def test_a_resumed_run_cannot_promote_on_the_staggered_start_window() -> None:
+  """A resume must not inherit mastery from episodes that no policy ever ran.
+
+  ``scripts/train.py`` passes ``init_at_random_ep_len=True``, so rsl_rl randomises
+  ``episode_length_buf`` at the start of ``learn()`` to desynchronise episode endings.
+  The construction reset then reports those staggers as finished episodes, and the
+  tracking accumulator is still zero, so the window claims long episodes with perfect
+  tracking.
+
+  A fresh run is shielded by the schedule, which is closed for the first 2000
+  iterations. A resume is not shielded, because the step counter survives the resume:
+  on 2026-10-26 a resumed run was promoted through both stages within two calls, at a
+  moment when the same log block reported a mean episode length of 17 steps.
+  """
+  env = _build_env(num_envs=128, steps=0)
+  try:
+    term = _ball_term(env, "curriculum", "ball_command_ramp")
+    step_dt = env.step_dt
+
+    # The schedule is wide open from the very first call, as it is after a resume.
+    env.common_step_counter = BALL_COMMAND_STAGES[-1]["min_step"] + 1
+
+    # The staggered start arrives in a handful of calls: every env reports the longest
+    # possible episode, the way the construction reset reports rsl_rl's randomised
+    # stagger, with an untouched tracking accumulator.
+    for _ in range(13):
+      env.episode_length_buf[:] = env.max_episode_length
+      state = term.func(env, slice(None), **term.params)
+    assert int(state["stage"]) == 0, "a staggered start is not evidence"
+    assert float(state["typical_episode_s"]) == 0.0
+
+    # A episode length of calls later the window is this run's own, and short episodes
+    # with untouched tracking cannot claim mastery.
+    env.episode_length_buf[:] = round(1.0 / step_dt)
+    for _ in range(int(env.max_episode_length) + 2):
+      state = term.func(env, slice(None), **term.params)
+    assert int(state["stage"]) == 0, "the burst must not survive into the window"
+    assert float(state["typical_episode_s"]) < float(term.params["mastery_floor_s"])
+
+    # The guard is a delay, not a wedge: sustained mastery still advances, by one stage.
+    env.episode_length_buf[:] = env.max_episode_length
+    for _ in range(BALL_COMMAND_WINDOW + 10):
+      previous = int(state["stage"])
+      state = term.func(env, slice(None), **term.params)
+      if int(state["stage"]) != previous:
+        assert int(state["stage"]) == previous + 1, "one stage per call"
+        break
+    else:
+      raise AssertionError("the guard never lifted")
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
 def test_a_few_lucky_episodes_cannot_promote_the_command_ramp() -> None:
   """The gate is a median, so outliers cannot outvote the typical episode.
 
@@ -1575,6 +1699,7 @@ def test_a_few_lucky_episodes_cannot_promote_the_command_ramp() -> None:
   try:
     term = _ball_term(env, "curriculum", "ball_command_ramp")
     step_dt = env.step_dt
+    _prime_ramp_gate(env, term)
 
     def feed(episode_seconds: float) -> dict:
       env.episode_length_buf[:] = round(episode_seconds / step_dt)
@@ -1636,6 +1761,7 @@ def test_the_command_ramp_promotes_only_when_the_policy_tracks_the_command() -> 
     term = _ball_term(env, "curriculum", "ball_command_ramp")
     ranges = env.command_manager.get_term("twist").cfg.ranges
     floor = float(term.params["mastery_floor_s"])
+    _prime_ramp_gate(env, term)
     feed = _ramp_feeder(env, term)
 
     # Inside stage 0's limit, so tracking cannot be what withholds the advance.
@@ -1676,6 +1802,7 @@ def test_long_episodes_alone_cannot_promote_the_command_ramp() -> None:
     term = _ball_term(env, "curriculum", "ball_command_ramp")
     ranges = env.command_manager.get_term("twist").cfg.ranges
     floor = float(term.params["mastery_floor_s"])
+    _prime_ramp_gate(env, term)
     feed = _ramp_feeder(env, term)
 
     # A full window of long, badly tracked episodes, with the schedule shut.
@@ -1706,6 +1833,7 @@ def test_the_track_error_limit_scales_with_the_stage() -> None:
   try:
     term = _ball_term(env, "curriculum", "ball_command_ramp")
     floor = float(term.params["mastery_floor_s"])
+    _prime_ramp_gate(env, term)
     feed = _ramp_feeder(env, term)
     # Comfortably inside the tightest limit, which is stage 0's.
     err = (
@@ -2171,3 +2299,102 @@ def test_the_bounce_count_reports_the_apex_payments() -> None:
     total += counted
 
   assert float(total[0]) == pytest.approx(1.0)
+
+
+##
+# 5. Deployed observation contract for the hardware controller.
+#
+# The controller reads the exported ``observation_names`` vector and builds its
+# input in that order. Its ``VelocityAdapter::Validate`` compares that vector with
+# an exact equality against the list below, so a rename, a reorder or a width
+# change here is a breaking deployment change, not a training-side refactor. The
+# author term key is ``ball_pos`` while the function is
+# ``mdp.ball_position_hold``; the controller matches the key, not the function.
+##
+
+JUGGLE_TASK_ID = "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle"
+
+DEPLOYED_ACTOR_TERMS = (
+  "base_ang_vel",
+  "projected_gravity",
+  "joint_pos",
+  "joint_vel",
+  "actions",
+  "command",
+  "ball_pos",
+)
+
+# 3 + 3 + 31 + 31 + 31 + 3 + 3.
+DEPLOYED_ACTOR_TERM_WIDTHS = (3, 3, 31, 31, 31, 3, 3)
+DEPLOYED_ACTOR_WIDTH = 105
+DEPLOYED_ACTION_WIDTH = 31
+
+
+@pytest.mark.parametrize("task_id", [TASK_ID, JUGGLE_TASK_ID])
+def test_the_actor_term_order_is_the_deployed_contract(task_id: str) -> None:
+  """The actor term keys, in order, are exactly what the controller loads.
+
+  The config is read directly, so this check needs no environment. The exported
+  list is ``env.observation_manager.active_terms["actor"]``, which iterates this
+  same dict in this same order; the width test below reads the built manager.
+  """
+  cfg = load_env_cfg(task_id)
+  terms = cfg.observations["actor"].terms
+  assert list(terms) == list(DEPLOYED_ACTOR_TERMS)
+  assert list(terms)[-1] == "ball_pos", "ball_pos must stay last"
+  # The key is not the function name: renaming it to ``ball_position_hold`` would
+  # keep training working and still break the deployed controller.
+  assert terms["ball_pos"].func is mdp.ball_position_hold
+
+
+@pytest.mark.parametrize("task_id", [TASK_ID, JUGGLE_TASK_ID])
+def test_the_actor_observations_are_105_wide_in_the_export(task_id: str) -> None:
+  """The built actor has seven terms whose widths sum to 105.
+
+  Widths are read from a built environment because a term's shape depends on the
+  compiled asset (31 joints), not on the config text. The same environment then
+  produces the export metadata, so this covers the dict the hardware controller
+  consumes rather than only the observation manager's internals.
+  """
+  from mjlab.rl.exporter_utils import get_base_metadata
+
+  env = ManagerBasedRlEnv(load_env_cfg(task_id), device="cpu", num_envs=1)
+  try:
+    om = env.observation_manager
+    # The exporter reads this property, so this is the exported list.
+    names = om.active_terms["actor"]
+    dims = om.group_obs_term_dim["actor"]
+    widths = tuple(int(np.prod(dim)) for dim in dims)
+    assert names == list(DEPLOYED_ACTOR_TERMS)
+    assert widths == DEPLOYED_ACTOR_TERM_WIDTHS
+    assert sum(widths) == DEPLOYED_ACTOR_WIDTH == 105
+    assert om.group_obs_dim["actor"] == (DEPLOYED_ACTOR_WIDTH,)
+    assert env.action_manager.total_action_dim == DEPLOYED_ACTION_WIDTH
+
+    metadata = get_base_metadata(env, "x2-tennis-observation-contract")
+    assert cast(list[str], metadata["observation_names"]) == list(DEPLOYED_ACTOR_TERMS)
+    assert cast(list[float], metadata["observation_terms_scale"])[-1] == 1.0
+    assert cast(list[int], metadata["observation_terms_history_length"])[-1] == 0
+  finally:
+    env.close()
+
+
+@pytest.mark.parametrize("task_id", [TASK_ID, JUGGLE_TASK_ID])
+def test_the_deployed_ball_term_keeps_unit_scale_and_no_history(task_id: str) -> None:
+  """The controller refuses a ball term scaled away from 1.0 or widened.
+
+  ``None`` and ``1.0`` mean the same thing to the exporter: it records 1.0 for an
+  absent scale. Any other scale changes the metres the controller receives; a
+  history length would change the width instead.
+  """
+  cfg = load_env_cfg(task_id)
+  group = cfg.observations["actor"]
+  term = group.terms["ball_pos"]
+  if term.scale is not None:
+    scale = np.asarray(term.scale, dtype=float)
+    assert np.all(scale == 1.0), term.scale
+  # No history at the term level, and no group override that could impose one.
+  # ``flatten_history_dim`` only acts when ``history_length > 0``, so at zero the
+  # term contributes exactly one 3-vector.
+  assert term.history_length == 0
+  assert group.history_length is None
