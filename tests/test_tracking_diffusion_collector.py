@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pytest
 import torch
@@ -12,13 +14,12 @@ from mjlab.tasks.tracking.diffusion import (
   AppendOnlyShardStore,
   CollectorError,
   DiffusionCollector,
-  FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
-  PpoObservation,
   StepEvidence,
   TrialSpec,
   VaeObservation,
+  WorldState,
 )
 
 
@@ -37,53 +38,63 @@ class _Vae(torch.nn.Module):
     return torch.full((latent.shape[0], 31), 0.1)
 
 
+@dataclass(frozen=True)
+class _DefaultRow:
+  """The standing padding row this fake environment serves."""
+
+  reference: np.ndarray
+  state: WorldState
+
+
+def _default_row() -> _DefaultRow:
+  return _DefaultRow(
+    reference=np.arange(68, dtype=np.float64),
+    state=WorldState(
+      np.array([0.1, 0.2, 0.66]),
+      np.array([1.0, 0.0, 0.0, 0.0]),
+      np.zeros(3),
+      np.zeros(3),
+      np.arange(60, dtype=np.float64).reshape(20, 3) * 0.001,
+      np.zeros((20, 3)),
+    ),
+  )
+
+
 class _Environment:
-  def __init__(self, *, final_fall: bool = False, handoff: bool = True) -> None:
+  """Fake single-row environment with a ``clip_frames``-long clip."""
+
+  def __init__(
+    self, *, clip_frames: int = 3, endpoint_tilt: float = 0.0, mid_tilt: float = 0.0
+  ) -> None:
     self.step_count = 0
     self.reset_calls = 0
     self.trial_reset_calls = 0
-    self.switch_calls = 0
-    self.controllers: list[str] = []
-    self.final_fall = final_fall
-    self.handoff = handoff
+    self.clip_frames = clip_frames
+    self.endpoint_tilt = endpoint_tilt
+    self.mid_tilt = mid_tilt
+    self.resets: list[tuple[int, str, bool]] = []
+    self.default_row_calls = 0
 
-  def reset(self, *, seed: int, motion_id: str, start_frame: int) -> None:
-    assert (seed, motion_id, start_frame) == (4, "motion", 3)
+  def reset(
+    self,
+    *,
+    seed: int,
+    motion_id: str,
+    initial_pose: str = "reference",
+    perturb: bool = True,
+  ) -> None:
+    assert motion_id == "motion"
     self.step_count = 0
     self.reset_calls += 1
+    self.resets.append((seed, initial_pose, perturb))
+
+  def default_row(self, motion_id: str) -> _DefaultRow:
+    assert motion_id == "motion"
+    self.default_row_calls += 1
+    return _default_row()
 
   def observe_vae(self) -> VaeObservation:
-    self.controllers.append("vae")
     return VaeObservation(
-      make_state(self.step_count),
-      np.ones(68),
-      np.ones(99),
-      "motion",
-      self.step_count,
-      0.0,
-    )
-
-  def observe_ppo(self) -> PpoObservation:
-    self.controllers.append("ppo")
-    return PpoObservation(
-      make_state(self.step_count), np.zeros(102), "motion", self.step_count, 0.0
-    )
-
-  def step(self, action: np.ndarray) -> int:
-    assert action.shape == (31,)
-    assert np.isfinite(action).all()
-    self.step_count += 1
-    return self.step_count
-
-  def post_step_evidence(self, result: int) -> PostStepBundle:
-    evidence = StepEvidence(
-      True,
-      terminated=self.handoff and result == 2,
-      reference_boundary=self.handoff and result == 2,
-      clip_ended=self.handoff and result == 2,
-      physical_fall=self.final_fall and result == 250,
-    )
-    observation = VaeObservation(
       make_state(self.step_count),
       np.ones(68),
       np.ones(99),
@@ -94,10 +105,32 @@ class _Environment:
       gravity_z_error=0.0,
       end_effector_z_error=0.0,
     )
-    return PostStepBundle(evidence, float(result), observation)
 
-  def switch_to_ppo(self) -> None:
-    self.switch_calls += 1
+  def step(self, action: np.ndarray) -> int:
+    assert action.shape == (31,)
+    assert np.isfinite(action).all()
+    self.step_count += 1
+    return self.step_count
+
+  def post_step_evidence(self, result: int) -> PostStepBundle:
+    boundary = result >= self.clip_frames
+    observation = VaeObservation(
+      make_state(self.step_count),
+      np.ones(68),
+      np.ones(99),
+      "motion",
+      self.step_count,
+      0.0,
+      physical_tilt_degrees=(self.endpoint_tilt if boundary else self.mid_tilt),
+      anchor_z_error=0.0,
+      gravity_z_error=0.0,
+      end_effector_z_error=0.0,
+    )
+    return PostStepBundle(
+      StepEvidence(True, reference_boundary=boundary, clip_ended=boundary),
+      float(result),
+      observation,
+    )
 
   def capture_initial_state(self) -> str:
     return "initial"
@@ -109,116 +142,142 @@ class _Environment:
     self.trial_reset_calls += 1
 
 
-def _collector(env: _Environment) -> DiffusionCollector:
+def _collector(env: _Environment | None = None, **kwargs) -> DiffusionCollector:
   contract = ActionContract(np.ones(31), np.zeros(31), np.ones(31), np.ones(31))
   return DiffusionCollector(
-    env,
+    env if env is not None else _Environment(),
     FrozenVaePolicy(_Vae(), contract),
-    FrozenPpoRecoveryPolicy(lambda observation: np.zeros((1, 31)), contract),
+    **kwargs,
   )
 
 
-def test_collector_aligns_pre_action_rows_and_preserves_last_frame_handoff() -> None:
-  env = _Environment()
+def _pair(seed: int = 4) -> tuple[TrialSpec, TrialSpec]:
+  clean = TrialSpec("run", "motion", seed, 0, pair_id="pair", initial_state_id="s")
+  ou = TrialSpec("run", "motion", seed, 0, "ou", pair_id="pair", initial_state_id="s")
+  return clean, ou
+
+
+def test_a_clean_rollout_runs_to_its_endpoint_and_qualifies() -> None:
+  env = _Environment(clip_frames=3)
+  clean, ou = _pair()
   collector = _collector(env)
-  collector.collect(
-    TrialSpec("run", "motion", 4, 3, pair_id="pair", initial_state_id="initial")
-  )
-  result = collector.collect(
-    TrialSpec("run", "motion", 4, 3, "ou", pair_id="pair", initial_state_id="initial")
-  )
+  collector.collect(clean)
+  result = collector.collect(ou)
   assert result.qualification.qualified
-  assert result.qualification.label == "vae_then_standing"
-  assert len(result.rows) == 250
-  assert result.rows[0].controller == "vae"
-  assert result.rows[0].previous_executed_action.tolist() == [0.0] * 31
-  assert result.rows[0].executed_action.shape == (31,)
-  assert result.rows[0].latent is not None
-  assert result.rows[1].reference_boundary
-  assert result.rows[2].controller == "ppo"
-  assert result.rows[2].latent is None
-  assert env.switch_calls == 2
+  assert result.qualification.label == "endpoint_pass"
+  assert result.qualification.steps == 3
+  # Eight padding rows precede the three clip rows.
+  assert len(result.rows) == 8 + 3
+  assert [row.tick for row in result.rows] == list(range(11))
+  assert [row.reference_frame for row in result.rows] == [
+    -8,
+    -7,
+    -6,
+    -5,
+    -4,
+    -3,
+    -2,
+    -1,
+    0,
+    1,
+    2,
+  ]
   assert env.trial_reset_calls == 2
+  assert env.resets == [(4, "reference", True), (4, "reference", True)]
 
 
-def test_post_step_tilt_is_derived_and_persisted_as_failure() -> None:
-  class _PostTilt(_Environment):
-    def post_step_evidence(self, result: int) -> PostStepBundle:
-      pre = VaeObservation(
-        make_state(self.step_count),
-        np.ones(68),
-        np.ones(99),
-        "motion",
-        self.step_count,
-        0.0,
-        physical_tilt_degrees=80.0 if result == 1 else 0.0,
-        anchor_z_error=0.0,
-        gravity_z_error=0.0,
-        end_effector_z_error=0.0,
-      )
-      return PostStepBundle(StepEvidence(True), float(result), pre)
+def test_the_padding_rows_carry_the_standing_default_row() -> None:
+  env = _Environment(clip_frames=2)
+  result = _collector(env, qualification=None).collect(TrialSpec("run", "motion", 4, 0))
+  padding = result.rows[:8]
+  default = _default_row()
+  for index, row in enumerate(padding):
+    assert row.controller == "vae"
+    assert row.reference_frame == index - 8
+    assert row.timestamp == pytest.approx((index - 8) * 0.02)
+    assert row.latent is not None and row.latent.shape == (32,)
+    # The frozen encoder of the standing reference is zeros in this fake.
+    np.testing.assert_array_equal(row.latent, np.zeros(32))
+    np.testing.assert_array_equal(row.state.root_position, default.state.root_position)
+    np.testing.assert_array_equal(
+      row.state.root_quaternion_wxyz, np.array([1.0, 0.0, 0.0, 0.0])
+    )
+    np.testing.assert_array_equal(
+      row.state.body_positions, default.state.body_positions
+    )
+    np.testing.assert_array_equal(row.state.root_linear_velocity, np.zeros(3))
+    np.testing.assert_array_equal(row.state.body_linear_velocities, np.zeros((20, 3)))
+    assert row.terminal_evidence is not None and row.terminal_evidence.available
+    assert not (row.reset or row.teleport or row.reference_boundary)
+  # The latent is encoded once per clip, not once per padding row.
+  assert env.default_row_calls == 1
 
-  result = _collector(_PostTilt()).collect(TrialSpec("run", "motion", 4, 3))
-  assert result.qualification.reason == "physical_fall"
-  assert result.rows[0].terminal_evidence is not None
-  assert result.rows[0].terminal_evidence.physical_fall
+
+def test_a_mid_rollout_deviation_is_kept_and_the_endpoint_decides() -> None:
+  env = _Environment(clip_frames=3, mid_tilt=80.0)
+  result = _collector(env).collect(TrialSpec("run", "motion", 4, 0))
+  assert result.qualification.qualified
+  assert result.qualification.fall_frames == 2
+  assert result.qualification.max_anchor_z_error_m == 0.0
 
 
-def test_final_step_fall_is_failed_and_not_accepted() -> None:
-  env = _Environment(final_fall=True)
-  result = _collector(env).collect(TrialSpec("run", "motion", 4, 3))
+def test_an_endpoint_fall_fails_and_no_row_is_accepted() -> None:
+  env = _Environment(clip_frames=2, endpoint_tilt=80.0)
+  result = _collector(env).collect(TrialSpec("run", "motion", 4, 0))
   assert result.failed_attempt
-  assert result.qualification.reason == "physical_fall"
+  assert result.qualification.reason == "endpoint_tilt"
   assert result.accepted_rows == ()
   assert env.trial_reset_calls == 1
 
 
+def test_a_rollout_without_an_endpoint_is_not_qualified() -> None:
+  class _NeverEnds(_Environment):
+    def post_step_evidence(self, result: int) -> PostStepBundle:
+      bundle = super().post_step_evidence(result)
+      return PostStepBundle(
+        StepEvidence(True, terminated=result >= 2, truncated=result >= 2),
+        bundle.timestamp,
+        bundle.observation,
+      )
+
+  result = _collector(_NeverEnds(clip_frames=9)).collect(
+    TrialSpec("run", "motion", 4, 0)
+  )
+  assert result.qualification.label == "incomplete"
+  assert result.qualification.reason == "early_termination"
+
+
 def test_remaining_transition_budget_stops_before_extra_action() -> None:
-  env = _Environment()
+  env = _Environment(clip_frames=5)
   result = _collector(env).collect(
-    TrialSpec("run", "motion", 4, 3), remaining_transitions=2
+    TrialSpec("run", "motion", 4, 0), remaining_transitions=2
   )
   assert env.step_count == 2
   assert result.stopped_reason == "control_transition_budget"
   assert not result.qualification.qualified
-  assert result.rows[0].group_key == "motion:3"
-  assert result.rows[0].provenance["group_key_generated"] == "true"
 
 
-def test_missing_post_step_observation_rejects_vae_trial() -> None:
-  class _MissingObservation(_Environment):
-    def post_step_evidence(self, result: int) -> PostStepBundle:
-      return PostStepBundle(StepEvidence(True), float(result))
+def test_rows_carry_the_anchor_group_and_the_pose_provenance() -> None:
+  env = _Environment(clip_frames=2)
+  spec = TrialSpec("run", "motion", 4, 0, initial_pose="standing")
+  result = _collector(env).collect(spec)
+  assert env.resets == [(4, "standing", True)]
+  assert [row.group_key for row in result.rows] == [
+    f"motion:4:{frame}" for frame in range(-8, 2)
+  ]
+  for row in result.rows:
+    assert row.provenance["initial_pose"] == "standing"
+    assert row.provenance["initial_state_mode"] == "perturbed"
+    assert row.provenance["pair_id"] == ""
+    assert row.provenance["group_key_generated"] == "true"
 
-  result = _collector(_MissingObservation()).collect(TrialSpec("run", "motion", 4, 3))
-  assert result.qualification.reason == "vae_tracking_rejection"
 
-
-def test_tilted_post_step_quaternion_rejects_without_metric() -> None:
-  from dataclasses import replace
-
-  class _QuaternionTilt(_Environment):
-    def post_step_evidence(self, result: int) -> PostStepBundle:
-      observation = VaeObservation(
-        replace(
-          make_state(self.step_count),
-          root_quaternion_wxyz=np.array(
-            [np.cos(np.pi / 4), np.sin(np.pi / 4), 0.0, 0.0]
-          ),
-        ),
-        np.ones(68),
-        np.ones(99),
-        "motion",
-        self.step_count,
-        0.0,
-        anchor_z_error=0.0,
-        gravity_z_error=0.0,
-        end_effector_z_error=0.0,
-      )
-      return PostStepBundle(StepEvidence(True), float(result), observation)
-
-  result = _collector(_QuaternionTilt()).collect(TrialSpec("run", "motion", 4, 3))
-  assert result.qualification.reason == "physical_fall"
+def test_an_ou_trial_without_a_perturbation_records_its_mode() -> None:
+  env = _Environment(clip_frames=2)
+  spec = TrialSpec("run", "motion", 4, 0, initial_state_mode="reference")
+  result = _collector(env).collect(spec)
+  assert env.resets == [(4, "reference", False)]
+  assert result.rows[0].provenance["initial_state_mode"] == "reference"
 
 
 def test_snapshot_setup_failure_still_resets_after_trial() -> None:
@@ -229,7 +288,7 @@ def test_snapshot_setup_failure_still_resets_after_trial() -> None:
   env = _CaptureFailure()
   with pytest.raises(RuntimeError, match="snapshot capture failed"):
     _collector(env).collect(
-      TrialSpec("run", "motion", 4, 3, pair_id="pair", initial_state_id="initial")
+      TrialSpec("run", "motion", 4, 0, pair_id="pair", initial_state_id="initial")
     )
   assert env.reset_calls == 1
   assert env.trial_reset_calls == 1
@@ -252,66 +311,53 @@ def test_pair_snapshots_do_not_alias_duplicate_initial_state_ids() -> None:
 
   env = _DistinctSnapshots()
   collector = _collector(env)
-  clean_a = TrialSpec("run", "motion", 4, 3, pair_id="a", initial_state_id="same")
-  clean_b = TrialSpec("run", "motion", 4, 3, pair_id="b", initial_state_id="same")
-  ou_a = TrialSpec("run", "motion", 4, 3, "ou", pair_id="a", initial_state_id="same")
-  ou_b = TrialSpec("run", "motion", 4, 3, "ou", pair_id="b", initial_state_id="same")
-  collector.collect(clean_a)
-  collector.collect(clean_b)
-  collector.collect(ou_a)
-  collector.collect(ou_b)
+  collector.collect(
+    TrialSpec("run", "motion", 4, 0, pair_id="a", initial_state_id="same")
+  )
+  collector.collect(
+    TrialSpec("run", "motion", 4, 0, pair_id="b", initial_state_id="same")
+  )
+  collector.collect(
+    TrialSpec("run", "motion", 4, 0, "ou", pair_id="a", initial_state_id="same")
+  )
+  collector.collect(
+    TrialSpec("run", "motion", 4, 0, "ou", pair_id="b", initial_state_id="same")
+  )
   assert env.restored == ["snapshot-1", "snapshot-2"]
 
 
-def test_collector_allows_unrelated_clean_after_ou_starts() -> None:
-  env = _Environment()
-  collector = _collector(env)
-  clean = TrialSpec("run", "motion", 4, 3, pair_id="a", initial_state_id="state")
-  ou = TrialSpec("run", "motion", 4, 3, "ou", pair_id="a", initial_state_id="state")
-  next_clean = TrialSpec("run", "motion", 4, 3, pair_id="b", initial_state_id="state-b")
-  collector.collect(clean)
-  collector.collect(ou)
-  assert collector.collect(next_clean).qualification.qualified
-
-
 def test_failed_clean_partner_blocks_ou_trial() -> None:
-  collector = _collector(_Environment(final_fall=True))
-  clean = TrialSpec("run", "motion", 4, 3, pair_id="pair", initial_state_id="state")
+  collector = _collector(_Environment(endpoint_tilt=80.0))
+  clean, ou = _pair()
   collector.collect(clean)
-  ou = TrialSpec("run", "motion", 4, 3, "ou", pair_id="pair", initial_state_id="state")
   with pytest.raises(CollectorError, match="clean partner did not qualify"):
     collector.collect(ou)
 
 
-def test_qualified_clean_without_handoff_permits_ou_trial() -> None:
-  """A ``vae_only`` clean partner is a valid OU pair.
-
-  The perturbation axis only needs a clean rollout that survived its window; a
-  clip end inside the budget is an endpoint-audit question, not a precondition.
-  """
-  collector = _collector(_Environment(handoff=False))
-  clean = TrialSpec("run", "motion", 4, 3, pair_id="pair", initial_state_id="state")
+def test_qualified_clean_partner_permits_ou_trial() -> None:
+  collector = _collector(_Environment(clip_frames=2))
+  clean, ou = _pair()
   clean_result = collector.collect(clean)
   assert clean_result.qualification.qualified
-  assert clean_result.qualification.label == "vae_only"
-  assert clean_result.qualification.handoff_step is None
-  ou = TrialSpec("run", "motion", 4, 3, "ou", pair_id="pair", initial_state_id="state")
   ou_result = collector.collect(ou)
   assert ou_result.qualification.qualified
-  assert ou_result.qualification.label == "vae_only"
   assert ou_result.accepted_rows
+  # The OU rollout perturbs every clip step and its clean partner never does;
+  # the padding rows are history and carry no noise.
+  assert all(np.any(row.ou_noise != 0.0) for row in ou_result.rows[8:])
+  assert all(np.all(row.ou_noise == 0.0) for row in ou_result.rows[:8])
+  assert all(np.all(row.ou_noise == 0.0) for row in clean_result.rows)
 
 
-def test_qualified_rows_are_persisted_with_segment_verdict(tmp_path) -> None:
-  env = _Environment()
+def test_qualified_rows_are_persisted_with_the_segment_verdict(tmp_path) -> None:
   contract = ActionContract(np.ones(31), np.zeros(31), np.ones(31), np.ones(31))
   store = AppendOnlyShardStore(tmp_path, max_rows_per_shard=300)
   result = DiffusionCollector(
-    env,
+    _Environment(clip_frames=2),
     FrozenVaePolicy(_Vae(), contract),
-    FrozenPpoRecoveryPolicy(lambda observation: np.zeros((1, 31)), contract),
     store=store,
-  ).collect(TrialSpec("run", "motion", 4, 3))
+  ).collect(TrialSpec("run", "motion", 4, 0))
   persisted = tuple(store.iter_rows())
-  assert len(persisted) == len(result.rows)
+  assert len(persisted) == len(result.rows) == 10
   assert sum(row.segment_qualified for row in persisted) == len(result.accepted_rows)
+  assert all(row.segment_qualified for row in persisted)

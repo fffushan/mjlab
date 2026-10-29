@@ -64,7 +64,13 @@ window:
   total_steps: 41
   require_constant_episode_segment_and_controller: true
   permit_reset_reference_teleport_or_policy_switch_crossing: false
-  padding: forbidden
+  # D1 revision 3: eight synthetic history rows pad every rollout so an anchor
+  # can sit on the clip's own frame 0.  See plan
+  # docs/plans/beyondmimic_diffusion_d1_uniform_anchor_collection.md.
+  padding: required_leading_history_from_default_pose
+  padding_steps: 8
+  padding_pose: STAND_KEYFRAME
+  padding_row_source: precomputed_default_row
 state:
   backend: simulator_ground_truth
   hardware_estimator: separate_D6_gate
@@ -189,16 +195,31 @@ guidance:
   deployment_input_VJP_backend: requires_D5_evidence
 
 qualification:
-  seconds_total_from_first_trial_action: 5.0
-  control_steps: 250
-  retained_interval_max_seconds: 2.5
-  retained_interval_max_steps: 125
+  # D1 revision 3: one rollout runs from clip frame 0 to its last frame.  There is
+  # no mid-rollout step budget and no policy handoff.  The stability test runs
+  # once, on the last row.
+  rollout_mode: vae_only_to_clip_end
+  step_budget: none
+  retained_interval_max_seconds: null
+  retained_interval_max_steps: null
+  reference_terminations_during_rollout: suspended
+  endpoint_test_row: last
+  endpoint_mode: last_row_stability_test
+  endpoint_integrity_checks_every_step:
+    [nonfinite_post_step, reference_teleport, unexpected_reset, missing_terminal_evidence]
+  endpoint_stability_checks:
+    - {name: physical_fall, limit_degrees: 70.0}
+    - {name: anchor_z_error, limit_m: 0.25}
+    - {name: gravity_z_error, limit: 0.8}
+    - {name: end_effector_z_error, limit_m: 0.25}
+  separate_outcome_labels: [endpoint_pass, endpoint_fail]
   ou: {theta: 0.8, mu: 0.0, sigma: 0.1, dt: 1.0}
   ou_units: normalized_decoder_action
   ou_reset_each_trial: true
-  ou_stops_at_step_125_or_ppo_handoff_whichever_first: true
-  endpoint_mode: vae_then_zero_command_standing_if_reference_ends
-  separate_outcome_labels: [vae_only, vae_then_standing]
+  ou_horizon: whole_rollout
+  failed_pair_fallback: rerun_pair_from_unperturbed_initial_pose_once
+  initial_poses: [reference, standing]
+  initial_state_modes: [perturbed, reference]
   finite_physics_observations_latents_and_actions_required: true
   # Reuse the standing task's physical fall criterion in BOTH controller phases.
   physical_fall:
@@ -241,8 +262,9 @@ pilot_budget:
   status: designed_not_launched_requires_D1_execution_authorization
   phases: clean_first_then_matched_OU
   seeds: [0, 1, 2]
-  start_phase_fractions: [0.1, 0.5, 0.8]
-  start_frame_rule: floor_fraction_times_N_minus_1
+  anchor_frames: uniform_0_to_N_minus_33
+  start_frame_rule: one_rollout_per_clip_from_frame_0
+  seeds_per_clip: 22
   cohort_members: 3
   clean_trials: 27
   perturbed_trials: 27
@@ -259,7 +281,7 @@ pilot_budget:
   max_output_mib: 512
   video: false
   automatic_bulk_collection_or_training: false
-  stop_before_OU_if_any_motion_lacks_clean_qualified_window_or_successful_handoff: true
+  stop_before_OU_if_any_motion_lacks_clean_endpoint_pass: true
   any_schema_parity_or_data_integrity_failure_stops_pilot: true
   physical_or_tracking_failures: reject_trial_and_report_no_silent_replacement
   budget_exhaustion: report_partial_not_increase_automatically

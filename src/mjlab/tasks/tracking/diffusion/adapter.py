@@ -649,30 +649,35 @@ class PpoObservation:
 
 
 class DiffusionEnvironment(Protocol):
-  """Minimal no-reset handoff boundary consumed by :class:`DiffusionCollector`."""
+  """Minimal no-reset rollout boundary consumed by :class:`DiffusionCollector`."""
 
-  def reset(self, *, seed: int, motion_id: str, start_frame: int) -> None: ...
+  def reset(
+    self,
+    *,
+    seed: int,
+    motion_id: str,
+    initial_pose: str = "reference",
+    perturb: bool = True,
+  ) -> None: ...
   def observe_vae(self) -> VaeObservation: ...
   def step(self, action: np.ndarray) -> Any: ...
-  def observe_ppo(self) -> PpoObservation: ...
-  def switch_to_ppo(self) -> None: ...
   def post_step_evidence(self, result: Any) -> PostStepBundle: ...
+  def default_row(self, motion_id: str) -> Any: ...
   def reset_after_trial(self) -> None: ...
   def capture_initial_state(self) -> Any: ...
   def restore_initial_state(self, snapshot: Any) -> None: ...
 
 
 class DiffusionBatchEnvironment(Protocol):
-  """Vectorized no-reset handoff boundary consumed by batched collection."""
+  """Vectorized no-reset rollout boundary consumed by batched collection."""
 
   num_envs: int
 
   def reset_batch(self, specs: Sequence[Any]) -> None: ...
   def observe_vae_batch(self, env_ids: np.ndarray) -> VaeObservationBatch: ...
-  def observe_ppo_batch(self, env_ids: np.ndarray) -> PpoObservationBatch: ...
   def step_batch(self, action: np.ndarray) -> Any: ...
   def post_step_evidence_batch(self, env_ids: np.ndarray) -> PostStepBundleBatch: ...
-  def switch_to_ppo_batch(self, env_ids: np.ndarray) -> None: ...
+  def default_row(self, motion_id: str) -> Any: ...
   def capture_initial_state_batch(self, env_ids: np.ndarray) -> Any: ...
   def restore_initial_state_batch(
     self, env_ids: np.ndarray, snapshots: Any
@@ -880,6 +885,25 @@ class FrozenVaePolicy:
 
   def action(self, observation: VaeObservation) -> tuple[np.ndarray, np.ndarray]:
     return self.latent_and_action(observation.reference, observation.conditioning)
+
+  def encode_reference(self, reference: Sequence[float] | np.ndarray) -> np.ndarray:
+    """Return the frozen encoder mean of one reference vector.
+
+    The D1 default row stores ``encode(reference)`` as its latent, so a caller
+    that owns no conditioning vector can still produce an exact latent.  The
+    encoder never sees the conditioning half of the model.
+    """
+    values = _vector("reference", reference, self.reference_width)
+    tensor = torch.as_tensor(values, dtype=torch.float32)[None]
+    device = self._model_device()
+    if device is not None:
+      tensor = tensor.to(device)
+    with torch.no_grad():
+      mu, _ = self.model.encode(tensor)
+    latent = mu[0].detach().cpu().numpy().astype(np.float64)
+    if latent.shape != (32,) or not np.isfinite(latent).all():
+      raise AdapterError("VAE produced an invalid encoder mean")
+    return latent
 
   def _check_reference_width(self, width: int, source: str) -> None:
     if width != self.reference_width:

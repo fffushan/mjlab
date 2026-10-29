@@ -1,0 +1,55 @@
+# VGK36 D1 runtime collection input. This file remains non-authorizing.
+# The launch environment must set MJLAB_D1_COHORT_MANIFEST to the VGK36
+# manifest because the current runtime factory reads that variable.
+schema_version: mjlab-x2-diffusion-d1-collection-v1
+contract: docs/plans/beyondmimic_diffusion_d1_no_mixtures_multimotion144_contract.yaml
+execution_authorized: false
+runtime_factory: null
+frequency_hz: 50
+physics_timestep_seconds: 0.005
+decimation: 4
+# D1 uniform-anchor schedule: every anchor 0..N-33 of every clip, in both
+# initial poses, with 22 seeds shared by both poses.  One rollout starts at
+# frame 0 and runs to the clip's last frame; there is no control-step cap.
+schedule:
+  seeds: 22
+  initial_poses: [reference, standing]
+  initial_state_modes: [perturbed]
+padding_steps: 8
+perturbation:
+  root_x_m: [-0.05, 0.05]
+  root_y_m: [-0.05, 0.05]
+  root_z_m: [-0.01, 0.01]
+  root_roll_rad: [-0.1, 0.1]
+  root_pitch_rad: [-0.1, 0.1]
+  root_yaw_rad: [-0.2, 0.2]
+  joint_rad: [-0.01, 0.01]
+  ankle_joint_rad: [-0.1, 0.1]
+  velocities: zero
+pilot:
+  max_trials: 54
+  max_control_transitions: 13500
+  # The D1 collector used to fail closed unless this was 1, because exactly one
+  # environment identity was carried end-to-end.  That semantic constraint is
+  # removed (2026-10-06): one shared multi-motion environment can hold several
+  # reference clips and many parallel rows.  This pilot value stays 1.
+  max_envs: 1
+  max_gpus: 1
+  max_wall_minutes: 15
+  monitor_inactivity_seconds: 120
+  max_output_mib: 512
+  clean_before_ou: true
+  video: false
+artifacts:
+  vae: logs/distillation/x2-multimotion-vae-10k-resume2-20261019/train/checkpoint-final.pt
+qualification:
+  ou_theta: 0.8
+  ou_mu: 0.0
+  ou_sigma: 0.1
+  ou_dt: 1.0
+  # Endpoint stability limits, applied once to the last row of a rollout.
+  endpoint_guards:
+    tilt_degrees: 70.0
+    anchor_z_error_m: 0.25
+    gravity_z_error: 0.8
+    end_effector_z_error_m: 0.25

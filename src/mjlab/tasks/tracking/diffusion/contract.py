@@ -135,6 +135,7 @@ class DiffusionContract:
   current_index: int = 8
   future_steps: int = 32
   window_steps: int = 41
+  padding_steps: int = 8
   projected_state_dimension: int = 135
   token_dimension: int = 167
   split_seed: int = 42
@@ -186,6 +187,10 @@ class DiffusionContract:
       raise ContractError("current_index must equal past_steps")
     if self.window_steps != self.past_steps + 1 + self.future_steps:
       raise ContractError("window dimensions are inconsistent")
+    if self.padding_steps < 0 or self.padding_steps > self.past_steps:
+      raise ContractError(
+        "padding rows are history only, so 0 <= padding_steps <= past_steps"
+      )
     if len(self.body_names) != self.body_count:
       raise ContractError("ordered body names and body count are inconsistent")
     widths = _state_field_widths(self.body_count)
@@ -277,6 +282,7 @@ class DiffusionContract:
         current_index=int(window["current_index"]),
         future_steps=int(window["future_steps"]),
         window_steps=int(window["total_steps"]),
+        padding_steps=int(window.get("padding_steps", 8)),
         projected_state_dimension=int(
           proj.get("projected_dimension", state["raw_dimension"])
         ),
@@ -335,6 +341,10 @@ class DiffusionContract:
     return replace(contract, contract_sha256=hashlib.sha256(source).hexdigest())
 
   def as_dict(self) -> dict[str, Any]:
+    # ``padding_steps`` shapes the collector's rows, not the packed tensor
+    # layout, so it stays out of the identity hash: a dataset, checkpoint or
+    # task config authored against this contract keeps matching after the
+    # padding width changes.
     return {
       "schema_version": self.schema_version,
       "contract_sha256": self.contract_sha256,

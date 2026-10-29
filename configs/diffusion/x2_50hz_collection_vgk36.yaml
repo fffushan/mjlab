@@ -8,6 +8,24 @@ runtime_factory: null
 frequency_hz: 50
 physics_timestep_seconds: 0.005
 decimation: 4
+# D1 uniform-anchor schedule: every anchor 0..N-33 of every clip, in both
+# initial poses, with 22 seeds shared by both poses.  One rollout starts at
+# frame 0 and runs to the clip's last frame; there is no control-step cap.
+schedule:
+  seeds: 22
+  initial_poses: [reference, standing]
+  initial_state_modes: [perturbed]
+padding_steps: 8
+perturbation:
+  root_x_m: [-0.05, 0.05]
+  root_y_m: [-0.05, 0.05]
+  root_z_m: [-0.01, 0.01]
+  root_roll_rad: [-0.1, 0.1]
+  root_pitch_rad: [-0.1, 0.1]
+  root_yaw_rad: [-0.2, 0.2]
+  joint_rad: [-0.01, 0.01]
+  ankle_joint_rad: [-0.1, 0.1]
+  velocities: zero
 pilot:
   max_trials: 54
   max_control_transitions: 13500
@@ -24,11 +42,14 @@ pilot:
   video: false
 artifacts:
   vae: logs/distillation/vae-vgk36-1024-env-per-teacher-4gpu-container-acc1-20261011T085632Z/output/checkpoint-final.pt
-  recovery_onnx: logs/rsl_rl/agibot_x2_velocity/2026-09-26_02-40-45_x2-tennis-recovery-n25/2026-09-26_02-40-45_x2-tennis-recovery-n25.onnx
 qualification:
-  retained_steps: 125
-  control_steps: 250
   ou_theta: 0.8
   ou_mu: 0.0
   ou_sigma: 0.1
   ou_dt: 1.0
+  # Endpoint stability limits, applied once to the last row of a rollout.
+  endpoint_guards:
+    tilt_degrees: 70.0
+    anchor_z_error_m: 0.25
+    gravity_z_error: 0.8
+    end_effector_z_error_m: 0.25

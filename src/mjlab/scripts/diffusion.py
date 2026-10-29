@@ -373,10 +373,7 @@ def _validate_runtime_bundle(
   if max_gpus is not None and str(provenance["max_gpus"]) != str(max_gpus):
     return "runtime did not honor the requested max_gpus budget"
 
-  from mjlab.tasks.tracking.diffusion.adapter import (
-    FrozenPpoRecoveryPolicy,
-    FrozenVaePolicy,
-  )
+  from mjlab.tasks.tracking.diffusion.adapter import FrozenVaePolicy
   from mjlab.tasks.tracking.diffusion.collector import DiffusionCollector
 
   collector = bundle.collector
@@ -384,18 +381,15 @@ def _validate_runtime_bundle(
     return "runtime collector must be the concrete DiffusionCollector type"
   if not isinstance(collector.vae, FrozenVaePolicy):
     return "runtime VAE binding is not a FrozenVaePolicy"
-  if not isinstance(collector.ppo, FrozenPpoRecoveryPolicy):
-    return "runtime PPO binding is not a FrozenPpoRecoveryPolicy"
   if collector.vae.artifact_path is None or collector.vae.artifact_sha256 is None:
     return "runtime VAE binding has no frozen artifact identity"
-  if collector.ppo.artifact_path is None or collector.ppo.artifact_sha256 is None:
-    return "runtime PPO binding has no frozen artifact identity"
   from mjlab.tasks.tracking.diffusion.contract import DEFAULT_CONTRACT
 
   selected_contract = contract if contract is not None else DEFAULT_CONTRACT
+  # D1 drives the frozen VAE for the whole rollout, so the VAE is the only
+  # policy artifact the collector binds.
   for name, policy, expected_hash in (
     ("VAE", collector.vae, selected_contract.vae_sha256),
-    ("PPO", collector.ppo, selected_contract.recovery_sha256),
   ):
     path = policy.artifact_path
     if not isinstance(path, Path) or not path.is_file():
@@ -408,16 +402,12 @@ def _validate_runtime_bundle(
       policy.action_contract.verify_metadata(metadata, require_actuator_metadata=True)
     except Exception as exc:
       return f"runtime {name} action metadata binding is invalid: {exc}"
-  if (
-    collector.vae_actions.joint_order != collector.vae.action_contract.joint_order
-    or collector.ppo_actions.joint_order != collector.ppo.action_contract.joint_order
-  ):
+  if collector.vae_actions.joint_order != collector.vae.action_contract.joint_order:
     return "runtime collector action bindings disagree with policy joint order"
   import numpy as np
 
   for collector_contract, policy_contract in (
     (collector.vae_actions, collector.vae.action_contract),
-    (collector.ppo_actions, collector.ppo.action_contract),
   ):
     if not all(
       np.allclose(
@@ -556,6 +546,48 @@ def _policy_device_environment(setting: str | None) -> Iterator[None]:
       os.environ["MJLAB_D1_POLICY_DEVICE"] = previous
 
 
+def _rollout_summary_payload(qualification: Any) -> dict[str, Any]:
+  """The endpoint verdict and the per-rollout stability measurements."""
+  return {
+    "qualified": qualification.qualified,
+    "label": qualification.label,
+    "reason": qualification.reason,
+    "steps": qualification.steps,
+    "min_tilt_degrees": qualification.min_tilt_degrees,
+    "max_anchor_z_error_m": qualification.max_anchor_z_error_m,
+    "max_end_effector_z_error_m": qualification.max_end_effector_z_error_m,
+    "fall_frames": qualification.fall_frames,
+  }
+
+
+@contextlib.contextmanager
+def _schedule_environment(
+  seeds: int | None, initial_poses: str | None
+) -> Iterator[None]:
+  """Scope the schedule overrides to the factory call that reads them.
+
+  The runtime factory builds the trial schedule itself, so the CLI cannot pass
+  these values as arguments.  Restoring the previous environment keeps a later
+  collection in the same process on its own configuration.
+  """
+  overrides = {
+    "MJLAB_D1_BULK_SEEDS": None if seeds is None else str(seeds),
+    "MJLAB_D1_INITIAL_POSES": initial_poses,
+  }
+  previous = {name: os.environ.get(name) for name in overrides}
+  try:
+    for name, value in overrides.items():
+      if value is not None:
+        os.environ[name] = value
+    yield
+  finally:
+    for name, value in previous.items():
+      if value is None:
+        os.environ.pop(name, None)
+      else:
+        os.environ[name] = value
+
+
 def _batched_outcome_payload(result: Any) -> dict[str, Any]:
   """Serialize one batched trial outcome for full rows or compact summaries."""
   rows = getattr(result, "rows", None)
@@ -571,14 +603,14 @@ def _batched_outcome_payload(result: Any) -> dict[str, Any]:
     "run_id": result.spec.run_id,
     "motion_id": result.spec.motion_id,
     "phase": result.spec.phase,
-    "qualified": result.qualification.qualified,
-    "label": result.qualification.label,
-    "reason": result.qualification.reason,
+    "initial_pose": result.spec.initial_pose,
+    "initial_state_mode": result.spec.initial_state_mode,
     "rows": row_count,
     "accepted_rows": accepted_rows,
     "verification_rows": verification_rows,
     "stopped_reason": result.stopped_reason,
     "store_files": list(result.store_files),
+    **_rollout_summary_payload(result.qualification),
   }
 
 
@@ -956,6 +988,9 @@ def _command_collect(args: argparse.Namespace) -> int:
   if budget_error is not None:
     print(budget_error, file=sys.stderr)
     return 2
+  if args.seeds is not None and args.seeds < 1:
+    print("--seeds must be one or more", file=sys.stderr)
+    return 2
   streaming_error = _validate_streaming_controls(args)
   if streaming_error is not None:
     print(streaming_error, file=sys.stderr)
@@ -966,9 +1001,10 @@ def _command_collect(args: argparse.Namespace) -> int:
     # runtime cannot honour a batched publication, progress or tensor option.
     print(_scalar_control_error(batched_only), file=sys.stderr)
     return 2
+  collection_config: dict[str, Any] = {}
   if args.config is not None:
     try:
-      _load_collection_config(args.config)
+      collection_config = _load_collection_config(args.config)
     except (OSError, RuntimeError, ValueError) as exc:
       print(f"collection config: {exc}", file=sys.stderr)
       return 2
@@ -988,8 +1024,8 @@ def _command_collect(args: argparse.Namespace) -> int:
     args.output,
     trial_specs,
     args.max_trials,
-    # No separate transition cap: the schedule and qualification.control_steps
-    # determine how many transitions a collection produces.
+    # No separate transition cap: the schedule and the clip lengths determine how
+    # many transitions a collection produces.
     None,
     args.max_envs,
     args.max_gpus,
@@ -1001,7 +1037,38 @@ def _command_collect(args: argparse.Namespace) -> int:
   # The factory reads the policy-device setting once, when it builds the frozen
   # policies, so the override is scoped to this call and cannot leak into a
   # later collection in the same process.
-  with _policy_device_environment(args.policy_device):
+  # The schedule size is a collection input, so an explicit CLI value wins and the
+  # config file is the declared default.  Without this fallback ``schedule.seeds``
+  # is inert and the runtime seed default silently applies.
+  declared = collection_config.get("schedule")
+  declared = declared if isinstance(declared, dict) else {}
+  schedule_seeds = args.seeds
+  if schedule_seeds is None:
+    raw_seeds = declared.get("seeds", collection_config.get("seeds"))
+    if raw_seeds is not None:
+      try:
+        schedule_seeds = int(raw_seeds)
+      except (TypeError, ValueError):
+        schedule_seeds = 0
+      if schedule_seeds < 1:
+        print("collection config: schedule.seeds must be a positive integer", file=sys.stderr)
+        return 2
+  if schedule_seeds is not None and schedule_seeds < 1:
+    print("--seeds must be one or more", file=sys.stderr)
+    return 2
+
+  schedule_poses = args.initial_poses
+  if schedule_poses is None:
+    raw_poses = declared.get("initial_poses")
+    if isinstance(raw_poses, (list, tuple)) and raw_poses:
+      schedule_poses = ",".join(str(pose) for pose in raw_poses)
+    elif isinstance(raw_poses, str) and raw_poses.strip():
+      schedule_poses = raw_poses
+
+  with (
+    _policy_device_environment(args.policy_device),
+    _schedule_environment(schedule_seeds, schedule_poses),
+  ):
     bundle = _load_factory(args.runtime_factory)(request)
   if not isinstance(bundle, RuntimeBundle):
     raise TypeError("runtime factory must return RuntimeBundle")
@@ -1089,6 +1156,7 @@ def _command_collect(args: argparse.Namespace) -> int:
         {"episode_id": episode_id, "reason": reason}
         for episode_id, reason in batch.abandoned_trials
       ],
+      "retried_pairs": list(batch.retried_pairs),
       "partial": batch.partial,
       "stop_reason": batch.stop_reason,
       "unstarted_trials": batch.unstarted_trials,
@@ -1146,12 +1214,7 @@ def _command_collect(args: argparse.Namespace) -> int:
             "pair_id": spec.pair_id,
             "clean_partner": None
             if clean_result is None
-            else {
-              "qualified": clean_result.qualification.qualified,
-              "label": clean_result.qualification.label,
-              "reason": clean_result.qualification.reason,
-              "handoff_step": clean_result.qualification.handoff_step,
-            },
+            else _rollout_summary_payload(clean_result.qualification),
           }
         )
         continue
@@ -1174,14 +1237,14 @@ def _command_collect(args: argparse.Namespace) -> int:
         "run_id": spec.run_id,
         "motion_id": spec.motion_id,
         "phase": spec.phase,
-        "qualified": result.qualification.qualified,
-        "label": result.qualification.label,
-        "reason": result.qualification.reason,
+        "initial_pose": spec.initial_pose,
+        "initial_state_mode": spec.initial_state_mode,
         "rows": len(result.rows),
         "accepted_rows": len(result.accepted_rows),
         "verification_rows": len(result.verification_rows),
         "stopped_reason": result.stopped_reason,
         "store_files": list(result.store_files),
+        **_rollout_summary_payload(result.qualification),
       }
     )
     output_bytes = sum(
@@ -1813,6 +1876,24 @@ def build_parser() -> argparse.ArgumentParser:
   collect.add_argument("--config", type=Path)
   collect.add_argument("--output", type=Path, required=True)
   collect.add_argument("--report", type=Path, required=True)
+  collect.add_argument(
+    "--seeds",
+    type=int,
+    default=None,
+    help=(
+      "seed count for a bulk schedule; overrides MJLAB_D1_BULK_SEEDS for this "
+      "run.  The seeds are 0..N-1 and are shared by both initial poses."
+    ),
+  )
+  collect.add_argument(
+    "--initial-poses",
+    choices=("reference", "standing", "both"),
+    default=None,
+    help=(
+      "initial poses to roll out: both (the plan's schedule), or one pose for a "
+      "bounded smoke run; overrides MJLAB_D1_INITIAL_POSES for this run"
+    ),
+  )
   collect.add_argument("--max-trials", type=int, default=1)
   collect.add_argument("--max-envs", type=int, default=256)
   collect.add_argument("--max-gpus", type=int, default=1)

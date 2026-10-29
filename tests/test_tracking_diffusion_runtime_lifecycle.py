@@ -12,7 +12,7 @@ from mjlab.tasks.tracking.diffusion.runtime_x2 import (
 )
 
 
-def test_idle_rows_cannot_set_pending_reset_and_recovery_keeps_timeouts() -> None:
+def test_reference_guards_are_suspended_and_time_outs_survive() -> None:
   calls = []
   terms = {}
   for name in ("anchor_pos", "anchor_ori", "ee_body_pos", "time_out"):
@@ -28,10 +28,11 @@ def test_idle_rows_cannot_set_pending_reset_and_recovery_keeps_timeouts() -> Non
   runtime.env = SimpleNamespace(termination_manager=manager, device="cpu")
   runtime._install_termination_masks()
   runtime.set_active_env_ids(np.array([0, 2]))
-  runtime._vae_phase[2] = False
   for name, cfg in terms.items():
     actual = cfg.func(runtime.env, **cfg.params)
-    expected = [True, False, name == "time_out"]
+    # Every reference guard stays suspended for the whole rollout; only the
+    # task time-out may end an active row.
+    expected = [name == "time_out", False, name == "time_out"]
     torch.testing.assert_close(actual, torch.tensor(expected))
   assert calls == list(terms)
   runtime.set_active_env_ids(np.array([1]))
@@ -81,24 +82,28 @@ def test_restore_parity_allows_origin_rounding_but_rejects_state_change() -> Non
     raise AssertionError("restore parity accepted a state change above tolerance")
 
 
-def test_recovery_and_idle_references_do_not_advance_or_wrap() -> None:
+def test_idle_rows_hold_and_active_rows_stop_at_their_last_frame() -> None:
   runtime = X2MultiMotionEnvironment.__new__(X2MultiMotionEnvironment)
   runtime.num_envs = 3
   runtime.device = "cpu"
   runtime._row_ids = torch.arange(3)
   runtime._active_rows = np.array([True, False, True])
-  runtime._vae_phase = np.array([True, True, False])
-  frames = torch.tensor([8, 8, 8])
+  frames = torch.tensor([0, 0, 1])
 
   def update(ids):
     frames[ids] += 1
 
-  runtime.command = SimpleNamespace(_update_command=update)
+  runtime.command = SimpleNamespace(
+    _update_command=update,
+    time_steps=frames,
+    row_lengths=torch.tensor([2, 2, 2]),
+  )
   runtime._install_reference_advance_mask()
+  # Row 0 advances, row 1 is idle, row 2 is already on its last frame.
   runtime.command._update_command()
-  torch.testing.assert_close(frames, torch.tensor([9, 8, 8]))
-  runtime.command._update_command(torch.tensor([1, 2]))
-  torch.testing.assert_close(frames, torch.tensor([9, 8, 8]))
-  runtime._vae_phase[2] = True
-  runtime.command._update_command(torch.tensor([2]))
-  torch.testing.assert_close(frames, torch.tensor([9, 8, 9]))
+  torch.testing.assert_close(frames, torch.tensor([1, 0, 1]))
+  # The reference never wraps past the last frame, so no row is resampled.
+  runtime.command._update_command()
+  torch.testing.assert_close(frames, torch.tensor([1, 0, 1]))
+  runtime.command._update_command(torch.tensor([1]))
+  torch.testing.assert_close(frames, torch.tensor([1, 0, 1]))

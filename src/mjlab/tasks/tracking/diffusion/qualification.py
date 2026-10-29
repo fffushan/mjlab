@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -234,12 +234,20 @@ def parse_step_evidence_batch(value: Any) -> StepEvidenceBatch:
   return StepEvidenceBatch.from_values(value)
 
 
+MAX_ROLLOUT_STEPS = 512
+"""Hard bound on one rollout, in control steps.
+
+A rollout ends when its reference reaches the last clip frame, so this bound
+only closes a run whose environment never reports that end.  The tracking task's
+own 500-step time-out normally fires first.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class QualificationConfig:
-  """Pinned D0 trial limits and physical/reference guard thresholds."""
+  """Pinned D1 padding width and endpoint stability limits."""
 
-  control_steps: int = 250
-  retained_steps: int = 125
+  padding_steps: int = DEFAULT_CONTRACT.padding_steps
   period_seconds: float = DEFAULT_CONTRACT.period_seconds
   physical_fall_degrees: float = 70.0
   anchor_z_error_m: float = 0.25
@@ -247,128 +255,136 @@ class QualificationConfig:
   end_effector_z_error_m: float = 0.25
 
   def __post_init__(self) -> None:
-    if self.control_steps <= 0 or self.retained_steps <= 0:
-      raise QualificationError("qualification step limits must be positive")
-    if self.retained_steps > self.control_steps:
-      raise QualificationError("retained interval cannot exceed trial duration")
+    if self.padding_steps < 0:
+      raise QualificationError("padding_steps must be non-negative")
+    if self.period_seconds <= 0:
+      raise QualificationError("the control period must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointMetrics:
+  """The four stability measurements of one row."""
+
+  tilt_degrees: float
+  anchor_z_error: float
+  gravity_z_error: float
+  end_effector_z_error: float
+
+  def __post_init__(self) -> None:
+    if not np.isfinite(
+      (
+        self.tilt_degrees,
+        self.anchor_z_error,
+        self.gravity_z_error,
+        self.end_effector_z_error,
+      )
+    ).all():
+      raise QualificationError("endpoint metrics must be finite")
+
+
+def row_metrics(observation: Any | None) -> EndpointMetrics | None:
+  """Read one row's stability metrics, or ``None`` when the row has no metrics.
+
+  A missing observation or a missing metric is reported as ``None`` so the
+  endpoint test can refuse the rollout instead of guessing that the robot stood
+  still.
+  """
+  if observation is None:
+    return None
+  tilt = _state_tilt_degrees(observation)
+  explicit = getattr(observation, "physical_tilt_degrees", None)
+  if explicit is not None:
+    try:
+      tilt = max(tilt, float(explicit))
+    except (TypeError, ValueError):
+      return None
+  anchor = getattr(observation, "anchor_z_error", None)
+  gravity = getattr(observation, "gravity_z_error", None)
+  end_effector = getattr(observation, "end_effector_z_error", None)
+  if anchor is None or gravity is None or end_effector is None:
+    return None
+  values = (float(tilt), float(anchor), float(gravity), float(end_effector))
+  if not np.isfinite(values).all():
+    return None
+  return EndpointMetrics(*values)
+
+
+def endpoint_rejection(
+  metrics: EndpointMetrics, config: QualificationConfig
+) -> str | None:
+  """Return the first stability check the endpoint row fails, if any."""
+  if metrics.tilt_degrees > config.physical_fall_degrees:
+    return "endpoint_tilt"
+  if abs(metrics.anchor_z_error) > config.anchor_z_error_m:
+    return "endpoint_anchor_z_error"
+  if abs(metrics.gravity_z_error) > config.gravity_z_error:
+    return "endpoint_gravity_z_error"
+  if abs(metrics.end_effector_z_error) > config.end_effector_z_error_m:
+    return "endpoint_end_effector_z_error"
+  return None
 
 
 @dataclass(frozen=True, slots=True)
 class QualificationResult:
-  """Final verdict and audit counters for one attempted trial."""
+  """Endpoint verdict and per-rollout summary for one attempted rollout."""
 
   qualified: bool
   label: str
   reason: str | None
   steps: int
-  vae_steps: int
-  retained_vae_steps: int
-  handoff_step: int | None
+  min_tilt_degrees: float
+  max_anchor_z_error_m: float
+  max_end_effector_z_error_m: float
+  fall_frames: int
 
 
 class QualificationTracker:
-  """Evaluate every post-step outcome, with final-step failure precedence."""
+  """Integrity checks on every row, stability checks on the last row only."""
 
   def __init__(self, config: QualificationConfig | None = None) -> None:
     self.config = config or QualificationConfig()
     self.steps = 0
-    self.vae_steps = 0
-    self.retained_vae_steps = 0
-    self.handoff_step: int | None = None
+    self.min_tilt_degrees = float("inf")
+    self.max_anchor_z_error_m = 0.0
+    self.max_end_effector_z_error_m = 0.0
+    self.fall_frames = 0
     self._failure: str | None = None
     self._interrupted = False
-    self._saw_handoff = False
+    self._endpoint = False
+    self._last: EndpointMetrics | None = None
 
   @property
   def failure(self) -> str | None:
     return self._failure
 
-  def observe(
-    self, controller: str, evidence: Any, observation: Any | None = None
-  ) -> StepEvidence:
-    """Record one post-step event; physical guards apply in both phases."""
-    if controller not in {"vae", "ppo"}:
-      raise QualificationError("controller must be vae or ppo")
-    if self.steps >= self.config.control_steps:
-      raise QualificationError("cannot observe after the trial budget")
+  @property
+  def done(self) -> bool:
+    """True when no further row may extend this rollout."""
+    return (
+      self._failure is not None
+      or self._interrupted
+      or self._endpoint
+      or self.steps >= MAX_ROLLOUT_STEPS
+    )
+
+  def observe(self, evidence: Any, observation: Any | None = None) -> StepEvidence:
+    """Record one post-step row; only integrity failures end a rollout here."""
+    if self.steps >= MAX_ROLLOUT_STEPS:
+      raise QualificationError("cannot observe past the rollout step bound")
     parsed = parse_step_evidence(evidence)
-    if observation is None:
-      parsed = StepEvidence(
-        parsed.terminal_available,
-        parsed.terminated,
-        parsed.truncated,
-        parsed.reason,
-        parsed.finite,
-        parsed.physical_fall or controller == "ppo",
-        parsed.tracking_rejection or controller == "vae",
-        parsed.reset,
-        parsed.teleport,
-        parsed.reference_boundary,
-        parsed.clip_ended,
-      )
-    else:
-      state_tilt = _state_tilt_degrees(observation)
-      tilt_value = getattr(observation, "physical_tilt_degrees", None)
-      tilt = state_tilt
-      if tilt_value is not None:
-        try:
-          tilt = max(float(tilt_value), state_tilt)
-        except (TypeError, ValueError):
-          tilt = float("inf")
-      if tilt > self.config.physical_fall_degrees:
-        parsed = StepEvidence(
-          parsed.terminal_available,
-          parsed.terminated,
-          parsed.truncated,
-          parsed.reason,
-          parsed.finite,
-          True,
-          parsed.tracking_rejection,
-          parsed.reset,
-          parsed.teleport,
-          parsed.reference_boundary,
-          parsed.clip_ended,
-        )
-      if controller == "vae":
-        metric_names = ("anchor_z_error", "gravity_z_error", "end_effector_z_error")
-        metrics = [getattr(observation, name, None) for name in metric_names]
-        if any(value is None for value in metrics):
-          parsed = StepEvidence(
-            parsed.terminal_available,
-            parsed.terminated,
-            parsed.truncated,
-            parsed.reason,
-            parsed.finite,
-            parsed.physical_fall,
-            True,
-            parsed.reset,
-            parsed.teleport,
-            parsed.reference_boundary,
-            parsed.clip_ended,
-          )
-        elif (
-          abs(float(cast(float, metrics[0]))) > self.config.anchor_z_error_m
-          or abs(float(cast(float, metrics[1]))) > self.config.gravity_z_error
-          or abs(float(cast(float, metrics[2]))) > self.config.end_effector_z_error_m
-        ):
-          parsed = StepEvidence(
-            parsed.terminal_available,
-            parsed.terminated,
-            parsed.truncated,
-            parsed.reason,
-            parsed.finite,
-            parsed.physical_fall,
-            True,
-            parsed.reset,
-            parsed.teleport,
-            parsed.reference_boundary,
-            parsed.clip_ended,
-          )
     self.steps += 1
-    if controller == "vae":
-      self.vae_steps += 1
-      if self.vae_steps <= self.config.retained_steps:
-        self.retained_vae_steps += 1
+    metrics = row_metrics(observation)
+    self._last = metrics
+    if metrics is not None:
+      self.min_tilt_degrees = min(self.min_tilt_degrees, metrics.tilt_degrees)
+      self.max_anchor_z_error_m = max(
+        self.max_anchor_z_error_m, abs(metrics.anchor_z_error)
+      )
+      self.max_end_effector_z_error_m = max(
+        self.max_end_effector_z_error_m, abs(metrics.end_effector_z_error)
+      )
+      if metrics.tilt_degrees > self.config.physical_fall_degrees:
+        self.fall_frames += 1
     if not parsed.terminal_available:
       self._fail("missing_terminal_evidence")
     elif not parsed.finite:
@@ -377,54 +393,45 @@ class QualificationTracker:
       self._fail("unexpected_reset")
     elif parsed.teleport:
       self._fail("reference_teleport")
-    elif parsed.physical_fall:
-      self._fail("physical_fall")
-    elif controller == "vae" and parsed.tracking_rejection:
-      self._fail("vae_tracking_rejection")
     if parsed.reference_boundary or parsed.clip_ended:
-      if controller != "vae":
-        self._fail("invalid_ppo_reference_boundary")
-      elif not self._saw_handoff:
-        self._saw_handoff = True
-        self.handoff_step = self.steps
-    if parsed.terminated or parsed.truncated:
-      if not (controller == "vae" and (parsed.reference_boundary or parsed.clip_ended)):
-        if self._failure is None:
-          self._interrupted = True
+      self._endpoint = True
+    elif parsed.terminated or parsed.truncated:
+      if self._failure is None:
+        self._interrupted = True
     return parsed
 
   def finish(self) -> QualificationResult:
-    """Close the trial; a failure on the last transition always wins."""
+    """Close the rollout and apply the endpoint test to its last row."""
     if self._failure is not None:
-      return QualificationResult(
-        False,
-        "failed",
-        self._failure,
-        self.steps,
-        self.vae_steps,
-        self.retained_vae_steps,
-        self.handoff_step,
+      return self._result(False, "failed", self._failure)
+    if self._interrupted:
+      return self._result(False, "incomplete", "early_termination")
+    if not self._endpoint:
+      reason = (
+        "rollout_step_cap"
+        if self.steps >= MAX_ROLLOUT_STEPS
+        else "missing_endpoint_evidence"
       )
-    if self._interrupted or self.steps < self.config.control_steps:
-      reason = "early_termination" if self._interrupted else "incomplete_timeout"
-      return QualificationResult(
-        False,
-        "incomplete",
-        reason,
-        self.steps,
-        self.vae_steps,
-        self.retained_vae_steps,
-        self.handoff_step,
-      )
-    label = "vae_then_standing" if self._saw_handoff else "vae_only"
+      return self._result(False, "incomplete", reason)
+    if self._last is None:
+      return self._result(False, "incomplete", "missing_stability_metrics")
+    rejection = endpoint_rejection(self._last, self.config)
+    if rejection is not None:
+      return self._result(False, "failed", rejection)
+    return self._result(True, "endpoint_pass", None)
+
+  def _result(
+    self, qualified: bool, label: str, reason: str | None
+  ) -> QualificationResult:
     return QualificationResult(
-      True,
+      qualified,
       label,
-      None,
+      reason,
       self.steps,
-      self.vae_steps,
-      self.retained_vae_steps,
-      self.handoff_step,
+      self.min_tilt_degrees,
+      self.max_anchor_z_error_m,
+      self.max_end_effector_z_error_m,
+      self.fall_frames,
     )
 
   def _fail(self, reason: str) -> None:
@@ -433,7 +440,7 @@ class QualificationTracker:
 
 
 class BatchedQualificationTracker:
-  """Vectorized qualification state for independent trial slots."""
+  """Vectorized endpoint qualification state for independent rollout slots."""
 
   _REASONS = (
     "",
@@ -441,9 +448,6 @@ class BatchedQualificationTracker:
     "nonfinite_post_step",
     "unexpected_reset",
     "reference_teleport",
-    "physical_fall",
-    "vae_tracking_rejection",
-    "invalid_ppo_reference_boundary",
   )
   _REASON_CODES = {name: index for index, name in enumerate(_REASONS) if name}
 
@@ -455,12 +459,14 @@ class BatchedQualificationTracker:
     self.config = config or QualificationConfig()
     self.batch_size = int(batch_size)
     self.steps = np.zeros(self.batch_size, dtype=np.int64)
-    self.vae_steps = np.zeros(self.batch_size, dtype=np.int64)
-    self.retained_vae_steps = np.zeros(self.batch_size, dtype=np.int64)
-    self.handoff_step = np.full(self.batch_size, -1, dtype=np.int64)
     self.failure_codes = np.zeros(self.batch_size, dtype=np.int8)
     self.interrupted = np.zeros(self.batch_size, dtype=bool)
-    self.saw_handoff = np.zeros(self.batch_size, dtype=bool)
+    self.endpoint = np.zeros(self.batch_size, dtype=bool)
+    self.min_tilt_degrees = np.full(self.batch_size, np.inf, dtype=np.float64)
+    self.max_anchor_z_error_m = np.zeros(self.batch_size, dtype=np.float64)
+    self.max_end_effector_z_error_m = np.zeros(self.batch_size, dtype=np.float64)
+    self.fall_frames = np.zeros(self.batch_size, dtype=np.int64)
+    self.last_metrics = np.full((self.batch_size, 4), np.nan, dtype=np.float64)
 
   @property
   def failure(self) -> np.ndarray:
@@ -471,7 +477,8 @@ class BatchedQualificationTracker:
     return (
       (self.failure_codes != 0)
       | self.interrupted
-      | (self.steps >= self.config.control_steps)
+      | self.endpoint
+      | (self.steps >= MAX_ROLLOUT_STEPS)
     )
 
   def reset(self, env_ids: Any) -> None:
@@ -479,12 +486,14 @@ class BatchedQualificationTracker:
     if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.batch_size):
       raise QualificationError("qualification reset indices are outside the batch")
     self.steps[ids] = 0
-    self.vae_steps[ids] = 0
-    self.retained_vae_steps[ids] = 0
-    self.handoff_step[ids] = -1
     self.failure_codes[ids] = 0
     self.interrupted[ids] = False
-    self.saw_handoff[ids] = False
+    self.endpoint[ids] = False
+    self.min_tilt_degrees[ids] = np.inf
+    self.max_anchor_z_error_m[ids] = 0.0
+    self.max_end_effector_z_error_m[ids] = 0.0
+    self.fall_frames[ids] = 0
+    self.last_metrics[ids] = np.nan
 
   def _set_failure(self, ids: np.ndarray, reason: str) -> None:
     code = self._REASON_CODES[reason]
@@ -507,83 +516,83 @@ class BatchedQualificationTracker:
     projected_gravity_z = 1.0 - 2.0 * (safe[:, 1] ** 2 + safe[:, 2] ** 2)
     return np.degrees(np.arccos(np.clip(projected_gravity_z, -1.0, 1.0)))
 
+  def _batch_metrics(self, observation: Any, rows: int) -> np.ndarray:
+    """Return one ``[rows, 4]`` metric block; non-finite entries mark a gap."""
+    tilt = self._tilt_degrees(observation)
+    explicit = getattr(observation, "physical_tilt_degrees", None)
+    if explicit is not None:
+      tilt = np.maximum(tilt, np.asarray(explicit, dtype=np.float64))
+    columns = [tilt]
+    for name in ("anchor_z_error", "gravity_z_error", "end_effector_z_error"):
+      values = getattr(observation, name, None)
+      if values is None:
+        return np.full((rows, 4), np.nan, dtype=np.float64)
+      columns.append(np.asarray(values, dtype=np.float64).reshape(-1))
+    metrics = np.stack(columns, axis=1)
+    if metrics.shape != (rows, 4):
+      return np.full((rows, 4), np.nan, dtype=np.float64)
+    metrics[~np.isfinite(metrics)] = np.nan
+    return metrics
+
   def observe(
     self,
     env_ids: Any,
-    controller_ppo: Any,
     evidence: Any,
     observation: Any | None = None,
   ) -> StepEvidenceBatch:
-    """Record one post-step event for the supplied independent rows."""
+    """Record one post-step row for every supplied independent slot."""
     ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
     if ids.size == 0 or np.any(ids < 0) or np.any(ids >= self.batch_size):
       raise QualificationError(
         "qualification observation indices are outside the batch"
       )
-    ppo = _batch_bool("controller_ppo", controller_ppo, ids.size)
     parsed = parse_step_evidence_batch(evidence)
     if parsed.batch_size != ids.size:
       raise QualificationError("evidence and qualification rows must align")
     terminal_available = parsed.terminal_available.copy()
-    terminated = parsed.terminated.copy()
-    truncated = parsed.truncated.copy()
     finite = parsed.finite.copy()
-    physical_fall = parsed.physical_fall.copy()
-    tracking_rejection = parsed.tracking_rejection.copy()
     reset = parsed.reset.copy()
     teleport = parsed.teleport.copy()
     reference_boundary = parsed.reference_boundary.copy()
     clip_ended = parsed.clip_ended.copy()
+    terminated = parsed.terminated.copy()
+    truncated = parsed.truncated.copy()
     reasons = list(parsed.reason)
 
     self.steps[ids] += 1
-    self.vae_steps[ids] += ~ppo
-    self.retained_vae_steps[ids] += (~ppo) & (
-      self.vae_steps[ids] <= self.config.retained_steps
+    metrics = (
+      np.full((ids.size, 4), np.nan, dtype=np.float64)
+      if observation is None
+      else self._batch_metrics(observation, ids.size)
     )
-    if observation is not None:
-      tilt = self._tilt_degrees(observation)
-      explicit_tilt = getattr(observation, "physical_tilt_degrees", None)
-      if explicit_tilt is not None:
-        tilt = np.maximum(tilt, np.asarray(explicit_tilt, dtype=np.float64))
-      physical_fall |= tilt > self.config.physical_fall_degrees
-      for name, limit in (
-        ("anchor_z_error", self.config.anchor_z_error_m),
-        ("gravity_z_error", self.config.gravity_z_error),
-        ("end_effector_z_error", self.config.end_effector_z_error_m),
-      ):
-        values = getattr(observation, name, None)
-        if values is None:
-          tracking_rejection |= ~ppo
-        else:
-          tracking_rejection |= (~ppo) & (
-            np.abs(np.asarray(values, dtype=np.float64)) > limit
-          )
-    else:
-      physical_fall |= ppo
-      tracking_rejection |= ~ppo
+    self.last_metrics[ids] = metrics
+    valid = np.isfinite(metrics[:, 0])
+    if valid.any():
+      rows = ids[valid]
+      block = metrics[valid]
+      self.min_tilt_degrees[rows] = np.minimum(self.min_tilt_degrees[rows], block[:, 0])
+      self.max_anchor_z_error_m[rows] = np.maximum(
+        self.max_anchor_z_error_m[rows], np.abs(block[:, 1])
+      )
+      self.max_end_effector_z_error_m[rows] = np.maximum(
+        self.max_end_effector_z_error_m[rows], np.abs(block[:, 3])
+      )
+      self.fall_frames[rows] += (
+        block[:, 0] > self.config.physical_fall_degrees
+      ).astype(np.int64)
 
-    selected = ids
     for mask, reason in (
       (~terminal_available, "missing_terminal_evidence"),
       (~finite, "nonfinite_post_step"),
       (reset, "unexpected_reset"),
       (teleport, "reference_teleport"),
-      (physical_fall, "physical_fall"),
-      ((~ppo) & tracking_rejection, "vae_tracking_rejection"),
-      (ppo & (reference_boundary | clip_ended), "invalid_ppo_reference_boundary"),
     ):
-      self._set_failure(selected[mask], reason)
-    valid_boundary = (
-      (~ppo) & (reference_boundary | clip_ended) & ~(terminated | truncated)
-    )
-    boundary_ids = selected[valid_boundary & ~self.saw_handoff[selected]]
-    self.saw_handoff[boundary_ids] = True
-    self.handoff_step[boundary_ids] = self.steps[boundary_ids]
-    interrupted = (terminated | truncated) & ~valid_boundary
-    # Apply the Boolean mask BEFORE selecting global integer row identities.
-    # Bitwise-AND of an ID and a Boolean maps even IDs to 0 and odd IDs to 1.
-    interrupted_ids = selected[interrupted & (self.failure_codes[selected] == 0)]
+      if mask.any():
+        self._set_failure(ids[mask], reason)
+    boundary = reference_boundary | clip_ended
+    self.endpoint[ids[boundary]] = True
+    interrupted = (terminated | truncated) & ~boundary
+    interrupted_ids = ids[interrupted & (self.failure_codes[ids] == 0)]
     self.interrupted[interrupted_ids] = True
     return StepEvidenceBatch(
       terminal_available,
@@ -591,8 +600,8 @@ class BatchedQualificationTracker:
       truncated,
       tuple(reasons),
       finite,
-      physical_fall,
-      tracking_rejection,
+      parsed.physical_fall,
+      parsed.tracking_rejection,
       reset,
       teleport,
       reference_boundary,
@@ -602,46 +611,55 @@ class BatchedQualificationTracker:
   def finish(self, env_id: int) -> QualificationResult:
     if env_id < 0 or env_id >= self.batch_size:
       raise QualificationError("qualification result index is outside the batch")
+
+    def result(qualified: bool, label: str, reason: str | None) -> QualificationResult:
+      return QualificationResult(
+        qualified,
+        label,
+        reason,
+        int(self.steps[env_id]),
+        float(self.min_tilt_degrees[env_id]),
+        float(self.max_anchor_z_error_m[env_id]),
+        float(self.max_end_effector_z_error_m[env_id]),
+        int(self.fall_frames[env_id]),
+      )
+
     code = int(self.failure_codes[env_id])
     if code:
-      return QualificationResult(
-        False,
-        "failed",
-        self._REASONS[code],
-        int(self.steps[env_id]),
-        int(self.vae_steps[env_id]),
-        int(self.retained_vae_steps[env_id]),
-        None if self.handoff_step[env_id] < 0 else int(self.handoff_step[env_id]),
-      )
-    if self.interrupted[env_id] or self.steps[env_id] < self.config.control_steps:
-      return QualificationResult(
+      return result(False, "failed", self._REASONS[code])
+    if self.interrupted[env_id]:
+      return result(False, "incomplete", "early_termination")
+    if not self.endpoint[env_id]:
+      return result(
         False,
         "incomplete",
-        "early_termination" if self.interrupted[env_id] else "incomplete_timeout",
-        int(self.steps[env_id]),
-        int(self.vae_steps[env_id]),
-        int(self.retained_vae_steps[env_id]),
-        None if self.handoff_step[env_id] < 0 else int(self.handoff_step[env_id]),
+        "rollout_step_cap"
+        if self.steps[env_id] >= MAX_ROLLOUT_STEPS
+        else "missing_endpoint_evidence",
       )
-    return QualificationResult(
-      True,
-      "vae_then_standing" if self.saw_handoff[env_id] else "vae_only",
-      None,
-      int(self.steps[env_id]),
-      int(self.vae_steps[env_id]),
-      int(self.retained_vae_steps[env_id]),
-      None if self.handoff_step[env_id] < 0 else int(self.handoff_step[env_id]),
+    block = self.last_metrics[env_id]
+    if not np.isfinite(block).all():
+      return result(False, "incomplete", "missing_stability_metrics")
+    rejection = endpoint_rejection(
+      EndpointMetrics(*(float(value) for value in block)), self.config
     )
+    if rejection is not None:
+      return result(False, "failed", rejection)
+    return result(True, "endpoint_pass", None)
 
 
 __all__ = [
   "BatchedQualificationTracker",
+  "EndpointMetrics",
+  "MAX_ROLLOUT_STEPS",
   "QualificationConfig",
   "QualificationError",
   "QualificationResult",
   "QualificationTracker",
   "StepEvidence",
   "StepEvidenceBatch",
+  "endpoint_rejection",
   "parse_step_evidence",
   "parse_step_evidence_batch",
+  "row_metrics",
 ]

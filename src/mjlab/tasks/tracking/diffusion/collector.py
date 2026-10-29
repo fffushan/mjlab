@@ -1,4 +1,4 @@
-"""Single-environment frozen-policy collection and handoff lifecycle."""
+"""Frozen-policy rollout collection for the D1 offline dataset."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import torch
 from .adapter import (
   ActionContract,
   AdapterError,
-  FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
 )
@@ -43,36 +42,32 @@ from .storage import (
   validate_monotonic_timestamps,
 )
 
+_INITIAL_POSES: tuple[str, ...] = ("reference", "standing")
+_INITIAL_STATE_MODES: tuple[str, ...] = ("perturbed", "reference")
+
 
 class CollectorError(ValueError):
-  """A collection lifecycle or policy handoff is invalid."""
+  """A collection lifecycle or row-assembly step is invalid."""
 
 
 def _qualified_row_partition(
   rows: Sequence[TrajectoryRow],
   qualification: QualificationResult,
-  retained_steps: int,
 ) -> tuple[
   tuple[TrajectoryRow, ...], tuple[TrajectoryRow, ...], tuple[TrajectoryRow, ...]
 ]:
-  """Split one trial's rows into accepted, verification and persisted rows.
+  """Split one rollout's rows into accepted, verification and persisted rows.
 
-  Accepted rows are the first ``retained_steps`` VAE rows of a qualified trial.
-  Persisted rows keep row order and carry the accepted flag, so the store
-  receives exactly the rows a caller sees in the result.  The partition walks
-  the rows once: it counts VAE rows in order, maps each accepted identity to its
-  first accepted row, and rebuilds the verification and persisted tuples in the
-  original order.
+  A rollout is one endpoint verdict, so a qualified rollout accepts every row,
+  padding included, and a failed one accepts none.  Persisted rows keep row
+  order and carry the accepted flag, so the store receives exactly the rows a
+  caller sees in the result.
   """
-  accepted_rows: list[TrajectoryRow] = []
-  if qualification.qualified:
-    vae_seen = 0
-    for row in rows:
-      if row.controller != "vae":
-        continue
-      vae_seen += 1
-      if vae_seen <= retained_steps:
-        accepted_rows.append(replace(row, segment_qualified=True))
+  accepted_rows: list[TrajectoryRow] = (
+    [replace(row, segment_qualified=True) for row in rows]
+    if qualification.qualified
+    else []
+  )
   accepted_by_identity: dict[Any, TrajectoryRow] = {}
   for row in accepted_rows:
     accepted_by_identity.setdefault(row.identity, row)
@@ -87,59 +82,45 @@ def _step_tensor_batch(
   *,
   observation: Any,
   active_ids: np.ndarray,
-  vae_ids: np.ndarray,
-  ppo_ids: np.ndarray,
   clean: np.ndarray,
   latent: np.ndarray,
   noise: np.ndarray,
 ) -> np.ndarray:
   """Run one batched step through the optional device tensor path.
 
-  The caller passes the single device-native VAE observation captured for this
-  step, so no second snapshot or CPU reference/conditioning copy is made.  The
-  seeded NumPy OU noise is copied to that device, and the composed action
-  returns to the host only because every active row records it.  ``clean`` and
-  ``latent`` receive the CPU copies of the VAE device tensors, and the CPU
-  recovery subset is copied onto the same device action.  The scalar NumPy path
-  remains the reference implementation.
+  Every active row is a VAE row, so the caller passes the single device-native
+  observation captured for this step and no second snapshot or CPU
+  reference/conditioning copy is made.  The seeded NumPy OU noise is copied to
+  that device, and the composed action returns to the host only because every
+  active row records it.  ``clean`` and ``latent`` receive the CPU copies of the
+  VAE device tensors.  The scalar NumPy path remains the reference
+  implementation.
   """
-  if vae_ids.size:
-    action_tensor = getattr(vae, "batch_action_tensor", None)
-    if not callable(action_tensor):
-      raise CollectorError("tensor dispatch lacks a VAE action method")
-    latent_tensor, clean_tensor = cast(Any, action_tensor)(observation)
-    if not isinstance(clean_tensor, torch.Tensor) or not isinstance(
-      latent_tensor, torch.Tensor
-    ):
-      raise CollectorError("tensor VAE must return device tensors")
-    if tuple(clean_tensor.shape) != (int(vae_ids.size), 31) or tuple(
-      latent_tensor.shape
-    ) != (int(vae_ids.size), 32):
-      raise CollectorError("tensor VAE produced an invalid latent or action")
-    if not bool(torch.isfinite(clean_tensor).all()) or not bool(
-      torch.isfinite(latent_tensor).all()
-    ):
-      raise CollectorError("tensor VAE produced non-finite values")
-    device = clean_tensor.device
-    executed_tensor = torch.zeros(
-      (clean.shape[0], 31), dtype=torch.float64, device=device
-    )
-    executed_tensor[vae_ids] = clean_tensor.to(torch.float64) + torch.as_tensor(
-      noise[vae_ids], dtype=torch.float64, device=device
-    )
-    clean[vae_ids] = clean_tensor.detach().to("cpu").numpy().astype(np.float64)
-    latent[vae_ids] = latent_tensor.detach().to("cpu").numpy().astype(np.float64)
-  else:
-    # No active VAE row owns the device, so the recovery-only action stays on
-    # the host exactly like the NumPy path.  The environment decides where to
-    # execute it.
-    executed_tensor = torch.zeros(
-      (clean.shape[0], 31), dtype=torch.float64, device=torch.device("cpu")
-    )
-  if ppo_ids.size:
-    executed_tensor[ppo_ids] = torch.as_tensor(
-      clean[ppo_ids], dtype=torch.float64, device=executed_tensor.device
-    )
+  action_tensor = getattr(vae, "batch_action_tensor", None)
+  if not callable(action_tensor):
+    raise CollectorError("tensor dispatch lacks a VAE action method")
+  latent_tensor, clean_tensor = cast(Any, action_tensor)(observation)
+  if not isinstance(clean_tensor, torch.Tensor) or not isinstance(
+    latent_tensor, torch.Tensor
+  ):
+    raise CollectorError("tensor VAE must return device tensors")
+  if tuple(clean_tensor.shape) != (int(active_ids.size), 31) or tuple(
+    latent_tensor.shape
+  ) != (int(active_ids.size), 32):
+    raise CollectorError("tensor VAE produced an invalid latent or action")
+  if not bool(torch.isfinite(clean_tensor).all()) or not bool(
+    torch.isfinite(latent_tensor).all()
+  ):
+    raise CollectorError("tensor VAE produced non-finite values")
+  device = clean_tensor.device
+  executed_tensor = torch.zeros(
+    (clean.shape[0], 31), dtype=torch.float64, device=device
+  )
+  executed_tensor[active_ids] = clean_tensor.to(torch.float64) + torch.as_tensor(
+    noise[active_ids], dtype=torch.float64, device=device
+  )
+  clean[active_ids] = clean_tensor.detach().to("cpu").numpy().astype(np.float64)
+  latent[active_ids] = latent_tensor.detach().to("cpu").numpy().astype(np.float64)
   executed = executed_tensor.detach().to("cpu").numpy().astype(np.float64)
   if not np.isfinite(executed[active_ids]).all():
     raise CollectorError("batched policy produced non-finite actions")
@@ -166,18 +147,34 @@ class TrialSpec:
   episode_id: str = ""
   pair_id: str = ""
   initial_state_id: str = ""
+  initial_pose: str = "reference"
+  initial_state_mode: str = "perturbed"
 
   def __post_init__(self) -> None:
     if not self.run_id or not self.motion_id or self.start_frame < 0:
       raise CollectorError("trial identity and start frame are invalid")
     if self.phase not in {"clean", "ou"}:
       raise CollectorError("trial phase must be clean or ou")
+    if self.initial_pose not in _INITIAL_POSES:
+      raise CollectorError(
+        f"initial pose must be one of {_INITIAL_POSES}, got {self.initial_pose!r}"
+      )
+    if self.initial_state_mode not in _INITIAL_STATE_MODES:
+      raise CollectorError(
+        "initial state mode must be one of "
+        f"{_INITIAL_STATE_MODES}, got {self.initial_state_mode!r}"
+      )
     if self.episode_id == "":
       object.__setattr__(
         self,
         "episode_id",
-        f"{self.run_id}:{self.motion_id}:{self.seed}:{self.start_frame}:{self.phase}",
+        f"{self.run_id}:{self.motion_id}:{self.seed}:{self.start_frame}:"
+        f"{self.initial_pose}:{self.initial_state_mode}:{self.phase}",
       )
+
+  @property
+  def perturb(self) -> bool:
+    return self.initial_state_mode == "perturbed"
 
   def initialization_fingerprint(self) -> tuple[str, str, int, int, str, str]:
     """Immutable identity shared by clean and OU partners."""
@@ -255,6 +252,7 @@ class BatchedCollectionResult:
   progress: CollectionProgress | None = None
   unstarted_trials: int = 0
   abandoned_trials: tuple[tuple[str, str], ...] = ()
+  retried_pairs: tuple[str, ...] = ()
 
   @property
   def partial(self) -> bool:
@@ -285,6 +283,7 @@ class TrialSlotScheduler:
     self._results: dict[str, TrialOutcome] = {}
     self._skipped_ou_pairs: list[str] = []
     self._abandoned: dict[str, str] = {}
+    self._retried_pairs: list[str] = []
 
   @property
   def active(self) -> dict[int, TrialSpec]:
@@ -301,6 +300,11 @@ class TrialSlotScheduler:
   @property
   def abandoned_trials(self) -> tuple[tuple[str, str], ...]:
     return tuple(self._abandoned.items())
+
+  @property
+  def retried_pairs(self) -> tuple[str, ...]:
+    """Pairs re-run from the reference initial pose after a failure (D9)."""
+    return tuple(self._retried_pairs)
 
   def abandon(self, slot: int, *, reason: str) -> TrialSpec:
     """Retire an admitted trial that cannot run and skip the rest of its pair.
@@ -392,7 +396,39 @@ class TrialSlotScheduler:
       self._completed_clean[spec.pair_id] = result
       if not result.qualification.qualified:
         self._blocked_pairs.add(spec.pair_id)
+        self._enqueue_reference_retry(spec)
     return self.fill() if fill else {}
+
+  def _enqueue_reference_retry(self, spec: TrialSpec) -> None:
+    """Re-run a failed perturbed pair once from the unperturbed initial pose.
+
+    Plan decision D9.  The retry is atomic over the pair: a new pair identity and
+    a new initial-state identity keep its clean and OU rows apart from the
+    failed attempt, while the group key stays the same so both attempts land in
+    one split component.  A pair that already used the reference pose is not
+    retried again.
+    """
+    if spec.initial_state_mode != "perturbed" or not spec.initial_pose:
+      return
+    retry_pair = f"{spec.pair_id}:retry"
+    if retry_pair in self._completed_clean or any(
+      pending.pair_id == retry_pair for pending in self._pending
+    ):
+      return
+    retry_state = f"{spec.initial_state_id}:retry"
+    retries = [
+      replace(
+        spec,
+        phase=phase,
+        pair_id=retry_pair,
+        initial_state_id=retry_state,
+        initial_state_mode="reference",
+        episode_id="",
+      )
+      for phase in ("clean", "ou")
+    ]
+    self._pending.extend(retries)
+    self._retried_pairs.append(spec.pair_id)
 
   def finish(self, *, allow_pending: bool = False) -> tuple[TrialOutcome, ...]:
     """Close the schedule and return its results.
@@ -414,32 +450,114 @@ SlotScheduler = TrialSlotScheduler
 
 
 class DiffusionCollector:
-  """Collect a bounded VAE interval and, at a clip boundary, PPO recovery.
+  """Collect one VAE rollout per trial, from clip frame 0 to its last frame.
 
   The collector deliberately owns no automatic reset.  ``reset_after_trial`` is
   called only after every post-step evidence object has been converted into a
-  row, so a reset state cannot masquerade as terminal survival.
+  row, so a reset state cannot masquerade as terminal survival.  Every rollout
+  emits ``padding_steps`` synthetic history rows first, so its window index can
+  place an anchor on the clip's own first frame.
   """
 
   def __init__(
     self,
     env: Any,
     vae: FrozenVaePolicy,
-    ppo: FrozenPpoRecoveryPolicy,
     *,
     vae_actions: ActionContract | None = None,
-    ppo_actions: ActionContract | None = None,
     qualification: QualificationConfig | None = None,
     store: AppendOnlyShardStore | None = None,
   ) -> None:
     self.env = env
     self.vae = vae
-    self.ppo = ppo
     self.vae_actions = vae_actions or vae.action_contract
-    self.ppo_actions = ppo_actions or ppo.action_contract
     self.qualification = qualification or QualificationConfig()
     self.store = store
     self._initial_snapshots: dict[tuple[str, str], _InitialSnapshot] = {}
+    self._padding_latents: dict[str, np.ndarray] = {}
+
+  def _row_group_key(self, spec: TrialSpec, reference_frame: int) -> str:
+    """The split group of one row: the clip, the seed and the anchor frame.
+
+    The anchor is the row's own clip frame.  Both initial poses of a clip share
+    this key, so they can never land in different splits, while the clean/OU
+    pair identity carries the pose that separates two rollouts of one anchor.
+    """
+    return f"{spec.motion_id}:{spec.seed}:{int(reference_frame)}"
+
+  def _row_provenance(
+    self,
+    spec: TrialSpec,
+    *,
+    reference_phase: str,
+    finite: bool,
+    reason: str,
+  ) -> dict[str, str]:
+    """The provenance every row of one rollout carries."""
+    return {
+      "phase": spec.phase,
+      "reference_phase": reference_phase,
+      "initial_seed": str(spec.seed),
+      "initial_pose": spec.initial_pose,
+      "initial_state_mode": spec.initial_state_mode,
+      "pair_id": spec.pair_id,
+      "initial_state_id": spec.initial_state_id,
+      "group_key_generated": "true",
+      "post_step_finite": str(finite),
+      "post_step_reason": reason,
+    }
+
+  def _padding_rows(
+    self, spec: TrialSpec, *, env_id: int = 0
+  ) -> tuple[TrajectoryRow, ...]:
+    """The synthetic history rows that pad the start of one rollout.
+
+    The runtime supplies the standing keyframe and its identity-root state, so
+    the padding is a pure function of the clip.  Its latent is the frozen
+    encoder mean of that reference, encoded once per clip.
+    """
+    count = self.qualification.padding_steps
+    if count == 0:
+      return ()
+    default = self.env.default_row(spec.motion_id)
+    latent = self._padding_latents.get(spec.motion_id)
+    if latent is None:
+      latent = self.vae.encode_reference(default.reference)
+      self._padding_latents[spec.motion_id] = latent
+    zeros = np.zeros(31, dtype=np.float64)
+    rows: list[TrajectoryRow] = []
+    for index in range(count):
+      reference_frame = index - count
+      rows.append(
+        TrajectoryRow(
+          run_id=spec.run_id,
+          env_id=env_id,
+          episode_id=spec.episode_id,
+          segment_id=f"{spec.episode_id}:vae",
+          tick=index,
+          timestamp=reference_frame * self.qualification.period_seconds,
+          motion_id=spec.motion_id,
+          reference_frame=reference_frame,
+          controller="vae",
+          state=default.state,
+          previous_executed_action=zeros,
+          clean_action=zeros,
+          ou_noise=zeros,
+          executed_action=zeros,
+          latent=latent,
+          terminal_evidence=TerminalEvidence(True, False, False, None, False, False),
+          segment_qualified=False,
+          fps=1.0 / self.qualification.period_seconds,
+          group_key=self._row_group_key(spec, reference_frame),
+          provenance=self._row_provenance(
+            spec,
+            reference_phase=f"{0.0:.9g}",
+            finite=True,
+            reason="padding_row",
+          ),
+        )
+      )
+    return tuple(rows)
 
   def collect(
     self, spec: TrialSpec, *, remaining_transitions: int | None = None
@@ -480,7 +598,10 @@ class DiffusionCollector:
           raise CollectorError("clean trial would overwrite an existing pair snapshot")
     try:
       self.env.reset(
-        seed=spec.seed, motion_id=spec.motion_id, start_frame=spec.start_frame
+        seed=spec.seed,
+        motion_id=spec.motion_id,
+        initial_pose=spec.initial_pose,
+        perturb=spec.perturb,
       )
       if spec.phase == "ou":
         restore = getattr(self.env, "restore_initial_state", None)
@@ -496,46 +617,29 @@ class DiffusionCollector:
         self._initial_snapshots[snapshot_key] = _InitialSnapshot(
           spec.initialization_fingerprint(), captured
         )
-      self.ppo.reset()
       ou = OUProcess(seed=spec.seed) if spec.phase == "ou" else None
       tracker = QualificationTracker(self.qualification)
-      rows: list[TrajectoryRow] = []
-      controller = "vae"
+      rows: list[TrajectoryRow] = list(self._padding_rows(spec))
       previous = np.zeros(31, dtype=np.float64)
       stopped_reason: str | None = None
     except BaseException:
       self.env.reset_after_trial()
       raise
     try:
-      for _ in range(self.qualification.control_steps):
+      while not tracker.done:
         if remaining_transitions is not None and tracker.steps >= remaining_transitions:
           stopped_reason = "control_transition_budget"
           break
-        if controller == "vae":
-          observation = self.env.observe_vae()
-          latent, clean = self.vae.action(observation)
-          noise = (
-            ou.sample()
-            if ou is not None and tracker.vae_steps < self.qualification.retained_steps
-            else np.zeros(31, dtype=np.float64)
-          )
-          action = make_policy_action(clean, noise)
-          segment_id = f"{spec.episode_id}:vae"
-          state = observation.state
-          motion_id = observation.motion_id
-          reference_frame = observation.reference_frame
-          reference_phase = observation.reference_phase
-          row_latent = latent
-        else:
-          observation = self.env.observe_ppo()
-          clean = self.ppo.action(observation)
-          action = make_policy_action(clean)
-          segment_id = f"{spec.episode_id}:ppo"
-          state = observation.state
-          motion_id = observation.motion_id
-          reference_frame = observation.reference_frame
-          reference_phase = observation.reference_phase
-          row_latent = None
+        observation = self.env.observe_vae()
+        latent, clean = self.vae.action(observation)
+        noise = ou.sample() if ou is not None else np.zeros(31, dtype=np.float64)
+        action = make_policy_action(clean, noise)
+        segment_id = f"{spec.episode_id}:vae"
+        state = observation.state
+        motion_id = observation.motion_id
+        reference_frame = observation.reference_frame
+        reference_phase = observation.reference_phase
+        row_latent = latent
 
         result = self.env.step(action.executed.copy())
         raw_bundle = self.env.post_step_evidence(result)
@@ -550,17 +654,17 @@ class DiffusionCollector:
         else:
           raise CollectorError("post-step evidence must include a physical timestamp")
         evidence = parse_step_evidence(bundle.evidence)
-        final_evidence = tracker.observe(controller, evidence, bundle.observation)
+        final_evidence = tracker.observe(evidence, bundle.observation)
         row = TrajectoryRow(
           run_id=spec.run_id,
           env_id=0,
           episode_id=spec.episode_id,
           segment_id=segment_id,
-          tick=tracker.steps - 1,
+          tick=self.qualification.padding_steps + tracker.steps - 1,
           timestamp=bundle.timestamp,
           motion_id=motion_id,
           reference_frame=reference_frame,
-          controller=controller,
+          controller="vae",
           state=state,
           previous_executed_action=previous,
           clean_action=action.clean,
@@ -571,36 +675,21 @@ class DiffusionCollector:
           segment_qualified=False,
           reset=final_evidence.reset,
           teleport=final_evidence.teleport,
-          reference_boundary=(
-            final_evidence.reference_boundary or final_evidence.clip_ended
-          ),
+          # There is no control handoff any more, so the clip-end row is
+          # ordinary training data: it is the last future target of the last
+          # window of its segment.  The row keeps its terminal evidence.
+          reference_boundary=False,
           fps=1.0 / self.qualification.period_seconds,
-          # Keep the stable row key while marking it as a generated split label.
-          group_key=spec.group_key or f"{spec.motion_id}:{spec.start_frame}",
-          provenance={
-            "phase": spec.phase,
-            "reference_phase": f"{reference_phase:.9g}",
-            "initial_seed": str(spec.seed),
-            "initial_start_frame": str(spec.start_frame),
-            "pair_id": spec.pair_id,
-            "initial_state_id": spec.initial_state_id,
-            "group_key_generated": "true" if not spec.group_key else "false",
-            "post_step_finite": str(evidence.finite),
-            "post_step_reason": evidence.reason or "",
-          },
+          group_key=self._row_group_key(spec, reference_frame),
+          provenance=self._row_provenance(
+            spec,
+            reference_phase=f"{reference_phase:.9g}",
+            finite=evidence.finite,
+            reason=evidence.reason or "",
+          ),
         )
         rows.append(row)
         previous = action.executed.copy()
-
-        if tracker.failure is not None:
-          break
-        if controller == "vae" and (evidence.reference_boundary or evidence.clip_ended):
-          physical = self.vae_actions.to_physical(action.executed)
-          self.ppo.handoff_from_physical(physical)
-          self.env.switch_to_ppo()
-          controller = "ppo"
-        elif evidence.terminated or evidence.truncated:
-          break
       validate_monotonic_timestamps(rows)
       qualification = tracker.finish()
       if spec.phase == "clean" and spec.pair_id:
@@ -608,9 +697,7 @@ class DiffusionCollector:
         self._initial_snapshots[(spec.pair_id, spec.initial_state_id)] = replace(
           current, qualification=qualification
         )
-      accepted, verification, persisted = _qualified_row_partition(
-        rows, qualification, self.qualification.retained_steps
-      )
+      accepted, verification, persisted = _qualified_row_partition(rows, qualification)
       if self.store is not None:
         store_files = self.store.append(persisted)
       else:
@@ -639,8 +726,8 @@ class DiffusionCollector:
 
     The scalar :meth:`collect` path remains the reference implementation.  This
     path only accepts an environment that exposes the explicit batch protocol.
-    Policy calls receive the VAE and PPO index subsets, so a row never evaluates
-    the policy that does not own its current phase.
+    Every row is produced by the frozen VAE: there is no policy handoff, so the
+    batch carries one policy for all slots.
 
     ``controls`` is optional and backward compatible.  Without it the call
     keeps full rows, appends once after the schedule, checks no limit and
@@ -694,10 +781,9 @@ class DiffusionCollector:
     required = (
       "reset_batch",
       "observe_vae_batch",
-      "observe_ppo_batch",
+      "default_row",
       "step_batch",
       "post_step_evidence_batch",
-      "switch_to_ppo_batch",
       "capture_initial_state_batch",
       "restore_initial_state_batch",
       "reset_after_trial_batch",
@@ -711,7 +797,6 @@ class DiffusionCollector:
     scheduler = TrialSlotScheduler(specs, batch_size)
     tracker = BatchedQualificationTracker(batch_size, self.qualification)
     ou = BatchedOUProcess([0] * batch_size)
-    controller_ppo = np.zeros(batch_size, dtype=bool)
     previous = np.zeros((batch_size, 31), dtype=np.float64)
     active_specs: list[TrialSpec | None] = [None] * batch_size
     slot_rows: list[list[TrajectoryRow]] = [[] for _ in range(batch_size)]
@@ -762,20 +847,14 @@ class DiffusionCollector:
       validate_monotonic_timestamps(slot_rows[slot])
       qualification = tracker.finish(slot)
       if stopped_reason is not None and qualification.qualified:
-        qualification = QualificationResult(
-          False,
-          "incomplete",
-          stopped_reason,
-          qualification.steps,
-          qualification.vae_steps,
-          qualification.retained_vae_steps,
-          qualification.handoff_step,
+        qualification = replace(
+          qualification, qualified=False, label="incomplete", reason=stopped_reason
         )
       rows = tuple(slot_rows[slot])
       # The slot buffer never outlives the publication of its trial.
       slot_rows[slot] = []
       accepted, verification, persisted_rows = _qualified_row_partition(
-        rows, qualification, self.qualification.retained_steps
+        rows, qualification
       )
       if publisher is None:
         persisted.extend(persisted_rows)
@@ -825,11 +904,10 @@ class DiffusionCollector:
       self.env.reset_batch(trial_specs, env_ids=ids)
       tracker.reset(ids)
       previous[ids] = 0.0
-      controller_ppo[ids] = False
       ou.reset(ids, [spec.seed for spec in trial_specs])
       for slot, spec in started.items():
         active_specs[slot] = spec
-        slot_rows[slot] = []
+        slot_rows[slot] = list(self._padding_rows(spec, env_id=slot))
         slot_latents[slot] = 0.0
         key = (spec.pair_id, spec.initial_state_id)
         if spec.phase == "clean":
@@ -852,8 +930,6 @@ class DiffusionCollector:
             active_specs[slot] = None
             slot_rows[slot] = []
             slot_latents[slot] = 0.0
-            if controller_ppo[slot]:
-              controller_ppo[slot] = False
             continue
           remaining_ou[key] -= 1
           if remaining_ou[key] <= 0:
@@ -867,16 +943,12 @@ class DiffusionCollector:
         if stop_reason is not None:
           break
       active_ids = _ids(tuple(sorted(scheduler.active)))
-      vae_ids = active_ids[~controller_ppo[active_ids]]
-      ppo_ids = active_ids[controller_ppo[active_ids]]
       # The VAE observation supplies both the inference input and the row
       # identity/state evidence.  Tensor dispatch captures it once on the
       # policy device and carries the CPU row metadata with it, so the packed
       # reference/conditioning never make a host round trip for inference.
-      if not vae_ids.size:
-        vae_observation = None
-      elif controls.tensor_dispatch:
-        vae_observation = self.env.observe_vae_tensor_batch(vae_ids)
+      if controls.tensor_dispatch:
+        vae_observation = self.env.observe_vae_tensor_batch(active_ids)
         required_evidence = ("state", "motion_id", "reference_frame", "reference_phase")
         missing = [
           name
@@ -888,40 +960,33 @@ class DiffusionCollector:
             f"tensor observation lacks collection row evidence: {', '.join(missing)}"
           )
       else:
-        vae_observation = self.env.observe_vae_batch(vae_ids)
-      ppo_observation = self.env.observe_ppo_batch(ppo_ids) if ppo_ids.size else None
+        vae_observation = self.env.observe_vae_batch(active_ids)
       clean = np.zeros((batch_size, 31), dtype=np.float64)
       latent = np.zeros((batch_size, 32), dtype=np.float64)
       noise = np.zeros((batch_size, 31), dtype=np.float64)
-      if vae_ids.size:
-        assert vae_observation is not None
-        if not controls.tensor_dispatch:
-          latent_values, clean_values = self.vae.batch_action(vae_observation)
-          clean[vae_ids] = clean_values
-          latent[vae_ids] = latent_values
-        retained = vae_ids[
-          (tracker.vae_steps[vae_ids] < self.qualification.retained_steps)
-          & np.asarray(
-            [
-              spec is not None and spec.phase == "ou"
-              for spec in (active_specs[int(slot)] for slot in vae_ids)
-            ],
-            dtype=bool,
-          )
-        ]
-        if retained.size:
-          noise[retained] = ou.sample(retained.tolist())
-      if ppo_ids.size:
-        assert ppo_observation is not None
-        clean[ppo_ids] = self.ppo.batch_action(ppo_observation, previous[ppo_ids])
+      if not controls.tensor_dispatch:
+        latent_values, clean_values = self.vae.batch_action(vae_observation)
+        clean[active_ids] = clean_values
+        latent[active_ids] = latent_values
+      # The OU perturbation runs on every step of an OU rollout.
+      ou_ids = active_ids[
+        np.asarray(
+          [
+            active_specs[int(slot)] is not None
+            and active_specs[int(slot)].phase == "ou"
+            for slot in active_ids
+          ],
+          dtype=bool,
+        )
+      ]
+      if ou_ids.size:
+        noise[ou_ids] = ou.sample(ou_ids.tolist())
       if controls.tensor_dispatch:
         executed = _step_tensor_batch(
           self.env,
           self.vae,
           observation=vae_observation,
           active_ids=active_ids,
-          vae_ids=vae_ids,
-          ppo_ids=ppo_ids,
           clean=clean,
           latent=latent,
           noise=noise,
@@ -940,24 +1005,16 @@ class DiffusionCollector:
       evidence = parse_step_evidence_batch(bundle.evidence)
       if evidence.batch_size != active_ids.size:
         raise CollectorError("batched evidence rows do not match active slots")
-      parsed = tracker.observe(
-        active_ids,
-        controller_ppo[active_ids],
-        evidence,
-        bundle.observation,
-      )
+      parsed = tracker.observe(active_ids, evidence, bundle.observation)
       position = {int(slot): index for index, slot in enumerate(active_ids.tolist())}
-      vae_position = {int(slot): index for index, slot in enumerate(vae_ids.tolist())}
-      ppo_position = {int(slot): index for index, slot in enumerate(ppo_ids.tolist())}
+      vae_position = {
+        int(slot): index for index, slot in enumerate(active_ids.tolist())
+      }
       for slot in active_ids.tolist():
         local = position[slot]
-        is_ppo = bool(controller_ppo[slot])
-        pre = ppo_observation if is_ppo else vae_observation
-        if pre is None:
+        if vae_observation is None:
           raise CollectorError("missing pre-step observation for an active slot")
-        pre_local = (ppo_position if is_ppo else vae_position)[slot]
-        pre_row = _row_evidence(pre, pre_local)
-        row_controller = "ppo" if is_ppo else "vae"
+        pre_row = _row_evidence(vae_observation, vae_position[slot])
         terminal = TerminalEvidence(
           bool(parsed.terminal_available[local]),
           bool(parsed.terminated[local]),
@@ -972,56 +1029,37 @@ class DiffusionCollector:
           run_id=spec.run_id,
           env_id=slot,
           episode_id=spec.episode_id,
-          segment_id=f"{spec.episode_id}:{row_controller}",
-          tick=int(tracker.steps[slot] - 1),
+          segment_id=f"{spec.episode_id}:vae",
+          tick=self.qualification.padding_steps + int(tracker.steps[slot] - 1),
           timestamp=float(bundle.timestamp[local]),
           motion_id=pre_row.motion_id,
           reference_frame=pre_row.reference_frame,
-          controller=row_controller,
+          controller="vae",
           state=pre_row.state,
           previous_executed_action=previous[slot].copy(),
           clean_action=clean[slot].copy(),
           ou_noise=noise[slot].copy(),
           executed_action=executed[slot].copy(),
-          latent=None if is_ppo else latent[slot].copy(),
+          latent=latent[slot].copy(),
           terminal_evidence=terminal,
           segment_qualified=False,
           reset=bool(parsed.reset[local]),
           teleport=bool(parsed.teleport[local]),
-          reference_boundary=bool(
-            parsed.reference_boundary[local] or parsed.clip_ended[local]
-          ),
+          # The clip-end row is ordinary training data: it is the last future
+          # target of the last window of its segment, and no control handoff
+          # follows it.
+          reference_boundary=False,
           fps=1.0 / self.qualification.period_seconds,
-          group_key=spec.group_key or f"{spec.motion_id}:{spec.start_frame}",
-          provenance={
-            "phase": spec.phase,
-            "reference_phase": f"{pre_row.reference_phase:.9g}",
-            "initial_seed": str(spec.seed),
-            "initial_start_frame": str(spec.start_frame),
-            "pair_id": spec.pair_id,
-            "initial_state_id": spec.initial_state_id,
-            "group_key_generated": "true" if not spec.group_key else "false",
-            "post_step_finite": str(bool(parsed.finite[local])),
-            "post_step_reason": parsed.reason[local] or "",
-          },
+          group_key=self._row_group_key(spec, pre_row.reference_frame),
+          provenance=self._row_provenance(
+            spec,
+            reference_phase=f"{pre_row.reference_phase:.9g}",
+            finite=bool(parsed.finite[local]),
+            reason=parsed.reason[local] or "",
+          ),
         )
         slot_rows[slot].append(row)
         previous[slot] = executed[slot].copy()
-
-      boundary = parsed.reference_boundary | parsed.clip_ended
-      if vae_ids.size:
-        vae_boundary = np.asarray(
-          [boundary[position[slot]] for slot in vae_ids.tolist()], dtype=bool
-        )
-        vae_failed = tracker.failure_codes[vae_ids] != 0
-        handoff = vae_ids[vae_boundary & ~vae_failed & ~tracker.interrupted[vae_ids]]
-      else:
-        handoff = np.empty(0, dtype=np.int64)
-      if handoff.size:
-        self.env.switch_to_ppo_batch(handoff)
-        controller_ppo[handoff] = True
-        physical = self.vae_actions.offset + self.vae_actions.scale * executed[handoff]
-        previous[handoff] = self.ppo.handoff_from_physical_batch(physical)
 
       done = active_ids[tracker.done[active_ids]]
       transitions += int(active_ids.size)
@@ -1034,16 +1072,13 @@ class DiffusionCollector:
       finished: list[TrialOutcome] = []
       for slot in done.tolist():
         stopped = (
-          STOP_TRANSITION_BUDGET
-          if capped and tracker.steps[slot] < self.qualification.control_steps
-          else None
+          STOP_TRANSITION_BUDGET if capped and not tracker.endpoint[slot] else None
         )
         result = _finish_slot(slot, stopped)
         finished.append(result)
         started = scheduler.complete(slot, result, fill=not capped)
         self.env.reset_after_trial_batch(np.asarray([slot], dtype=np.int64))
         active_specs[slot] = None
-        controller_ppo[slot] = False
         replacement_specs.update(started)
       for result in finished:
         reporter.emit(
@@ -1128,6 +1163,7 @@ class DiffusionCollector:
       progress,
       unstarted_trials,
       scheduler.abandoned_trials,
+      scheduler.retried_pairs,
     )
 
 

@@ -324,3 +324,71 @@ perturbation ranges.
 Clip lengths: `data/tennis/*.npz` for the 144 ids in
 `configs/distillation/x2_tennis_multimotion_v1.yaml`. Sum 45 653 frames, range
 213–453.
+
+## 13. Implementation and smoke status
+
+Status: implemented and smoke-tested at 2026-10-29 19:40 (+08). Not committed.
+No full-cohort run exists.
+
+Both runtime paths now run the protocol. The scalar path needed three fixes that
+the first pass missed, and they are recorded here because each one was silent:
+
+| Defect | Effect | Fix |
+|---|---|---|
+| The scalar runtime never held the reference at the clip end | `--max-envs 1` wrapped to a new start frame, reported a teleport and failed every rollout, producing a zero-window dataset | `X2MotionEnvironment` installs the same advance hold as the batched class |
+| The scalar parity check compared float32 state exactly | every OU pair failed with a 9.3e-9 quaternion difference | both paths use `_RESTORE_PARITY_ATOL = 1e-6` |
+| The collection config's `schedule.seeds` was inert | the runtime seed default (57) applied silently | the CLI reads `schedule.seeds` and `schedule.initial_poses` when the flags are absent |
+
+Smoke result, two clips (`single_000`, `single_001`), 2 seeds, 2 initial poses,
+clean and OU:
+
+| Quantity | Batched (`--max-envs 16`) | Scalar (`--max-envs 1`) |
+|---|---:|---:|
+| rollouts | 16 | 16 |
+| endpoint pass | 16 | 16 |
+| rows | 6 472 | 6 472 |
+| windows | 5 832 | 5 832 |
+| `rows − windows` | 640 = `32×16 + 8×16` | 640 |
+| windows with a padding current row | 0 | 0 |
+| `ppo` rows | 0 | 0 |
+| anchors `vgk000` | 0–420 (421) | 0–420 (421) |
+| anchors `vgk001` | 0–307 (308) | 0–307 (308) |
+| groups / split | 1458 · train 1157 / test 461 / val 0 | same |
+
+The two paths agree exactly, which is the property the scalar path lacked.
+
+Test status: `pytest tests/ -k "diffusion or tracking"` gives 2072 passed and 17
+failed. All 17 fail identically at `de82a8a56` without these changes; they are
+pre-existing and unrelated. Verified by stashing the change and re-running the
+same selection.
+
+Still unverified: the failure side of the endpoint test (all smoke rollouts
+passed with wide margin), the D9 retry end to end (unit-tested only, no smoke
+failure occurred), the full-cohort window count, and token-cache validation.
+
+### 13.1 The cohort and the VAE must match
+
+A rollout teacher must belong to the frozen VAE's own cohort, so the 144-clip
+dataset cannot use the 36-member VGK36 VAE. That VAE refuses `single_*` ids:
+
+```
+frozen VAE cohort member 'single_000' could not be loaded:
+cohort member selection refused: the cohort has no member 'single_000'
+```
+
+The 144-clip run uses a separate pin:
+
+| Item | Path |
+|---|---|
+| VAE | `logs/distillation/x2-multimotion-vae-10k-resume2-20261019/train/checkpoint-final.pt` |
+| cohort manifest | `configs/distillation/x2_tennis_multimotion_v1.yaml`, 144 members |
+| contract | `docs/plans/beyondmimic_diffusion_d1_no_mixtures_multimotion144_contract.yaml` |
+| config | `configs/diffusion/x2_50hz_collection_multimotion144.yaml` |
+
+The manifest is byte-identical to the training cohort manifest the checkpoint
+recorded (`cd597b1c…`), so the VAE accepts it.
+
+The 144-clip cohort also uses the version-2 reference layout, which appends one
+`motion_lookahead` frame. The padding row therefore needs a default for that
+field as well: the standing joints again, with zero velocity. The VGK36 cohort
+has no preview field, so a smoke run on that cohort cannot detect the omission.

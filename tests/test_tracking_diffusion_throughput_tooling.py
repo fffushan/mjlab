@@ -346,11 +346,18 @@ def test_batched_outcome_payload_reads_compact_counts() -> None:
     run_id = "run"
     motion_id = "motion"
     phase = "clean"
+    initial_pose = "reference"
+    initial_state_mode = "perturbed"
 
   class _Qualification:
     qualified = True
-    label = "vae_only"
+    label = "endpoint_pass"
     reason = ""
+    steps = 4
+    min_tilt_degrees = 1.0
+    max_anchor_z_error_m = 0.01
+    max_end_effector_z_error_m = 0.01
+    fall_frames = 0
 
   class _Summary:
     spec = _Spec()
@@ -377,12 +384,13 @@ def _summary(spec: Any, *, rows: int = 4, steps: int = 4) -> CollectionSummary:
     spec,
     QualificationResult(
       qualified=True,
-      label="vae_only",
+      label="endpoint_pass",
       reason=None,
       steps=steps,
-      vae_steps=steps,
-      retained_vae_steps=2,
-      handoff_step=None,
+      min_tilt_degrees=1.0,
+      max_anchor_z_error_m=0.01,
+      max_end_effector_z_error_m=0.01,
+      fall_frames=0,
     ),
     row_count=rows,
     accepted_row_count=rows - 1,

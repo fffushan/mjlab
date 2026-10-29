@@ -1,22 +1,25 @@
-"""Concrete AgiBot X2 runtime factory for D1 pilot collection.
+"""Concrete AgiBot X2 runtime factory for D1 uniform-anchor collection.
 
 This module owns the simulator boundary the offline D1 code deliberately does
 not: it builds the registered tracking environment, drives the frozen
-version-3 cohort VAE and the frozen zero-command recovery policy, and reports
-physical post-step evidence.
+version-3 cohort VAE for a whole rollout, and reports physical post-step
+evidence.
 
-Design constraints taken from the frozen D0 contract
----------------------------------------------------
+Design constraints taken from the D1 uniform-anchor plan
+------------------------------------------------------
 
 * A shared multi-motion environment may carry many rows.  Rows pin their own
   reference clip and the collector owns every reset boundary.
-* The VAE phase ends at the clip's last reference frame, where control hands to
-  the zero-command recovery policy in the *same* simulator state (continuation,
-  never a state transplant).
-* Physical fall is the tracking task's own root-quantum tilt criterion applied
-  in both phases by the collector's qualification tracker; the VAE reference
-  guards apply only while the VAE owns control.
-* Recovery rows are not training data; no window may cross the handoff.
+* One rollout starts at frame 0 of its clip and runs to the last frame.  The
+  collector ends it there; nothing continues past the clip end.
+* The tracking task's own reference terminations and the reference wrap are
+  suspended for active rows, so a rollout can only end on its own endpoint or
+  on the task time-out.
+* Both initial poses (the reference state at frame 0 and ``STAND_KEYFRAME``)
+  receive the same seeded perturbation in the same simulator state, so the
+  clean/OU snapshot check has one deterministic reset to verify.
+* Eight synthetic ``DEFAULT_ROW`` rows pad every rollout.  They hold the
+  standing keyframe and its identity-root kinematics, and are history only.
 
 The module is intentionally not a CLI: :func:`build_x2_runtime` is the
 ``--runtime-factory`` entry point, and the CLI has already applied its
@@ -26,7 +29,7 @@ fail-closed budget and artifact checks before calling it.
 from __future__ import annotations
 
 import hashlib
-import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -37,10 +40,8 @@ import torch
 from .adapter import (
   ActionContract,
   AdapterError,
-  FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
-  PpoObservation,
   VaeObservation,
   VaeObservationTensorBatch,
   resolve_inference_device,
@@ -51,11 +52,16 @@ from .model import ContractDimensions, contract_dimensions
 from .qualification import QualificationConfig, StepEvidence
 from .state import WorldState
 
-# Frozen D1 pilot design (docs/plans/beyondmimic_diffusion_d0_contract.yaml).
-PHASE_FRACTIONS: tuple[float, ...] = (0.1, 0.5, 0.8)
+# Frozen D1 design (docs/plans/beyondmimic_diffusion_d1_uniform_anchor_collection.md).
+INITIAL_POSES: tuple[str, ...] = ("reference", "standing")
+INITIAL_STATE_MODES: tuple[str, ...] = ("perturbed", "reference")
 PILOT_SEEDS: tuple[int, ...] = (0, 1, 2)
 D1_RUN_ID = "d1-pilot-x2-tennis-mixed-v1"
 D1_BULK_RUN_ID = "d1-bulk-x2-tennis-mixed-v1"
+
+# One window needs ``future_steps`` rows after its anchor, so the last anchor of
+# a clip of ``N`` frames is ``N - future_steps - 1``.
+_ANCHOR_TAIL = DEFAULT_CONTRACT.future_steps
 
 # Frozen three-clip cohort used by both frozen revisions' pilot schedule.
 _DEFAULT_COHORT_MANIFEST = "configs/distillation/x2_tennis_mixed.yaml"
@@ -63,6 +69,11 @@ _DEFAULT_COHORT_MANIFEST = "configs/distillation/x2_tennis_mixed.yaml"
 # The plan sizes the bulk collection as ``L * 50 * 100`` retained rows
 # (~111300 for the three clips).  At the pilot yield of ~108 accepted rows per
 # trial that is ~1030 trials, i.e. 57 seeds x 3 phases x 3 clips pairs.
+# Parity tolerance for "the OU reset reproduced the clean reset".  The state is
+# written, read back through the simulator and round-tripped in single precision,
+# so a reproducible reset can still differ in the last bits of a quaternion.
+_RESTORE_PARITY_ATOL = 1e-6
+
 BULK_SEED_COUNT = 57
 
 _END_EFFECTOR_BODIES: tuple[str, ...] = (
@@ -78,6 +89,24 @@ _BODY_COUNT = len(DEFAULT_CONTRACT.body_names)
 _REFERENCE_TERMINATIONS: tuple[str, ...] = ("anchor_pos", "anchor_ori", "ee_body_pos")
 
 
+def _yaw_only(quaternion: torch.Tensor) -> torch.Tensor:
+  """The yaw-only orientation of a quaternion, as the standing insert writes it."""
+  from mjlab.utils.lab_api.math import yaw_quat
+
+  return yaw_quat(quaternion)
+
+
+def _apply_rpy(quaternion: torch.Tensor, rpy: np.ndarray) -> torch.Tensor:
+  """Left-multiply one quaternion batch by a roll/pitch/yaw delta."""
+  from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul
+
+  angles = torch.as_tensor(
+    np.asarray(rpy, dtype=np.float64), dtype=torch.float32, device=quaternion.device
+  ).reshape(1, 3)
+  delta = quat_from_euler_xyz(angles[:, 0], angles[:, 1], angles[:, 2])
+  return quat_mul(delta, quaternion)
+
+
 def _never_terminate(env: Any, **_: Any) -> torch.Tensor:
   """Always-false termination, used to suspend reference guards."""
   return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -87,14 +116,173 @@ class RuntimeX2Error(RuntimeError):
   """The concrete X2 runtime cannot be built or driven safely."""
 
 
-def start_frames_for(frames: int) -> tuple[int, ...]:
-  """Contract start frames ``floor(fraction * (N - 1))`` for one clip."""
-  if frames < 2:
-    raise RuntimeX2Error(f"clip must have at least two frames, got {frames}")
-  return tuple(
-    min(frames - 1, int(math.floor(fraction * (frames - 1))))
-    for fraction in PHASE_FRACTIONS
+@dataclass(frozen=True, slots=True)
+class InitialPerturbation:
+  """One seeded reset perturbation, in the world and joint frames."""
+
+  root_offset: np.ndarray
+  root_rpy: np.ndarray
+  joint_offsets: np.ndarray
+
+  def __post_init__(self) -> None:
+    object.__setattr__(
+      self, "root_offset", np.asarray(self.root_offset, dtype=np.float64).reshape(3)
+    )
+    object.__setattr__(
+      self, "root_rpy", np.asarray(self.root_rpy, dtype=np.float64).reshape(3)
+    )
+    offsets = np.asarray(self.joint_offsets, dtype=np.float64).reshape(-1)
+    if offsets.shape != (DEFAULT_CONTRACT.action_dimension,):
+      raise RuntimeX2Error("joint perturbation must cover every actuated joint")
+    if not all(
+      np.isfinite(value).all() for value in (self.root_offset, self.root_rpy, offsets)
+    ):
+      raise RuntimeX2Error("initial perturbation must be finite")
+    object.__setattr__(self, "joint_offsets", offsets)
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultRow:
+  """The synthetic standing row that pads the start of every rollout.
+
+  ``reference`` is the standing keyframe packed in the frozen reference layout.
+  ``state`` is that keyframe's kinematics from an identity root.  Only
+  ``state.root_position`` comes from the clip, so the fake history adds no
+  world-absolute step at frame 0.
+  """
+
+  reference: np.ndarray
+  state: WorldState
+
+
+_ANKLE_JOINT = re.compile(r"^(?:left|right)_ankle_(?:pitch|roll)_joint$")
+_JOINT_OFFSET_RANGE = (-0.01, 0.01)
+_ANKLE_OFFSET_RANGE = (-0.1, 0.1)
+_ROOT_OFFSET_RANGES = ((-0.05, 0.05), (-0.05, 0.05), (-0.01, 0.01))
+_ROOT_ROTATION_RANGES = ((-0.1, 0.1), (-0.1, 0.1), (-0.2, 0.2))
+_REFERENCE_FIELD_WIDTHS: tuple[tuple[str, int], ...] = (
+  ("reference_q", DEFAULT_CONTRACT.action_dimension),
+  ("reference_dq", DEFAULT_CONTRACT.action_dimension),
+  ("anchor_orientation_error", 6),
+  # Version-2 cohorts append one future reference frame: joint positions and
+  # joint velocities.  A padding row has no future, so its preview is the same
+  # standing pose with zero velocity.
+  ("motion_lookahead", 2 * DEFAULT_CONTRACT.action_dimension),
+)
+
+
+def initial_perturbation(seed: int, joint_names: Sequence[str]) -> InitialPerturbation:
+  """The plan's reset perturbation for one seed.
+
+  The generator depends on the seed alone, so the same seed produces the same
+  perturbation for both initial poses and for the clean and OU phase of a pair.
+  Velocities stay zero for this build.
+  """
+  names = tuple(joint_names)
+  if len(names) != DEFAULT_CONTRACT.action_dimension:
+    raise RuntimeX2Error(
+      f"expected {DEFAULT_CONTRACT.action_dimension} joints, got {len(names)}"
+    )
+  rng = np.random.default_rng(int(seed))
+  root_offset = np.asarray(
+    [rng.uniform(*bounds) for bounds in _ROOT_OFFSET_RANGES], dtype=np.float64
   )
+  root_rpy = np.asarray(
+    [rng.uniform(*bounds) for bounds in _ROOT_ROTATION_RANGES], dtype=np.float64
+  )
+  offsets = np.asarray(
+    rng.uniform(*_JOINT_OFFSET_RANGE, size=len(names)), dtype=np.float64
+  )
+  ankles = [index for index, name in enumerate(names) if _ANKLE_JOINT.match(name)]
+  if ankles:
+    offsets[ankles] = rng.uniform(*_ANKLE_OFFSET_RANGE, size=len(ankles))
+  return InitialPerturbation(root_offset, root_rpy, offsets)
+
+
+def stand_joint_positions(joint_names: Sequence[str]) -> np.ndarray:
+  """``STAND_KEYFRAME`` joint positions in the given joint order."""
+  from mjlab.asset_zoo.robots.agibot_x2.x2_constants import STAND_KEYFRAME
+  from mjlab.utils.string import resolve_expr
+
+  patterns = STAND_KEYFRAME.joint_pos
+  if patterns is None:
+    raise RuntimeX2Error("STAND_KEYFRAME declares no joint_pos patterns")
+  return np.asarray(
+    resolve_expr(patterns, tuple(joint_names), 0.0),
+    dtype=np.float64,
+  )
+
+
+def stand_body_positions(model: Any, robot: Any) -> np.ndarray:
+  """Body positions of ``STAND_KEYFRAME`` under an identity root pose.
+
+  ``mj_kinematics`` runs on a private data object, so this reads the compiled
+  model without stepping, sensing, or writing the running simulation.
+  """
+  import mujoco
+
+  data = mujoco.MjData(model)
+  data.qpos[:] = 0.0
+  data.qvel[:] = 0.0
+  free = robot.indexing.free_joint_q_adr.detach().cpu().numpy()
+  if free.size != 7:
+    raise RuntimeX2Error("the X2 robot root is not a free joint")
+  data.qpos[int(free[3])] = 1.0
+  joints = robot.indexing.joint_q_adr.detach().cpu().numpy()
+  data.qpos[joints] = stand_joint_positions(robot.joint_names)
+  mujoco.mj_kinematics(model, data)
+  # The compiled entity prefixes its body names ("robot/pelvis"), so resolve the
+  # contract order through the entity's own name table and model indices.
+  entity_names = tuple(robot.body_names)
+  entity_ids = robot.indexing.body_ids.detach().cpu().numpy()
+  body_ids = [
+    int(entity_ids[entity_names.index(name)]) for name in DEFAULT_CONTRACT.body_names
+  ]
+  return np.asarray(data.xpos[body_ids], dtype=np.float64).reshape(_BODY_COUNT, 3)
+
+
+def stand_reference(
+  reference_names: Sequence[str], joint_positions: np.ndarray
+) -> np.ndarray:
+  """The standing keyframe packed in the frozen reference layout.
+
+  ``reference_q`` holds the standing joints, ``reference_dq`` and the anchor
+  orientation error are zero: the padding row states the standing pose, not a
+  measurement of the robot against it.
+  """
+  widths = dict(_REFERENCE_FIELD_WIDTHS)
+  pieces: list[np.ndarray] = []
+  for name in reference_names:
+    width = widths.get(name)
+    if width is None:
+      raise RuntimeX2Error(
+        f"reference layout field {name!r} has no standing default; the padding "
+        "row is defined for reference_q, reference_dq, anchor_orientation_error"
+      )
+    joints = np.asarray(joint_positions, dtype=np.float64).reshape(-1)
+    if name == "reference_q":
+      pieces.append(joints.reshape(width))
+    elif name == "motion_lookahead":
+      # The preview is (q, dq) of the next frame; the padding row holds the
+      # standing pose at rest, so the repeated q is the same standing joints.
+      pieces.append(np.concatenate((joints, np.zeros_like(joints))).reshape(width))
+    else:
+      pieces.append(np.zeros(width, dtype=np.float64))
+  return np.concatenate(pieces)
+
+
+def anchor_frames_for(frames: int) -> range:
+  """Anchor frames ``0 … N - 33`` for a clip of ``N`` frames.
+
+  The anchor is the current row of a training window, so it needs 32 rows
+  behind it for the history (eight padding rows plus the clip opening) and 32
+  after it for the future targets.
+  """
+  if frames < _ANCHOR_TAIL + 1:
+    raise RuntimeX2Error(
+      f"clip must have at least {_ANCHOR_TAIL + 1} frames, got {frames}"
+    )
+  return range(0, frames - _ANCHOR_TAIL)
 
 
 def build_trials(
@@ -102,15 +290,16 @@ def build_trials(
   *,
   seeds: Sequence[int],
   run_id: str,
+  initial_poses: Sequence[str] = INITIAL_POSES,
   worker: int = 0,
   workers: int = 1,
 ) -> tuple[TrialSpec, ...]:
-  """Build a pair-local clean/OU schedule for the given seeds.
+  """Build a pair-local clean/OU schedule for the given seeds and poses.
 
   Each OU item follows its own clean item.  Unrelated pairs may interleave.  The
   old global clean-before-OU ordering protected the single-row snapshot map, but
-  the collector now checks the matching fingerprint and qualification at each
-  pair admission, so that global restriction is not required.
+  the collector checks the matching fingerprint and qualification at each pair
+  admission, so that global restriction is not required.
 
   ``worker``/``workers`` take a disjoint stride slice of whole pairs so several
   processes can collect in parallel.  Each worker still receives every one of
@@ -118,41 +307,53 @@ def build_trials(
   collector and the CLI require, and a pair is never split across workers
   because the OU restore needs its clean partner in the same process.
 
-  ``group_key`` is set explicitly to the pair family
-  (``motion:seed:start_frame``).  The collector would otherwise synthesize
-  ``motion:start_frame``, which carries no seed and collapses every seed of a
-  start frame into one split group -- enough for a 27-pair pilot (9 groups,
-  empty validation) but not for a dataset that needs a populated validation
-  partition.  The explicit key is the family itself, so clean and OU partners
-  still share a split and the pair relation cannot leak.
+  One rollout covers every anchor of its clip, because it starts at frame 0 and
+  runs to the last frame.  The pair identity therefore carries the initial pose,
+  which is what makes the two poses of one clip separate clean/OU pairs.  The
+  per-row split group is ``motion:seed:anchor`` and is set by the collector, so
+  the two poses of a clip cannot land in different splits.
   """
   if workers < 1 or not 0 <= worker < workers:
     raise RuntimeX2Error(
       f"worker must satisfy 0 <= worker < workers, got {worker}/{workers}"
     )
+  poses = tuple(initial_poses)
+  unknown = [pose for pose in poses if pose not in INITIAL_POSES]
+  if not poses or unknown:
+    raise RuntimeX2Error(
+      f"initial poses must be a non-empty subset of {INITIAL_POSES}, got {poses}"
+    )
+  if len(set(poses)) != len(poses):
+    raise RuntimeX2Error(f"initial poses repeat a value: {poses}")
+  for motion_id, frames in motion_frames:
+    if frames < _ANCHOR_TAIL + 1:
+      raise RuntimeX2Error(
+        f"clip {motion_id!r} needs {_ANCHOR_TAIL + 1} frames, has {frames}"
+      )
   pairs = [
-    (motion_id, seed, start_frame)
-    for motion_id, frames in motion_frames
+    (motion_id, seed, pose)
+    for motion_id, _ in motion_frames
     for seed in seeds
-    for start_frame in start_frames_for(frames)
+    for pose in poses
   ]
   clean: list[TrialSpec] = []
   ou: list[TrialSpec] = []
-  for motion_id, seed, start_frame in pairs[worker::workers]:
-    pair_id = f"{motion_id}:{seed}:{start_frame}"
-    # Each seed produces its own perturbed initial state, so the state
-    # identity must carry the seed too.
-    initial_state_id = f"init:{motion_id}:{seed}:{start_frame}"
+  for motion_id, seed, pose in pairs[worker::workers]:
+    pair_id = f"{motion_id}:{seed}:{pose}"
+    # The clean and OU trials of one pose share one initial state; a later
+    # unperturbed attempt would use its own identity.
+    initial_state_id = f"init:{motion_id}:{seed}:{pose}:" + "perturbed"
     clean.append(
       TrialSpec(
         run_id=run_id,
         motion_id=motion_id,
         seed=seed,
-        start_frame=start_frame,
+        start_frame=0,
         phase="clean",
         group_key=pair_id,
         pair_id=pair_id,
         initial_state_id=initial_state_id,
+        initial_pose=pose,
       )
     )
     ou.append(
@@ -160,11 +361,12 @@ def build_trials(
         run_id=run_id,
         motion_id=motion_id,
         seed=seed,
-        start_frame=start_frame,
+        start_frame=0,
         phase="ou",
         group_key=pair_id,
         pair_id=pair_id,
         initial_state_id=initial_state_id,
+        initial_pose=pose,
       )
     )
   return tuple(item for pair in zip(clean, ou, strict=True) for item in pair)
@@ -196,12 +398,18 @@ def build_pilot_trials(
   motion_frames: Sequence[tuple[str, int]],
   *,
   run_id: str = D1_RUN_ID,
+  initial_poses: Sequence[str] = INITIAL_POSES,
   worker: int = 0,
   workers: int = 1,
 ) -> tuple[TrialSpec, ...]:
-  """The frozen 54-trial pilot schedule (seeds 0-2)."""
+  """The pilot schedule: seeds 0-2, every initial pose, every anchor."""
   return build_trials(
-    motion_frames, seeds=PILOT_SEEDS, run_id=run_id, worker=worker, workers=workers
+    motion_frames,
+    seeds=PILOT_SEEDS,
+    run_id=run_id,
+    initial_poses=initial_poses,
+    worker=worker,
+    workers=workers,
   )
 
 
@@ -210,19 +418,42 @@ def build_bulk_trials(
   *,
   seed_count: int = BULK_SEED_COUNT,
   run_id: str = D1_BULK_RUN_ID,
+  initial_poses: Sequence[str] = INITIAL_POSES,
   worker: int = 0,
   workers: int = 1,
 ) -> tuple[TrialSpec, ...]:
-  """The ~100-fold coverage schedule (``seed_count`` seeds per phase/clip)."""
+  """The bulk schedule: ``seed_count`` seeds times every initial pose."""
   if seed_count <= 0:
     raise RuntimeX2Error("bulk collection needs at least one seed")
   return build_trials(
     motion_frames,
     seeds=tuple(range(seed_count)),
     run_id=run_id,
+    initial_poses=initial_poses,
     worker=worker,
     workers=workers,
   )
+
+
+def resolve_initial_poses(value: str) -> tuple[str, ...]:
+  """Resolve ``MJLAB_D1_INITIAL_POSES`` to the poses every clip is rolled out in.
+
+  ``both`` is the plan's schedule; the two single-pose values exist for a
+  bounded smoke run and for diagnosing one pose at a time.
+  """
+  text = value.strip().lower()
+  if text in ("", "both"):
+    return INITIAL_POSES
+  chosen = tuple(part.strip() for part in text.split(",") if part.strip())
+  unknown = [pose for pose in chosen if pose not in INITIAL_POSES]
+  if not chosen or unknown:
+    raise RuntimeX2Error(
+      f"MJLAB_D1_INITIAL_POSES must be 'both' or a subset of {INITIAL_POSES}, "
+      f"got {value!r}"
+    )
+  if len(set(chosen)) != len(chosen):
+    raise RuntimeX2Error(f"MJLAB_D1_INITIAL_POSES repeats a pose: {chosen}")
+  return chosen
 
 
 def resolve_policy_device(value: str, *, simulation_device: str) -> str:
@@ -366,9 +597,9 @@ class X2MotionEnvironment:
       ) from exc
     self.joint_names = tuple(self.robot.joint_names)
 
-    # The tracking task's own reference guards must apply while the VAE tracks and
-    # must be suspended once the zero-command recovery policy owns the trial:
-    # a standing policy cannot follow a reference the clip no longer advances.
+    # The tracking task's own reference guards are suspended for the whole
+    # rollout: a rollout is a stability test, and its reference terminations would
+    # end it before the last frame is reached.
     self._reference_terms: dict[str, tuple[Any, dict[str, Any]]] = {}
     manager = self.env.termination_manager
     for name in _REFERENCE_TERMINATIONS:
@@ -381,50 +612,46 @@ class X2MotionEnvironment:
       if term_cfg.time_out:
         raise RuntimeX2Error(f"termination {name!r} must not be a time-out term")
       self._reference_terms[name] = (term_cfg.func, dict(term_cfg.params))
-    self._set_reference_terminations(True)
+    self._set_reference_terminations(False)
 
-    self._phase = "vae"
     self._last_frame = 0
-    self._handoff_frame = 0
     self._trial_clock = 0.0
     self._initial: InitialStateSnapshot | None = None
+    self._stand_body_positions: np.ndarray | None = None
+    self._install_reference_advance_mask()
+    self._default_row: DefaultRow | None = None
 
   # -- lifecycle -----------------------------------------------------------
 
-  def reset(self, *, seed: int, start_frame: int) -> None:
-    """Full reset, then a deterministic teleport to the trial start frame."""
-    if start_frame < 0 or start_frame >= self.clip_frames:
+  def reset(
+    self, *, seed: int, initial_pose: str = "reference", perturb: bool = True
+  ) -> None:
+    """Full reset to frame 0, then the chosen initial pose and perturbation."""
+    if initial_pose not in INITIAL_POSES:
       raise RuntimeX2Error(
-        f"start frame {start_frame} is outside clip length {self.clip_frames}"
+        f"initial pose must be one of {INITIAL_POSES}, got {initial_pose!r}"
       )
     self.env.reset(seed=seed)
-    self.command.reset_to_frame(self._row_ids, int(start_frame))
-    # Replay the environment's own post-reset recompute tail so the observation
-    # cache, history, and sensor data describe the teleported state.  The
-    # command's own update is deliberately skipped: ``_update_command``
-    # increments ``time_steps`` unconditionally, which would land on
-    # ``start_frame + 1``.
-    self.env.scene.write_data_to_sim()
-    self.env.sim.forward()
-    self.env.sim.sense()
-    # ``reset_to_frame`` changes ``time_steps`` after the environment's own
-    # command compute, so the anchor-relative reference cache (used by the
-    # tracking task's ``body_pos_relative_w`` termination and by the D1
-    # reference guard) is stale until it is refreshed here.
-    self.command.update_relative_body_poses()
-    self.env.obs_buf = self.env.observation_manager.compute(
-      update_history=True, env_ids=self._row_ids
+    self.command.reset_to_frame(self._row_ids, 0)
+    self._refresh()
+    self._remember_default_row()
+    self._write_initial_pose(
+      initial_pose=initial_pose, seed=int(seed), perturb=bool(perturb)
     )
-    self._phase = "vae"
-    self._last_frame = int(start_frame)
-    self._handoff_frame = int(start_frame)
+    self._refresh()
+    self._last_frame = 0
     self._trial_clock = 0.0
-    self._set_reference_terminations(True)
     self._initial = InitialStateSnapshot(
       seed=int(seed),
-      start_frame=int(start_frame),
+      start_frame=0,
       signature=self._initial_signature(),
     )
+
+  def default_row(self) -> DefaultRow:
+    """The padded history row of this clip, computed before the first rollout."""
+    if self._default_row is None:
+      raise RuntimeX2Error("the default row needs one reset before it is readable")
+    return self._default_row
 
   def capture_initial_state(self) -> InitialStateSnapshot:
     if self._initial is None:
@@ -432,17 +659,34 @@ class X2MotionEnvironment:
     return self._initial
 
   def restore_initial_state(self, snapshot: InitialStateSnapshot) -> None:
-    current = self._initial_signature()
-    if tuple(current) != tuple(snapshot.signature):
+    """Verify that the reset reproduced the pair's captured initial state.
+
+    The comparison uses the same float32 parity tolerance as the batched path.
+    Exact equality is wrong here: the state is written, read back through the
+    simulator and round-tripped in single precision, so a reproducible reset can
+    still differ in the last bits of one quaternion component.
+    """
+    current = np.asarray(self._initial_signature(), dtype=np.float64)
+    expected = np.asarray(snapshot.signature, dtype=np.float64)
+    if current.shape != expected.shape or not np.allclose(
+      current, expected, rtol=0.0, atol=_RESTORE_PARITY_ATOL
+    ):
+      delta = np.abs(current - expected) if current.shape == expected.shape else None
+      worst = int(delta.argmax()) if delta is not None and delta.size else -1
+      detail = (
+        f"; worst component {worst} now {current[worst]!r} expected {expected[worst]!r}"
+        f" (max abs delta {float(delta.max()):.6g})"
+        if delta is not None and delta.size
+        else ""
+      )
       raise AdapterError(
         "OU trial could not reproduce its clean partner's initial state; "
-        f"expected {snapshot.digest()}"
+        f"expected {snapshot.digest()}{detail}"
       )
 
   def reset_after_trial(self) -> None:
     """Return the simulator to a clean, non-pending state for the next trial."""
     self.env.reset(env_ids=self._row_ids)
-    self._phase = "vae"
 
   def close(self) -> None:
     self.adapter.close()
@@ -450,24 +694,7 @@ class X2MotionEnvironment:
   # -- observations --------------------------------------------------------
 
   def observe_vae(self) -> VaeObservation:
-    if self._phase != "vae":
-      raise RuntimeX2Error(
-        "VAE observation requested while the recovery policy owns control"
-      )
     return self._vae_observation(self.adapter.snapshot())
-
-  def observe_ppo(self) -> PpoObservation:
-    if self._phase != "ppo":
-      raise RuntimeX2Error("recovery observation requested before the handoff")
-    return self._ppo_observation(self.adapter.snapshot())
-
-  def switch_to_ppo(self) -> None:
-    # The reference has ended: freeze its frame so the recovery phase reports the
-    # handoff frame, and suspend the tracking task's reference guards, which the
-    # frozen contract marks inactive after the handoff.
-    self._handoff_frame = self._last_frame
-    self._set_reference_terminations(False)
-    self._phase = "ppo"
 
   def step(self, action: np.ndarray) -> Any:
     tensor = torch.as_tensor(
@@ -484,20 +711,14 @@ class X2MotionEnvironment:
     """
     snapshot = result.snapshot
     frame = int(snapshot.reference_frame[0].item())
-    # The reference drives neither control nor the guard once the recovery policy
-    # owns the trial, so its wrap is not an unexpected reference teleport.
-    if self._phase == "vae":
-      clip_end = frame >= self.clip_frames - 1
-      teleport = frame != self._last_frame + 1
-      self._last_frame = frame
-    else:
-      clip_end = False
-      teleport = False
-    observation = (
-      self._vae_observation(snapshot)
-      if self._phase == "vae"
-      else self._ppo_observation(snapshot)
-    )
+    # ``_last_frame`` is the frame the recorded row acts at.  The reference holds
+    # on the clip's last frame, so a post frame equal to the row frame there is
+    # expected rather than an unexpected teleport.
+    row_frame = self._last_frame
+    clip_end = row_frame >= self.clip_frames - 1
+    teleport = frame != row_frame + 1 and not (clip_end and frame == row_frame)
+    self._last_frame = frame
+    observation = self._vae_observation(snapshot)
     evidence = StepEvidence(
       terminal_available=True,
       terminated=bool(result.terminated[0].item()),
@@ -514,6 +735,28 @@ class X2MotionEnvironment:
     return PostStepBundle(evidence, self._timestamp(), observation)
 
   # -- internals -----------------------------------------------------------
+
+  def _install_reference_advance_mask(self) -> None:
+    """Advance the reference and hold it on the clip's last frame.
+
+    The command's wrap path resamples a start frame and teleports the robot, so
+    it must never run during a rollout: a rollout ends on its own endpoint
+    instead.  A single-motion command has one clip, so ``clip_frames`` is its
+    row length; the batched runtime reads a per-row length instead.
+    """
+    update = getattr(self.command, "_update_command", None)
+    if update is None:
+      # A command double without the private update hook cannot wrap, so there is
+      # nothing to hold.  The real single-motion command always exposes it.
+      return
+
+    def advance(env_ids: torch.Tensor | None = None) -> None:
+      ids = self._row_ids if env_ids is None else env_ids
+      advancing = self.command.time_steps[ids] + 1 < self.clip_frames
+      if bool(advancing.any()):
+        update(ids[advancing])
+
+    self.command._update_command = advance
 
   def _set_reference_terminations(self, enabled: bool) -> None:
     """Enable or suspend the tracking task's reference-dependent terminations.
@@ -595,14 +838,80 @@ class X2MotionEnvironment:
       **metrics,
     )
 
-  def _ppo_observation(self, snapshot: Any) -> PpoObservation:
-    frame = self._handoff_frame
-    return PpoObservation(
-      state=self._world_state(),
-      observation=self._recovery_observation(),
-      motion_id=self.teacher_id,
-      reference_frame=frame,
-      reference_phase=self._reference_phase(frame),
+  def _refresh(self) -> None:
+    """Replay the environment's own post-write recompute tail.
+
+    ``reset_to_frame`` and the initial-state write change qpos/qvel after the
+    environment's own command compute, so the observation cache, the anchor
+    cache and the sensor data are stale until this runs.
+    """
+    self.env.scene.write_data_to_sim()
+    self.env.sim.forward()
+    self.env.sim.sense()
+    self.command.update_relative_body_poses()
+    self.env.obs_buf = self.env.observation_manager.compute(
+      update_history=True, env_ids=self._row_ids
+    )
+
+  def _remember_default_row(self) -> None:
+    """Cache the standing row from the clip's frame-0 reference position."""
+    if self._default_row is not None:
+      return
+    if self._stand_body_positions is None:
+      self._stand_body_positions = self._measure_stand_body_positions()
+    root_position = _as_numpy(self.command.body_pos_w[0, 0], 3).copy()
+    self._default_row = DefaultRow(
+      reference=stand_reference(
+        self._schema.reference_names, stand_joint_positions(self.joint_names)
+      ),
+      state=WorldState(
+        root_position=root_position,
+        root_quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+        root_linear_velocity=np.zeros(3, dtype=np.float64),
+        root_angular_velocity=np.zeros(3, dtype=np.float64),
+        body_positions=self._stand_body_positions.copy(),
+        body_linear_velocities=np.zeros((_BODY_COUNT, 3), dtype=np.float64),
+      ),
+    )
+
+  def _measure_stand_body_positions(self) -> np.ndarray:
+    """Forward kinematics of ``STAND_KEYFRAME`` from an identity root."""
+    if self._stand_body_positions is not None:
+      return self._stand_body_positions
+    self._stand_body_positions = stand_body_positions(self.env.sim.mj_model, self.robot)
+    return self._stand_body_positions
+
+  def _write_initial_pose(self, *, initial_pose: str, seed: int, perturb: bool) -> None:
+    """Write the initial pose of one rollout and its seeded perturbation."""
+    to_torch = lambda value, width: torch.as_tensor(  # noqa: E731
+      np.asarray(value, dtype=np.float64),
+      dtype=torch.float32,
+      device=self.device,
+    ).reshape(1, width)
+    data = self.robot.data
+    root_pos = to_torch(_as_numpy(data.root_link_pos_w[0], 3), 3)
+    root_quat = to_torch(_as_numpy(data.root_link_quat_w[0], 4), 4)
+    joint_pos = to_torch(
+      _as_numpy(data.joint_pos[0], len(self.joint_names)), len(self.joint_names)
+    )
+    if initial_pose == "standing":
+      origin_z = float(self.env.scene.env_origins[0, 2].item())
+      root_pos[0, 2] = float(data.default_root_state[0, 2].item()) + origin_z
+      root_quat = _yaw_only(self.command.anchor_quat_w[0:1])
+      joint_pos = to_torch(
+        stand_joint_positions(self.joint_names), len(self.joint_names)
+      )
+    if perturb:
+      values = initial_perturbation(seed, self.joint_names)
+      root_pos = root_pos + to_torch(values.root_offset, 3)
+      root_quat = _apply_rpy(root_quat, values.root_rpy)
+      joint_pos = joint_pos + to_torch(values.joint_offsets, len(self.joint_names))
+    zeros3 = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+    self.robot.write_root_state_to_sim(
+      torch.cat((root_pos, root_quat, zeros3, zeros3), dim=1), self._row_ids
+    )
+    self.robot.write_joint_state_to_sim(
+      joint_pos, torch.zeros_like(joint_pos), env_ids=self._row_ids
     )
 
   def _reference_metrics(self) -> dict[str, float]:
@@ -637,39 +946,11 @@ class X2MotionEnvironment:
       "end_effector_z_error": end_effector_z_error,
     }
 
-  def _recovery_observation(self) -> np.ndarray:
-    """The frozen recovery policy's 102-D observation.
-
-    Built with the *same* mjlab observation terms the policy was trained with in
-    the no-state-estimation velocity task: the IMU gyro and up-vector sensors,
-    the **biased** relative joint position (encoder bias included), relative
-    joint velocity, the last applied action, and a **zero** standing command
-    (never a tracking command).
-    """
-    from mjlab.envs import mdp as envs_mdp
-
-    joint_count = len(self.joint_names)
-    ang_vel = _as_numpy(
-      envs_mdp.builtin_sensor(self.env, sensor_name="robot/imu_ang_vel")[0], 3
-    )
-    gravity = _as_numpy(
-      envs_mdp.projected_gravity_from_sensor(
-        self.env, sensor_name="robot/imu_upvector"
-      )[0],
-      3,
-    )
-    joint_pos = _as_numpy(envs_mdp.joint_pos_rel(self.env, biased=True)[0], joint_count)
-    joint_vel = _as_numpy(envs_mdp.joint_vel_rel(self.env)[0], joint_count)
-    actions = _as_numpy(envs_mdp.last_action(self.env)[0], joint_count)
-    return np.concatenate(
-      (ang_vel, gravity, joint_pos, joint_vel, actions, np.zeros(3, dtype=np.float64))
-    )
-
 
 class X2MultiMotionEnvironment:
   """Shared X2 environment exposing the collector's vectorized row protocol."""
 
-  _RESTORE_PARITY_ATOL = 1e-6
+  _RESTORE_PARITY_ATOL = _RESTORE_PARITY_ATOL
 
   def __init__(
     self,
@@ -710,8 +991,6 @@ class X2MultiMotionEnvironment:
     self._row_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
     self.command: Any = self.env.command_manager.get_term("motion")
     self.robot = self.env.scene["robot"]
-    self._phase_ppo = np.zeros(self.num_envs, dtype=bool)
-    self._handoff_frame = np.zeros(self.num_envs, dtype=np.int64)
     self._trial_clock = np.zeros(self.num_envs, dtype=np.float64)
     self._pre_frames = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self._last_result: Any = None
@@ -732,26 +1011,38 @@ class X2MultiMotionEnvironment:
     # The batched runtime packs the cohort's live layout, preview included;
     # a preview cohort must not fall back to the preview-blind base schema.
     self._schema = default_schema_for_cohort(cohort)
+    self._default_rows: dict[str, DefaultRow] = {}
+    self._stand_body_positions: np.ndarray | None = None
     self._install_termination_masks()
     self._install_reference_advance_mask()
 
   def _install_reference_advance_mask(self) -> None:
-    """Hold recovery frames without invoking the motion wrap/teleport path."""
+    """Advance active references and hold them at their last clip frame.
+
+    The wrap path resamples a new start frame and teleports the robot, so it must
+    never run during a rollout: a rollout ends on its own endpoint instead.
+    """
     update = self.command._update_command
 
     def advance(env_ids: torch.Tensor | None = None) -> None:
       candidates = self._row_ids if env_ids is None else env_ids
-      enabled = torch.as_tensor(
-        self._active_rows & self._vae_phase, dtype=torch.bool, device=self.device
+      advancing = torch.as_tensor(
+        self._active_rows, dtype=torch.bool, device=self.device
+      )[candidates] & (
+        self.command.time_steps[candidates] + 1 < self.command.row_lengths[candidates]
       )
-      update(candidates[enabled[candidates]])
+      if bool(advancing.any()):
+        update(candidates[advancing])
 
     self.command._update_command = advance
 
   def _install_termination_masks(self) -> None:
-    """Keep idle physics rows and recovery references out of termination."""
+    """Keep idle rows and every reference guard out of termination.
+
+    The reference guards are suspended for the whole rollout, not only after a
+    handoff: the collection is a stability test that must reach the last frame.
+    """
     self._reference_terms: list[tuple[Any, dict[str, Any]]] = []
-    self._vae_phase = np.ones(self.num_envs, dtype=bool)
     self._active_rows = np.zeros(self.num_envs, dtype=bool)
     manager = self.env.termination_manager
     for name in _REFERENCE_TERMINATIONS:
@@ -760,19 +1051,16 @@ class X2MultiMotionEnvironment:
     for name in manager.active_terms:
       cfg = manager.get_term_cfg(name)
       original, params = cfg.func, dict(cfg.params)
-      is_reference = name in _REFERENCE_TERMINATIONS
-      if is_reference:
+      if name in _REFERENCE_TERMINATIONS:
         self._reference_terms.append((original, params))
 
       def masked(
         env: Any,
         _original: Any = original,
-        _reference: bool = is_reference,
+        _reference: bool = name in _REFERENCE_TERMINATIONS,
         **kwargs: Any,
       ) -> Any:
-        enabled = self._active_rows
-        if _reference:
-          enabled = enabled & self._vae_phase
+        enabled = np.zeros_like(self._active_rows) if _reference else self._active_rows
         return _original(env, **kwargs) & torch.as_tensor(
           enabled, dtype=torch.bool, device=env.device
         )
@@ -803,8 +1091,6 @@ class X2MultiMotionEnvironment:
     if np.any(slots >= self.num_envs):
       raise RuntimeX2Error("trial batch exceeds shared environment slots")
     self._active_rows[slots] = True
-    self._phase_ppo[slots] = False
-    self._vae_phase[slots] = True
     ids = torch.as_tensor(slots, dtype=torch.long, device=self.device)
     motion_codes = torch.as_tensor(
       [self.teacher_ids.index(spec.motion_id) for spec in specs],
@@ -829,13 +1115,90 @@ class X2MultiMotionEnvironment:
       if frame_ids.numel():
         self.command.reset_to_frame(frame_ids, int(frame))
     self._refresh(ids)
-    self._phase_ppo[slots] = False
-    self._vae_phase[slots] = True
-    self._handoff_frame[slots] = np.asarray(
-      [spec.start_frame for spec in specs], dtype=np.int64
-    )
+    self._write_initial_poses(specs, ids)
+    self._refresh(ids)
     self._trial_clock[slots] = 0.0
     self._pre_frames[ids] = self.command.time_steps[ids]
+
+  def default_row(self, motion_id: str) -> DefaultRow:
+    """The padded history row of one clip, computed before its first rollout."""
+    row = self._default_rows.get(motion_id)
+    if row is None:
+      raise RuntimeX2Error(
+        f"the default row of {motion_id!r} needs one reset before it is readable"
+      )
+    return row
+
+  def _measure_stand_body_positions(self) -> np.ndarray:
+    """Forward kinematics of ``STAND_KEYFRAME`` from an identity root.
+
+    The pose is solved on a private MuJoCo data object, so no live rollout row
+    is touched and no device work is scheduled.  The result is a pure function
+    of the compiled model and the standing keyframe.
+    """
+    if self._stand_body_positions is not None:
+      return self._stand_body_positions
+    self._stand_body_positions = stand_body_positions(self.env.sim.mj_model, self.robot)
+    return self._stand_body_positions
+
+  def _write_initial_poses(self, specs: Sequence[TrialSpec], ids: torch.Tensor) -> None:
+    """Write each slot's initial pose, its perturbation and its default row."""
+    if self._stand_body_positions is None:
+      self._measure_stand_body_positions()
+    assert self._stand_body_positions is not None
+    data = self.robot.data
+    stand_joints = torch.as_tensor(
+      stand_joint_positions(self.joint_names),
+      dtype=torch.float32,
+      device=self.device,
+    ).repeat(len(specs), 1)
+    root_pos = data.root_link_pos_w[ids].clone()
+    root_quat = data.root_link_quat_w[ids].clone()
+    joint_pos = data.joint_pos[ids].clone()
+    for index, spec in enumerate(specs):
+      if spec.initial_pose == "standing":
+        row = ids[index]
+        root_pos[index, 2] = (
+          data.default_root_state[row, 2] + self.env.scene.env_origins[row, 2]
+        )
+        root_quat[index] = _yaw_only(self.command.anchor_quat_w[row : row + 1])[0]
+        joint_pos[index] = stand_joints[index]
+      if spec.initial_state_mode == "perturbed":
+        values = initial_perturbation(spec.seed, self.joint_names)
+        root_pos[index] += torch.as_tensor(
+          values.root_offset, dtype=torch.float32, device=self.device
+        )
+        root_quat[index : index + 1] = _apply_rpy(
+          root_quat[index : index + 1], values.root_rpy
+        )
+        joint_pos[index] += torch.as_tensor(
+          values.joint_offsets, dtype=torch.float32, device=self.device
+        )
+    zeros = torch.zeros((len(specs), 3), dtype=torch.float32, device=self.device)
+    self.robot.write_root_state_to_sim(
+      torch.cat((root_pos, root_quat, zeros, zeros), dim=1), ids
+    )
+    self.robot.write_joint_state_to_sim(
+      joint_pos, torch.zeros_like(joint_pos), env_ids=ids
+    )
+    for index, spec in enumerate(specs):
+      if spec.motion_id in self._default_rows:
+        continue
+      self._default_rows[spec.motion_id] = DefaultRow(
+        reference=stand_reference(
+          self._schema.reference_names, stand_joint_positions(self.joint_names)
+        ),
+        state=WorldState(
+          root_position=(
+            self.command.body_pos_w[ids[index], 0].detach().cpu().numpy().copy()
+          ),
+          root_quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+          root_linear_velocity=np.zeros(3, dtype=np.float64),
+          root_angular_velocity=np.zeros(3, dtype=np.float64),
+          body_positions=self._stand_body_positions.copy(),
+          body_linear_velocities=np.zeros((_BODY_COUNT, 3), dtype=np.float64),
+        ),
+      )
 
   def _snapshot(self) -> Any:
     return self._capture_snapshot(
@@ -962,44 +1325,6 @@ class X2MultiMotionEnvironment:
       frames / np.maximum(lengths - 1, 1),
     )
 
-  def _recovery_observation(self, ids: np.ndarray) -> np.ndarray:
-    from mjlab.envs import mdp as envs_mdp
-
-    tensor_ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
-    gyro = envs_mdp.builtin_sensor(self.env, sensor_name="robot/imu_ang_vel")[
-      tensor_ids
-    ]
-    gravity = envs_mdp.projected_gravity_from_sensor(
-      self.env, sensor_name="robot/imu_upvector"
-    )[tensor_ids]
-    joint_pos = envs_mdp.joint_pos_rel(self.env, biased=True)[tensor_ids]
-    joint_vel = envs_mdp.joint_vel_rel(self.env)[tensor_ids]
-    actions = envs_mdp.last_action(self.env)[tensor_ids]
-    return (
-      torch.cat(
-        (gyro, gravity, joint_pos, joint_vel, actions, torch.zeros_like(gyro)), dim=1
-      )
-      .detach()
-      .cpu()
-      .numpy()
-    )
-
-  def observe_ppo_batch(self, env_ids: np.ndarray) -> Any:
-    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
-    frames = self._handoff_frame[ids]
-    from mjlab.tasks.tracking.diffusion.adapter import PpoObservationBatch
-
-    return PpoObservationBatch(
-      self._world_state(ids),
-      self._recovery_observation(ids),
-      tuple(
-        self.teacher_ids[int(code)]
-        for code in self.command.motion_ids.detach().cpu().numpy()[ids]
-      ),
-      frames,
-      frames / np.maximum(self.command.row_lengths.detach().cpu().numpy()[ids] - 1, 1),
-    )
-
   def set_active_env_ids(self, env_ids: np.ndarray) -> None:
     """Declare the trial-owned rows before the next full-batch physics step."""
     self._active_rows[:] = False
@@ -1046,9 +1371,12 @@ class X2MultiMotionEnvironment:
     pre = self._pre_frames.detach().cpu().numpy()[ids]
     post = self._post_frames.detach().cpu().numpy()[ids]
     lengths = self.command.row_lengths.detach().cpu().numpy()[ids]
-    vae = ~self._phase_ppo[ids]
-    boundary = vae & ((pre + 1 >= lengths) | (post >= lengths - 1))
-    teleport = vae & (~boundary) & (post != pre + 1)
+    # ``pre`` is the frame the recorded row acts at.  The endpoint row is the
+    # row on the clip's last frame; there the reference holds instead of
+    # wrapping, so a post frame equal to the pre frame is expected, not a
+    # teleport.
+    boundary = pre + 1 >= lengths
+    teleport = ~boundary & (post != pre + 1) & (post != pre)
     from mjlab.tasks.tracking.diffusion.adapter import PostStepBundleBatch
     from mjlab.tasks.tracking.diffusion.qualification import StepEvidenceBatch
 
@@ -1074,12 +1402,6 @@ class X2MultiMotionEnvironment:
       timestamp,
       self.observe_vae_batch(ids),
     )
-
-  def switch_to_ppo_batch(self, env_ids: np.ndarray) -> None:
-    ids = np.asarray(env_ids, dtype=np.int64).reshape(-1)
-    self._phase_ppo[ids] = True
-    self._vae_phase[ids] = False
-    self._handoff_frame[ids] = self._post_frames.detach().cpu().numpy()[ids]
 
   def capture_initial_state_batch(
     self, env_ids: np.ndarray
@@ -1136,8 +1458,7 @@ class X2MultiMotionEnvironment:
     ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
     self.env.reset(env_ids=ids)
     rows = np.asarray(env_ids, dtype=np.int64).reshape(-1)
-    self._phase_ppo[rows] = False
-    self._vae_phase[rows] = True
+    self._active_rows[rows] = False
 
   def close(self) -> None:
     self.env.close()
@@ -1179,21 +1500,25 @@ class X2DiffusionRuntime:
   def periods(self) -> dict[str, float]:
     return {motion_id: env.period_seconds for motion_id, env in self._envs.items()}
 
-  def reset(self, *, seed: int, motion_id: str, start_frame: int) -> None:
+  def reset(
+    self,
+    *,
+    seed: int,
+    motion_id: str,
+    initial_pose: str = "reference",
+    perturb: bool = True,
+  ) -> None:
     self._active = self.environment(motion_id)
-    self._active.reset(seed=seed, start_frame=start_frame)
+    self._active.reset(seed=seed, initial_pose=initial_pose, perturb=perturb)
 
   def observe_vae(self) -> VaeObservation:
     return self.active.observe_vae()
 
-  def observe_ppo(self) -> PpoObservation:
-    return self.active.observe_ppo()
-
   def step(self, action: np.ndarray) -> Any:
     return self.active.step(action)
 
-  def switch_to_ppo(self) -> None:
-    self.active.switch_to_ppo()
+  def default_row(self, motion_id: str) -> DefaultRow:
+    return self.environment(motion_id).default_row()
 
   def post_step_evidence(self, result: Any) -> PostStepBundle:
     return self.active.post_step_evidence(result)
@@ -1295,10 +1620,18 @@ def build_x2_runtime(request: Any) -> Any:
       f"MJLAB_D1_SCHEDULE must be 'pilot' or 'bulk', got {schedule!r}"
     )
   run_id = os.environ.get("MJLAB_D1_RUN_ID", "").strip() or default_run_id
+  initial_poses = resolve_initial_poses(
+    os.environ.get("MJLAB_D1_INITIAL_POSES", "both")
+  )
   base_schedule = (
-    partial(build_pilot_trials, run_id=run_id)
+    partial(build_pilot_trials, run_id=run_id, initial_poses=initial_poses)
     if schedule == "pilot"
-    else partial(build_bulk_trials, seed_count=seed_count, run_id=run_id)
+    else partial(
+      build_bulk_trials,
+      seed_count=seed_count,
+      run_id=run_id,
+      initial_poses=initial_poses,
+    )
   )
   schedule_trials = partial(base_schedule, worker=worker, workers=workers)
 
@@ -1334,13 +1667,6 @@ def build_x2_runtime(request: Any) -> Any:
     contract=selected_contract,
     device=policy_device,
   )
-  ppo_action_contract = _action_contract_from_onnx(
-    repo_root / selected_contract.recovery_onnx
-  )
-  ppo = FrozenPpoRecoveryPolicy.from_onnx(
-    repo_root / selected_contract.recovery_onnx, ppo_action_contract
-  )
-
   runtime: Any
   if request.max_envs > 1:
     runtime: Any = X2MultiMotionEnvironment(
@@ -1368,9 +1694,7 @@ def build_x2_runtime(request: Any) -> Any:
   collector = DiffusionCollector(
     runtime,
     vae,
-    ppo,
     vae_actions=action_contract,
-    ppo_actions=ppo_action_contract,
     qualification=qualification,
     store=request.store,
   )
@@ -1427,6 +1751,8 @@ def build_x2_runtime(request: Any) -> Any:
       "run_id": run_id,
       "schedule": schedule,
       "seeds": seed_count,
+      "initial_poses": list(initial_poses),
+      "padding_steps": qualification.padding_steps,
       "trials": len(trials),
       "worker": worker,
       "workers": workers,
@@ -1439,18 +1765,26 @@ __all__ = [
   "BULK_SEED_COUNT",
   "D1_BULK_RUN_ID",
   "D1_RUN_ID",
-  "resolve_policy_device",
-  "resolve_rollout_ids",
-  "PHASE_FRACTIONS",
-  "PILOT_SEEDS",
+  "DefaultRow",
+  "INITIAL_POSES",
+  "INITIAL_STATE_MODES",
+  "InitialPerturbation",
   "InitialStateSnapshot",
+  "PILOT_SEEDS",
   "RuntimeX2Error",
   "X2DiffusionRuntime",
   "X2MultiMotionEnvironment",
   "X2MotionEnvironment",
+  "anchor_frames_for",
   "build_bulk_trials",
   "build_pilot_trials",
   "build_trials",
   "build_x2_runtime",
-  "start_frames_for",
+  "initial_perturbation",
+  "resolve_initial_poses",
+  "resolve_policy_device",
+  "resolve_rollout_ids",
+  "stand_body_positions",
+  "stand_joint_positions",
+  "stand_reference",
 ]

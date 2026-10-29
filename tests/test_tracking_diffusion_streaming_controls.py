@@ -19,10 +19,8 @@ from mjlab.tasks.tracking.diffusion import (
   CollectionResult,
   CollectorError,
   DiffusionCollector,
-  FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundleBatch,
-  PpoObservationBatch,
   QualificationConfig,
   StepEvidence,
   StepEvidenceBatch,
@@ -71,23 +69,33 @@ class _Snapshot:
   generation: int
 
 
-class _FakeBatchEnv:
-  """Batch-protocol stand-in that records actions, snapshots and resets."""
+@dataclass(frozen=True)
+class _DefaultRow:
+  """Standing padding row served by the fake environment."""
 
-  def __init__(self, num_envs: int, *, handoff_step: int | None = None) -> None:
+  reference: np.ndarray
+  state: WorldState
+
+
+class _FakeBatchEnv:
+  """Batch-protocol stand-in that records actions, snapshots and resets.
+
+  ``clip_frames`` is the clip length of every fake motion, so a rollout ends on
+  the post-step row that reaches the last frame, exactly like the real runtime.
+  """
+
+  def __init__(self, num_envs: int, *, clip_frames: int = 3) -> None:
     self.num_envs = num_envs
-    self.handoff_step = handoff_step
+    self.clip_frames = clip_frames
     self.motion_ids: list[str] = [""] * num_envs
     self.step_counts = np.zeros(num_envs, dtype=np.int64)
     self.generation = np.zeros(num_envs, dtype=np.int64)
-    self.ppo = np.zeros(num_envs, dtype=bool)
     self.active = np.ones(num_envs, dtype=bool)
     self.terminate_at: dict[int, int] = {}
     self.step_actions: list[np.ndarray] = []
     self.events: list[str] = []
     self.active_masks: list[np.ndarray] = []
     self.vae_observation_ids: list[np.ndarray] = []
-    self.ppo_observation_ids: list[np.ndarray] = []
     self.captured = 0
     self.restored = 0
     self.snapshot_refs: list[weakref.ReferenceType[_Snapshot]] = []
@@ -103,7 +111,6 @@ class _FakeBatchEnv:
       self.motion_ids[slot] = spec.motion_id
       self.step_counts[slot] = 0
       self.generation[slot] += 1
-      self.ppo[slot] = False
 
   def _reference_phase(self, slots: Sequence[int]) -> np.ndarray:
     return np.asarray([0.25 * int(self.generation[slot]) for slot in slots])
@@ -126,24 +133,22 @@ class _FakeBatchEnv:
     self.vae_observation_ids.append(ids.copy())
     return self._vae_batch(ids.tolist())
 
-  def observe_ppo_batch(self, env_ids: Any) -> PpoObservationBatch:
-    ids = np.asarray(env_ids, dtype=np.int64)
-    self.ppo_observation_ids.append(ids.copy())
-    slots = ids.tolist()
-    return PpoObservationBatch(
-      WorldState.stack(make_state(self.step_counts[slot]) for slot in slots),
-      np.stack([np.full(102, 0.1) for slot in slots]),
-      tuple(self.motion_ids[slot] for slot in slots),
-      np.asarray([int(self.step_counts[slot]) for slot in slots]),
-      self._reference_phase(slots),
+  def default_row(self, motion_id: str) -> _DefaultRow:
+    del motion_id
+    return _DefaultRow(
+      reference=np.full(68, 0.5),
+      state=WorldState(
+        np.array([0.0, 0.0, 0.66]),
+        np.array([1.0, 0.0, 0.0, 0.0]),
+        np.zeros(3),
+        np.zeros(3),
+        np.zeros((20, 3)),
+        np.zeros((20, 3)),
+      ),
     )
 
   def _evidence(self, slot: int) -> StepEvidence:
-    boundary = (
-      self.handoff_step is not None
-      and not self.ppo[slot]
-      and self.step_counts[slot] == self.handoff_step
-    )
+    boundary = self.step_counts[slot] >= self.clip_frames
     limit = self.terminate_at.get(slot)
     terminated = limit is not None and self.step_counts[slot] >= limit
     return StepEvidence(
@@ -169,9 +174,6 @@ class _FakeBatchEnv:
     self.events.append("step")
     self.step_actions.append(values.copy())
     self.step_counts[self.active] += 1
-
-  def switch_to_ppo_batch(self, env_ids: Any) -> None:
-    self.ppo[np.asarray(env_ids, dtype=np.int64)] = True
 
   def capture_initial_state_batch(self, env_ids: Any) -> tuple[_Snapshot, ...]:
     slots = np.asarray(env_ids, dtype=np.int64).tolist()
@@ -204,8 +206,8 @@ class _TensorBatchEnv(_FakeBatchEnv):
   row-evidence half of the same capture.
   """
 
-  def __init__(self, num_envs: int, *, handoff_step: int | None = None) -> None:
-    super().__init__(num_envs, handoff_step=handoff_step)
+  def __init__(self, num_envs: int, *, clip_frames: int = 3) -> None:
+    super().__init__(num_envs, clip_frames=clip_frames)
     self.tensor_observation_ids: list[np.ndarray] = []
     self.tensor_steps: list[np.ndarray] = []
     self.tensor_devices: list[torch.device] = []
@@ -306,32 +308,21 @@ def _pair_specs(motion: str) -> tuple[TrialSpec, TrialSpec]:
   )
 
 
-def _ppo_action(observation: np.ndarray) -> np.ndarray:
-  values = np.asarray(observation, dtype=np.float64)[:, :31]
-  return 0.1 * np.tanh(values)
-
-
-def _policies() -> tuple[FrozenVaePolicy, FrozenPpoRecoveryPolicy]:
+def _policy() -> FrozenVaePolicy:
   contract = ActionContract(np.ones(31), np.zeros(31), np.ones(31), np.ones(31))
-  vae = FrozenVaePolicy(_Model(), contract)
-  return vae, FrozenPpoRecoveryPolicy(_ppo_action, contract)
+  return FrozenVaePolicy(_Model(), contract)
 
 
 def _collector(
   env: Any,
   store: Any,
   *,
-  control_steps: int,
-  retained_steps: int = 2,
+  padding_steps: int = 0,
 ) -> DiffusionCollector:
-  vae, ppo = _policies()
   return DiffusionCollector(
     env,
-    vae,
-    ppo,
-    qualification=QualificationConfig(
-      control_steps=control_steps, retained_steps=retained_steps
-    ),
+    _policy(),
+    qualification=QualificationConfig(padding_steps=padding_steps),
     store=store,
   )
 
@@ -343,20 +334,15 @@ def _collect(
   controls: CollectionControls | None = None,
   slots: int = 1,
   control_steps: int = 4,
-  retained_steps: int = 2,
   tensor: bool = False,
-  handoff_step: int | None = None,
   terminate_at: dict[int, int] | None = None,
 ) -> tuple[Any, _RecordingStore, Any]:
-  env = (_TensorBatchEnv if tensor else _FakeBatchEnv)(slots, handoff_step=handoff_step)
+  env = (_TensorBatchEnv if tensor else _FakeBatchEnv)(
+    slots, clip_frames=control_steps
+  )
   env.terminate_at.update(terminate_at or {})
   store = _RecordingStore(root)
-  collector = _collector(
-    env,
-    store,
-    control_steps=control_steps,
-    retained_steps=retained_steps,
-  )
+  collector = _collector(env, store)
   return env, store, collector.collect_batched(specs, slots=slots, controls=controls)
 
 
@@ -491,14 +477,13 @@ def test_max_rows_per_append_is_an_upper_bound_across_trials(tmp_path) -> None:
 def test_streamed_rows_match_the_legacy_single_append_exactly(tmp_path) -> None:
   specs = _pair_specs("motion")
   legacy_env, legacy_store, legacy = _collect(
-    tmp_path / "legacy", specs, slots=1, control_steps=5, handoff_step=2
+    tmp_path / "legacy", specs, slots=1, control_steps=5
   )
   env, store, batch = _collect(
     tmp_path / "streamed",
     specs,
     slots=1,
     control_steps=5,
-    handoff_step=2,
     controls=CollectionControls(stream_rows=True),
   )
   assert legacy.stop_reason is None and batch.stop_reason is None
@@ -517,10 +502,10 @@ def test_streamed_rows_match_the_legacy_single_append_exactly(tmp_path) -> None:
   assert sum(row.segment_qualified for row in store.iter_rows()) == sum(
     len(result.accepted_rows) for result in batch.results
   )
-  # The seeded OU stream and the clean zero noise survive streaming.
+  # The seeded OU stream runs on every step of an OU rollout, and the clean
+  # partner stays noise-free.
   ou_rows = batch.results[1].rows
-  assert np.any(ou_rows[0].ou_noise != 0.0)
-  assert np.all(ou_rows[2].ou_noise == 0.0)
+  assert all(np.any(row.ou_noise != 0.0) for row in ou_rows)
   assert all(np.all(row.ou_noise == 0.0) for row in batch.results[0].rows)
 
 
@@ -552,7 +537,7 @@ def test_compact_results_keep_row_accounting_after_rows_are_released(tmp_path) -
     assert right.row_count == (right.accepted_row_count + right.verification_row_count)
   qualified = next(item for item in compact.results if item.qualification.qualified)
   assert qualified.row_count == 5
-  assert qualified.accepted_row_count == 2
+  assert qualified.accepted_row_count == 5
   _assert_rows_equal(full_store.rows, compact_store.rows)
 
 
@@ -612,8 +597,7 @@ def test_inactivity_deadline_restarts_after_each_completed_trial(tmp_path) -> No
     specs,
     slots=1,
     control_steps=1,
-    retained_steps=1,
-    controls=CollectionControls(
+      controls=CollectionControls(
       stream_rows=True,
       limits=CollectionLimits(inactivity_seconds=25.0),
       clock=_SteppingClock(20.0),
@@ -633,7 +617,7 @@ def test_output_size_limit_stops_after_a_bounded_publication(tmp_path) -> None:
   baseline = sum(
     path.stat().st_size for path in store.root.glob("**/*") if path.is_file()
   )
-  collector = _collector(env, store, control_steps=3)
+  collector = _collector(env, store)
   batch = collector.collect_batched(
     (_trial("a"), _trial("b")),
     slots=1,
@@ -665,9 +649,9 @@ def test_output_size_limit_stops_after_a_bounded_publication(tmp_path) -> None:
 
 
 def test_output_limit_stops_before_any_physics_work(tmp_path) -> None:
-  env = _FakeBatchEnv(1)
+  env = _FakeBatchEnv(1, clip_frames=3)
   store = _RecordingStore(tmp_path)
-  collector = _collector(env, store, control_steps=3)
+  collector = _collector(env, store)
   batch = collector.collect_batched(
     (_trial("a"), _trial("b")),
     slots=1,
@@ -686,12 +670,12 @@ def test_output_limit_stops_before_any_physics_work(tmp_path) -> None:
 
 
 def test_final_flush_output_overage_keeps_the_stop_verdict(tmp_path) -> None:
-  env = _FakeBatchEnv(1)
+  env = _FakeBatchEnv(1, clip_frames=1)
   store = _RecordingStore(tmp_path)
   baseline = sum(
     path.stat().st_size for path in store.root.glob("**/*") if path.is_file()
   )
-  collector = _collector(env, store, control_steps=1, retained_steps=1)
+  collector = _collector(env, store)
   batch = collector.collect_batched(
     (_trial("a"), _trial("b"), _trial("c")),
     slots=1,
@@ -780,7 +764,7 @@ def test_progress_reports_actual_published_counts(tmp_path) -> None:
   assert log.records[-1] is batch.progress
   assert batch.progress is not None
   assert batch.progress.transitions == 8
-  assert batch.progress.accepted_rows == 4
+  assert batch.progress.accepted_rows == 8
   assert batch.progress.store_files == batch.store_files
   assert batch.progress.stored_bytes is not None
   assert batch.progress.stored_bytes > 0
@@ -799,9 +783,9 @@ def test_progress_callback_failure_propagates_and_keeps_written_rows(
         raise _ProgressFailure("progress consumer failed")
 
   log = _FailingLog()
-  env = _FakeBatchEnv(1)
+  env = _FakeBatchEnv(1, clip_frames=2)
   store = _RecordingStore(tmp_path)
-  collector = _collector(env, store, control_steps=2)
+  collector = _collector(env, store)
   with pytest.raises(_ProgressFailure, match="progress consumer failed"):
     collector.collect_batched(
       (_trial("a"), _trial("b"), _trial("c")),
@@ -828,7 +812,7 @@ def test_storage_faults_fail_closed(tmp_path, fault, message) -> None:
       return ()
 
   store = _FaultyStore(tmp_path)
-  collector = _collector(_FakeBatchEnv(1), store, control_steps=2)
+  collector = _collector(_FakeBatchEnv(1, clip_frames=2), store)
   with pytest.raises((OSError, CollectionControlError), match=message):
     collector.collect_batched(
       (_trial("a"),),
@@ -849,12 +833,10 @@ def test_collection_controls_reject_incoherent_requests(tmp_path) -> None:
     CollectionControls(limits=CollectionLimits(max_output_bytes=1024))
   with pytest.raises(CollectionControlError, match="wall_seconds must be positive"):
     CollectionLimits(wall_seconds=0.0)
-  vae, ppo = _policies()
   collector = DiffusionCollector(
     _FakeBatchEnv(1),
-    vae,
-    ppo,
-    qualification=QualificationConfig(control_steps=2, retained_steps=1),
+    _policy(),
+    qualification=QualificationConfig(padding_steps=0),
   )
   with pytest.raises(CollectorError, match="needs a collector store"):
     collector.collect_batched(
@@ -870,7 +852,7 @@ def test_output_limit_requires_a_measurable_store(tmp_path) -> None:
       del rows
       return ()
 
-  collector = _collector(_FakeBatchEnv(1), _OpaqueStore(), control_steps=2)
+  collector = _collector(_FakeBatchEnv(1, clip_frames=2), _OpaqueStore())
   with pytest.raises(CollectorError, match="needs a measurable store output"):
     collector.collect_batched(
       (_trial("a"),),
@@ -889,13 +871,11 @@ def test_tensor_dispatch_requires_the_full_tensor_api(tmp_path) -> None:
 
   contract = ActionContract(np.ones(31), np.zeros(31), np.ones(31), np.ones(31))
   vae = _NoTensorVae(_Model(), contract)
-  _vae, ppo = _policies()
   store = cast(Any, _RecordingStore(tmp_path))
   collector = DiffusionCollector(
     _FakeBatchEnv(1),
     vae,
-    ppo,
-    qualification=QualificationConfig(control_steps=2, retained_steps=2),
+    qualification=QualificationConfig(padding_steps=0),
     store=store,
   )
   with pytest.raises(CollectorError, match="tensor dispatch is unavailable") as error:
@@ -918,12 +898,10 @@ def test_tensor_dispatch_refuses_missing_row_evidence_before_step(tmp_path) -> N
 
   env = _InferenceOnlyEnv(1)
   store = _RecordingStore(tmp_path)
-  vae, ppo = _policies()
   collector = DiffusionCollector(
     env,
-    vae,
-    ppo,
-    qualification=QualificationConfig(control_steps=3, retained_steps=2),
+    _policy(),
+    qualification=QualificationConfig(padding_steps=0),
     store=cast(Any, store),
   )
   with pytest.raises(CollectorError, match="lacks collection row evidence"):
@@ -939,12 +917,11 @@ def test_tensor_dispatch_refuses_missing_row_evidence_before_step(tmp_path) -> N
 def test_tensor_dispatch_runs_the_base_frozen_vae_tensor_method(tmp_path) -> None:
   env = _TensorBatchEnv(1)
   store = _RecordingStore(tmp_path)
-  vae, ppo = _policies()
+  vae = _policy()
   collector = DiffusionCollector(
     env,
     vae,
-    ppo,
-    qualification=QualificationConfig(control_steps=3, retained_steps=2),
+    qualification=QualificationConfig(padding_steps=0),
     store=cast(Any, store),
   )
   # The dispatch must exercise the base policy method, not a test subclass.
@@ -965,14 +942,13 @@ def test_tensor_dispatch_runs_the_base_frozen_vae_tensor_method(tmp_path) -> Non
 def test_tensor_dispatch_matches_the_numpy_rows_and_noise(tmp_path) -> None:
   specs = _pair_specs("motion")
   numpy_env, numpy_store, numpy_batch = _collect(
-    tmp_path / "numpy", specs, slots=1, control_steps=5, handoff_step=2
+    tmp_path / "numpy", specs, slots=1, control_steps=5
   )
   tensor_env, tensor_store, tensor_batch = _collect(
     tmp_path / "tensor",
     specs,
     slots=1,
     control_steps=5,
-    handoff_step=2,
     tensor=True,
     controls=CollectionControls(stream_rows=True, tensor_dispatch=True),
   )
@@ -992,7 +968,7 @@ def test_tensor_dispatch_matches_the_numpy_rows_and_noise(tmp_path) -> None:
   controllers = {
     row.controller for result in tensor_batch.results for row in result.rows
   }
-  assert controllers == {"vae", "ppo"}
+  assert controllers == {"vae"}
   # Both dispatch modes selected the same rows for the VAE observation, and the
   # tensor path never requested the full NumPy VAE observation.
   assert [ids.tolist() for ids in tensor_env.tensor_observation_ids] == [
@@ -1053,9 +1029,9 @@ def test_tensor_dispatch_keeps_row_identity_for_noncontiguous_slots(tmp_path) ->
 
 
 def test_transition_budget_reports_partial_completion(tmp_path) -> None:
-  env = _FakeBatchEnv(1)
+  env = _FakeBatchEnv(1, clip_frames=3)
   store = _RecordingStore(tmp_path)
-  collector = _collector(env, store, control_steps=4)
+  collector = _collector(env, store)
   batch = collector.collect_batched(
     (_trial("a"), _trial("b")), slots=1, remaining_transitions=2
   )

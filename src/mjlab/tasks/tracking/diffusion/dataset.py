@@ -302,6 +302,10 @@ def segment_window_scan(
   or on two neighbouring rows, becomes one prefix sum over the segment, and the
   frame-rate tolerance uses the window maximum and minimum.  The result is the
   per-window answer of :meth:`WindowIndex._eligible` for the whole segment.
+
+  A window whose current row carries a negative ``reference_frame`` is not
+  eligible: those rows are rollout padding, and the anchor of a training window
+  is always a clip frame.
   """
   width = contract.window_steps
   ordered = tuple(sorted(rows, key=lambda row: row.tick))
@@ -310,6 +314,7 @@ def segment_window_scan(
   timestamps = np.empty(count, dtype=np.float64)
   fps = np.empty(count, dtype=np.float64)
   row_ok = np.empty(count, dtype=bool)
+  current_ok = np.empty(count, dtype=bool)
   motion = np.empty(count, dtype=np.int64)
   if not ordered:
     return SegmentWindowScan(ordered, ticks, np.zeros(0, dtype=bool), width)
@@ -322,6 +327,9 @@ def segment_window_scan(
     timestamps[position] = row.timestamp
     fps[position] = row.fps
     row_ok[position] = _row_can_be_indexed(row)
+    # A padding row is history only: it may never be the current row of a
+    # window, because the anchor is what the window predicts from.
+    current_ok[position] = row.reference_frame >= 0
     code = motion_codes.get(row.motion_id)
     if code is None:
       code = len(motion_codes)
@@ -343,8 +351,10 @@ def segment_window_scan(
     )
   row_prefix = np.concatenate(([0], np.cumsum(blocked_rows)))
   pair_prefix = np.concatenate(([0], np.cumsum(blocked_pairs)))
-  eligible = (row_prefix[starts + width] - row_prefix[starts] == 0) & (
-    pair_prefix[starts + width - 1] - pair_prefix[starts] == 0
+  eligible = (
+    (row_prefix[starts + width] - row_prefix[starts] == 0)
+    & (pair_prefix[starts + width - 1] - pair_prefix[starts] == 0)
+    & current_ok[starts + contract.current_index]
   )
   # ``_eligible`` compares every row with the frame rate of the first row of its
   # window.  Equal frame rates satisfy that tolerance for every window; a
@@ -420,6 +430,8 @@ class WindowIndex:
     ):
       return False
     if any(rows[i + 1].tick != rows[i].tick + 1 for i in range(len(rows) - 1)):
+      return False
+    if rows[contract.current_index].reference_frame < 0:
       return False
     try:
       validate_monotonic_timestamps(rows)
@@ -614,7 +626,11 @@ def _fit_range_statistics(
     starts: list[int] = []
     for position in np.flatnonzero(scan.eligible_starts):
       first = scan.rows[position]
-      if assignments.split_for(_row_group(first)) != "train":
+      # The split belongs to the window's CURRENT row, which is the anchor.  Keying
+      # it on the first row would resolve a different group than the index used
+      # (anchor minus the history depth) and silently disagree with the index.
+      anchor = scan.rows[position + contract.current_index]
+      if assignments.split_for(_row_group(anchor)) != "train":
         continue
       positions.append(int(position))
       starts.append(int(first.tick))
@@ -714,7 +730,11 @@ def _combine_statistics(
     wanted = np.fromiter(
       (ref.start_tick for ref in refs), dtype=np.int64, count=len(refs)
     )
-    if not np.array_equal(reported[key], wanted):
+    # Compare as sets, not sequences.  The index orders a segment's windows by
+    # its sort key, which includes the group string, so a per-anchor group sorts
+    # "0, 1, 10, 100, ..." while the scan emits "0, 1, 2, ...".  This check asks
+    # whether the fit covered exactly the indexed windows, not in what order.
+    if not np.array_equal(np.sort(reported[key]), np.sort(wanted)):
       raise DatasetError(
         f"statistics windows of segment {key!r} differ from the window index"
       )
@@ -986,9 +1006,15 @@ def _segment_refs(
   """
   scan = segment_window_scan(segment_rows, contract)
   refs: list[WindowRef] = []
+  current_offset = contract.current_index
   for position in np.flatnonzero(scan.eligible_starts):
     first = scan.rows[position]
-    group = _row_group(first)
+    # The window belongs to the group of its CURRENT row, which is the anchor and
+    # the rows the model is asked to predict from.  Grouping by the first row
+    # would label every window with the anchor minus the history depth, which
+    # goes negative for the first anchors and never names a real anchor.
+    current = scan.rows[position + current_offset]
+    group = _row_group(current)
     refs.append(
       WindowRef(
         first.run_id,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -10,12 +10,9 @@ from mjlab.tasks.tracking.diffusion import (
   ActionContract,
   CollectionResult,
   DiffusionCollector,
-  FrozenPpoRecoveryPolicy,
   FrozenVaePolicy,
   PostStepBundle,
   PostStepBundleBatch,
-  PpoObservation,
-  PpoObservationBatch,
   QualificationConfig,
   StepEvidence,
   StepEvidenceBatch,
@@ -43,15 +40,46 @@ class _Model(torch.nn.Module):
     return latent[:, :1].repeat(1, 31) + conditioning[:, :1] * 0.0
 
 
-class _ScalarEnv:
-  def __init__(self) -> None:
-    self.step_count = 0
-    self.phase = "vae"
+@dataclass(frozen=True)
+class _DefaultRow:
+  """Standing padding row served by the fake environment."""
 
-  def reset(self, *, seed: int, motion_id: str, start_frame: int) -> None:
-    assert (seed, motion_id, start_frame) in {(7, "a", 3), (8, "b", 4)}
+  reference: np.ndarray
+  state: WorldState
+
+
+class _ScalarEnv:
+  def __init__(self, *, clip_frames: int = 2) -> None:
     self.step_count = 0
-    self.phase = "vae"
+    self.clip_frames = clip_frames
+
+  def reset(
+    self,
+    *,
+    seed: int,
+    motion_id: str,
+    initial_pose: str = "reference",
+    perturb: bool = True,
+  ) -> None:
+    assert (seed, motion_id, initial_pose, perturb) in {
+      (7, "a", "reference", True),
+      (8, "b", "reference", True),
+    }
+    self.step_count = 0
+
+  def default_row(self, motion_id: str) -> _DefaultRow:
+    del motion_id
+    return _DefaultRow(
+      reference=np.full(68, 0.25),
+      state=WorldState(
+        np.array([0.0, 0.0, 0.66]),
+        np.array([1.0, 0.0, 0.0, 0.0]),
+        np.zeros(3),
+        np.zeros(3),
+        np.zeros((20, 3)),
+        np.zeros((20, 3)),
+      ),
+    )
 
   def observe_vae(self) -> VaeObservation:
     return VaeObservation(
@@ -66,26 +94,18 @@ class _ScalarEnv:
       end_effector_z_error=0.0,
     )
 
-  def observe_ppo(self) -> PpoObservation:
-    return PpoObservation(
-      make_state(self.step_count), np.zeros(102), "a", self.step_count, 0.0
-    )
-
   def step(self, action: np.ndarray) -> int:
     assert action.shape == (31,)
     self.step_count += 1
     return self.step_count
 
   def post_step_evidence(self, result: int) -> PostStepBundle:
-    boundary = self.phase == "vae" and result == 2
+    boundary = result >= self.clip_frames
     return PostStepBundle(
       StepEvidence(True, reference_boundary=boundary, clip_ended=boundary),
       float(result),
       self.observe_vae(),
     )
-
-  def switch_to_ppo(self) -> None:
-    self.phase = "ppo"
 
   def capture_initial_state(self) -> str:
     return "initial"
@@ -100,8 +120,8 @@ class _ScalarEnv:
 class _BatchEnv:
   num_envs = 1
 
-  def __init__(self) -> None:
-    self.rows = [_ScalarEnv() for _ in range(self.num_envs)]
+  def __init__(self, *, clip_frames: int = 2) -> None:
+    self.rows = [_ScalarEnv(clip_frames=clip_frames) for _ in range(self.num_envs)]
 
   @staticmethod
   def _vae(values: list[VaeObservation]) -> VaeObservationBatch:
@@ -120,21 +140,17 @@ class _BatchEnv:
   def reset_batch(self, specs, *, env_ids):
     for row, spec in zip(env_ids.tolist(), specs, strict=True):
       self.rows[row].reset(
-        seed=spec.seed, motion_id=spec.motion_id, start_frame=spec.start_frame
+        seed=spec.seed,
+        motion_id=spec.motion_id,
+        initial_pose=spec.initial_pose,
+        perturb=spec.perturb,
       )
+
+  def default_row(self, motion_id: str) -> _DefaultRow:
+    return self.rows[0].default_row(motion_id)
 
   def observe_vae_batch(self, env_ids):
     return self._vae([self.rows[row].observe_vae() for row in env_ids.tolist()])
-
-  def observe_ppo_batch(self, env_ids):
-    values = [self.rows[row].observe_ppo() for row in env_ids.tolist()]
-    return PpoObservationBatch(
-      WorldState.stack(value.state for value in values),
-      np.stack([value.observation for value in values]),
-      tuple(value.motion_id for value in values),
-      np.asarray([value.reference_frame for value in values]),
-      np.asarray([value.reference_phase for value in values]),
-    )
 
   def step_batch(self, action):
     return [self.rows[row].step(action[row]) for row in range(self.num_envs)]
@@ -150,10 +166,6 @@ class _BatchEnv:
       self._vae([bundle.observation for bundle in bundles]),
     )
 
-  def switch_to_ppo_batch(self, env_ids):
-    for row in env_ids.tolist():
-      self.rows[row].switch_to_ppo()
-
   def capture_initial_state_batch(self, env_ids):
     return tuple(self.rows[row].capture_initial_state() for row in env_ids.tolist())
 
@@ -166,14 +178,9 @@ class _BatchEnv:
       self.rows[row].reset_after_trial()
 
 
-def _policies():
+def _policy() -> FrozenVaePolicy:
   contract = ActionContract(np.ones(31), np.zeros(31), np.ones(31), np.ones(31))
-  return (
-    FrozenVaePolicy(_Model(), contract),
-    FrozenPpoRecoveryPolicy(
-      lambda observation: np.zeros((observation.shape[0], 31)), contract
-    ),
-  )
+  return FrozenVaePolicy(_Model(), contract)
 
 
 def test_slot_scheduler_replaces_rows_and_admits_pair_locally() -> None:
@@ -214,7 +221,7 @@ def test_slot_scheduler_abandons_one_pair_without_stopping_the_rest() -> None:
   abandoned = scheduler.abandon(slot_a, reason="ou rows could not reproduce")
   assert abandoned.pair_id == "a"
   assert scheduler.abandoned_trials == (
-    ("run:a:7:3:clean", "ou rows could not reproduce"),
+    ("run:a:7:3:reference:perturbed:clean", "ou rows could not reproduce"),
   )
   # The remaining partner of the retired pair is skipped, not collected, and the
   # unrelated pair still runs to completion.
@@ -233,22 +240,21 @@ def test_slot_scheduler_abandons_one_pair_without_stopping_the_rest() -> None:
       scheduler.complete(slot, result)
   assert not scheduler.active and not scheduler.pending
   completed = {result.spec.episode_id for result in scheduler.results}
-  assert completed == {"run:b:8:4:clean", "run:b:8:4:ou"}
+  assert completed == {
+    "run:b:8:4:reference:perturbed:clean",
+    "run:b:8:4:reference:perturbed:ou",
+  }
 
 
 def test_batched_rows_are_bit_identical_to_single_row_rows() -> None:
-  config = QualificationConfig(control_steps=4, retained_steps=2)
-  scalar_vae, scalar_ppo = _policies()
-  scalar = DiffusionCollector(
-    _ScalarEnv(), scalar_vae, scalar_ppo, qualification=config
-  )
+  config = QualificationConfig(padding_steps=0)
+  scalar = DiffusionCollector(_ScalarEnv(), _policy(), qualification=config)
   clean = TrialSpec("run", "a", 7, 3, pair_id="pair", initial_state_id="state")
   ou = TrialSpec("run", "a", 7, 3, "ou", pair_id="pair", initial_state_id="state")
   scalar_clean = scalar.collect(clean)
   single = scalar.collect(ou)
 
-  batch_vae, batch_ppo = _policies()
-  batch = DiffusionCollector(_BatchEnv(), batch_vae, batch_ppo, qualification=config)
+  batch = DiffusionCollector(_BatchEnv(), _policy(), qualification=config)
   result = batch.collect_batched((clean, ou), slots=1)
   batch_clean = next(item for item in result.results if item.spec.phase == "clean")
   for left, right in zip(scalar_clean.rows, batch_clean.rows, strict=True):
@@ -278,7 +284,6 @@ def test_batched_rows_are_bit_identical_to_single_row_rows() -> None:
 
 
 def test_batched_store_receives_one_write_for_multiple_trials(tmp_path) -> None:
-  vae, ppo = _policies()
   calls = []
 
   class _Store:
@@ -289,9 +294,8 @@ def test_batched_store_receives_one_write_for_multiple_trials(tmp_path) -> None:
 
   collector = DiffusionCollector(
     _BatchEnv(),
-    vae,
-    ppo,
-    qualification=QualificationConfig(control_steps=2, retained_steps=1),
+    _policy(),
+    qualification=QualificationConfig(padding_steps=0),
     store=_Store(),
   )
   specs = (
@@ -307,7 +311,9 @@ def test_batched_store_receives_one_write_for_multiple_trials(tmp_path) -> None:
   assert len(calls[0]) == sum(
     len(item.rows) for item in result.results if isinstance(item, CollectionResult)
   )
-  assert all(row.group_key == "a" for row in calls[0])
+  # The collector generates the per-row group from the clip, seed and anchor,
+  # so the explicit spec label never reaches a row.
+  assert [row.group_key for row in calls[0]] == ["a:7:0", "a:7:1"] * 2
 
 
 def test_multi_slot_terminal_reset_and_idle_tail_do_not_block_other_rows() -> None:
@@ -315,7 +321,7 @@ def test_multi_slot_terminal_reset_and_idle_tail_do_not_block_other_rows() -> No
     num_envs = 4
 
     def __init__(self):
-      super().__init__()
+      super().__init__(clip_frames=4)
       self.pending = np.zeros(4, dtype=bool)
       self.active_masks = []
       self.resets = []
@@ -347,9 +353,8 @@ def test_multi_slot_terminal_reset_and_idle_tail_do_not_block_other_rows() -> No
       super().reset_after_trial_batch(ids)
 
   env = _StrictBatchEnv()
-  vae, ppo = _policies()
   collector = DiffusionCollector(
-    env, vae, ppo, qualification=QualificationConfig(control_steps=4, retained_steps=2)
+    env, _policy(), qualification=QualificationConfig(padding_steps=0)
   )
   specs = tuple(TrialSpec(f"run{i}", "a", 7, 3) for i in range(3))
   results = collector.collect_batched(specs, slots=4).results
@@ -366,7 +371,8 @@ def test_multi_slot_terminal_reset_and_idle_tail_do_not_block_other_rows() -> No
 
 
 def test_batch_policy_methods_accept_selected_subsets() -> None:
-  vae, ppo = _policies()
+  contract = ActionContract(np.ones(31), np.zeros(31), np.ones(31), np.ones(31))
+  policy = FrozenVaePolicy(_Model(), contract)
   state = WorldState.stack([make_state(0), make_state(1)])
   vae_observation = VaeObservationBatch(
     state,
@@ -376,17 +382,66 @@ def test_batch_policy_methods_accept_selected_subsets() -> None:
     np.asarray([0, 1]),
     np.zeros(2),
   )
-  latent, action = vae.batch_action(vae_observation.select(np.asarray([1])))
+  latent, action = policy.batch_action(vae_observation.select(np.asarray([1])))
   assert latent.shape == (1, 32)
   assert action.shape == (1, 31)
-  ppo_observation = PpoObservationBatch(
-    state,
-    np.zeros((2, 102)),
-    ("a", "a"),
-    np.asarray([0, 1]),
-    np.zeros(2),
+  mean = policy.encode_reference(np.zeros(68))
+  assert mean.shape == (32,)
+
+
+def _outcome(spec: TrialSpec, *, qualified: bool) -> object:
+  return type(
+    "Result",
+    (),
+    {
+      "spec": spec,
+      "qualification": type("Q", (), {"qualified": qualified})(),
+    },
+  )()
+
+
+def _live(scheduler: TrialSlotScheduler) -> tuple[TrialSpec, ...]:
+  return tuple(scheduler.pending) + tuple(scheduler.active.values())
+
+
+def test_failed_pair_is_retried_once_from_the_unperturbed_initial_pose() -> None:
+  """D9: a failed pair re-runs once from the reference pose, then stops."""
+  clean = TrialSpec(
+    "run", "a", 7, 3, pair_id="a", initial_state_id="ia", group_key="a:7"
   )
-  recovery = ppo.batch_action(
-    ppo_observation.select(np.asarray([1])), np.zeros((1, 31))
+  ou = TrialSpec(
+    "run", "a", 7, 3, "ou", pair_id="a", initial_state_id="ia", group_key="a:7"
   )
-  assert recovery.shape == (1, 31)
+  scheduler = TrialSlotScheduler((clean, ou), 1)
+  slot, admitted = next(iter(scheduler.fill().items()))
+  assert admitted is clean
+
+  scheduler.complete(slot, _outcome(clean, qualified=False))
+  retry = [spec for spec in _live(scheduler) if spec.pair_id == "a:retry"]
+  assert len(retry) == 2
+  assert {spec.phase for spec in retry} == {"clean", "ou"}
+  assert {spec.initial_state_mode for spec in retry} == {"reference"}
+  # The retry keeps the split group, so both attempts share one component.
+  assert {spec.group_key for spec in retry} == {"a:7"}
+  assert scheduler.retried_pairs == ("a",)
+
+  retry_clean = next(spec for spec in retry if spec.phase == "clean")
+  if retry_clean not in tuple(scheduler.active.values()):
+    scheduler.fill()
+  retry_slot = next(
+    slot for slot, spec in scheduler.active.items() if spec is retry_clean
+  )
+  scheduler.complete(retry_slot, _outcome(retry_clean, qualified=False))
+  # A reference-pose attempt is never retried again.
+  assert scheduler.retried_pairs == ("a",)
+  assert not any(spec.pair_id.endswith(":retry:retry") for spec in _live(scheduler))
+
+
+def test_successful_pair_is_not_retried() -> None:
+  clean = TrialSpec("run", "a", 7, 3, pair_id="a", initial_state_id="ia")
+  ou = TrialSpec("run", "a", 7, 3, "ou", pair_id="a", initial_state_id="ia")
+  scheduler = TrialSlotScheduler((clean, ou), 1)
+  slot, admitted = next(iter(scheduler.fill().items()))
+  scheduler.complete(slot, _outcome(clean, qualified=True))
+  assert scheduler.retried_pairs == ()
+  assert not any(spec.pair_id == "a:retry" for spec in _live(scheduler))
