@@ -1,6 +1,18 @@
 Upcoming version (not yet released)
 ===================================
 
+Changed
+^^^^^^^
+
+- Narrowed both X2 head joint ranges in ``x2_ultra.xml`` from ``-0.366..0.366`` (yaw) and
+  ``-0.3838..0.3838`` (pitch) to **``-0.3..0.3``**, by operator decision, to bound what a
+  head-pose-randomized policy has to represent. Soft limits become ``+-0.27``. Two effects
+  to know about: the trained default yaw of 0.2760 now sits above the soft limit, so a zero
+  action settles the target at 0.2661 rather than 0.2760 (about 0.01 rad of ``joint_pos``
+  shift), and the tracking family, which tracks ``head_yaw_link``/``head_pitch_link`` as
+  bodies, will clamp any reference motion that drives the head beyond the new range. The
+  motions were not measured.
+
 Added
 ^^^^^
 

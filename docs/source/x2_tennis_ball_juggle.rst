@@ -253,21 +253,29 @@ by a clamp, because the soft range for head yaw is narrower than the offset and 
 piles environments onto one limit. The scale map is keyed by joint pattern and every key
 must match, so the two head entries must be dropped along with the joints.
 
-**Measured on the built environment** (64 environments): yaw spans -0.219..+0.325 with
-59 of 64 distinct, pitch -0.343..+0.343 with 61 of 64, and one environment at a limit
-against the 32 that a clamp would have produced. The held target does not change during
-an episode, and ``ball_in_camera_fov`` stays at 0.63-1.00 (mean 0.98) across the sampled
-poses, so the randomization does not fight that reward.
+**The head range is +-0.3 rad for both joints** in ``x2_ultra.xml``, by operator
+decision; the operator keeps the real robots inside it. Soft limits are 0.9 of the hard
+limits, so the reachable band is ``+-0.27`` and that is what the sampler draws from.
 
-**Known limit, and it needs an operator decision.** The model's joint ranges are
-``-0.366..0.366`` for head yaw and ``-0.3838..0.3838`` for head pitch, and the *soft*
-limits are narrower still at about ``-0.02..0.345``. Both robots measured are outside
-them: ``.132`` reads pitch ``+0.5115`` and ``.236`` reads yaw up to ``+0.493``. So this
-variant cannot represent two of the three measured head configurations, and the sampled
-band covers only the near-default ones. Covering them needs the head range in
-``x2_ultra.xml`` widened from measurement. That is a robot-model change and is not made
-here: it also changes the limits a deployed controller enforces, because the hardware
-config reads ``limits: source: robot_model``.
+**Measured on the built environment** (64 environments, at +-0.3): yaw spans
+-0.201..+0.256 and pitch -0.252..+0.267, 60 of 64 distinct each, none outside +-0.3.
+The held target does not change during an episode, and ``ball_in_camera_fov`` reads
+1.000 for every environment, so at this range the randomization does not touch that
+reward at all. Under the earlier +-0.5 request the band was -0.219..+0.325 and the same
+term ranged 0.63-1.00.
+
+Two consequences of the tighter range are worth stating rather than discovering later.
+The trained default yaw is 0.2760, which is now *above* the +-0.27 soft limit and only
+24 mrad below the hard limit: a zero action on the 31-DOF task settles the target at
+0.2661 instead of 0.2760, so a trained policy sees ``joint_pos`` shifted by about 0.01
+rad. That is inside the noise a policy already tolerates, but it is not zero. And the
+measured robots that motivated this task are now **outside** the model range: ``.132``
+reads pitch ``+0.5115`` and ``.236`` reads yaw up to ``+0.493``. Those poses are not
+representable, by choice, so a robot parked beyond +-0.3 rad is an operator problem.
+
+The range also applies to the tracking family, which tracks ``head_yaw_link`` and
+``head_pitch_link`` as bodies: a reference motion that drives the head beyond +-0.3 is
+now clamped. **Not measured** - no motion dataset was checked.
 
 **Deployment contract.** The exported metadata gains ``action_joint_names``.
 ``joint_names`` remains the entity's 31-joint list, which is what the observation refers

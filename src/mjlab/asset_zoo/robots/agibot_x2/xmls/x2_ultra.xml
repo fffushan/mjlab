@@ -264,11 +264,11 @@
             </body>
             <body name="head_yaw_link" pos="0.00834773 0 0.309397">
               <inertial pos="-0.003139 0.001399 0.051838" fullinertia="0.003861 0.003231 0.001103 9e-06 -2.1e-05 -3.9e-05" mass="0.720047" />
-              <joint name="head_yaw_joint" pos="0 0 0" axis="0 0 1" range="-0.366 0.366" actuatorfrcrange="-2.6 2.6" />
+              <joint name="head_yaw_joint" pos="0 0 0" axis="0 0 1" range="-0.3 0.3" actuatorfrcrange="-2.6 2.6" />
               <geom class="visual" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.866667 0.866667 0.890196 1" mesh="head_yaw_link" />
               <body name="head_pitch_link" pos="0 0 0.0889">
                 <inertial pos="0.003033 -6e-05 0.004395" fullinertia="0.002913 0.003598 0.002668 1.7e-05 0.000147 -2.2e-05" mass="0.999287" />
-                <joint name="head_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.3838 0.3838" actuatorfrcrange="-0.6 0.6" />
+                <joint name="head_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.3 0.3" actuatorfrcrange="-0.6 0.6" />
                 <geom class="collision" size="0.074 0.05" pos="0 0 0.015" quat="0.499898 0.5 0.5 -0.500102" type="cylinder" rgba="0.498039 0.498039 0.498039 1" name="head_pitch_link_collision" />
                 <geom class="visual" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.2 0.2 0.2 1" mesh="head_pitch_link" />
                 <site name="imu_2" pos="0.0259999 -8.25389e-05 0.0176" group="3" />

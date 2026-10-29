@@ -234,8 +234,8 @@ def reset_head_pose(
   limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
   # Sample uniformly inside the *feasible* band rather than about the default followed
   # by a clamp. A clamp piles environments onto whichever limit the band ends at, and
-  # this band is narrow: the model allows +-0.366 rad for head yaw while its default
-  # sits at 0.276, so half of a +-0.5 offset would land on the same number. Uniform
+  # this band is narrow: the model allows +-0.3 rad for head yaw while its default
+  # sits at 0.276, so most of a +-0.5 offset would land on the same number. Uniform
   # over the intersection keeps the poses spread and never oversamples a limit.
   half = max(abs(position_range[0]), abs(position_range[1]))
   lo = torch.maximum(limits[..., 0], default - half)

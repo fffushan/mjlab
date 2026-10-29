@@ -951,11 +951,14 @@ HEAD_JOINT_NAMES = ("head_yaw_joint", "head_pitch_joint")
 # 0.061799387799999994), radians:
 #   .132  yaw -0.349, pitch +0.450  (yaw axis delivers no torque, pitch is free)
 #   .236  yaw  0.000 to +0.217
-#   .147  yaw +2.866  (frozen at +3.141590118; deliberately outside this range, since
-#         a head turned 180 deg puts the ball behind the camera and no policy can
-#         recover it)
-# +-0.5 rad covers every measured usable configuration with margin. The sample is
-# clamped to the joint's soft limits, so an unreachable pose cannot be requested.
+#   .147  yaw +2.866  (frozen at +3.141590118)
+#
+# The model's head joint range is +-0.3 rad (x2_ultra.xml), which the operator chose
+# and will enforce on the robots. Note what that means: the last two configurations
+# above are **outside** it, and the sampler cannot reach them. A robot parked beyond
+# +-0.3 rad is therefore an operator problem, not something this policy can absorb.
+# These constants are the widest offset worth asking for; the sample is intersected
+# with the joint's soft limits, so the reachable band is what the model allows.
 JUGGLE_HEAD_YAW_RANGE_RAD = 0.5
 JUGGLE_HEAD_PITCH_RANGE_RAD = 0.5
 
