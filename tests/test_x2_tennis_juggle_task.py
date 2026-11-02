@@ -143,9 +143,12 @@ def test_the_ball_terms_are_wired_with_the_juggle_constants() -> None:
 
   lift = juggle.rewards["racket_lift"]
   assert lift.func is mdp.racket_lift
-  # Negative: the term returns metres of excess lift, so it has to cost.
-  assert lift.weight == -JUGGLE_RACKET_LIFT_WEIGHT
-  assert lift.weight < 0
+  # The default installs no lift penalty: two 30k batches showed the charge suppresses
+  # bouncing rather than parking. The derived weight is still one override away, and
+  # the sign rule below is what a charged arm must satisfy.
+  assert lift.weight == -JUGGLE_RACKET_LIFT_WEIGHT == 0.0
+  blocking = juggle_racket_lift_weight()
+  assert -blocking < 0, "the derived weight must charge excess lift"
   assert lift.params["plate_top_rest_z"] == (JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z)
   assert lift.params["deadband"] == JUGGLE_RACKET_LIFT_DEADBAND_M
 
@@ -155,19 +158,22 @@ def test_the_ball_terms_are_wired_with_the_juggle_constants() -> None:
   assert energy.params["ball_cfg"] is centred.params["ball_cfg"]
 
 
-def test_the_lift_weight_is_derived_from_sigma() -> None:
-  """The weight follows the maximum-slope rule, so a sigma change moves it."""
+def test_the_lift_weight_defaults_off_and_the_derivation_still_holds() -> None:
+  """No penalty by default; the maximum-slope rule stays valid for the ablation.
+
+  The rule is not wrong about the single point it models, so it is still exercised.
+  What two batches showed is that paying it stops the policy bouncing at all: at
+  -11.22 it held the ball on the plate (1.95 impacts per episode, ball_energy 0.080,
+  reward 82 from standing) and at 0.0 it bounced (16.7 impacts, 0.423).
+  """
   assert JUGGLE_ENERGY_TARGET_HEIGHT_M == pytest.approx(0.40)
   assert JUGGLE_ENERGY_SIGMA_J_PER_KG == 1.5
-  assert JUGGLE_RACKET_LIFT_WEIGHT == pytest.approx(
-    juggle_racket_lift_weight(sigma=JUGGLE_ENERGY_SIGMA_J_PER_KG)
-  )
-  # Halving sigma doubles the steepest slope, and so the published weight.
-  assert juggle_racket_lift_weight(sigma=0.75) == pytest.approx(
-    2.0 * JUGGLE_RACKET_LIFT_WEIGHT
-  )
+  assert JUGGLE_RACKET_LIFT_WEIGHT == 0.0
+  blocking = juggle_racket_lift_weight(sigma=JUGGLE_ENERGY_SIGMA_J_PER_KG)
   # 2.0 * sqrt(2) * (9.81 / 1.5) * exp(-0.5). The old rule gave 5.405405.
-  assert JUGGLE_RACKET_LIFT_WEIGHT == pytest.approx(11.219551615286045, rel=1e-12)
+  assert blocking == pytest.approx(11.219551615286045, rel=1e-12)
+  # Halving sigma doubles the steepest slope, and so the derived weight.
+  assert juggle_racket_lift_weight(sigma=0.75) == pytest.approx(2.0 * blocking)
 
 
 def test_the_observations_are_the_carry_tasks() -> None:
@@ -850,7 +856,7 @@ def test_lifting_the_resting_ball_to_the_target_is_not_profitable() -> None:
   assert lift == pytest.approx(
     JUGGLE_ENERGY_TARGET_HEIGHT_M - JUGGLE_RACKET_LIFT_DEADBAND_M
   )
-  net = JUGGLE_ENERGY_WEIGHT * energy_reward - JUGGLE_RACKET_LIFT_WEIGHT * lift
+  net = JUGGLE_ENERGY_WEIGHT * energy_reward - juggle_racket_lift_weight() * lift
   assert net == pytest.approx(-2.15, abs=0.01)
   assert net < 0.0
 
@@ -865,7 +871,7 @@ def test_no_partial_lift_turns_the_energy_pair_positive() -> None:
     energy_reward = float(mdp.ball_energy(env, **_energy_reward_params())[0])
     penalty = float(mdp.racket_lift(env, **_lift_params())[0])
     net[index] = (
-      JUGGLE_ENERGY_WEIGHT * energy_reward - JUGGLE_RACKET_LIFT_WEIGHT * penalty
+      JUGGLE_ENERGY_WEIGHT * energy_reward - juggle_racket_lift_weight() * penalty
     )
 
   # The best lift is the free edge of the deadband, not a partial lift near the
@@ -884,7 +890,7 @@ def test_no_partial_lift_turns_the_energy_pair_positive() -> None:
   )
   at_target = JUGGLE_ENERGY_WEIGHT * float(
     mdp.ball_energy(env, **_energy_reward_params())[0]
-  ) - JUGGLE_RACKET_LIFT_WEIGHT * float(mdp.racket_lift(env, **_lift_params())[0])
+  ) - juggle_racket_lift_weight() * float(mdp.racket_lift(env, **_lift_params())[0])
   assert at_target < -1.0
 
 
@@ -910,7 +916,7 @@ def test_raising_the_whole_robot_is_charged_like_an_arm_lift() -> None:
   lift = float(mdp.racket_lift(env, **_lift_params())[0])
   assert energy_reward == pytest.approx(1.0)
   assert lift == pytest.approx(rise - JUGGLE_RACKET_LIFT_DEADBAND_M)
-  net = JUGGLE_ENERGY_WEIGHT * energy_reward - JUGGLE_RACKET_LIFT_WEIGHT * lift
+  net = JUGGLE_ENERGY_WEIGHT * energy_reward - juggle_racket_lift_weight() * lift
   assert net < 0.0
 
 
@@ -922,7 +928,7 @@ def test_a_higher_lift_is_punished_rather_than_merely_neutralised() -> None:
   energy_reward = float(mdp.ball_energy(env, **_energy_reward_params())[0])
   lift = float(mdp.racket_lift(env, **_lift_params())[0])
 
-  net = JUGGLE_ENERGY_WEIGHT * energy_reward - JUGGLE_RACKET_LIFT_WEIGHT * lift
+  net = JUGGLE_ENERGY_WEIGHT * energy_reward - juggle_racket_lift_weight() * lift
   assert net < 0.0
 
 

@@ -1170,7 +1170,22 @@ def juggle_racket_lift_weight(
 # 11.2196 * (0.10 - 0.03) * 5 = 3.9 in weight-value units, while one 20-step bounce
 # cycle at the target earns about 2.0 * 20 = 40. The strike is affordable; only
 # parking the ball at the target height is ruled out.
-JUGGLE_RACKET_LIFT_WEIGHT = juggle_racket_lift_weight()
+#
+# **Default off since 2026-11-03, on two batches of evidence.** The argument above
+# models the reward at a single point; what it does not model is what the policy does
+# with the rest of the episode. Both batches agree that the penalty suppresses
+# bouncing rather than parking:
+#   A0-A4 sweep   the lift-0.0 arm (A3) was the only arm that juggled, and is the
+#                 policy deployed on the robots.
+#   stage-1 30k   racket_lift -11.22 held the ball on the plate: 1.95 impacts per
+#                 20 s episode, ball_energy 0.080 against a 3.92 target, and a reward
+#                 of 82 earned by standing. At 0.0 the same task gave 16.7 impacts and
+#                 ball_energy 0.423 for a tenth of the reward.
+# So the default installs no penalty. The derived weight stays available through
+# `juggle_racket_lift_weight()` and the MJLAB_JUGGLE_LIFT_WEIGHT override, so the
+# charged arm can be re-run without editing this file. Nothing here claims the
+# parking problem is solved: neither setting reaches the energy target.
+JUGGLE_RACKET_LIFT_WEIGHT = 0.0
 
 # The two blocks below parameterise the earlier per-bounce design:
 # ``ball_bounce_apex`` and ``ball_at_rest`` in ``rewards.py``. **The juggling task no

@@ -4,6 +4,20 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **The tennis juggling tasks no longer charge for lifting the ball.** ``racket_lift``
+  is installed with weight 0, so ``JUGGLE_RACKET_LIFT_WEIGHT = 0.0``. The maximum-slope
+  derivation was a correct argument about the reward at one point, but it does not model
+  what the policy does with the rest of the episode, and two independent 30k-iteration
+  batches agree it suppresses bouncing rather than parking: in the A0-A4 sweep the
+  lift-0.0 arm (A3) was the only one that juggled and is the deployed policy, and in the
+  stage-1 four-arm batch the charged arms held the ball on the plate (1.95 impacts per
+  20 s episode, ``ball_energy`` 0.080 against a 3.92 target, reward 82 earned by
+  standing) while weight 0.0 gave 16.7 impacts and 0.423. ``juggle_racket_lift_weight()``
+  and the ``MJLAB_JUGGLE_LIFT_WEIGHT`` override are unchanged, so the charged arm can be
+  re-run without editing code. Neither setting reaches the energy target: parking the
+  ball is not solved by this change, and the acceptance signal stays ``ball_energy`` and
+  ``ball_impact_count`` rather than reward.
+
 - Narrowed both X2 head joint ranges in ``x2_ultra.xml`` from ``-0.366..0.366`` (yaw) and
   ``-0.3838..0.3838`` (pitch) to **``-0.3..0.3``**, by operator decision, to bound what a
   head-pose-randomized policy has to represent. Soft limits become ``+-0.27``. Two effects
