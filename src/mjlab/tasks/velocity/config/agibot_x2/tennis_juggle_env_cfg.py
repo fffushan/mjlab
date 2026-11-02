@@ -145,6 +145,10 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_OBS_UPDATE_PERIOD_STEPS,
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
+  BALL_STREAM_LATENCY_RANGE_S,
+  BALL_STREAM_RATE_RANGE_HZ,
+  BALL_STREAM_STALL_PROB,
+  BALL_STREAM_STALL_RANGE_S,
   BALL_SPAWN_DROP_HEIGHT,
   CAMERA_HALF_ANGLE_X,
   CAMERA_HALF_ANGLE_Y,
@@ -542,9 +546,47 @@ def agibot_x2_tennis_juggle_env_cfg(
     # Only the actor's ball term changes. The term applies its own per-sample noise
     # and its own latency, so neither a ``noise`` model nor any ``delay_*`` field may
     # be set here or the delay and noise would be applied twice.
+    #
+    # That also makes the fixed-delay ablation knobs meaningless here. They are read
+    # unconditionally above, so an operator re-running the "rate18" arm on this task
+    # would get the built-in stream instead and no warning. Refuse instead of silently
+    # ignoring: a run that looks ablated but is not is worse than a loud failure.
+    stale = [
+      name
+      for name in (
+        "BALL_DELAY_MIN_STEPS",
+        "BALL_DELAY_MAX_STEPS",
+        "BALL_DELAY_PERIOD_STEPS",
+      )
+      if _ablation_value(name) is not None
+    ]
+    if stale:
+      raise ValueError(
+        "MJLAB_JUGGLE_"
+        + "/MJLAB_JUGGLE_".join(stale)
+        + " configure the fixed-delay ball model, which this task does not use. Set "
+        "MJLAB_JUGGLE_BALL_STREAM_RATE_MIN_HZ / _MAX_HZ and "
+        "MJLAB_JUGGLE_BALL_STREAM_LATENCY_MIN_S / _MAX_S instead."
+      )
     cfg.observations["actor"].terms["ball_hist"] = ObservationTermCfg(
       func=mdp.ball_history_samples,
-      params=dict(ball_state_params, bias_half_width_m=ball_bias_half_m),
+      params=dict(
+        ball_state_params,
+        bias_half_width_m=ball_bias_half_m,
+        stream_rate_hz=(
+          _ablation_value("BALL_STREAM_RATE_MIN_HZ", BALL_STREAM_RATE_RANGE_HZ[0]),
+          _ablation_value("BALL_STREAM_RATE_MAX_HZ", BALL_STREAM_RATE_RANGE_HZ[1]),
+        ),
+        stream_latency_s=(
+          _ablation_value("BALL_STREAM_LATENCY_MIN_S", BALL_STREAM_LATENCY_RANGE_S[0]),
+          _ablation_value("BALL_STREAM_LATENCY_MAX_S", BALL_STREAM_LATENCY_RANGE_S[1]),
+        ),
+        stall_prob=_ablation_value("BALL_STREAM_STALL_PROB", BALL_STREAM_STALL_PROB),
+        stall_range_s=(
+          _ablation_value("BALL_STREAM_STALL_MIN_S", BALL_STREAM_STALL_RANGE_S[0]),
+          _ablation_value("BALL_STREAM_STALL_MAX_S", BALL_STREAM_STALL_RANGE_S[1]),
+        ),
+      ),
     )
   else:
     cfg.observations["actor"].terms["ball_pos"] = ObservationTermCfg(

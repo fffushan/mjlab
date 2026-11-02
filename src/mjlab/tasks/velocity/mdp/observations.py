@@ -372,8 +372,21 @@ class ball_history_samples(ManagerTermBase):
     plate_cfg: SceneEntityCfg,
     ball_cfg: SceneEntityCfg,
     bias_half_width_m: float = 0.0,
+    stream_rate_hz: tuple[float, float] = BALL_STREAM_RATE_RANGE_HZ,
+    stream_latency_s: tuple[float, float] = BALL_STREAM_LATENCY_RANGE_S,
+    stall_prob: float = BALL_STREAM_STALL_PROB,
+    stall_range_s: tuple[float, float] = BALL_STREAM_STALL_RANGE_S,
   ) -> torch.Tensor:
     del bias_half_width_m  # Drawn once per episode in ``reset``/``__init__``.
+    # The stream magnitudes are parameters, not module globals, so an ablation arm can
+    # vary them from the configuration and the value a run used is recorded in the
+    # run's own params/env.yaml. They default to the measured constants.
+    if not (0.0 < stream_rate_hz[0] <= stream_rate_hz[1]):
+      raise ValueError(f"stream_rate_hz must be positive and ordered, got {stream_rate_hz}")
+    if not (0.0 <= stream_latency_s[0] <= stream_latency_s[1]):
+      raise ValueError(
+        f"stream_latency_s must be non-negative and ordered, got {stream_latency_s}"
+      )
     device = self._ring.device
 
     # A call at the same control step is a re-entry: a subset reset computes the
@@ -403,9 +416,9 @@ class ball_history_samples(ManagerTermBase):
     # One draw per environment per step, so an acquisition in one environment says
     # nothing about any other. The values on a step with no acquisition are
     # consumed and ignored.
-    latency = BALL_STREAM_LATENCY_RANGE_S[0] + torch.rand(
-      self.num_envs, device=device
-    ) * (BALL_STREAM_LATENCY_RANGE_S[1] - BALL_STREAM_LATENCY_RANGE_S[0])
+    latency = stream_latency_s[0] + torch.rand(self.num_envs, device=device) * (
+      stream_latency_s[1] - stream_latency_s[0]
+    )
     lag_steps = torch.round(latency / self._step_dt).long().clamp(min=0)
     # Before the episode has enough true history the latency cannot be honoured.
     # Clamping to the reset step keeps the sample a real state of this episode.
@@ -445,14 +458,14 @@ class ball_history_samples(ManagerTermBase):
     # Schedule the next acquisition: one interval at the drawn stream rate, plus a
     # stall with the measured probability. The stall is a longer gap, not a separate
     # state; its only visible effect is the growing age of the held sample.
-    rate = BALL_STREAM_RATE_RANGE_HZ[0] + torch.rand(self.num_envs, device=device) * (
-      BALL_STREAM_RATE_RANGE_HZ[1] - BALL_STREAM_RATE_RANGE_HZ[0]
+    rate = stream_rate_hz[0] + torch.rand(self.num_envs, device=device) * (
+      stream_rate_hz[1] - stream_rate_hz[0]
     )
     interval_steps = torch.round((1.0 / rate) / self._step_dt).long().clamp(min=1)
-    stall = torch.rand(self.num_envs, device=device) < BALL_STREAM_STALL_PROB
-    stall_s = BALL_STREAM_STALL_RANGE_S[0] + torch.rand(
-      self.num_envs, device=device
-    ) * (BALL_STREAM_STALL_RANGE_S[1] - BALL_STREAM_STALL_RANGE_S[0])
+    stall = torch.rand(self.num_envs, device=device) < stall_prob
+    stall_s = stall_range_s[0] + torch.rand(self.num_envs, device=device) * (
+      stall_range_s[1] - stall_range_s[0]
+    )
     stall_steps = torch.round(stall_s / self._step_dt).long()
     next_acq = (
       now_step

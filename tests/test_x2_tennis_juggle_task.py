@@ -78,6 +78,7 @@ from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_env_cfg import (
   BALL_ENTITY,
   BAT_BALL_CONTACT_SENSOR,
+  agibot_x2_tennis_juggle_env_cfg,
 )
 from mjlab.tasks.velocity.mdp.velocity_command import UniformVelocityCommandCfg
 from mjlab.utils.lab_api.math import quat_apply
@@ -358,6 +359,29 @@ def _build_env(
   for _ in range(steps):
     env.step(action)
   return env
+
+
+def test_ball_history_ablations_are_wired_and_stale_knobs_refuse(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A perception arm must change this task, and a knob that cannot apply must fail.
+
+  The fixed-delay knobs are read unconditionally when the config is built, so re-running
+  the "rate18" arm on this task used to build the shipped stream and say nothing. A run
+  that looks ablated but is not is worse than one that refuses to start.
+  """
+  # The registry builds each config once at import, so the override has to be read by
+  # the builder, not by load_env_cfg. A real run sets these before the process starts.
+  monkeypatch.setenv("MJLAB_JUGGLE_BALL_STREAM_RATE_MAX_HZ", "12.0")
+  monkeypatch.setenv("MJLAB_JUGGLE_BALL_STREAM_LATENCY_MAX_S", "0.12")
+  cfg = agibot_x2_tennis_juggle_env_cfg(head_actuated=False, ball_history=True)
+  params = cfg.observations["actor"].terms["ball_hist"].params
+  assert params["stream_rate_hz"] == (5.0, 12.0)
+  assert params["stream_latency_s"] == (0.08, 0.12)
+
+  monkeypatch.setenv("MJLAB_JUGGLE_BALL_DELAY_PERIOD_STEPS", "3")
+  with pytest.raises(ValueError, match="fixed-delay ball model"):
+    agibot_x2_tennis_juggle_env_cfg(head_actuated=False, ball_history=True)
 
 
 @pytest.mark.slow
