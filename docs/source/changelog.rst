@@ -30,6 +30,21 @@ Changed
 Added
 ^^^^^
 
+- Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3``,
+  the 29-DOF juggling task whose actor observes **three timestamped ball samples** instead
+  of one delayed position: 12 numbers, ``[x, y, z, t]`` per slot, newest first, ages in
+  seconds clipped at 1.0 s. Widths 29 / 112 / 121. The term models the estimator's own
+  chain (5-20 Hz schedule, 80-250 ms latency, stalls, per-episode bias, per-sample noise)
+  rather than applying a fixed delay, so latency becomes an observable input instead of a
+  trained assumption; the two robots publish at 18.44 Hz and 5.40 Hz with different
+  latencies. Slots are ordered by capture step, duplicates repeat the oldest sample with
+  its own age, and the term counts its own control steps because rsl_rl randomises
+  ``episode_length_buf`` at the start of every ``learn()``. Measured on CPU: in single-arc
+  triples the three-sample fit extrapolates to a median 69 mm against 472 mm for the
+  freshest sample alone, but only 69 of 740 triples were single-arc, so the gain is
+  conditional. Not supported by the deployed controller. See
+  ``docs/source/x2_tennis_ball_juggle.rst``.
+
 - Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF``,
   the juggling task with the two head joints removed from the action space: 29
   actions and actor/critic widths of 103/121 instead of 105/123.

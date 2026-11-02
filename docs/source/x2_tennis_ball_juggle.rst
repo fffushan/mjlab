@@ -281,6 +281,46 @@ now clamped. **Not measured** - no motion dataset was checked.
 ``joint_names`` remains the entity's 31-joint list, which is what the observation refers
 to, so the two no longer agree and a consumer must map actions through the new field.
 
+The Ball3 variant: three timestamped samples
+--------------------------------------------
+
+``...-Juggle-29DOF-Ball3`` is the 29-DOF task with the actor's ball input changed from one
+delayed plate-frame position to **three timestamped samples**: 12 numbers, interleaved
+``[x0, y0, z0, t0, x1, y1, z1, t1, x2, y2, z2, t2]``, newest first, where ``t`` is the age
+of that sample in seconds relative to the current control step, clipped at 1.0 s. Widths
+become **29 / 112 / 121** against 29 / 103 / 121 for the 29-DOF task; the critic keeps its
+clean position and velocity and is unchanged.
+
+**Why the stream, not a delay.** A single delayed position cannot say how stale it is, so
+training had to choose one latency model and the two robots broke it: the estimator
+measured 18.44 Hz on ``.147`` and 5.40 Hz on ``.132``, where one stall held a value for
+10.4 s and a third of the published estimates were 2-3 m ghosts. The term therefore models
+the chain itself - a per-environment ring of true positions sampled on a 5-20 Hz schedule,
+each acquisition reading one drawn latency (80-250 ms) back, plus a per-episode constant
+bias and per-sample noise. A stall is not a state: the sample stays and its age grows, so
+the previous hold term is not used here.
+
+**Slots are ordered by capture step, not arrival.** Latency jitter can deliver an older
+frame after a newer one; ordering by arrival would put it in slot 0 and make the ages
+non-monotonic. Fewer than three samples repeat the oldest slot **with its own age**, so a
+duplicate is self-evident. The term counts its own control steps rather than reading
+``episode_length_buf``, which rsl_rl seeds with ``randint`` at the start of every
+``learn()``: that trap already produced phantom ``ball_not_lifted`` counts here.
+
+**What it buys, measured on CPU.** With noise and bias off, fitting a parabola through the
+three samples and extrapolating to the current step gives a median **69 mm** error against
+**472 mm** for the freshest sample alone, in single-arc triples. Only 69 of 740 triples
+were single-arc: the rest straddle a bounce, where the fit is meaningless. The gain is real
+and **conditional**, and the policy has to learn when to trust the fit.
+
+That conditionality has a physical cause worth stating: the ring stores each sample in the
+plate frame **of its own capture step**, so the three positions live in three different
+moving frames. Ballistic extrapolation is only valid while the plate barely moves between
+samples.
+
+**Not supported by the controller.** The deployed adaptor builds one plate-frame position,
+so this task is training-only until the provider keeps a short history and reports ages.
+
 Acceptance metrics
 ------------------
 
