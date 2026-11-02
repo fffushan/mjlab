@@ -352,6 +352,16 @@ class ball_history_samples(ManagerTermBase):
     # guarantees a sample exists before any latency is drawn, and reset() restores
     # it for every new episode.
     self._next_acq = torch.zeros(n, dtype=torch.long, device=device)
+    # The term counts its **own** control steps instead of reading
+    # ``episode_length_buf``. rsl_rl seeds that buffer with randint(0,
+    # max_episode_length) at the start of every learn(), so the first rollout would
+    # otherwise age the samples by a random amount and read ring slots that this
+    # episode never wrote - a fabricated ball at the plate origin with a plausible
+    # age. The same trap produced phantom ball_not_lifted counts in the stage-1
+    # terms; the rule there, applied here, is that elapsed time is counted per term.
+    self._step = torch.zeros(n, dtype=torch.long, device=device)
+    self._last_buf: torch.Tensor | None = None
+    self._last_out: torch.Tensor | None = None
     self._noise_half = torch.tensor(
       BALL_POSITION_NOISE_M, dtype=torch.float32, device=device
     )
@@ -365,7 +375,21 @@ class ball_history_samples(ManagerTermBase):
   ) -> torch.Tensor:
     del bias_half_width_m  # Drawn once per episode in ``reset``/``__init__``.
     device = self._ring.device
-    now_step = env.episode_length_buf.to(device=device)
+
+    # A call at the same control step is a re-entry: a subset reset computes the
+    # observation for the whole batch, and the viewer refreshes the same way. Those
+    # paths must not push a second sample, redraw the schedule, or advance the
+    # clock, so return the previous output unchanged. ``episode_length_buf`` is used
+    # only to recognise that case - never as a clock.
+    # ``clone`` matters: on a CPU env ``.to(device).long()`` returns the buffer
+    # itself, so caching it un-cloned would alias a tensor that the env increments in
+    # place and the guard below would then match on every step and freeze the term at
+    # its reset-time output.
+    buf = env.episode_length_buf.to(device=device).long().clone()
+    if self._last_out is not None and torch.equal(buf, self._last_buf):
+      return self._last_out
+
+    now_step = self._step
     rows = torch.arange(self.num_envs, device=device)
     true_pos = ball_position_in_plate(env, plate_cfg, ball_cfg)
 
@@ -445,7 +469,11 @@ class ball_history_samples(ManagerTermBase):
     steps = self._hist_step.gather(1, pick)
     ages = (now_step[:, None] - steps).to(torch.float32) * self._step_dt
     ages = ages.clamp(min=0.0, max=BALL_HISTORY_AGE_CLIP_S)
-    return torch.cat([positions, ages.unsqueeze(-1)], dim=-1).reshape(self.num_envs, -1)
+    out = torch.cat([positions, ages.unsqueeze(-1)], dim=-1).reshape(self.num_envs, -1)
+    self._step += 1
+    self._last_buf = buf
+    self._last_out = out
+    return out
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if env_ids is None:
@@ -455,6 +483,10 @@ class ball_history_samples(ManagerTermBase):
     self._hist_step[env_ids] = 0
     self._hist_count[env_ids] = 0
     self._next_acq[env_ids] = 0
+    self._step[env_ids] = 0
+    # The cached output belongs to the step being left, so it cannot be served to a
+    # new episode even if two resets happen at the same episode_length_buf value.
+    self._last_out = None
     if self._bias_half_width_m > 0.0:
       n = self._bias[env_ids].shape[0]
       self._bias[env_ids] = self._draw_bias(

@@ -355,6 +355,47 @@ def _build_env(
 
 
 @pytest.mark.slow
+def test_ball_history_ignores_a_random_episode_length_seed() -> None:
+  """The term must keep its own clock, not read ``episode_length_buf``.
+
+  rsl_rl passes ``init_at_random_ep_len=True``, so it overwrites
+  ``episode_length_buf`` with ``randint(0, max_episode_length)`` at the start of every
+  ``learn()``, including resumes. A term that used that buffer as elapsed time would
+  age its samples by up to a thousand steps and read ring slots this episode never
+  wrote, which surfaces as a ball at the plate origin with a plausible age. The same
+  trap already produced phantom ``ball_not_lifted`` counts in the stage-1 terms.
+
+  The invariants checked are the ones the failure breaks: the clock advances by one
+  control step regardless of the buffer, and the ages grow by one step instead of
+  jumping to the 1.0 s clip.
+  """
+  cfg = load_env_cfg(f"{TASK_ID}-29DOF-Ball3")
+  cfg.scene.num_envs = 8
+  cfg.terminations = {}
+  cfg.episode_length_s = 1000.0
+  env = ManagerBasedRlEnv(cfg, device="cpu", num_envs=cfg.scene.num_envs)
+  try:
+    env.reset()
+    term = env.observation_manager.get_term_cfg("actor", "ball_hist").func
+    action = torch.zeros(env.num_envs, env.action_manager.total_action_dim)
+    for _ in range(6):
+      env.step(action)
+    step_before = int(term._step[0])
+    ages_before = env.obs_buf["actor"][:, -12:][:, 3:12:4].clone()
+
+    env.episode_length_buf[:] = 700  # what rsl_rl does before the first rollout
+    env.step(action)
+
+    assert int(term._step[0]) == step_before + 1, "the clock followed episode_length_buf"
+    ages_after = env.obs_buf["actor"][:, -12:][:, 3:12:4]
+    jump = float((ages_after - ages_before).max())
+    assert jump <= 2.0 * env.step_dt + 1e-6, f"ages jumped by {jump:.3f} s"
+    assert float(ages_after.max()) < 1.0, "ages reached the clip, so a stale slot was read"
+  finally:
+    env.close()
+
+
+@pytest.mark.slow
 def test_the_29dof_variant_drops_head_actions_and_randomizes_head_pose() -> None:
   """The 29-DOF family: the head leaves the action space but stays an input.
 
