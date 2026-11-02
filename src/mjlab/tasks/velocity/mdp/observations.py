@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 
-from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import FACE_SITE_POS
+from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_HISTORY_AGE_CLIP_S,
+  BALL_HISTORY_DEPTH,
+  BALL_POSITION_NOISE_M,
+  BALL_STREAM_LATENCY_RANGE_S,
+  BALL_STREAM_RATE_RANGE_HZ,
+  BALL_STREAM_STALL_PROB,
+  BALL_STREAM_STALL_RANGE_S,
+  BALL_TRUE_HISTORY_S,
+  FACE_SITE_POS,
+)
 from mjlab.entity import Entity
 from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.observation_manager import ObservationTermCfg
@@ -259,6 +270,199 @@ class ball_position_hold(ManagerTermBase):
 
   @staticmethod
   def _draw_bias(n: int, device, half: float):
+    if half <= 0.0:
+      return torch.zeros(n, 3, device=device)
+    return (torch.rand(n, 3, device=device) * 2.0 - 1.0) * half
+
+
+class ball_history_samples(ManagerTermBase):
+  """Three timestamped plate-frame ball samples, newest first.
+
+  A measurement chain cannot deliver the ball's current position: it delivers a
+  stream of older positions at an irregular rate. This term models that stream
+  directly instead of applying a fixed delay to a fresh position. Each environment
+  keeps a ring of its **true** plate-frame ball positions, written every control
+  step, and samples that ring on its own acquisition schedule. An acquisition draws
+  a latency, reads the true position ``latency`` seconds back, adds the per-episode
+  constant bias and per-sample noise, and pushes ``(position, step)`` into a
+  three-slot history. The output is the history flattened as ``x, y, z, age`` per
+  slot, newest first, where ``age`` is the time between the sample's capture step
+  and the current control step, clipped at :data:`BALL_HISTORY_AGE_CLIP_S`.
+
+  **Newest is by capture time, not by arrival time.** Latency jitter lets a frame
+  arrive after one that was captured later than itself, so pushing on arrival alone
+  would put that older frame in slot 0 and make the ages non-monotonic. The history
+  instead keeps the three largest capture steps, so ``t0 <= t1 <= t2`` always holds.
+
+  **Latency becomes an observable input.** The age of the newest sample is the
+  stream's latency plus the time since it arrived, so the policy reads the latency
+  from an input instead of being trained against one fixed delay model. That is what
+  lets one policy cover the two robots whose estimators run at 18.44 Hz and 5.40 Hz
+  with different latencies.
+
+  **Three samples are the minimum that constrains curvature.** Three
+  ``(position, age)`` pairs determine a parabola, so the policy can fit the ball's
+  trajectory, extrapolate it ballistically to the current step, and reject a single
+  outlier - a 2-3 m ghost from the real estimator - by its inconsistency with the
+  other two samples.
+
+  **A stream stall is just a growing age**, which is why the old hold hack
+  (:class:`ball_position_hold`) is not used here. A stalled stream needs no special
+  state: the same sample stays in the history and its age grows, which is exactly the
+  information the policy needs. Fewer than ``BALL_HISTORY_DEPTH`` samples are
+  available only at the start of an episode; the oldest available slot is repeated
+  **with its own age**, so the duplicate is self-evident rather than a fabricated
+  fresh measurement.
+
+  The term applies its own delay and its own noise, so its
+  :class:`~mjlab.managers.observation_manager.ObservationTermCfg` must set neither
+  ``noise`` nor any ``delay_*`` field. The noise is uniform with the per-axis
+  half-widths :data:`BALL_POSITION_NOISE_M`, the same placeholders and the same
+  distribution the rest of the velocity task uses.
+
+  Args:
+    plate_cfg: The racket body inside the robot entity. Must resolve to one body.
+    ball_cfg: The ball entity.
+    bias_half_width_m: Half-width of the constant per-episode offset, in metres on
+      each plate axis. 0.0 disables it.
+
+  Returns:
+    Tensor of shape ``(num_envs, 12)``: ``[x0, y0, z0, t0, x1, y1, z1, t1, x2, y2,
+    z2, t2]`` in the plate frame, newest sample first.
+  """
+
+  def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._bias_half_width_m = float(cfg.params.get("bias_half_width_m", 0.0) or 0.0)
+    self._step_dt = float(env.step_dt)
+    # The ring must cover the longest latency plus the three-sample span at the
+    # slowest stream rate, with margin. The epsilon keeps float dust in
+    # 1.5 / 0.02 from adding a slot to the intended 75.
+    self._ring_len = max(1, math.ceil(BALL_TRUE_HISTORY_S / self._step_dt - 1e-9))
+    n = env.num_envs
+    device = env.device
+    self._bias = self._draw_bias(n, device, self._bias_half_width_m)
+    self._ring = torch.zeros(n, self._ring_len, 3, device=device)
+    self._hist_pos = torch.zeros(n, BALL_HISTORY_DEPTH, 3, device=device)
+    self._hist_step = torch.zeros(
+      n, BALL_HISTORY_DEPTH, dtype=torch.long, device=device
+    )
+    self._hist_count = torch.zeros(n, dtype=torch.long, device=device)
+    # 0 means the first control step of the episode acquires immediately. That
+    # guarantees a sample exists before any latency is drawn, and reset() restores
+    # it for every new episode.
+    self._next_acq = torch.zeros(n, dtype=torch.long, device=device)
+    self._noise_half = torch.tensor(
+      BALL_POSITION_NOISE_M, dtype=torch.float32, device=device
+    )
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    plate_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    bias_half_width_m: float = 0.0,
+  ) -> torch.Tensor:
+    del bias_half_width_m  # Drawn once per episode in ``reset``/``__init__``.
+    device = self._ring.device
+    now_step = env.episode_length_buf.to(device=device)
+    rows = torch.arange(self.num_envs, device=device)
+    true_pos = ball_position_in_plate(env, plate_cfg, ball_cfg)
+
+    # Write the true position at this control step. Indexing by the step itself
+    # makes a repeated call at the same step idempotent, and makes the ring read
+    # below a direct lookup of a known step.
+    self._ring[rows, now_step % self._ring_len] = true_pos
+
+    due = now_step >= self._next_acq
+
+    # One draw per environment per step, so an acquisition in one environment says
+    # nothing about any other. The values on a step with no acquisition are
+    # consumed and ignored.
+    latency = BALL_STREAM_LATENCY_RANGE_S[0] + torch.rand(
+      self.num_envs, device=device
+    ) * (BALL_STREAM_LATENCY_RANGE_S[1] - BALL_STREAM_LATENCY_RANGE_S[0])
+    lag_steps = torch.round(latency / self._step_dt).long().clamp(min=0)
+    # Before the episode has enough true history the latency cannot be honoured.
+    # Clamping to the reset step keeps the sample a real state of this episode.
+    capture_step = (now_step - lag_steps).clamp(min=0)
+    measured = self._ring[rows, capture_step % self._ring_len] + self._bias
+    measured = measured + (torch.rand(self.num_envs, 3, device=device) * 2.0 - 1.0) * (
+      self._noise_half
+    )
+
+    # Keep the three samples with the largest capture step. Sorting by capture time
+    # rather than dropping the oldest arrival keeps ``t0 <= t1 <= t2`` when a late
+    # frame is older than the one already in slot 0. The tie-break puts the new
+    # sample first among equal steps: on the first step of an episode every step is
+    # still the reset zero and the new sample must not be displaced by a zero slot.
+    # ``torch.where`` keeps every environment not due this step frozen; a new tensor
+    # is built rather than shifting with overlapping slices.
+    all_steps = torch.cat([capture_step.unsqueeze(1), self._hist_step], dim=1)
+    all_pos = torch.cat([measured.unsqueeze(1), self._hist_pos], dim=1)
+    tie_break = torch.arange(
+      BALL_HISTORY_DEPTH + 1, 0, -1, device=device, dtype=all_steps.dtype
+    )
+    keep = (all_steps * (BALL_HISTORY_DEPTH + 1) + tie_break).argsort(
+      dim=1, descending=True
+    )[:, :BALL_HISTORY_DEPTH]
+    self._hist_pos = torch.where(
+      due[:, None, None],
+      all_pos.gather(1, keep[:, :, None].expand(-1, -1, 3)),
+      self._hist_pos,
+    )
+    self._hist_step = torch.where(
+      due[:, None], all_steps.gather(1, keep), self._hist_step
+    )
+    self._hist_count = torch.where(
+      due, (self._hist_count + 1).clamp(max=BALL_HISTORY_DEPTH), self._hist_count
+    )
+
+    # Schedule the next acquisition: one interval at the drawn stream rate, plus a
+    # stall with the measured probability. The stall is a longer gap, not a separate
+    # state; its only visible effect is the growing age of the held sample.
+    rate = BALL_STREAM_RATE_RANGE_HZ[0] + torch.rand(self.num_envs, device=device) * (
+      BALL_STREAM_RATE_RANGE_HZ[1] - BALL_STREAM_RATE_RANGE_HZ[0]
+    )
+    interval_steps = torch.round((1.0 / rate) / self._step_dt).long().clamp(min=1)
+    stall = torch.rand(self.num_envs, device=device) < BALL_STREAM_STALL_PROB
+    stall_s = BALL_STREAM_STALL_RANGE_S[0] + torch.rand(
+      self.num_envs, device=device
+    ) * (BALL_STREAM_STALL_RANGE_S[1] - BALL_STREAM_STALL_RANGE_S[0])
+    stall_steps = torch.round(stall_s / self._step_dt).long()
+    next_acq = (
+      now_step
+      + interval_steps
+      + torch.where(stall, stall_steps, torch.zeros_like(stall_steps))
+    )
+    self._next_acq = torch.where(due, next_acq, self._next_acq)
+
+    # Repeat the oldest available slot in the unfilled slots, with that slot's own
+    # age, so a duplicate cannot be mistaken for a fresh sample.
+    slots = torch.arange(BALL_HISTORY_DEPTH, device=device)
+    pick = torch.minimum(slots[None, :], (self._hist_count - 1).clamp(min=0)[:, None])
+    positions = self._hist_pos.gather(1, pick[:, :, None].expand(-1, -1, 3))
+    steps = self._hist_step.gather(1, pick)
+    ages = (now_step[:, None] - steps).to(torch.float32) * self._step_dt
+    ages = ages.clamp(min=0.0, max=BALL_HISTORY_AGE_CLIP_S)
+    return torch.cat([positions, ages.unsqueeze(-1)], dim=-1).reshape(self.num_envs, -1)
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._ring[env_ids] = 0.0
+    self._hist_pos[env_ids] = 0.0
+    self._hist_step[env_ids] = 0
+    self._hist_count[env_ids] = 0
+    self._next_acq[env_ids] = 0
+    if self._bias_half_width_m > 0.0:
+      n = self._bias[env_ids].shape[0]
+      self._bias[env_ids] = self._draw_bias(
+        n, self._bias.device, self._bias_half_width_m
+      )
+
+  @staticmethod
+  def _draw_bias(n: int, device, half: float) -> torch.Tensor:
     if half <= 0.0:
       return torch.zeros(n, 3, device=device)
     return (torch.rand(n, 3, device=device) * 2.0 - 1.0) * half

@@ -766,6 +766,26 @@ BALL_DROPOUT_PROB = 0.02  # Probability per control step of a rejected frame.
 BALL_DROPOUT_HOLD_STEPS = (5, 15)  # Hold length in control steps: 100-300 ms.
 
 ##
+# Ball-stream history observation (``ball_hist``).
+#
+# The real estimator does not publish at a fixed rate, so the actor cannot be
+# trained against the fixed delay model above. Measured on the robots: it published
+# 18.44 Hz on .147 and only 5.40 Hz on .132, and .132 also stalled for 10.4 s once,
+# hence the age clip below. .132's published estimates were 34% wrong, with 2-3 m
+# ghosts, which three samples can reject with a parabola consistency check.
+# Timestamps make the latency an input instead of a fixed delay model, so one
+# policy covers both robots. Newest first, so the freshest sample keeps a fixed
+# offset, and three slots are the minimum that constrains curvature.
+##
+BALL_HISTORY_DEPTH = 3
+BALL_HISTORY_AGE_CLIP_S = 1.0
+BALL_STREAM_RATE_RANGE_HZ = (5.0, 20.0)
+BALL_STREAM_LATENCY_RANGE_S = (0.080, 0.250)
+BALL_STREAM_STALL_PROB = 0.02
+BALL_STREAM_STALL_RANGE_S = (0.1, 0.6)
+BALL_TRUE_HISTORY_S = 1.5
+
+##
 # Command curriculum.
 #
 # Balancing a ball and walking are two separate skills, and the base velocity task

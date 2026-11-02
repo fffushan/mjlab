@@ -78,6 +78,26 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# The 29-DOF juggling task with the actor's ball observation widened from one
+# delayed plate-frame position (3 numbers) to three timestamped samples (12
+# numbers): the estimator's rate, latency, stalls, bias and noise are modelled
+# inside the term instead of by a fixed delay buffer. Actor 103 -> 112, critic stays
+# 121, actions stay 29. The observation contract and therefore the normalizer width
+# changed, so this is a separate task and experiment.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_env_cfg(head_actuated=False, ball_history=True),
+  play_env_cfg=agibot_x2_tennis_juggle_env_cfg(
+    play=True, head_actuated=False, ball_history=True
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

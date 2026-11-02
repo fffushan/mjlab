@@ -336,6 +336,7 @@ def _make_ball_sensor(history_length: int) -> ContactSensorCfg:
 def agibot_x2_tennis_juggle_env_cfg(
   play: bool = False,
   head_actuated: bool = True,
+  ball_history: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create the AgiBot X2 tennis-ball juggling velocity environment config.
 
@@ -352,6 +353,13 @@ def agibot_x2_tennis_juggle_env_cfg(
       of being commanded, which is what lets one policy cover robots that park the
       head differently. ``head_joint_motion`` is dropped in that case: it would
       charge the policy for motion it cannot cause.
+    ball_history: If True, replaces the actor's single delayed plate-frame ball
+      position with ``ball_hist``, the three timestamped samples of
+      :class:`~mjlab.tasks.velocity.mdp.observations.ball_history_samples`, which
+      widens the actor by 9 numbers (3 -> 12). The critic keeps its clean position
+      and velocity terms, so it is unchanged. The term models the estimator's own
+      rate, latency, stalls and noise, so it needs no ``noise`` or ``delay_*``
+      settings of its own.
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` with the tennis equipment in the scene, the
@@ -530,24 +538,33 @@ def agibot_x2_tennis_juggle_env_cfg(
     _ablation_value("BALL_DELAY_PERIOD_STEPS", BALL_OBS_UPDATE_PERIOD_STEPS)
   )
   ball_bias_half_m = float(_ablation_value("BALL_BIAS_M", BALL_POSITION_BIAS_M) or 0.0)
-  cfg.observations["actor"].terms["ball_pos"] = ObservationTermCfg(
-    func=mdp.ball_position_hold,
-    params=dict(
-      ball_state_params,
-      rejection_prob=BALL_DROPOUT_PROB,
-      hold_steps=BALL_DROPOUT_HOLD_STEPS,
-      bias_half_width_m=ball_bias_half_m,
-    ),
-    noise=Unoise(
-      n_min=tuple(-m for m in BALL_POSITION_NOISE_M),
-      n_max=BALL_POSITION_NOISE_M,
-    ),
-    delay_min_lag=ball_delay_min,
-    delay_max_lag=ball_delay_max,
-    delay_update_period=ball_delay_period,
-    delay_per_env=True,
-    delay_per_env_phase=True,
-  )
+  if ball_history:
+    # Only the actor's ball term changes. The term applies its own per-sample noise
+    # and its own latency, so neither a ``noise`` model nor any ``delay_*`` field may
+    # be set here or the delay and noise would be applied twice.
+    cfg.observations["actor"].terms["ball_hist"] = ObservationTermCfg(
+      func=mdp.ball_history_samples,
+      params=dict(ball_state_params, bias_half_width_m=ball_bias_half_m),
+    )
+  else:
+    cfg.observations["actor"].terms["ball_pos"] = ObservationTermCfg(
+      func=mdp.ball_position_hold,
+      params=dict(
+        ball_state_params,
+        rejection_prob=BALL_DROPOUT_PROB,
+        hold_steps=BALL_DROPOUT_HOLD_STEPS,
+        bias_half_width_m=ball_bias_half_m,
+      ),
+      noise=Unoise(
+        n_min=tuple(-m for m in BALL_POSITION_NOISE_M),
+        n_max=BALL_POSITION_NOISE_M,
+      ),
+      delay_min_lag=ball_delay_min,
+      delay_max_lag=ball_delay_max,
+      delay_update_period=ball_delay_period,
+      delay_per_env=True,
+      delay_per_env_phase=True,
+    )
   # No ball velocity for the actor. Position is the only quantity the perception
   # chain provides on the real robot: the best available velocity is a finite
   # difference of a 10 Hz noisy position, which is unusable. Velocity is therefore
