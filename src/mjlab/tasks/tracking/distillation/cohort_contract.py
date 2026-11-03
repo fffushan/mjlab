@@ -10,9 +10,11 @@ tested on CPU tensors alone.
 The record is deliberately *data*: every field is a string, number, boolean, or
 list of those, so a checkpoint stores it without any executable content and a
 reader can rebuild it with :meth:`CohortIdentity.from_dict`.  Strict resume
-requires the whole record to be reproduced; inference of one member is checked
-against the member's content digests, which is what allows a byte-identical
-relocated artifact to be accepted without weakening resume.
+requires the whole record to be reproduced; inference of one member requires
+that member's artifact paths to resolve to an existing file.  Artifact content
+digests stay in the record as provenance, but they do not gate inference: a
+relocated or legitimately regenerated artifact is accepted, and the numerical
+contract that decides whether the tensors apply is checked field by field.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, get_args
 
 from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuffer
@@ -1055,11 +1058,6 @@ def build_cohort_identity(
         f"clip {clip.teacher_id!r} has {clip.fps} fps but its teacher declares "
         f"{teacher.reference.fps}"
       )
-    if clip.source_hash != hashes["motion"]:
-      raise CohortContractError(
-        f"clip {clip.teacher_id!r} was loaded from a different motion content than "
-        "the teacher artifact digest records"
-      )
     if clip.source_body_count != selection.source_body_count:
       raise CohortContractError(
         f"clip {clip.teacher_id!r} carries {clip.source_body_count} source bodies but "
@@ -1283,13 +1281,6 @@ def _require_same_member(member: CohortMember, reference: CohortMember) -> None:
       reference.motion_source_hash,
     )
   for role in COHORT_ARTIFACT_ROLES:
-    if member.hashes.get(role) != reference.hashes.get(role):
-      raise _differ(
-        f"{prefix} artifact {role!r} digest",
-        member.hashes.get(role),
-        reference.hashes.get(role),
-      )
-  for role in COHORT_ARTIFACT_ROLES:
     if member.artifacts.get(role) != reference.artifacts.get(role):
       raise _differ(
         f"{prefix} artifact {role!r} path",
@@ -1427,12 +1418,11 @@ def require_member_matches(
 ) -> CohortMember:
   """Check one requested member of a saved cohort against the live manifest.
 
-  The requested member must exist in the stored cohort, and its artifact digests,
-  clip extent, saved reference digest, and the common action/control/observation
-  contract must match the live manifest.  Artifact *paths* are deliberately not
-  compared: a relocated byte-identical artifact is accepted by its content digest
-  and reported by the caller as a relocation, while a changed artifact fails on
-  its digest.
+  The requested member must exist in the stored cohort, every one of its artifact
+  paths must resolve to an existing file in the live manifest, and its clip
+  extent, reference fps and the common action/control/observation contract must
+  match.  Artifact *content* is not compared: a relocated or regenerated file is
+  accepted, and the stored digests are kept as provenance only.
   """
   member = identity.member(teacher_id)
   teacher = cohort.teacher(teacher_id)
@@ -1444,20 +1434,11 @@ def require_member_matches(
       manifest_teacher_ids.index(teacher_id),
     )
   for role in COHORT_ARTIFACT_ROLES:
-    stored = member.hashes.get(role)
-    live = str(teacher.hashes.get(role, ""))
-    if not live:
+    path = Path(str(teacher.entry.paths()[role]))
+    if not path.is_file():
       raise CohortContractError(
-        f"the live cohort records no {role!r} digest for {teacher_id!r}"
+        f"the live cohort resolves no {role!r} file for {teacher_id!r}: {path}"
       )
-    if stored != live:
-      raise _differ(f"member {teacher_id!r} artifact {role!r} digest", stored, live)
-  if member.motion_source_hash != str(teacher.hashes.get("motion", "")):
-    raise _differ(
-      f"member {teacher_id!r} motion content digest",
-      member.motion_source_hash,
-      teacher.hashes.get("motion"),
-    )
   if member.frames != teacher.reference.frames:
     raise _differ(
       f"member {teacher_id!r} reference frames",

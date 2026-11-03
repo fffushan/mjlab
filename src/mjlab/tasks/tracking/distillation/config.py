@@ -526,7 +526,8 @@ def resolve_cohort(manifest: Manifest) -> CohortContract:
     DistillationError: if any artifact, dimension, timing, or cross-teacher
       contract check fails.
   """
-  teachers = tuple(_resolve_teacher(entry) for entry in manifest.teachers)
+  cache = _ResolveCache()
+  teachers = tuple(_resolve_teacher(entry, cache) for entry in manifest.teachers)
   first = teachers[0]
 
   for teacher in teachers[1:]:
@@ -561,14 +562,55 @@ def resolve_cohort(manifest: Manifest) -> CohortContract:
   )
 
 
-def _resolve_teacher(entry: TeacherEntry) -> ResolvedTeacher:
+class _ResolveCache:
+  """Per-resolution caches for artifacts that many cohort members share.
+
+  A multi-motion manifest usually points every teacher at one 94 MB PPO
+  checkpoint and one saved env config, so the naive resolution reads and parses
+  the same bytes once per member.  Caching is keyed by resolved path and lives
+  only for one :func:`resolve_cohort` call, so a file changed on disk between
+  resolutions is always reread.
+  """
+
+  def __init__(self) -> None:
+    self._digests: dict[Path, str] = {}
+    self._yaml: dict[Path, Mapping[str, Any]] = {}
+    self._actors: dict[Path, dict[str, torch.Tensor]] = {}
+
+  def digest(self, path: Path) -> str:
+    key = Path(path)
+    value = self._digests.get(key)
+    if value is None:
+      value = sha256_file(key)
+      self._digests[key] = value
+    return value
+
+  def saved_yaml(self, path: Path) -> Mapping[str, Any]:
+    key = Path(path)
+    value = self._yaml.get(key)
+    if value is None:
+      value = load_saved_yaml(key)
+      self._yaml[key] = value
+    return value
+
+  def actor_state(self, path: Path) -> dict[str, torch.Tensor]:
+    key = Path(path)
+    value = self._actors.get(key)
+    if value is None:
+      value = load_actor_state_dict(key)
+      self._actors[key] = value
+    # Hand each teacher its own mapping so no caller can mutate a shared one.
+    return dict(value)
+
+
+def _resolve_teacher(entry: TeacherEntry, cache: _ResolveCache) -> ResolvedTeacher:
   agent_config = _require_mapping(
-    load_saved_yaml(entry.agent_config), f"{entry.id} agent config"
+    cache.saved_yaml(entry.agent_config), f"{entry.id} agent config"
   )
   env_config = _require_mapping(
-    load_saved_yaml(entry.env_config), f"{entry.id} env config"
+    cache.saved_yaml(entry.env_config), f"{entry.id} env config"
   )
-  actor_state_dict = load_actor_state_dict(entry.checkpoint)
+  actor_state_dict = cache.actor_state(entry.checkpoint)
   actor = _resolve_actor(entry, agent_config, actor_state_dict)
   control = _resolve_control(entry, env_config)
   onnx = load_onnx_artifact(entry.onnx, f"{entry.id} ONNX export")
@@ -609,7 +651,7 @@ def _resolve_teacher(entry: TeacherEntry) -> ResolvedTeacher:
 
   return ResolvedTeacher(
     entry=entry,
-    hashes={role: sha256_file(path) for role, path in entry.paths().items()},
+    hashes={role: cache.digest(path) for role, path in entry.paths().items()},
     env_config=env_config,
     agent_config=agent_config,
     actor=actor,
