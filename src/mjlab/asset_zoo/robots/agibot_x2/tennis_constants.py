@@ -1353,6 +1353,20 @@ first passive bounce to lift the ball. The limit is short enough that a policy
 which never lifts the ball does not spend the whole 20 s episode on it.
 """
 
+JUGGLE_NO_BOUNCE_TIMEOUT_S = 2.5
+"""Control time without a racket-ball impact before the juggle episode ends.
+
+The deadline is measured from the last impact, not from reset. 2.5 s is 4.4
+flight times of a 0.40 m bounce, and the window only expires on sustained
+contact: a missed bounce ends the episode through ``ball_dropped`` 0.5 s later,
+so 2.5 s of airborne misses cannot accrue. The timeout is greater than
+:data:`JUGGLE_NO_LIFT_TIMEOUT_S` (1.5 s), so this term cannot pre-empt
+``ball_not_lifted`` on a plate start that is never lifted. The cap is the
+point: in the last ablation the parked arms collected about 4.5 reward per
+second for 19.4 s with 2.5 impacts per episode, and the episode reward is
+divided by the 20 s limit, so duration multiplied their score.
+"""
+
 JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG = 1.0
 """Ball energy that counts as lifted, in J/kg, shared by the termination and metric.
 
@@ -1517,6 +1531,7 @@ __all__ = [
   "JUGGLE_ENERGY_TARGET_HEIGHT_M",
   "JUGGLE_ENERGY_WEIGHT",
   "JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG",
+  "JUGGLE_NO_BOUNCE_TIMEOUT_S",
   "JUGGLE_NO_LIFT_TIMEOUT_S",
   "JUGGLE_PLATE_START_FRACTION",
   "JUGGLE_PLATE_START_LATERAL_RANGE_M",

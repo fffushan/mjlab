@@ -126,13 +126,9 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 
-from mjlab.asset_zoo.robots.agibot_x2.x2_constants import X2_ACTION_SCALE
-from mjlab.envs.mdp.actions import JointPositionActionCfg
-
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_CENTRE_PLATEAU,
   BALL_CENTRE_SIGMA,
-  BALL_POSITION_BIAS_M,
   BALL_DROP_GRACE_S,
   BALL_DROPOUT_HOLD_STEPS,
   BALL_DROPOUT_PROB,
@@ -143,13 +139,14 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_OBS_DELAY_MAX_STEPS,
   BALL_OBS_DELAY_MIN_STEPS,
   BALL_OBS_UPDATE_PERIOD_STEPS,
+  BALL_POSITION_BIAS_M,
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
+  BALL_SPAWN_DROP_HEIGHT,
   BALL_STREAM_LATENCY_RANGE_S,
   BALL_STREAM_RATE_RANGE_HZ,
   BALL_STREAM_STALL_PROB,
   BALL_STREAM_STALL_RANGE_S,
-  BALL_SPAWN_DROP_HEIGHT,
   CAMERA_HALF_ANGLE_X,
   CAMERA_HALF_ANGLE_Y,
   CAMERA_MOUNT_QUAT,
@@ -157,8 +154,6 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   FACE_SITE,
   HEAD_JOINT_NAMES,
   HEAD_MOTION_WEIGHT,
-  JUGGLE_HEAD_PITCH_RANGE_RAD,
-  JUGGLE_HEAD_YAW_RANGE_RAD,
   JUGGLE_ARM_RESET_RANGE_RAD,
   JUGGLE_CENTRE_WEIGHT,
   JUGGLE_COMMAND_ANG_VEL_RPS,
@@ -167,7 +162,10 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_ENERGY_SIGMA_J_PER_KG,
   JUGGLE_ENERGY_TARGET_HEIGHT_M,
   JUGGLE_ENERGY_WEIGHT,
+  JUGGLE_HEAD_PITCH_RANGE_RAD,
+  JUGGLE_HEAD_YAW_RANGE_RAD,
   JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG,
+  JUGGLE_NO_BOUNCE_TIMEOUT_S,
   JUGGLE_NO_LIFT_TIMEOUT_S,
   JUGGLE_RACKET_LIFT_DEADBAND_M,
   JUGGLE_RACKET_LIFT_PLATE_TOP_REST_Z,
@@ -177,8 +175,10 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   get_tennis_ball_cfg,
   get_x2_tennis_robot_cfg,
 )
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import X2_ACTION_SCALE
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
@@ -750,6 +750,21 @@ def agibot_x2_tennis_juggle_env_cfg(
       "timeout_s": JUGGLE_NO_LIFT_TIMEOUT_S,
       "ball_cfg": ball_cfg,
       "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
+    },
+  )
+
+  # Parking the ball on the plate is the failure this term targets. A parked
+  # episode runs to the 20 s cap and the reward is divided by that cap, so
+  # duration multiplies what standing collects. Only a rising-edge impact
+  # restarts the 2.5 s clock; sustained contact does not. The clock runs from
+  # the last impact, and an inert drop start ends through ``ball_dropped`` long
+  # before it. The timeout is longer than ``ball_not_lifted``'s 1.5 s, so the
+  # two cannot race on a plate start that is never lifted.
+  cfg.terminations["ball_no_bounce"] = TerminationTermCfg(
+    func=mdp.ball_no_bounce,
+    params={
+      "sensor_name": BAT_BALL_CONTACT_SENSOR,
+      "timeout_s": JUGGLE_NO_BOUNCE_TIMEOUT_S,
     },
   )
 

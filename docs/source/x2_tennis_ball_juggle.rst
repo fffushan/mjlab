@@ -321,6 +321,46 @@ samples.
 **Not supported by the controller.** The deployed adaptor builds one plate-frame position,
 so this task is training-only until the provider keeps a short history and reports ages.
 
+Terminations
+------------
+
+The base velocity task's fall and timeout terms are unchanged; three ball terms are
+added. ``ball_dropped`` is the carrying task's ground test: the ball centre 20 mm
+below the plate for 0.5 s. ``ball_not_lifted`` ends a plate start that never reached
+1.0 J/kg of lift energy within 1.5 s. ``ball_no_bounce`` ends any episode in which
+the racket has produced no **rising-edge impact** for 2.5 s of control time.
+
+``ball_no_bounce`` targets a measured failure mode. In the last ablation the parked
+arms collected about 4.5 reward per second for 19.4 s with 2.5 impacts per episode,
+while the only bouncing arm survived 6.4 s at 1.3 impacts per second. Episode reward
+is ``sum(raw × weight × dt) / max_episode_length_s``, so duration multiplies
+everything; ending an episode whose last impact is 2.5 s old removes that advantage.
+Only a rising edge restarts the clock: a ball resting on the plate is sustained
+contact, not an impact, so parking stays visible to the term.
+
+The deadline is 2.5 s since the **last impact**, not a fixed time in the episode. A
+carry-up with sustained contact fires at about 2.6-2.8 s, and a toss at 1.4 s followed
+by parking fires at about 4.3-4.5 s, because a release from a resting plate is not a
+rising edge: without an intervening impact the clock keeps running from the pre-release
+contact, so a plate start that lifts at 1.4 s has about 2.2-2.4 s of allowance left. 2.5 s is 4.4 flight times of a 0.40 m bounce, and
+the window only expires on sustained contact: a missed bounce ends the episode through
+``ball_dropped`` 0.5 s later, so 2.5 s of airborne misses cannot accrue. The timeout is
+also longer than ``ball_not_lifted``'s 1.5 s, so a plate start that is never lifted is
+ended by that term first.
+
+A drop start cannot reach this deadline either. Measured on 8 environments with zero
+action and every ball termination removed, a drop start produced 1-4 impacts in
+20 s, its contact fraction decayed to zero, and the ball ended on the floor. The first
+contact arrives 0.2-0.35 s after release, and an inert policy ends through
+``ball_dropped`` about 0.5 s later, long before 2.5 s. Ground bouncing is already
+closed by ``ball_dropped``. A sustained minimum-height dribble that keeps producing
+rising edges remains possible and is deliberately not guarded here.
+
+``Episode_Reward/*`` values and per-episode sums (``ball_impact_count``,
+``ball_flight_time``) are not comparable with runs before this change: the reward
+denominator is the fixed 20 s cap, and both a shortened episode and a shorter
+denominator move those numbers for reasons unrelated to behaviour.
+
 Acceptance metrics
 ------------------
 
@@ -388,14 +428,15 @@ Not implemented
   filter tried for this reward so far has reintroduced a datum that can be farmed.
 * **Real-robot verification.** None. The target, the weights and the camera geometry are
   simulator-level and unverified on hardware.
-* **A validated arm impedance.** The simulated arm returns more impact energy than a passive
-  support can. With no policy action at all the ball rebounds to 1.02-1.05 times its drop
-  height and bounces indefinitely (34 bounces in 18 s, apexes alternating about 0.21 and
-  0.06 m). An operator measurement of the shipped ball and racket gives a hard upper bound of
-  0.767 for a *rigidly supported* racket, so no passive surface can return more, and the
-  position servo is the only remaining energy source. The contact model is not the cause and
-  is left at the reference fit. Consequences: the energy metric alone cannot separate
-  juggling from doing nothing, and a target at or below the drop height is free. The contact
-  metrics are the intended check. This is deliberately deferred, because the arm's impedance
-  has a sim-to-real gap and should be tuned from hardware behaviour rather than fitted in
-  simulation.
+* **A validated arm impedance.** The arm's impedance under impact is not validated: the
+  simulated arm can return more impact energy than a passive support can. Measured on this
+  task's resets with 8 environments, zero action and every ball termination removed, the
+  ball produced 1-4 impacts in 20 s, its contact fraction decayed to zero and it ended on
+  the floor; it did not bounce indefinitely. An operator measurement of the shipped ball and
+  racket gives a hard upper bound of 0.767 for a *rigidly supported* racket, so no passive
+  surface can return more, and the position servo is the only remaining energy source. The
+  contact model is not the cause and is left at the reference fit. Consequences: the energy
+  metric alone cannot separate juggling from doing nothing, and a target at or below the
+  drop height is free. The contact metrics are the intended check. This is deliberately
+  deferred, because the arm's impedance has a sim-to-real gap and should be tuned from
+  hardware behaviour rather than fitted in simulation.

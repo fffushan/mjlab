@@ -4,6 +4,26 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **The tennis juggle tasks now end an episode whose last racket-ball impact is
+  2.5 s old.** ``ball_no_bounce`` counts rising edges of the per-step contact flag and
+  restarts only on a strike; sustained contact does not restart it, so a ball parked on
+  the plate no longer earns to the 20 s cap. In the last ablation the parked arms
+  collected about 4.5 reward per second for 19.4 s with 2.5 impacts per episode, while
+  the only bouncing arm survived 6.4 s at 1.3 per second; episode reward is divided by
+  the 20 s limit, so duration multiplied the parked score. The deadline is 2.5 s since
+  the last impact, not a fixed episode time: a carry-up with sustained contact fires at
+  about 2.6-2.8 s, and a toss at 1.4 s followed by parking at about 4.3-4.5 s. 2.5 s is
+  4.4 flight times of a 0.40 m bounce, and the window only expires on sustained
+  contact: a missed bounce ends the episode through ``ball_dropped`` 0.5 s later, so
+  2.5 s of airborne misses cannot accrue. The timeout is longer than
+  ``ball_not_lifted``'s 1.5 s, so it cannot pre-empt a never-lifted plate start, and an
+  inert drop start ends through ``ball_dropped`` long before it. ``Episode_Reward/*``
+  values and per-episode sums (``ball_impact_count``, ``ball_flight_time``) are not
+  comparable with runs before this change: the reward denominator is the fixed 20 s
+  cap, and both a shortened episode and a shorter denominator move those numbers for
+  reasons unrelated to behaviour. All three juggle tasks (31-DOF, 29-DOF,
+  29-DOF-Ball3) inherit it.
+
 - **The tennis juggling tasks no longer charge for lifting the ball.** ``racket_lift``
   is installed with weight 0, so ``JUGGLE_RACKET_LIFT_WEIGHT = 0.0``. The maximum-slope
   derivation was a correct argument about the reward at one point, but it does not model

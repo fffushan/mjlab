@@ -12,6 +12,11 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
+from mjlab.tasks.velocity.mdp.ball_contact import (
+  history_length_or_raise,
+  step_contact,
+  substep_contact,
+)
 from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.terrain_utils import terrain_normal_from_sensors
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_mul
@@ -1126,22 +1131,6 @@ class ball_at_rest(ManagerTermBase):
 _BALL_CONTACT_MODES = ("impact_count", "flight_time", "sustained_contact")
 
 
-def _ball_contact_substeps(force_history: torch.Tensor) -> torch.Tensor:
-  """Contact flags for every substep in the sensor's force history.
-
-  Args:
-    force_history: ``[B, N, H, 3]`` contact forces, newest substep at index 0.
-
-  Returns:
-    ``[B, H]`` bool, oldest substep first.
-  """
-  force_mag = torch.linalg.vector_norm(force_history, dim=-1)  # [B, N, H]
-  # A non-zero force in any slot is a contact. A zero-force touch has nothing to
-  # see in the force channel and is indistinguishable from no contact here.
-  contact = torch.any(force_mag > 0.0, dim=1)  # [B, H], newest first
-  return contact.flip(-1)
-
-
 def _consecutive_true_runs(
   mask: torch.Tensor, carry: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1242,14 +1231,9 @@ class ball_contact_metric(ManagerTermBase):
     self._step_dt = env.step_dt
     self._substep_dt = env.physics_dt
     sensor: ContactSensor = env.scene[self._sensor_name]
-    decimation = round(self._step_dt / self._substep_dt)
-    history_length = sensor.cfg.history_length
-    if history_length not in (0, decimation):
-      msg = (
-        f"Sensor '{self._sensor_name}' has history_length={history_length}, but "
-        f"ball_contact_metric needs 0 (fallback) or one control step, {decimation}."
-      )
-      raise ValueError(msg)
+    history_length_or_raise(
+      sensor, self._step_dt, self._substep_dt, "ball_contact_metric"
+    )
     self._prev_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     self._air_run = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     self._contact_run = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -1262,19 +1246,16 @@ class ball_contact_metric(ManagerTermBase):
     del sensor_name, mode  # Resolved in ``__init__``.
     sensor: ContactSensor = env.scene[self._sensor_name]
     data = sensor.data
+    contact = step_contact(data)
     if data.force_history is not None:
       # [B, N, H, 3], H = decimation, so the window is this control step.
-      substep_contact = _ball_contact_substeps(data.force_history)
+      substeps = substep_contact(data.force_history)
       substep_dt = self._substep_dt
     else:
-      assert data.found is not None, (
-        "ball_contact_metric needs the sensor's 'force' history or 'found' field"
-      )
       # One sample per control step: the pre-history fallback.
-      substep_contact = torch.any(data.found > 0, dim=-1).unsqueeze(-1)
+      substeps = contact.unsqueeze(-1)
       substep_dt = self._step_dt
 
-    contact = substep_contact.any(dim=-1)
     rising = contact & ~self._prev_contact
     self._prev_contact = contact.clone()
 
@@ -1283,8 +1264,8 @@ class ball_contact_metric(ManagerTermBase):
 
     air_carry = self._air_run
     contact_carry = self._contact_run
-    air_run, air_end = _consecutive_true_runs(~substep_contact, air_carry)
-    contact_run, contact_end = _consecutive_true_runs(substep_contact, contact_carry)
+    air_run, air_end = _consecutive_true_runs(~substeps, air_carry)
+    contact_run, contact_end = _consecutive_true_runs(substeps, contact_carry)
     self._air_run = air_end
     self._contact_run = contact_end
 
@@ -1294,7 +1275,7 @@ class ball_contact_metric(ManagerTermBase):
       air_before = torch.cat([air_carry.unsqueeze(1), air_run[:, :-1]], dim=1)
       # A rising edge closes a flight. At episode start the carry is zero, so a
       # contact on the first sampled substep has no flight before it.
-      rising_substep = substep_contact & (air_before > 0)
+      rising_substep = substeps & (air_before > 0)
       self._flight_sum = self._flight_sum + (
         air_before.float() * substep_dt * rising_substep
       ).sum(dim=-1)

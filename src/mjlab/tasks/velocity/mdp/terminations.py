@@ -9,6 +9,7 @@ from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactSensor
+from mjlab.tasks.velocity.mdp.ball_contact import step_contact
 from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
 
@@ -248,3 +249,111 @@ class ball_not_lifted(ManagerTermBase):
       env_ids = slice(None)
     self._peak_energy[env_ids] = 0.0
     self._steps[env_ids] = 0
+
+
+class ball_no_bounce(ManagerTermBase):
+  """End an episode in which the racket has not struck the ball for a while.
+
+  A parked ball is a measured failure mode: in the last ablation the parked arms
+  collected about 4.5 reward per second for 19.4 s with 2.5 impacts per episode,
+  while the only bouncing arm survived 6.4 s at 1.3 impacts per second. Episode
+  reward is ``sum(raw * weight * dt) / max_episode_length_s``, so duration
+  multiplies everything the policy collects. Ending an episode whose last impact
+  is 2.5 s old caps a permanently parked episode at about 2.5 s after that
+  impact and removes the advantage.
+
+  **Impact is a rising edge.** Contact now with no contact on the previous
+  control step restarts the timer. Sustained contact does not: a ball resting on
+  the plate is sustained contact, and treating it as an impact would make
+  parking invisible to this term. The deadline is therefore measured from the
+  last impact, not from reset: a carry-up with sustained contact fires at about
+  2.6-2.8 s, while a toss at 1.4 s followed by parking fires at about 4.3-4.5 s.
+
+  **Why this cannot pre-empt the other terms.** ``ball_not_lifted`` fires first,
+  at its 1.5 s timeout, for a plate start the policy never lifts, because this
+  term's deadline is longer. A drop start cannot reach this deadline either.
+  Measured on 8 environments with zero action and every ball termination
+  removed, a drop start produced 1-4 impacts in 20 s, its contact fraction
+  decayed to zero, and the ball ended on the floor. The first contact arrives
+  0.2-0.35 s after release, and an inert policy ends through ``ball_dropped``
+  about 0.5 s later, long before 2.5 s.
+
+  **A missed bounce does not accumulate tolerance.** A missed bounce ends the
+  episode through ``ball_dropped`` 0.5 s later, so 2.5 s of airborne misses
+  cannot accrue. 2.5 s is 4.4 flight times of a 0.40 m bounce, and the window
+  only expires on sustained contact.
+
+  **Substep history is required.** The term refuses the instantaneous ``found``
+  fallback. One sample per control step misses about half of the 9-10 ms
+  contacts, so five consecutive misses on a live bounce cycle would falsely end
+  the episode. The sensor must keep one control step of force history
+  (``history_length == decimation``).
+
+  **What it does not close.** Ground bouncing is already closed by
+  ``ball_dropped``: the ball 2 cm below the plate for 0.5 s. A sustained
+  minimum-height dribble that keeps producing rising edges remains possible and
+  is deliberately not guarded here.
+
+  The clock is counted in this term's own control steps
+  (``_steps_since * env.step_dt``) and is zeroed on reset.
+  ``env.episode_length_buf`` is not read: the RL wrapper overwrites it with a
+  random value at the start of every ``learn()`` (``init_at_random_ep_len``), so
+  a term that trusted it would fire on step 1. ``ball_lost`` and
+  ``ball_not_lifted`` in this module count their own steps for the same reason.
+
+  Args:
+    sensor_name: Scene name of the racket-ball
+      :class:`~mjlab.sensor.ContactSensor`.
+    timeout_s: Control time without a rising-edge contact before the episode
+      ends, in seconds.
+
+  Returns:
+    Shape ``(num_envs,)`` bool.
+  """
+
+  def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._sensor_name = str(cfg.params["sensor_name"])
+    self._step_dt = env.step_dt
+    self._substep_dt = env.physics_dt
+    sensor: ContactSensor = env.scene[self._sensor_name]
+    decimation = round(self._step_dt / self._substep_dt)
+    # The metrics may fall back to the instantaneous ``found`` sample; a
+    # termination may not, because a missed impact would extend the deadline
+    # instead of being harmless.
+    if sensor.cfg.history_length != decimation or "force" not in sensor.cfg.fields:
+      msg = (
+        f"Sensor '{sensor.cfg.name}' has history_length="
+        f"{sensor.cfg.history_length} and fields={tuple(sensor.cfg.fields)}, but "
+        f"ball_no_bounce needs one control "
+        f"step, {decimation}, of force history: the instantaneous 'found' "
+        "fallback misses about half of the 9-10 ms contacts, so five "
+        "consecutive misses would falsely terminate a live juggle."
+      )
+      raise ValueError(msg)
+    self._prev_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self._steps_since = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+  def __call__(
+    self, env: ManagerBasedRlEnv, sensor_name: str, timeout_s: float
+  ) -> torch.Tensor:
+    del sensor_name  # Resolved in ``__init__``.
+    sensor: ContactSensor = env.scene[self._sensor_name]
+    contact = step_contact(sensor.data)
+    rising = contact & ~self._prev_contact
+    # Clone: environment buffers are written in place, and an uncloned alias
+    # made a guard fire every step and froze a term in this repo before.
+    self._prev_contact = contact.clone()
+    self._steps_since = torch.where(
+      rising,
+      torch.zeros_like(self._steps_since),
+      self._steps_since + 1,
+    )
+    elapsed = self._steps_since.float() * self._step_dt
+    return elapsed >= timeout_s
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._prev_contact[env_ids] = False
+    self._steps_since[env_ids] = 0
