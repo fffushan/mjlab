@@ -230,8 +230,8 @@ def _ablation_value(name: str, default: float | None = None) -> float | None:
   returns *default*, so the shipped configuration is unchanged and cannot drift
   from the constants in ``tennis_constants``.
 
-  Only the three reward weights and the four ball-perception magnitudes are
-  readable here. Nothing in the observation **layout**, the action, the
+  Only the reward weights, the target apex height and the four ball-perception
+  magnitudes are readable here. Nothing in the observation **layout**, the action, the
   termination or the physics path may be overridden this way: the actor's width and
   every non-perception input have to stay identical across arms or the comparison
   means nothing. A perception magnitude is a distribution parameter, not a layout
@@ -652,6 +652,14 @@ def agibot_x2_tennis_juggle_env_cfg(
   # silently reopens the parking farm it was derived to close.
   energy_override = _ablation_value("ENERGY_WEIGHT")
   energy_weight = JUGGLE_ENERGY_WEIGHT if energy_override is None else energy_override
+  # The target apex is the other half of the same objective, so an arm may move it
+  # too. It changes no layout: every consumer (the reward and both metrics) reads
+  # the one value, so an arm cannot score against one target and be measured
+  # against another.
+  target_override = _ablation_value("ENERGY_TARGET_HEIGHT_M")
+  energy_target_height = (
+    JUGGLE_ENERGY_TARGET_HEIGHT_M if target_override is None else target_override
+  )
   lift_override = _ablation_value("LIFT_WEIGHT")
   lift_weight = (
     JUGGLE_RACKET_LIFT_WEIGHT * energy_weight / JUGGLE_ENERGY_WEIGHT
@@ -662,7 +670,7 @@ def agibot_x2_tennis_juggle_env_cfg(
     func=mdp.ball_energy,
     weight=energy_weight,
     params={
-      "target_height": JUGGLE_ENERGY_TARGET_HEIGHT_M,
+      "target_height": energy_target_height,
       "sigma": JUGGLE_ENERGY_SIGMA_J_PER_KG,
       "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
       **ball_state_params,
@@ -789,7 +797,7 @@ def agibot_x2_tennis_juggle_env_cfg(
   cfg.metrics["ball_energy"] = MetricsTermCfg(
     func=mdp.ball_energy_value,
     params={
-      "target_height": JUGGLE_ENERGY_TARGET_HEIGHT_M,
+      "target_height": energy_target_height,
       "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
       **ball_state_params,
     },
@@ -798,7 +806,7 @@ def agibot_x2_tennis_juggle_env_cfg(
   cfg.metrics["ball_energy_error"] = MetricsTermCfg(
     func=mdp.ball_energy_error,
     params={
-      "target_height": JUGGLE_ENERGY_TARGET_HEIGHT_M,
+      "target_height": energy_target_height,
       "ball_rest_z": JUGGLE_ENERGY_BALL_REST_Z,
       **ball_state_params,
     },

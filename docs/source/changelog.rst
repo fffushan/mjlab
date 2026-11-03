@@ -4,6 +4,14 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **The juggle task's target apex height is now ablatable.** ``MJLAB_JUGGLE_ENERGY_TARGET_HEIGHT_M``
+  overrides ``JUGGLE_ENERGY_TARGET_HEIGHT_M`` (0.40 m) for one arm. The reward and both
+  energy metrics read the same resolved value, so an arm cannot score against one target
+  and be measured against another. Unset leaves the shipped 0.40 m and cannot drift from
+  the constants. A lower target is a much easier objective: at 0.20 m the target energy is
+  1.962 J/kg against 3.924, and the reward at the 0.20 m drop-start release rises from
+  0.18 to 1.0 of the Gaussian maximum, so the arm begins inside the reward's useful range.
+
 - **The tennis juggle tasks now end an episode whose last racket-ball impact is
   2.5 s old.** ``ball_no_bounce`` counts rising edges of the per-step contact flag and
   restarts only on a strike; sustained contact does not restart it, so a ball parked on
