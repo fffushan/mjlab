@@ -487,8 +487,19 @@ centimetre precision that the perception cannot resolve.
 
 The height term exists only to remove one loophole: without it, throwing the ball
 straight up and staying centred would pay as well as holding it still. It is
-deliberately small, and it is flat from the string plane to 100 mm above it, so
-the ball sinking into the compliant bed costs nothing.
+deliberately small, and it is flat from 5 mm below the string plane to 100 mm above
+it, so the ball sinking into the compliant bed costs nothing.
+
+Both plate-frame rewards are **bounded below**, which they were not. ``ball_centred``
+measures horizontal distance only, so it says nothing about a ball that has left the
+plate downward, and ``ball_height`` used to clamp its excursion from above only, so
+every height below the string plane scored 1.0. Together they paid full credit for a
+ball half a metre under the racket: the contract was that such a ball is fatal, and
+that stopped being true when the loss test moved to the ball's absolute height, which
+a ball held above 0.5 m satisfies while hanging under the strings. ``ball_centred`` is
+now zero below ``BALL_SINK_M`` and ``ball_height`` decays on both sides of its flat
+band. Measured at the plate frame: resting, 1 cm above and 3 mm sunk all score
+1.0 / 1.0; 20 mm sunk scores 0.0 / 0.87; 30 cm under scores 0.0 / 0.0.
 
 **Termination.** ``ball_dropped`` ends the episode when the ball's centre is at or
 below 0.5 m above the ground. The test is the ball's **absolute** world height and

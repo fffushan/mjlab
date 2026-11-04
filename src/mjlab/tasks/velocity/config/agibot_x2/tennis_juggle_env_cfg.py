@@ -141,6 +141,8 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_OBS_UPDATE_PERIOD_STEPS,
   BALL_POSITION_BIAS_M,
   BALL_POSITION_NOISE_M,
+  BALL_RADIUS,
+  BALL_SINK_M,
   BALL_SPAWN_DROP_HEIGHT,
   BALL_STREAM_LATENCY_RANGE_S,
   BALL_STREAM_RATE_RANGE_HZ,
@@ -642,6 +644,8 @@ def agibot_x2_tennis_juggle_env_cfg(
     params={
       "plateau": BALL_CENTRE_PLATEAU,
       "sigma": BALL_CENTRE_SIGMA,
+      "ball_radius": BALL_RADIUS,
+      "sink": BALL_SINK_M,
       **ball_state_params,
     },
   )

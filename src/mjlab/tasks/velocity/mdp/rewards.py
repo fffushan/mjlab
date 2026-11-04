@@ -483,6 +483,8 @@ def ball_centred(
   env: ManagerBasedRlEnv,
   plateau: float,
   sigma: float,
+  ball_radius: float,
+  sink: float,
   plate_cfg: SceneEntityCfg,
   ball_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
@@ -497,6 +499,11 @@ def ball_centred(
   Args:
     plateau: Radius inside which the reward is exactly 1, in metres.
     sigma: Falloff distance beyond the plateau, in metres.
+    ball_radius: The ball's radius; the stored height is to its centre.
+    sink: How far below the string plane the ball may be and still count as on the
+      plate, in metres. Below that the reward is zero. The horizontal distance alone
+      cannot separate a ball on the strings from one that has left the plate
+      downward, and paying it there paid full credit for a lost ball.
     plate_cfg: Racket body; the plate frame is defined by it.
     ball_cfg: Ball entity.
 
@@ -506,7 +513,9 @@ def ball_centred(
   position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
   distance = torch.linalg.norm(position[:, :2], dim=1)
   outside = torch.clamp(distance - plateau, min=0.0)
-  return torch.exp(-torch.square(outside / sigma))
+  centred = torch.exp(-torch.square(outside / sigma))
+  height = position[:, 2] - ball_radius
+  return torch.where(height > -sink, centred, torch.zeros_like(centred))
 
 
 def ball_height(
@@ -514,15 +523,22 @@ def ball_height(
   limit: float,
   sigma: float,
   ball_radius: float,
+  sink: float,
   plate_cfg: SceneEntityCfg,
   ball_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
   """Reward the ball being on the strings or up to ``limit`` above them.
 
-  Full credit from the string plane (negative heights included, because a
-  compliant contact lets the ball sink slightly) up to ``limit``, then a Gaussian
-  falloff with ``sigma``. A ball below the plate is not this term's business: it
-  is a termination, see ``ball_below_plate``.
+  Full credit from ``sink`` below the string plane (a compliant contact lets the
+  ball penetrate slightly) up to ``limit``, then a Gaussian falloff with ``sigma``
+  on either side. A ball further below the strings than ``sink`` is gone, so it
+  decays instead of collecting the clamp's free maximum.
+
+  The clamp used to be one-sided, `max(0, height - limit)`, which paid 1.0 for
+  every height below ``limit`` including half a metre under the racket. The
+  below-plate case was left to a termination, and that termination is now the
+  ball's absolute height, which a ball held above 0.5 m can satisfy while hanging
+  under the strings.
 
   Without this term "throw the ball straight up and keep it centred" would pay as
   well as holding it still.
@@ -530,7 +546,8 @@ def ball_height(
   position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
   height = position[:, 2] - ball_radius
   above = torch.clamp(height - limit, min=0.0)
-  return torch.exp(-torch.square(above / sigma))
+  below = torch.clamp(-sink - height, min=0.0)
+  return torch.exp(-torch.square((above + below) / sigma))
 
 
 def ball_in_camera_fov(

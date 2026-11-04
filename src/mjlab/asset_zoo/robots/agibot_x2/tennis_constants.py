@@ -675,10 +675,22 @@ BALL_CENTRE_SIGMA = 0.040
 
 # Height band. The ball is wanted on or just above the strings and not thrown up:
 # anything from the string plane to 10 cm above it earns full credit, and a ball
-# higher than that decays with the same sigma as the centring term. A ball below
-# the plate is not penalised but **fatal**, see ``BALL_LOST_MIN_WORLD_Z_M``.
+# higher than that decays with the same sigma as the centring term. A ball that sinks
+# more than ``BALL_SINK_M`` below the string plane decays the same way: it is gone, not
+# resting (see ``BALL_SINK_M`` and ``BALL_LOST_MIN_WORLD_Z_M``).
 BALL_HEIGHT_LIMIT = 0.10
 BALL_HEIGHT_SIGMA = 0.040
+
+# How far the ball may sink below the string plane and still count as on the plate.
+#
+# A compliant contact lets the ball penetrate a fraction of a millimetre, so a hard
+# zero would make a carried ball pay less than 1. Without a floor at all, both
+# plate-frame rewards paid full credit for a ball that had left the plate downward:
+# ``ball_centred`` measures its horizontal distance only, and ``ball_height`` clamps
+# its excursion from above, so a ball half a metre under the strings scored 1.0 on
+# both. 5 mm separates "resting, slightly sunk" from "gone", and it is below the
+# smallest height a real bounce reaches in one control step.
+BALL_SINK_M = 0.005
 
 # The ball's centre at or below this height above the ground counts as lost.
 #

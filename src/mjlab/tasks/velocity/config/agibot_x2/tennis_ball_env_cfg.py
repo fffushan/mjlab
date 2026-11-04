@@ -77,6 +77,7 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_OBS_UPDATE_PERIOD_STEPS,
   BALL_POSITION_NOISE_M,
   BALL_RADIUS,
+  BALL_SINK_M,
   CAMERA_HALF_ANGLE_X,
   CAMERA_HALF_ANGLE_Y,
   CAMERA_MOUNT_QUAT,
@@ -366,6 +367,8 @@ def agibot_x2_tennis_ball_env_cfg(
     params={
       "plateau": BALL_CENTRE_PLATEAU,
       "sigma": BALL_CENTRE_SIGMA,
+      "ball_radius": BALL_RADIUS,
+      "sink": BALL_SINK_M,
       **ball_state_params,
     },
   )
@@ -376,6 +379,7 @@ def agibot_x2_tennis_ball_env_cfg(
       "limit": BALL_HEIGHT_LIMIT,
       "sigma": BALL_HEIGHT_SIGMA,
       "ball_radius": BALL_RADIUS,
+      "sink": BALL_SINK_M,
       **ball_state_params,
     },
   )

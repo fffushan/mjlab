@@ -10,7 +10,6 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactSensor
 from mjlab.tasks.velocity.mdp.ball_contact import step_contact
-from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
 
 if TYPE_CHECKING:
@@ -160,36 +159,6 @@ class ball_lost(ManagerTermBase):
     if env_ids is None:
       env_ids = slice(None)
     self._lost_steps[env_ids] = 0
-
-
-def ball_below_plate(
-  env: ManagerBasedRlEnv,
-  threshold: float,
-  ball_radius: float,
-  plate_cfg: SceneEntityCfg,
-  ball_cfg: SceneEntityCfg,
-) -> torch.Tensor:
-  """End the episode when the ball has dropped below the plate.
-
-  Args:
-    threshold: Height above the plate's top surface below which the episode
-      ends, in metres. Negative, so the small penetration a compliant contact
-      allows does not fire it. A ball rolling off the edge reaches -20 mm about
-      65 ms after leaving the plate.
-    ball_radius: The ball's radius; the stored height is to its centre.
-    plate_cfg: Racket body; the plate frame is defined by it.
-    ball_cfg: Ball entity.
-
-  Returns:
-    Boolean tensor of shape ``(num_envs,)``.
-  """
-  position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
-  height = position[:, 2] - ball_radius
-  below = height < threshold
-  # Don't fire on the first steps after a reset, when the ball's state may still
-  # be the one the resetter wrote rather than a stepped one.
-  below &= env.episode_length_buf > 2
-  return below
 
 
 class ball_not_lifted(ManagerTermBase):

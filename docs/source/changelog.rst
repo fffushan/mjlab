@@ -4,6 +4,19 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **The two plate-frame rewards are now bounded below.** ``ball_centred`` measures the
+  ball's horizontal distance from the plate centre and ``ball_height`` clamped its
+  height excursion from above only, so a ball that had left the plate downward scored
+  1.0 on both. The pair was safe while "below the plate" was fatal, and that stopped
+  being true when ``ball_dropped`` moved to the ball's absolute height: a ball hanging
+  half a metre under the strings, kept above 0.5 m world, paid full credit and never
+  ended the episode. ``ball_centred`` is now zero when the ball is more than
+  ``BALL_SINK_M`` (5 mm) below the string plane, and ``ball_height`` decays on both
+  sides of its flat band. Measured at the plate frame: resting on the strings, 1 cm
+  above, and 3 mm sunk all score 1.0 / 1.0; 20 mm sunk scores 0.0 / 0.87; 30 cm under
+  scores 0.0 / 0.0. ``ball_below_plate``, the dead plate-frame termination that would
+  have restored the old contract, is deleted.
+
 - **``ball_dropped`` now tests the ball's absolute height, not its height above the
   plate.** The old test measured the ball in the plate frame, so "below the plate"
   rotated with the racket. A policy could hold the racket near vertical, leave the
