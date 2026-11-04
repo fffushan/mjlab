@@ -43,7 +43,7 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_DROP_GRACE_S,
   BALL_DROPOUT_HOLD_STEPS,
   BALL_DROPOUT_PROB,
-  BALL_FALL_THRESHOLD,
+  BALL_LOST_MIN_WORLD_Z_M,
   BALL_MASS,
   BALL_OBS_DELAY_MAX_STEPS,
   BALL_OBS_DELAY_MIN_STEPS,
@@ -1403,26 +1403,36 @@ def test_the_height_reward_is_full_on_the_strings_and_decays_above() -> None:
 
 @pytest.mark.slow
 def test_losing_the_ball_ends_the_episode_and_a_bounce_does_not() -> None:
+  """The loss test is the ball's absolute height, not its height above the plate.
+
+  It must not depend on the racket at all: the failure this guards against is a
+  policy that tilts the racket near vertical and leaves the ball on the floor,
+  which defeats any plate-frame test because "below the plate" rotates with it.
+  """
   # Four steps: the drop term deliberately ignores the first three after a reset,
   # so that a stale ball state cannot end a fresh episode.
   env = _build_env(steps=4)
   try:
     term = _ball_term(env, "termination", "ball_dropped")
-    # A ball on the strings, and one thrown a hand's width up, are both fine.
-    for dz in (BALL_RADIUS, BALL_RADIUS + 0.15):
-      _place_ball(env, (0.0, 0.0, dz))
-      assert not bool(term.func(env, **term.params)[0]), dz
-    # A ball below the plate is fatal once the grace has elapsed.
-    term.func.reset(env_ids=slice(None))
-    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.05))
+    floor_z = float(term.params["min_world_z"])
     grace = int(term.params["grace_steps"])
+
+    # Carried at the plate, and thrown a hand's width up: both are fine.
+    for z in (floor_z + 0.40, floor_z + 0.60):
+      _place_ball_world(env, (0.30, 0.0, z))
+      assert not bool(term.func(env, **term.params)[0]), z
+
+    # On the floor, whatever the racket does, is fatal once the grace elapses.
+    term.func.reset(env_ids=slice(None))
+    _place_ball_world(env, (0.30, 0.0, BALL_RADIUS))
     for _ in range(grace):
       fired = bool(term.func(env, **term.params)[0])
     assert fired
-    # Just above the threshold it must not fire at all: a sinking contact is not
-    # a drop, however long it lasts.
+
+    # Just above the floor threshold it must not fire at all, however long it
+    # hovers there: only a ball that is actually down counts as lost.
     term.func.reset(env_ids=slice(None))
-    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.010))
+    _place_ball_world(env, (0.30, 0.0, floor_z + 0.01))
     for _ in range(grace + 5):
       assert not bool(term.func(env, **term.params)[0])
   finally:
@@ -1513,7 +1523,7 @@ def test_the_drop_termination_is_a_grace_not_a_weaker_threshold() -> None:
   cfg = load_env_cfg(TASK_ID)
   term = cfg.terminations["ball_dropped"]
   assert term.func is mdp.ball_lost
-  assert term.params["threshold"] == BALL_FALL_THRESHOLD
+  assert term.params["min_world_z"] == BALL_LOST_MIN_WORLD_Z_M
   assert term.params["grace_steps"] == round(
     BALL_DROP_GRACE_S / (cfg.sim.mujoco.timestep * cfg.decimation)
   )
@@ -1529,16 +1539,17 @@ def test_a_lost_ball_ends_the_episode_only_after_the_grace() -> None:
     grace = int(term.params["grace_steps"])
     term.func.reset(env_ids=slice(None))
 
-    # Ball well below the plate: the first grace-1 steps must not fire.
-    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.05))
+    floor_z = float(term.params["min_world_z"])
+    # Ball on the floor: the first grace-1 steps must not fire.
+    _place_ball_world(env, (0.30, 0.0, BALL_RADIUS))
     for step in range(grace - 1):
       assert not bool(term.func(env, **term.params)[0]), step
     assert bool(term.func(env, **term.params)[0]), "must fire when the grace runs out"
 
-    # Back above the plate: the count restarts, so it does not fire.
-    _place_ball(env, (0.0, 0.0, BALL_RADIUS))
+    # Back up in play: the count restarts, so it does not fire.
+    _place_ball_world(env, (0.30, 0.0, floor_z + 0.40))
     assert not bool(term.func(env, **term.params)[0])
-    _place_ball(env, (0.0, 0.0, BALL_RADIUS - 0.05))
+    _place_ball_world(env, (0.30, 0.0, BALL_RADIUS))
     assert not bool(term.func(env, **term.params)[0]), "count must have restarted"
 
     # A reset clears it too.

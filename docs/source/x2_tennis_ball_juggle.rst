@@ -325,8 +325,9 @@ Terminations
 ------------
 
 The base velocity task's fall and timeout terms are unchanged; three ball terms are
-added. ``ball_dropped`` is the carrying task's ground test: the ball centre 20 mm
-below the plate for 0.5 s. ``ball_not_lifted`` ends a plate start that never reached
+added. ``ball_dropped`` is the carrying task's ground test: the ball centre at or below
+0.5 m above the ground for 0.5 s, measured in the world frame so tilting the racket
+cannot satisfy it. ``ball_not_lifted`` ends a plate start that never reached
 1.0 J/kg of lift energy within 1.5 s. ``ball_no_bounce`` ends any episode in which
 the racket has produced no **rising-edge impact** for 2.5 s of control time.
 

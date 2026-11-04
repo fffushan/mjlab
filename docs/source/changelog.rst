@@ -4,6 +4,22 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **``ball_dropped`` now tests the ball's absolute height, not its height above the
+  plate.** The old test measured the ball in the plate frame, so "below the plate"
+  rotated with the racket. A policy could hold the racket near vertical, leave the
+  ball on the floor, and keep the ball on the positive side of that plane: the height
+  never fell below the threshold and the episode ran to the 20 s limit with no ball at
+  all. The 30 k Ball3 baseline shows it, with 3.6 racket contacts across a 19.2 s
+  episode and 94 % of episodes ending by truncation instead of by losing the ball. The
+  term now ends the episode when the ball centre stays at or below
+  ``BALL_LOST_MIN_WORLD_Z_M`` = 0.5 m above the ground for 0.5 s. That number cannot be
+  changed by any pose of the robot, so the only way to stay above it is to keep the
+  ball up. A carried ball sits at about 1.15 m and a ball on the floor at 0.03 m, so
+  the margin is 0.65 m. The plate is no longer an argument of the term, and the
+  ``BALL_FALL_THRESHOLD`` constant is replaced by ``BALL_LOST_MIN_WORLD_Z_M``.
+  Episodes in the carry and juggle tasks are not comparable with runs before this
+  change: long episodes that ended by truncation may have had the ball on the floor.
+
 - **The juggle task's target apex height is now ablatable.** ``MJLAB_JUGGLE_ENERGY_TARGET_HEIGHT_M``
   overrides ``JUGGLE_ENERGY_TARGET_HEIGHT_M`` (0.40 m) for one arm. The reward and both
   energy metrics read the same resolved value, so an arm cannot score against one target

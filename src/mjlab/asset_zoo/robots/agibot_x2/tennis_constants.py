@@ -676,14 +676,24 @@ BALL_CENTRE_SIGMA = 0.040
 # Height band. The ball is wanted on or just above the strings and not thrown up:
 # anything from the string plane to 10 cm above it earns full credit, and a ball
 # higher than that decays with the same sigma as the centring term. A ball below
-# the plate is not penalised but **fatal**, see ``BALL_FALL_THRESHOLD``.
+# the plate is not penalised but **fatal**, see ``BALL_LOST_MIN_WORLD_Z_M``.
 BALL_HEIGHT_LIMIT = 0.10
 BALL_HEIGHT_SIGMA = 0.040
 
-# The ball's centre below this height above the plate surface counts as lost.
-# Negative, so the small penetration a compliant contact allows does not fire it;
-# a ball that rolls off the edge reaches it about 65 ms after leaving the plate.
-BALL_FALL_THRESHOLD = -0.020
+# The ball's centre at or below this height above the ground counts as lost.
+#
+# Absolute, in the world frame, and the plate is not consulted. A plate-frame test is
+# defeated by the policy: "below the plate" rotates with the racket, so tilting the
+# racket to near vertical and dropping the ball on the floor keeps the ball on the
+# positive side of that plane and the episode runs to the 20 s limit with no ball at
+# all. The 30 k Ball3 baseline shows it: 3.6 racket contacts in a 19.2 s episode, and
+# 94 % of its episodes ended by truncation instead of by losing the ball.
+#
+# 0.5 m leaves room for a strike from below the plate, which is carried at about
+# BAT_CARRY_BASE_HEIGHT = 0.67 m, while a ball on the floor rests BALL_RADIUS = 32.7 mm
+# above the ground. No pose of the robot changes this number, so the only way to stay
+# above it is to keep the ball up.
+BALL_LOST_MIN_WORLD_Z_M = 0.5
 
 # How long the ball may stay lost before the episode actually ends.
 #

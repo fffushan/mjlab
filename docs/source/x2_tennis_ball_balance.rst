@@ -361,10 +361,10 @@ stage is written directly and the ramp is not registered, because an evaluation
 should not start at a crawl.
 
 **Losing the ball does not end the episode immediately.** The ball counts as lost
-at the same height as before — 20 mm below the plate — but the episode only ends
-once it has stayed lost for 25 control steps (0.5 s). The counter is consecutive
+when its centre is at or below **0.5 m above the ground**, and the episode only ends
+once it has stayed there for 25 control steps (0.5 s). The counter is consecutive
 and per-environment, is zeroed on every reset, and restarts if the ball comes back
-above the plate, so a recovering policy can continue. This is patience, not a
+up, so a recovering policy can continue. This is patience, not a
 relaxed threshold: an untrained policy loses the ball in about 0.55 s, and without
 the grace every episode would end there.
 
@@ -490,12 +490,14 @@ straight up and staying centred would pay as well as holding it still. It is
 deliberately small, and it is flat from the string plane to 100 mm above it, so
 the ball sinking into the compliant bed costs nothing.
 
-**Termination.** ``ball_dropped`` ends the episode when the ball's centre is more
-than 20 mm below the plate's top surface. The threshold is negative so the
-fraction of a millimetre a compliant contact allows does not fire it; a ball that
-rolls off the edge reaches it about 65 ms after leaving the bed. The term ignores
-the first three steps after a reset, so a stale ball state cannot end a fresh
-episode.
+**Termination.** ``ball_dropped`` ends the episode when the ball's centre is at or
+below 0.5 m above the ground. The test is the ball's **absolute** world height and
+does not involve the plate: a plate-frame test is defeated by tilting the racket,
+because "below the plate" rotates with it, and a ball left on the floor beside a
+near-vertical racket stays on the positive side of that plane forever. A carried
+ball sits at about 1.15 m, so the margin is 0.65 m; a ball on the floor rests at
+0.03 m. The term requires 0.5 s below the threshold, so a ball that dips under it
+during a strike is not lost.
 
 **A new experiment name.** The observation width changed, so the observation
 normalizer has a different width and runs made before the ball was observed cannot

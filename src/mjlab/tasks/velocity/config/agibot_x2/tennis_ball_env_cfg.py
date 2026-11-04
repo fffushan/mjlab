@@ -65,13 +65,13 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_DROP_GRACE_S,
   BALL_DROPOUT_HOLD_STEPS,
   BALL_DROPOUT_PROB,
-  BALL_FALL_THRESHOLD,
   BALL_FOV_PLATEAU,
   BALL_FOV_SIGMA,
   BALL_FOV_WEIGHT,
   BALL_HEIGHT_LIMIT,
   BALL_HEIGHT_SIGMA,
   BALL_HEIGHT_WEIGHT,
+  BALL_LOST_MIN_WORLD_Z_M,
   BALL_OBS_DELAY_MAX_STEPS,
   BALL_OBS_DELAY_MIN_STEPS,
   BALL_OBS_UPDATE_PERIOD_STEPS,
@@ -415,10 +415,9 @@ def agibot_x2_tennis_ball_env_cfg(
   cfg.terminations["ball_dropped"] = TerminationTermCfg(
     func=mdp.ball_lost,
     params={
-      "threshold": BALL_FALL_THRESHOLD,
-      "ball_radius": BALL_RADIUS,
+      "min_world_z": BALL_LOST_MIN_WORLD_Z_M,
       "grace_steps": grace_steps,
-      **ball_state_params,
+      "ball_cfg": ball_cfg,
     },
   )
 

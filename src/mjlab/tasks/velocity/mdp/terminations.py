@@ -108,26 +108,32 @@ def terrain_edge_reached(
 
 
 class ball_lost(ManagerTermBase):
-  """End the episode when the ball has stayed below the plate for a while.
+  """End the episode when the ball has stayed below a fixed height above the ground.
 
-  A stateless "ball is below the plate" check would end an untrained policy's
-  episode within 20 control steps, because that is how long an uncontrolled ball
-  takes to roll off. This term instead counts **consecutive** steps with the ball
-  below the threshold and fires only once the count reaches ``grace_steps``, so the
-  policy gets time to react to a ball that has left the plate.
+  The test is the ball's **absolute** world height. It does not involve the plate.
 
-  The count is per environment and is zeroed on every reset, so a stale ball state
-  cannot end a fresh episode, and a ball that comes back above the threshold
-  restarts the count.
+  **Why not the plate frame.** A plate-frame test is defeated by the policy, because
+  "below the plate" rotates with the racket. Holding the racket near vertical and
+  dropping the ball on the floor keeps the ball on the positive side of that plane,
+  so the height never falls below the threshold and the episode runs to the time
+  limit with no ball at all. The 30 k Ball3 baseline shows the failure: 3.6 racket
+  contacts across a 19.2 s episode, and 94 % of its episodes ended by truncation
+  rather than by losing the ball.
+
+  **Why absolute.** No pose of the robot changes the number, so the test cannot be
+  satisfied by a gesture. The only way to stay above ``min_world_z`` is to keep the
+  ball up. A plane test is also defeated by its own extent: it asks whether the ball
+  is above an infinite plane, not above the plate.
+
+  The grace count is unchanged: ``grace_steps`` consecutive control steps below the
+  threshold are required, so a ball that briefly passes below the height during a
+  strike does not end the episode, and a ball that comes back up restarts the count.
 
   Args:
-    threshold: Height above the plate's top surface below which the ball counts as
-      lost, in metres. Negative, so the fraction of a millimetre a compliant
-      contact allows does not start the count.
-    ball_radius: The ball's radius; the stored height is to its centre.
-    grace_steps: Consecutive control steps the ball may stay lost. ``0`` fires on
-      the first lost step.
-    plate_cfg: Racket body; the plate frame is defined by it.
+    min_world_z: Ball-centre height above the ground, in metres, at or below which
+      the ball counts as lost.
+    grace_steps: Consecutive control steps the ball may stay lost. ``0`` fires on the
+      first lost step.
     ball_cfg: Ball entity.
   """
 
@@ -138,15 +144,13 @@ class ball_lost(ManagerTermBase):
   def __call__(
     self,
     env: ManagerBasedRlEnv,
-    threshold: float,
-    ball_radius: float,
+    min_world_z: float,
     grace_steps: int,
-    plate_cfg: SceneEntityCfg,
     ball_cfg: SceneEntityCfg,
   ) -> torch.Tensor:
-    position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
-    height = position[:, 2] - ball_radius
-    lost = height < threshold
+    ball: Entity = env.scene[ball_cfg.name]
+    # The ball's root is its only body, so this is the ball centre's world height.
+    lost = ball.data.root_link_pos_w[:, 2] <= min_world_z
     self._lost_steps = torch.where(
       lost, self._lost_steps + 1, torch.zeros_like(self._lost_steps)
     )
