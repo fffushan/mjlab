@@ -221,6 +221,13 @@ They use separate log directories so checkpoints cannot overwrite one another.
 
 ### Ablation 2 — correlated DR
 
+**Task removed.** The task registration
+``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR`` was deleted
+in the task clean-up. The configuration factory
+``agibot_x2_flat_tracking_correlated_dr_env_cfg`` remains, because Ablation 3 and
+the distillation base task build on it. The text below records the measurement;
+it is not a runnable task any more.
+
 ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR`` changes
 only these enabled-axis knobs:
 
@@ -273,6 +280,12 @@ Its PPO runs are written below
 
 ### Standing-start initialization (Ablation 3 fork)
 
+**Task removed.** The task registration
+``...-Correlated-DR-Reduced-Perturbations-Standing-Start`` was deleted in the
+task clean-up. The factory ``agibot_x2_flat_tracking_standing_start_env_cfg``
+remains, because the single-motion teacher task builds on it. The text below
+records the design and the measurement.
+
 ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Standing-Start``
 is Ablation 3 plus one initialization change: with probability 0.3, an episode
 whose sampled start frame lies in the motion's first 25 frames (capped at bin
@@ -295,6 +308,12 @@ PPO runs are written below
 ``logs/rsl_rl/agibot_x2_tracking_correlated_dr_reduced_perturbations_standing_start``.
 
 ### Additive observation ablations from the reduced-perturbation baseline
+
+**Removed.** All three tasks of this family
+(``...-Projected-Gravity``, ``...-Projected-Gravity-And-Anchor`` and
+``...-Vendor-Velocity-Scaling``) and their factory
+``agibot_x2_flat_tracking_observation_ablation_env_cfg`` were deleted in the task
+clean-up. The text below records the measurement only.
 
 The selected ABLATION3 baseline is
 ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations``.
@@ -393,6 +412,11 @@ pre-existing push, torso-COM, encoder-bias, and foot-friction terms enabled.
 
 ### Anchor ablation — pelvis anchor
 
+**Task removed.** ``...-Reduced-Perturbations-Pelvis-Anchor`` was deleted in the
+task clean-up. The ``anchor_body_name`` argument of
+``agibot_x2_flat_tracking_env_cfg`` remains available. The text below records the
+measurement only.
+
 ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Pelvis-Anchor``
 is the reduced-perturbation baseline with ``commands.motion.anchor-body-name``
 changed from ``torso_link`` to ``pelvis``. Nothing else changes: same robot,
@@ -468,6 +492,11 @@ ablations above, the reward terms that the anchor weights most heavily
 track hardware survival.
 
 ### Torso IMU — pelvis gyro vs torso gyro
+
+**Task removed.** ``...-Reduced-Perturbations-Torso-IMU`` was deleted in the task
+clean-up, together with the ``imu_source`` argument of the X2 tracking factories
+and the task-local ``imu_1`` sensors. The text below records the measurement
+only.
 
 ``Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-Reduced-Perturbations-Torso-IMU``
 is the reduced-perturbation baseline with the anchor still on ``torso_link`` but
@@ -593,6 +622,13 @@ checkpoints rather than merely making them stale.
 
 
 ## X2 velocity task — torso IMU and critic-frame ablations
+
+**Removed.** All four tasks of this grid
+(``...-Torso-IMU-Critic-Pelvis-Root``, ``...-Critic-Pelvis-Upvector``,
+``...-Critic-Torso-Root`` and ``...-Critic-Torso-Upvector``) were deleted in the
+task clean-up, together with the ``imu_source``, ``critic_imu_source`` and
+``critic_gravity_source`` arguments and the task-local ``imu_1`` sensors. The
+text below records the measurement only.
 
 The shipped X2 velocity task
 (``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation``) has no anchor: it is a

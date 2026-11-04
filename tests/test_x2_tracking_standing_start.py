@@ -28,10 +28,6 @@ from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
 from mjlab.utils.lab_api.math import quat_apply_inverse
 
-TASK = (
-  "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-  "Reduced-Perturbations-Standing-Start"
-)
 REDUCED_TASK = (
   "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
   "Reduced-Perturbations"
@@ -39,7 +35,8 @@ REDUCED_TASK = (
 # Any real tennis motion: 359 frames @ 50 fps, bin 0 = frames 0-44 > 25.
 MOTION_FILE = Path("data/tennis/single_093_zhanghongyu_agibot_x2_tracking.npz")
 INCREATED_TASK = (
-  "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations"
+  "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations-"
+  "Vendor-Gains"
 )
 
 
@@ -73,7 +70,7 @@ def test_increated_task_uses_g1_motion_perturbation_magnitudes() -> None:
 def test_increated_task_is_registered_and_play_keeps_rsi_disabled() -> None:
   assert INCREATED_TASK in list_tasks()
   assert load_rl_cfg(INCREATED_TASK).experiment_name == (
-    "agibot_x2_tracking_increated_perturbations"
+    "agibot_x2_tracking_increated_perturbations_vendor_gains"
   )
 
   play = load_env_cfg(INCREATED_TASK, play=True)
@@ -82,14 +79,6 @@ def test_increated_task_is_registered_and_play_keeps_rsi_disabled() -> None:
   assert play_motion.velocity_range == {}
   assert play_motion.sampling_mode == "start"
   assert play_motion.standing_start_prob == 0.0
-
-
-def test_task_is_registered_with_isolated_experiment_directory() -> None:
-  assert TASK in list_tasks()
-  assert (
-    load_rl_cfg(TASK).experiment_name
-    == "agibot_x2_tracking_correlated_dr_reduced_perturbations_standing_start"
-  )
 
 
 def test_factory_forks_reduced_perturbations_plus_standing_start() -> None:
@@ -118,7 +107,6 @@ def test_play_configuration_never_inserts() -> None:
   play = agibot_x2_flat_tracking_standing_start_env_cfg(play=True)
   assert motion_cfg(play).standing_start_prob == 0.0
   assert motion_cfg(play).sampling_mode == "start"
-  assert motion_cfg(load_env_cfg(TASK, play=True)).standing_start_prob == 0.0
 
 
 ##

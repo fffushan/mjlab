@@ -27,12 +27,8 @@ def motion_cfg(cfg) -> MotionCommandCfg:
   return motion
 
 
-def test_registered_tasks_have_isolated_experiment_directories() -> None:
-  assert CORRELATED_TASK in list_tasks()
+def test_registered_task_has_isolated_experiment_directory() -> None:
   assert REDUCED_TASK in list_tasks()
-  assert (
-    load_rl_cfg(CORRELATED_TASK).experiment_name == "agibot_x2_tracking_correlated_dr"
-  )
   assert (
     load_rl_cfg(REDUCED_TASK).experiment_name
     == "agibot_x2_tracking_correlated_dr_reduced_perturbations"
@@ -138,10 +134,7 @@ def test_axis_selection_never_recreates_disabled_correlated_terms(
 
 
 def test_play_preserves_standard_overrides_and_reduced_joint_reset_range() -> None:
-  for task_id, expected_joint_range in (
-    (CORRELATED_TASK, (-0.1, 0.1)),
-    (REDUCED_TASK, (-0.05, 0.05)),
-  ):
+  for task_id, expected_joint_range in ((REDUCED_TASK, (-0.05, 0.05)),):
     cfg = load_env_cfg(task_id, play=True)
     motion = motion_cfg(cfg)
 

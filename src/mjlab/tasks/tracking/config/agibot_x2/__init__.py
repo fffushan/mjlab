@@ -7,11 +7,7 @@ from mjlab.tasks.tracking.rl import (
 from .env_cfgs import (
   agibot_x2_flat_tracking_correlated_dr_env_cfg,
   agibot_x2_flat_tracking_env_cfg,
-  agibot_x2_flat_tracking_increated_perturbations_env_cfg,
   agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg,
-  agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg,
-  agibot_x2_flat_tracking_observation_ablation_env_cfg,
-  agibot_x2_flat_tracking_standing_start_env_cfg,
   agibot_x2_multi_motion_tracking_env_cfg,
 )
 from .rl_cfg import (
@@ -35,16 +31,9 @@ register_mjlab_task(
   runner_cls=MotionTrackingOnPolicyRunner,
 )
 
-register_mjlab_task(
-  task_id="Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR",
-  env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(),
-  play_env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(play=True),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name="agibot_x2_tracking_correlated_dr"
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
+# The tracking task the distillation and closed-loop teacher pipeline uses as its
+# ``base_task``: correlated domain randomization with the perturbation and reset
+# ranges halved. See docs/source/x2_tennis_distillation.rst.
 register_mjlab_task(
   task_id=(
     "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
@@ -59,32 +48,11 @@ register_mjlab_task(
   ),
   runner_cls=MotionTrackingOnPolicyRunner,
 )
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-    "Reduced-Perturbations-Standing-Start"
-  ),
-  env_cfg=agibot_x2_flat_tracking_standing_start_env_cfg(),
-  play_env_cfg=agibot_x2_flat_tracking_standing_start_env_cfg(play=True),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name=(
-      "agibot_x2_tracking_correlated_dr_reduced_perturbations_standing_start"
-    )
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
 
-
-register_mjlab_task(
-  task_id=("Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations"),
-  env_cfg=agibot_x2_flat_tracking_increated_perturbations_env_cfg(),
-  play_env_cfg=agibot_x2_flat_tracking_increated_perturbations_env_cfg(play=True),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name="agibot_x2_tracking_increated_perturbations"
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
+# The single-motion teacher behind the multi-motion task: increased
+# perturbations with the vendor reference-policy PD gains. The multi-motion
+# configuration is built on this one, so the two share a robot, action scale,
+# observation set and domain randomization by construction.
 register_mjlab_task(
   task_id=(
     "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations-"
@@ -96,114 +64,6 @@ register_mjlab_task(
   ),
   rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
     experiment_name="agibot_x2_tracking_increated_perturbations_vendor_gains"
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations-"
-    "Vendor-Gains-No-PD-Gain-DR"
-  ),
-  env_cfg=agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg(),
-  play_env_cfg=agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg(
-    play=True
-  ),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name=(
-      "agibot_x2_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr"
-    )
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-    "Reduced-Perturbations-Projected-Gravity"
-  ),
-  env_cfg=agibot_x2_flat_tracking_observation_ablation_env_cfg("projected_gravity"),
-  play_env_cfg=agibot_x2_flat_tracking_observation_ablation_env_cfg(
-    "projected_gravity", play=True
-  ),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name=(
-      "agibot_x2_tracking_correlated_dr_reduced_perturbations_projected_gravity"
-    )
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-    "Reduced-Perturbations-Projected-Gravity-And-Anchor"
-  ),
-  env_cfg=agibot_x2_flat_tracking_observation_ablation_env_cfg(
-    "projected_gravity_anchor"
-  ),
-  play_env_cfg=agibot_x2_flat_tracking_observation_ablation_env_cfg(
-    "projected_gravity_anchor", play=True
-  ),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name=(
-      "agibot_x2_tracking_correlated_dr_reduced_perturbations_projected_gravity_anchor"
-    )
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-    "Reduced-Perturbations-Vendor-Velocity-Scaling"
-  ),
-  env_cfg=agibot_x2_flat_tracking_observation_ablation_env_cfg(
-    "vendor_velocity_scaling"
-  ),
-  play_env_cfg=agibot_x2_flat_tracking_observation_ablation_env_cfg(
-    "vendor_velocity_scaling", play=True
-  ),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name=(
-      "agibot_x2_tracking_correlated_dr_reduced_perturbations_vendor_velocity_scaling"
-    )
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-    "Reduced-Perturbations-Pelvis-Anchor"
-  ),
-  env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(
-    reduced_perturbations=True, anchor_body_name="pelvis"
-  ),
-  play_env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(
-    reduced_perturbations=True, play=True, anchor_body_name="pelvis"
-  ),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name=(
-      "agibot_x2_tracking_correlated_dr_reduced_perturbations_pelvis_anchor"
-    )
-  ),
-  runner_cls=MotionTrackingOnPolicyRunner,
-)
-
-register_mjlab_task(
-  task_id=(
-    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Correlated-DR-"
-    "Reduced-Perturbations-Torso-IMU"
-  ),
-  env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(
-    reduced_perturbations=True, imu_source="torso"
-  ),
-  play_env_cfg=agibot_x2_flat_tracking_correlated_dr_env_cfg(
-    reduced_perturbations=True, play=True, imu_source="torso"
-  ),
-  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
-    experiment_name="agibot_x2_tracking_correlated_dr_reduced_perturbations_torso_imu"
   ),
   runner_cls=MotionTrackingOnPolicyRunner,
 )

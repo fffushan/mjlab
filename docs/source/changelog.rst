@@ -55,6 +55,39 @@ Changed
   bodies, will clamp any reference motion that drives the head beyond the new range. The
   motions were not measured.
 
+Removed
+^^^^^^^
+
+- **Deleted thirteen ablation task registrations that no active workflow needs.** The four
+  velocity torso-IMU and critic-frame tasks
+  (``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Torso-IMU-Critic-{Pelvis,Torso}-{Root,Upvector}``)
+  are gone together with the ``imu_source``, ``critic_imu_source`` and
+  ``critic_gravity_source`` arguments of ``agibot_x2_flat_velocity_env_cfg`` and the
+  task-local ``imu_1`` gyro, velocimeter and ``framezaxis`` sensors. Nine tracking
+  ablations are gone: ``-Correlated-DR``,
+  ``-Correlated-DR-Reduced-Perturbations-Standing-Start``, ``-Increated-Perturbations``,
+  ``-Increated-Perturbations-Vendor-Gains-No-PD-Gain-DR``,
+  ``-Correlated-DR-Reduced-Perturbations-{Projected-Gravity,Projected-Gravity-And-Anchor,Vendor-Velocity-Scaling,Pelvis-Anchor,Torso-IMU}``.
+  Two factories left with them:
+  ``agibot_x2_flat_tracking_observation_ablation_env_cfg`` and
+  ``agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg``.
+  The ``imu_source`` argument, the ``X2TrackingImuSource`` and
+  ``X2TrackingObservationAblation`` aliases and the task-local ``imu_1`` sensors are
+  gone from the tracking factories too. The tasks that stay registered in these
+  families are the base velocity task, the base tracking task and its
+  no-state-estimation variant, ``-Correlated-DR-Reduced-Perturbations`` (the
+  distillation ``base_task``), ``-Increated-Perturbations-Vendor-Gains`` (the
+  multi-motion teacher) and ``Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion``. The
+  factories those remaining tasks build on stay, so
+  ``agibot_x2_flat_tracking_correlated_dr_env_cfg``,
+  ``agibot_x2_flat_tracking_standing_start_env_cfg`` and
+  ``agibot_x2_flat_tracking_increated_perturbations_env_cfg`` still exist. A deleted
+  task ID can no longer be loaded, so the runs under its
+  ``logs/rsl_rl/<experiment_name>`` directory can no longer be resumed or played from
+  the CLI; the checkpoint files are not deleted. Measurements of the removed
+  ablations stay in ``docs/source/sim2real_domain_randomization.md``, marked as
+  removed.
+
 Added
 ^^^^^
 

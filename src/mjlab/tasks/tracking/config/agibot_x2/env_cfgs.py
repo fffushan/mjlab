@@ -1,8 +1,6 @@
 """AgiBot X2 Ultra flat tracking environment configurations."""
 
-from copy import deepcopy
 from dataclasses import fields
-from typing import Literal
 
 from mjlab.asset_zoo.robots import (
   X2_ACTION_SCALE,
@@ -13,14 +11,13 @@ from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
   actuator_group_index,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.envs import mdp as env_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
-from mjlab.sensor import BuiltinSensorCfg, ContactMatch, ContactSensorCfg, ObjRef
+from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg, motion_lookahead
 from mjlab.tasks.tracking.mdp.multi_motion_ppo import (
   MultiMotionPpoCommandCfg,
@@ -49,76 +46,12 @@ X2_DAMPING_RANGES: dict[str, tuple[float, float]] = {
   if group.effort_limit is not None
 }
 
-X2TrackingObservationAblation = Literal[
-  "projected_gravity",
-  "projected_gravity_anchor",
-  "vendor_velocity_scaling",
-]
-"""Actor-observation changes evaluated from the reduced-perturbation baseline."""
-
-X2TrackingImuSource = Literal["pelvis", "torso"]
-"""IMU frame the actor's base velocity observations are read from.
-
-``pelvis`` keeps the entity XML's gyro/velocimeter on site ``imu_0`` (the
-historical behavior); ``torso`` adds task-local gyro/velocimeter sensors on
-site ``imu_1`` (a child of ``torso_link``) and re-points the base angular and
-linear velocity observations at them. Site ``imu_1`` is rigidly attached to
-``torso_link``, so its gyro reads the torso frame's angular velocity, which
-already contains the waist joint rates rather than a rotation of the pelvis
-angular velocity.
-"""
-
-_TORSO_IMU_SITE = "imu_1"
-_TORSO_IMU_GYRO = "robot/imu_1_ang_vel"
-_TORSO_IMU_VELOCIMETER = "robot/imu_1_lin_vel"
-
 _MULTI_MOTION_PREVIEW_S = 0.2
 """Reference preview offset of the multi-motion teacher, in seconds.
 
 Ten reference steps at the task's 50 Hz control rate, which is one future
 frame of joint positions and velocities.
 """
-
-
-def _torso_imu_sensors() -> tuple[BuiltinSensorCfg, BuiltinSensorCfg]:
-  """Task-local torso IMU sensors, named to avoid the entity's ``imu_0`` ones."""
-  return (
-    BuiltinSensorCfg(
-      name="imu_1_ang_vel",
-      sensor_type="gyro",
-      obj=ObjRef(type="site", name=_TORSO_IMU_SITE, entity="robot"),
-    ),
-    BuiltinSensorCfg(
-      name="imu_1_lin_vel",
-      sensor_type="velocimeter",
-      obj=ObjRef(type="site", name=_TORSO_IMU_SITE, entity="robot"),
-    ),
-  )
-
-
-def _select_imu_source(
-  cfg: ManagerBasedRlEnvCfg, imu_source: X2TrackingImuSource
-) -> None:
-  """Point the base velocity observations at the selected IMU and add its sensors.
-
-  ``pelvis`` is a no-op: the observation params already name the entity XML's
-  ``robot/imu_ang_vel``/``robot/imu_lin_vel`` sensors on site ``imu_0``. ``torso``
-  adds the task-local ``imu_1`` sensors to the scene and re-points every present
-  ``base_ang_vel``/``base_lin_vel`` term in the actor and critic groups.
-  """
-  if imu_source == "pelvis":
-    return
-  assert imu_source == "torso"
-  cfg.scene.sensors = cfg.scene.sensors + _torso_imu_sensors()
-  sensor_names = {
-    "base_ang_vel": _TORSO_IMU_GYRO,
-    "base_lin_vel": _TORSO_IMU_VELOCIMETER,
-  }
-  for group_name in ("actor", "critic"):
-    terms = cfg.observations[group_name].terms
-    for term_name, sensor_name in sensor_names.items():
-      if term_name in terms:
-        terms[term_name].params["sensor_name"] = sensor_name
 
 
 def apply_x2_tracking_robot_randomization(cfg: ManagerBasedRlEnvCfg) -> None:
@@ -193,7 +126,6 @@ def agibot_x2_flat_tracking_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
   anchor_body_name: str = "torso_link",
-  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """Create AgiBot X2 Ultra flat terrain tracking configuration.
 
@@ -208,17 +140,7 @@ def agibot_x2_flat_tracking_env_cfg(
   X2 controller (``x2_docker``) reconstructs it from the pelvis IMU plus
   measured waist joints, and its policy loader rejects any other value.
   ``pelvis`` is the one frame the robot measures directly.
-
-  ``imu_source`` selects which physical IMU the ``base_ang_vel``/``base_lin_vel``
-  observations are read from independently of the anchor; see
-  :data:`X2TrackingImuSource`.
   """
-  if imu_source not in ("pelvis", "torso"):
-    raise ValueError(
-      f"imu_source {imu_source!r} must be 'pelvis' (imu_0 on the pelvis) or "
-      f"'torso' (imu_1 on torso_link)"
-    )
-
   cfg = make_tracking_env_cfg()
 
   cfg.scene.entities = {"robot": get_x2_robot_cfg()}
@@ -314,10 +236,6 @@ def agibot_x2_flat_tracking_env_cfg(
       enable_corruption=True,
     )
 
-  # Applied after the NSE actor rebuild so the terms it re-points are the final
-  # ones, and before the play overrides, which do not touch sensor names.
-  _select_imu_source(cfg, imu_source)
-
   # Apply play mode overrides.
   if play:
     # Effectively infinite episode length.
@@ -339,14 +257,12 @@ def agibot_x2_flat_tracking_correlated_dr_env_cfg(
   reduced_perturbations: bool = False,
   play: bool = False,
   anchor_body_name: str = "torso_link",
-  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """Create the X2 no-state-estimation correlated-DR ablation configuration."""
   cfg = agibot_x2_flat_tracking_env_cfg(
     has_state_estimation=False,
     play=play,
     anchor_body_name=anchor_body_name,
-    imu_source=imu_source,
   )
 
   if "randomize_pd_gains" in cfg.events:
@@ -390,7 +306,6 @@ def agibot_x2_flat_tracking_correlated_dr_env_cfg(
 def agibot_x2_flat_tracking_standing_start_env_cfg(
   play: bool = False,
   anchor_body_name: str = "torso_link",
-  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """Reduced-perturbation tracking cfg with standing-pose episode starts.
 
@@ -410,7 +325,6 @@ def agibot_x2_flat_tracking_standing_start_env_cfg(
     reduced_perturbations=True,
     play=play,
     anchor_body_name=anchor_body_name,
-    imu_source=imu_source,
   )
   motion_cmd = cfg.commands["motion"]
   assert isinstance(motion_cmd, MotionCommandCfg)
@@ -421,7 +335,6 @@ def agibot_x2_flat_tracking_standing_start_env_cfg(
 def agibot_x2_flat_tracking_increated_perturbations_env_cfg(
   play: bool = False,
   anchor_body_name: str = "torso_link",
-  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """X2 standing-start tracking with the G1-sized motion perturbations.
 
@@ -433,7 +346,6 @@ def agibot_x2_flat_tracking_increated_perturbations_env_cfg(
   cfg = agibot_x2_flat_tracking_standing_start_env_cfg(
     play=play,
     anchor_body_name=anchor_body_name,
-    imu_source=imu_source,
   )
   if play:
     return cfg
@@ -461,7 +373,6 @@ def agibot_x2_flat_tracking_increated_perturbations_env_cfg(
 def agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
   play: bool = False,
   anchor_body_name: str = "torso_link",
-  imu_source: X2TrackingImuSource = "pelvis",
 ) -> ManagerBasedRlEnvCfg:
   """Increased-perturbation tracking with the vendor reference-policy PD gains.
 
@@ -487,84 +398,8 @@ def agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
   cfg = agibot_x2_flat_tracking_increated_perturbations_env_cfg(
     play=play,
     anchor_body_name=anchor_body_name,
-    imu_source=imu_source,
   )
   apply_vendor_rl_gains(cfg.scene.entities["robot"])
-  return cfg
-
-
-def agibot_x2_flat_tracking_increated_perturbations_vendor_gains_no_pd_gain_dr_env_cfg(
-  play: bool = False,
-  anchor_body_name: str = "torso_link",
-  imu_source: X2TrackingImuSource = "pelvis",
-) -> ManagerBasedRlEnvCfg:
-  """Vendor-gain tracking with no randomization of the servo PD gains.
-
-  Identical to
-  :func:`agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg`
-  except that the ``randomize_pd_gains`` event is removed. That event is the
-  only term in these tasks that randomizes the servo gains kp and kd: the parent
-  draws one scale per environment from ``(0.7, 1.3)`` and applies it to both,
-  because it sets ``shared_gain_scale``. Without it, every episode runs the
-  nominal vendor gains. The event writes only the solver's actuator
-  ``gainprm``/``biasprm`` fields, so removing it is the whole change.
-
-  The passive ``randomize_joint_damping`` axis is deliberately kept: it
-  randomizes the model's ``<joint damping>`` property (about 0.03 on an X2 hip
-  against a Kd of 4), which is a transmission property and not a servo gain. So
-  is the 0-2 physics-step per-actuator command delay, which models the 50 Hz
-  transport to the motors.
-
-  One caveat worth knowing: the axes come from ``MJLAB_DR_AXES`` at build time.
-  If that variable excludes ``pd_gains`` to begin with, the parent has no such
-  event and this task builds exactly like its parent. The variable is unset by
-  default (all axes on) and the job queue does not set it, so under the queue
-  this task differs from its parent by the removed event only.
-  """
-  cfg = agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
-    play=play,
-    anchor_body_name=anchor_body_name,
-    imu_source=imu_source,
-  )
-  cfg.events.pop("randomize_pd_gains", None)
-  return cfg
-
-
-def agibot_x2_flat_tracking_observation_ablation_env_cfg(
-  ablation: X2TrackingObservationAblation,
-  play: bool = False,
-) -> ManagerBasedRlEnvCfg:
-  """Create a fresh actor-observation ablation from the reduced-DR baseline."""
-  cfg = agibot_x2_flat_tracking_correlated_dr_env_cfg(
-    reduced_perturbations=True, play=play
-  )
-  actor_observations = cfg.observations["actor"]
-  actor_terms = actor_observations.terms
-
-  if ablation in ("projected_gravity", "projected_gravity_anchor"):
-    anchor_orientation = actor_terms["motion_anchor_ori_b"]
-    # Deep-copy the reference term's corruption configuration before replacing
-    # its motion-dependent callable. Projected gravity is a root-body measurement.
-    projected_gravity = deepcopy(anchor_orientation)
-    projected_gravity.func = env_mdp.projected_gravity
-    projected_gravity.params = {}
-    projected_gravity.scale = 1.0
-
-    new_actor_terms = {}
-    for name, term in actor_terms.items():
-      if name == "motion_anchor_ori_b":
-        new_actor_terms["projected_gravity"] = projected_gravity
-        if ablation == "projected_gravity_anchor":
-          new_actor_terms[name] = term
-      else:
-        new_actor_terms[name] = term
-    actor_observations.terms = new_actor_terms
-  elif ablation == "vendor_velocity_scaling":
-    actor_terms["base_ang_vel"].scale = 0.25
-    actor_terms["joint_vel"].scale = 0.05
-  else:
-    raise ValueError(f"Unknown X2 tracking observation ablation: {ablation}")
-
   return cfg
 
 
