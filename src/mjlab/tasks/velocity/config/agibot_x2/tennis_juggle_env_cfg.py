@@ -342,6 +342,7 @@ def agibot_x2_tennis_juggle_env_cfg(
   play: bool = False,
   head_actuated: bool = True,
   ball_history: bool = False,
+  ball_history_frame: str = "plate",
 ) -> ManagerBasedRlEnvCfg:
   """Create the AgiBot X2 tennis-ball juggling velocity environment config.
 
@@ -359,12 +360,18 @@ def agibot_x2_tennis_juggle_env_cfg(
       head differently. ``head_joint_motion`` is dropped in that case: it would
       charge the policy for motion it cannot cause.
     ball_history: If True, replaces the actor's single delayed plate-frame ball
-      position with ``ball_hist``, the three timestamped samples of
+      position with the three timestamped samples of
       :class:`~mjlab.tasks.velocity.mdp.observations.ball_history_samples`, which
       widens the actor by 9 numbers (3 -> 12). The critic keeps its clean position
       and velocity terms, so it is unchanged. The term models the estimator's own
       rate, latency, stalls and noise, so it needs no ``noise`` or ``delay_*``
       settings of its own.
+    ball_history_frame: The frame those three samples are expressed in.
+      ``"plate"`` (default) is the shipped term, ``ball_hist``, in the racket
+      frame. ``"pelvis"`` installs the same stream as ``ball_hist_pelvis``,
+      measured from the pelvis body origin instead. Only the actor's ball term
+      changes: the widths stay 29 / 112 / 121, and every old task keeps
+      ``ball_hist``. A non-default frame requires ``ball_history=True``.
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` with the tennis equipment in the scene, the
@@ -372,6 +379,8 @@ def agibot_x2_tennis_juggle_env_cfg(
     ``bat_ball_contact`` sensor. The base task's observations, terminations,
     actions and domain randomization are unchanged.
   """
+  if ball_history_frame != "plate" and not ball_history:
+    raise ValueError("ball_history_frame requires ball_history=True")
   cfg = agibot_x2_flat_velocity_env_cfg(play=play)
 
   if not head_actuated:
@@ -496,16 +505,10 @@ def agibot_x2_tennis_juggle_env_cfg(
   )
 
   ##
-  # Ball observation. The policy cannot balance a ball it cannot see, so both
-  # groups get the ball's position relative to the plate, and the critic alone also
-  # gets its velocity. The critic reads both terms **without** corruption, like the
-  # rest of its privileged set.
-  #
-  # Corruption is the perception budget, not physics: on hardware the ball
-  # position comes from an external perception program. Both terms are in the
-  # plate frame, so a ball carried along with the bat reads zero velocity. Each
-  # dimension of each term is randomized independently; see the constants file for
-  # the magnitudes and how they were derived.
+  # Ball observation. The critic gets clean plate-relative position and velocity.
+  # The actor gets corrupted position samples: plate-relative by default, or
+  # pelvis-relative for ball_hist_pelvis. The critic stays unchanged in both cases.
+  # Corruption models perception, not physics. See the constants for its magnitudes.
   ##
 
   plate_cfg = SceneEntityCfg("robot", body_names=(RACKET_BODY,))
@@ -569,10 +572,26 @@ def agibot_x2_tennis_juggle_env_cfg(
         "MJLAB_JUGGLE_BALL_STREAM_RATE_MIN_HZ / _MAX_HZ and "
         "MJLAB_JUGGLE_BALL_STREAM_LATENCY_MIN_S / _MAX_S instead."
       )
-    cfg.observations["actor"].terms["ball_hist"] = ObservationTermCfg(
+    # Change only the actor's reference frame and term name. Keep the legacy
+    # plate term's parameters unchanged, including its implicit frame default.
+    if ball_history_frame == "plate":
+      term_name = "ball_hist"
+      frame_params = {"plate_cfg": plate_cfg}
+    elif ball_history_frame == "pelvis":
+      term_name = "ball_hist_pelvis"
+      frame_params = {
+        "pelvis_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+        "reference_frame": "pelvis",
+      }
+    else:
+      raise ValueError(
+        f"ball_history_frame must be 'plate' or 'pelvis', got {ball_history_frame!r}"
+      )
+    cfg.observations["actor"].terms[term_name] = ObservationTermCfg(
       func=mdp.ball_history_samples,
       params=dict(
-        ball_state_params,
+        ball_cfg=ball_cfg,
+        **frame_params,
         bias_half_width_m=ball_bias_half_m,
         stream_rate_hz=(
           _ablation_value("BALL_STREAM_RATE_MIN_HZ", BALL_STREAM_RATE_RANGE_HZ[0]),

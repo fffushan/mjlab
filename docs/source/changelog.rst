@@ -120,6 +120,12 @@ Removed
 Added
 ^^^^^
 
+- Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3-Pelvis``.
+  Its ``ball_hist_pelvis`` actor term stores three capture-time pelvis-relative positions
+  and their ages. It reuses the existing stream without an estimator or proprioception
+  history. Old tasks are unchanged. Controller support is not implemented; learning
+  improvement is not tested. See :doc:`x2_tennis_ball_juggle`.
+
 - Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3``,
   the 29-DOF juggling task whose actor observes **three timestamped ball samples** instead
   of one delayed position: 12 numbers, ``[x, y, z, t]`` per slot, newest first, ages in

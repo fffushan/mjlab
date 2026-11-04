@@ -98,6 +98,25 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# Opt-in pelvis-frame history. The distinct task and term names keep old Ball3
+# checkpoints on their original plate-frame contract; widths stay 29 / 112 / 121.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_env_cfg(
+    head_actuated=False, ball_history=True, ball_history_frame="pelvis"
+  ),
+  play_env_cfg=agibot_x2_tennis_juggle_env_cfg(
+    play=True, head_actuated=False, ball_history=True, ball_history_frame="pelvis"
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

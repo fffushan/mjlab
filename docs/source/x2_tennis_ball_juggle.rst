@@ -321,6 +321,39 @@ samples.
 **Not supported by the controller.** The deployed adaptor builds one plate-frame position,
 so this task is training-only until the provider keeps a short history and reports ages.
 
+The Ball3-Pelvis variant: samples in the pelvis frame
+-----------------------------------------------------
+
+``...-Juggle-29DOF-Ball3-Pelvis`` changes only the actor's ball-history frame and its
+contract identity. The actor term is ``ball_hist_pelvis``. Action/actor/critic widths
+remain **29 / 112 / 121**. The critic, rewards, actions and physics are unchanged.
+
+**Frame and timing.** At capture time, compute
+``p_local = R_pelvis.T @ (p_ball_world - p_pelvis_world)``.
+Use the pelvis body origin and axes, not its centre of mass.
+Store three positions and their capture timestamps, newest capture first.
+The output remains ``[x0, y0, z0, age0, x1, y1, z1, age1, x2, y2, z2, age2]``.
+Stored positions stay unchanged; their ages advance. Do not reproject old samples
+into the current pelvis frame. Noise, latency, stalls and age clipping are unchanged.
+
+Racket motion alone no longer changes the measured ball position. Pelvis motion
+still does. The history is not a fixed-world ballistic trajectory. Small movement
+commands do not guarantee a stationary pelvis, especially with the existing pushes.
+This change adds no estimator, proprioception history, recurrent network or extra feature.
+
+**Controller contract, not implemented.** The deployed adaptor cannot supply this
+three-sample input. A future controller must convert each new camera measurement to
+pelvis coordinates once, then store the position and capture timestamp.
+Exact capture-time conversion needs a fixed camera-to-pelvis transform or capture-time
+chain state. Using arrival-time joint state without history is an approximation.
+That timing approximation is not modeled by this frame change and is not measured here.
+
+**Validation.** ``tests/test_x2_tennis_pelvis_ball_history.py`` checks the coordinate
+transform, unchanged stored samples, and task configuration. Existing Ball3 tasks
+retain their plate-frame input. Use the separate task and experiment for new training;
+do not assume an old checkpoint is compatible merely because its input width matches.
+Learning improvement and controller deployment are **not tested**.
+
 Terminations
 ------------
 

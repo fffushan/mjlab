@@ -65,7 +65,7 @@ def foot_contact_forces(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tenso
 
 
 ##
-# Tennis ball, expressed in the plate frame.
+# Tennis ball, expressed in a body frame of the robot.
 #
 # These are X2-tennis specific and live here only because the observation is the
 # primitive: the reward and termination terms import the same helper, so there is
@@ -73,11 +73,11 @@ def foot_contact_forces(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tenso
 ##
 
 
-def _single_body_id(plate_cfg: SceneEntityCfg) -> int:
-  """The one body index a plate config must resolve to."""
-  ids = plate_cfg.body_ids
+def _single_body_id(cfg: SceneEntityCfg) -> int:
+  """The one body index an observation frame config must resolve to."""
+  ids = cfg.body_ids
   if isinstance(ids, slice) or len(ids) != 1:
-    raise ValueError(f"plate_cfg must resolve to exactly one racket body, got {ids}")
+    raise ValueError(f"{cfg.name} must resolve to exactly one body, got {ids}")
   return ids[0]
 
 
@@ -174,6 +174,31 @@ def ball_velocity_in_plate(
   return velocity
 
 
+def ball_position_in_pelvis(
+  env: ManagerBasedRlEnv,
+  pelvis_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Ball position relative to the pelvis, in the pelvis frame.
+
+  Measured from the pelvis body **origin**, rotated by the pelvis body axes:
+  ``p_local = R_pelvis.T @ (p_ball_world - p_pelvis_world)``. A controller must
+  use the same body origin, not the centre of mass.
+
+  Args:
+    pelvis_cfg: The pelvis body inside the robot entity. Must resolve to one body.
+    ball_cfg: The ball entity.
+
+  Returns:
+    Tensor of shape ``(num_envs, 3)``.
+  """
+  robot: Entity = env.scene[pelvis_cfg.name]
+  ball: Entity = env.scene[ball_cfg.name]
+  body_id = _single_body_id(pelvis_cfg)
+  offset_w = ball.data.root_link_pos_w - robot.data.body_link_pos_w[:, body_id]
+  return quat_apply_inverse(robot.data.body_link_quat_w[:, body_id], offset_w)
+
+
 class ball_position_hold(ManagerTermBase):
   """Ball position in the plate frame, with rejected frames served from a hold.
 
@@ -266,7 +291,9 @@ class ball_position_hold(ManagerTermBase):
     self._just_held[env_ids] = False
     if self._bias_half_width_m > 0.0:
       n = self._bias[env_ids].shape[0]
-      self._bias[env_ids] = self._draw_bias(n, self._bias.device, self._bias_half_width_m)
+      self._bias[env_ids] = self._draw_bias(
+        n, self._bias.device, self._bias_half_width_m
+      )
 
   @staticmethod
   def _draw_bias(n: int, device, half: float):
@@ -276,17 +303,17 @@ class ball_position_hold(ManagerTermBase):
 
 
 class ball_history_samples(ManagerTermBase):
-  """Three timestamped plate-frame ball samples, newest first.
+  """Three timestamped ball samples in a body frame, newest first.
 
   A measurement chain cannot deliver the ball's current position: it delivers a
   stream of older positions at an irregular rate. This term models that stream
   directly instead of applying a fixed delay to a fresh position. Each environment
-  keeps a ring of its **true** plate-frame ball positions, written every control
-  step, and samples that ring on its own acquisition schedule. An acquisition draws
-  a latency, reads the true position ``latency`` seconds back, adds the per-episode
-  constant bias and per-sample noise, and pushes ``(position, step)`` into a
-  three-slot history. The output is the history flattened as ``x, y, z, age`` per
-  slot, newest first, where ``age`` is the time between the sample's capture step
+  keeps a ring of its **true** ball positions, written every control step in the
+  chosen reference frame, and samples that ring on its own acquisition schedule. An
+  acquisition draws a latency, reads the true position ``latency`` seconds back, adds
+  the per-episode constant bias and per-sample noise, and pushes ``(position, step)``
+  into a three-slot history. The output is the history flattened as ``x, y, z, age``
+  per slot, newest first, where ``age`` is the time between the sample's capture step
   and the current control step, clipped at :data:`BALL_HISTORY_AGE_CLIP_S`.
 
   **Newest is by capture time, not by arrival time.** Latency jitter lets a frame
@@ -320,15 +347,26 @@ class ball_history_samples(ManagerTermBase):
   half-widths :data:`BALL_POSITION_NOISE_M`, the same placeholders and the same
   distribution the rest of the velocity task uses.
 
+  **The reference frame is chosen once, and a sample keeps the frame it was
+  captured in.** ``reference_frame="plate"`` is the shipped behaviour and
+  ``reference_frame="pelvis"`` stores the stream in the pelvis frame instead. No
+  stored sample is ever re-expressed in a later frame: an old position is served
+  exactly as it was measured, and only its age advances. This history does not
+  compensate pelvis motion between samples.
+
   Args:
-    plate_cfg: The racket body inside the robot entity. Must resolve to one body.
     ball_cfg: The ball entity.
+    plate_cfg: The racket body inside the robot entity, used when
+      ``reference_frame="plate"``. Must resolve to one body.
+    pelvis_cfg: The pelvis body inside the robot entity, used when
+      ``reference_frame="pelvis"``. Must resolve to one body.
+    reference_frame: ``"plate"`` (default) or ``"pelvis"``.
     bias_half_width_m: Half-width of the constant per-episode offset, in metres on
-      each plate axis. 0.0 disables it.
+      each frame axis. 0.0 disables it.
 
   Returns:
     Tensor of shape ``(num_envs, 12)``: ``[x0, y0, z0, t0, x1, y1, z1, t1, x2, y2,
-    z2, t2]`` in the plate frame, newest sample first.
+    z2, t2]`` in the reference frame, newest sample first.
   """
 
   def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedRlEnv):
@@ -369,8 +407,10 @@ class ball_history_samples(ManagerTermBase):
   def __call__(
     self,
     env: ManagerBasedRlEnv,
-    plate_cfg: SceneEntityCfg,
     ball_cfg: SceneEntityCfg,
+    plate_cfg: SceneEntityCfg | None = None,
+    pelvis_cfg: SceneEntityCfg | None = None,
+    reference_frame: str = "plate",
     bias_half_width_m: float = 0.0,
     stream_rate_hz: tuple[float, float] = BALL_STREAM_RATE_RANGE_HZ,
     stream_latency_s: tuple[float, float] = BALL_STREAM_LATENCY_RANGE_S,
@@ -382,7 +422,9 @@ class ball_history_samples(ManagerTermBase):
     # vary them from the configuration and the value a run used is recorded in the
     # run's own params/env.yaml. They default to the measured constants.
     if not (0.0 < stream_rate_hz[0] <= stream_rate_hz[1]):
-      raise ValueError(f"stream_rate_hz must be positive and ordered, got {stream_rate_hz}")
+      raise ValueError(
+        f"stream_rate_hz must be positive and ordered, got {stream_rate_hz}"
+      )
     if not (0.0 <= stream_latency_s[0] <= stream_latency_s[1]):
       raise ValueError(
         f"stream_latency_s must be non-negative and ordered, got {stream_latency_s}"
@@ -404,7 +446,18 @@ class ball_history_samples(ManagerTermBase):
 
     now_step = self._step
     rows = torch.arange(self.num_envs, device=device)
-    true_pos = ball_position_in_plate(env, plate_cfg, ball_cfg)
+    if reference_frame == "plate":
+      if plate_cfg is None:
+        raise ValueError("reference_frame='plate' needs plate_cfg")
+      true_pos = ball_position_in_plate(env, plate_cfg, ball_cfg)
+    elif reference_frame == "pelvis":
+      if pelvis_cfg is None:
+        raise ValueError("reference_frame='pelvis' needs pelvis_cfg")
+      true_pos = ball_position_in_pelvis(env, pelvis_cfg, ball_cfg)
+    else:
+      raise ValueError(
+        f"reference_frame must be 'plate' or 'pelvis', got {reference_frame!r}"
+      )
 
     # Write the true position at this control step. Indexing by the step itself
     # makes a repeated call at the same step idempotent, and makes the ring read
