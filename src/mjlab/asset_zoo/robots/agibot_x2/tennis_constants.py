@@ -1588,6 +1588,17 @@ JUGGLE_HOLD_DELAY_S = (0.0, 2.0)
 immediate release must stay in the distribution, or stillness becomes a
 precondition and the policy can learn a countdown instead of watching the ball."""
 
+JUGGLE_HOLD_LONG_DELAY_S = (0.0, 6.0)
+"""Uniform hold duration for the long-wait rung, in seconds.
+
+An episode is 20 s, and episode reward is ``sum(raw * weight * dt) /
+max_episode_length_s``, so every second spent holding is a second that earns
+nothing and cannot be recovered. A 6 s upper bound gives a mean wait of 3 s, which
+still leaves 14 s of juggling and 70 % of the reachable return. The hold phases are
+the only place a permanently parked policy could hide, so the bound is a reward
+argument as much as a curriculum one: at 10 s the ceiling is half, and past that
+the rung measures endurance rather than waiting."""
+
 JUGGLE_HOLD_LATERAL_RANGE_M = 0.02
 """Half-width of the world x/y hold offset, in metres. The same +-20 mm spread the
 S6 release uses, centred on the nominal bed point."""

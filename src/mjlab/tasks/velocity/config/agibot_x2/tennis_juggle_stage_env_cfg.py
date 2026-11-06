@@ -31,6 +31,7 @@ import os
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_HOLD_DELAY_S,
+  JUGGLE_HOLD_LONG_DELAY_S,
   JUGGLE_HOLD_HEIGHT_M,
   JUGGLE_HOLD_LATERAL_RANGE_M,
   JUGGLE_WAIT_ALIGN_WEIGHT,
@@ -254,6 +255,27 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "hold": {
       "hold_height_m": None,
       "hold_delay_s": JUGGLE_HOLD_DELAY_S,
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+  },
+  # S7c - S7b isolates the wait length: every other key is S7b's, so the only
+  # difference is how long the ball is held before release. 6 s is bounded by the
+  # reward accounting, not by the episode: an episode is 20 s and reward is
+  # normalised by that maximum, so a mean 3 s wait still leaves 14 s of juggling.
+  "s7c-long-hold": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": (0.10, 0.40),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": None,
+      "hold_delay_s": JUGGLE_HOLD_LONG_DELAY_S,
       "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
   },

@@ -544,6 +544,7 @@ task suffix                                 condition
 ``-Nominal-S6-Release``                      S5 plus a release-position distribution
 ``-Nominal-S7a-DelayedRelease``              S6's perception plus a 0-2 s held ball, then release
 ``-Nominal-S7b-VariableHold``                S7a's hold with a 0.10-0.40 m release height
+``-Nominal-S7c-LongHold``                    S7b with the wait lengthened to a 0-6 s hold
 ==========================================  ==============================================
 
 ``...-Ball3-Pelvis-Nominal-S1-15Hz`` is the first rung. It is the

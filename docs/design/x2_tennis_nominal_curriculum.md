@@ -283,8 +283,15 @@ The height is sampled once by the reset and the pin follows it, measured to 0.0 
 disagreement over six environments, and `ball_release_alignment_m` logs the plate-frame
 offset at release so the waiting alignment is measured rather than watched.
 
-Open: the release delay is the only randomised quantity in S7a, no measured hand release
-exists yet, and the "no release" evaluation case is not built.
+`S7c` (`s7c-long-hold`, suffix `-Nominal-S7c-LongHold`) keeps S7b's held ball and
+height range and lengthens the wait to a uniform 0-6 s, so S7c - S7b is the wait
+length alone. The upper bound is a reward argument, not an episode argument: an
+episode is 20 s and episode reward is normalised by that maximum, so a mean 3 s
+wait still leaves 14 s of juggling and 70 % of the reachable return, while 10 s
+would halve the ceiling and turn the rung into an endurance test.
+
+Open: no measured hand release exists yet, and the "no release" evaluation case is
+not built.
 
 ## 5. Real-robot measurement and acceptance
 
