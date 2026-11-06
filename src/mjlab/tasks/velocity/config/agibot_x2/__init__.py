@@ -315,6 +315,25 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# Rung S7b: S7a's hold with the release-height range S6 had. The ball is held at a
+# uniform 0.10-0.40 m and released after a 0-2 s wait, so the wait must generalise
+# across the geometry an operator chooses. It resumes an S6 checkpoint, not S7a's, so
+# S7b - S6 is the hold alone and S7b - S7a is the height range alone.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S7b-VariableHold"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s7b-variable-hold"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(
+    stage="s7b-variable-hold", play=True
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

@@ -37,6 +37,7 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
 from mjlab.utils.lab_api.math import quat_apply, sample_uniform
 
@@ -431,11 +432,18 @@ class hold_ball(ManagerTermBase):
 
   Args:
     asset_cfg: The ball entity, which must be a floating base.
-    hold_height_m: Ball-centre height above its resting state, in metres.
+    hold_height_m: Ball-centre height above its resting state, in metres, or
+      ``None`` to follow the height the ball reset sampled. ``None`` is the mode a
+      randomised rung uses: ``reset_ball_release`` then owns the single sample, the
+      pin follows it, and ``ball_start_height_m`` cannot report a height the ball
+      was never held at.
     hold_delay_s: ``(low, high)`` uniform hold duration before release. Include
       ``0.0`` so an immediate release stays in the distribution and stillness
       never becomes a precondition.
     lateral_range_m: Half-width of the world x/y hold offset, in metres.
+    release_event: Name of the :class:`reset_ball_release` term whose sampled
+      height is followed when ``hold_height_m`` is ``None``.
+    plate_cfg: Racket body, used only to record the waiting alignment at release.
   """
 
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -454,27 +462,41 @@ class hold_ball(ManagerTermBase):
     self.released = torch.zeros(num_envs, dtype=torch.bool, device=device)
     """True once the current episode has released the ball."""
     self._released_this_step = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.release_alignment_m = torch.zeros(num_envs, device=device)
+    """Plate-frame horizontal distance from the plate centre to the ball at the
+    instant of release, in metres. Written once per episode, logging only."""
+    self._asset_cfg: SceneEntityCfg | None = None
+    self._plate_cfg: SceneEntityCfg | None = None
 
   def __call__(
     self,
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
-    hold_height_m: float,
+    hold_height_m: float | None,
     hold_delay_s: tuple[float, float],
     lateral_range_m: float,
+    release_event: str = "reset_ball",
+    plate_cfg: SceneEntityCfg | None = None,
   ) -> None:
     env_ids = resolve_env_ids(env, env_ids)
     asset: Entity = env.scene[asset_cfg.name]
     num_envs = len(env_ids)
     device = env.device
+    self._asset_cfg = asset_cfg
+    self._plate_cfg = plate_cfg
 
     anchor = torch.tensor(ball_spawn_init_pos(0.0), device=device, dtype=torch.float32)
     normal = torch.tensor(BALL_SPAWN_FACE_NORMAL, device=device, dtype=torch.float32)
     anchor = anchor.expand(num_envs, 3)
     normal = normal.expand(num_envs, 3)
     lateral = sample_uniform(-lateral_range_m, lateral_range_m, (num_envs, 2), device)
-    point = anchor + normal * hold_height_m
+    if hold_height_m is None:
+      # Single authority: the reset sampled the release height, so hold there.
+      height = _release_term(env, release_event).start_height[env_ids].clone()
+    else:
+      height = torch.full((num_envs,), float(hold_height_m), device=device)
+    point = anchor + normal * height[:, None]
     point[:, :2] += lateral
     point += env.scene.env_origins[env_ids]
 
@@ -500,6 +522,7 @@ class hold_ball(ManagerTermBase):
       self._pin(env, asset, still_held.nonzero(as_tuple=False).squeeze(-1))
     if bool(due.any()):
       due_ids = due.nonzero(as_tuple=False).squeeze(-1)
+      self._record_alignment(env, due_ids)
       self._pin(env, asset, due_ids)
       self.held[due_ids] = False
       self.released[due_ids] = True
@@ -507,6 +530,14 @@ class hold_ball(ManagerTermBase):
       # Start the post-release clock at the release: every environment then gets
       # the same full window regardless of how long the operator waited.
       env.episode_length_buf[due_ids] = 0
+
+  def _record_alignment(self, env: ManagerBasedRlEnv, env_ids: torch.Tensor) -> None:
+    """Store the plate-frame lateral offset at the release instant."""
+    if self._plate_cfg is None or self._asset_cfg is None:
+      return
+    position, _ = plate_relative_ball_state(env, self._plate_cfg, self._asset_cfg)
+    distance = torch.linalg.norm(position[:, :2], dim=1)
+    self.release_alignment_m[env_ids] = distance[env_ids]
 
   def _pin(
     self,
@@ -579,23 +610,27 @@ class ball_hold_state(ManagerTermBase):
   ``held`` is 1.0 while the ball is pinned and 0.0 after release, so
   ``reduce="mean"`` reports the held fraction of the episode. ``release_after_s``
   is the sampled hold duration and is constant per episode, so it is logged with
-  ``reduce="last"``. Both are simulator-side facts used for accounting only; the
+  ``reduce="last"``. ``release_alignment_m`` is the plate-frame horizontal distance
+  between the plate centre and the ball at the moment of release: the measured
+  answer to "did it get under the ball", which is otherwise only visible by eye. Both are simulator-side facts used for accounting only; the
   actor never sees them.
 
   Args:
     hold_event: Name of the :class:`hold_ball` event term.
-    field: ``"held"`` or ``"release_after_s"``.
+    field: ``"held"``, ``"release_after_s"`` or ``"release_alignment_m"``.
   """
 
   def __init__(self, cfg: MetricsTermCfg, env: ManagerBasedRlEnv):
     super().__init__(env)
     term = hold_term(env, cfg.params["hold_event"])
     field = str(cfg.params.get("field", "held"))
-    assert field in ("held", "release_after_s"), f"unknown hold field '{field}'"
+    assert field in ("held", "release_after_s", "release_alignment_m"), (
+      f"unknown hold field '{field}'"
+    )
     # Keep the buffer itself, never a converted copy: ``held`` is a bool tensor, so
     # ``.float()`` allocates and a cached copy would report the values from
     # construction time for the whole run. The conversion happens on read instead.
-    self._source = term.held if field == "held" else term.release_after_s
+    self._source = getattr(term, field)
 
   def __call__(
     self,

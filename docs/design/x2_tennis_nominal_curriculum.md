@@ -274,8 +274,17 @@ gets the same post-release window regardless of how long the operator waited; wi
 it a 2 s wait both shortens the juggling opportunity and stays in the reward
 denominator.
 
-Open: the hold height is fixed, the release delay is the only randomised quantity, and
-no measured hand release exists yet. The "no release" evaluation case is not built.
+`S7b` (`s7b-variable-hold`, suffix `-Nominal-S7b-VariableHold`) then restores the height
+range S6 had and keeps the hold: uniform 0.10-0.40 m above the resting state, everything
+else S7a's, resuming an **S6** checkpoint so that S7b - S6 is the hold alone and
+S7b - S7a is the height range alone. The floor is 0.10 m because a hold at 0.0 rests the
+ball on the strings, which is a plate start rather than a hold an operator can perform.
+The height is sampled once by the reset and the pin follows it, measured to 0.0 m
+disagreement over six environments, and `ball_release_alignment_m` logs the plate-frame
+offset at release so the waiting alignment is measured rather than watched.
+
+Open: the release delay is the only randomised quantity in S7a, no measured hand release
+exists yet, and the "no release" evaluation case is not built.
 
 ## 5. Real-robot measurement and acceptance
 

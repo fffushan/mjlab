@@ -543,6 +543,7 @@ task suffix                                 condition
 ``-Nominal-S5-Noise``                        S4b plus +-(10, 10, 15) mm position noise
 ``-Nominal-S6-Release``                      S5 plus a release-position distribution
 ``-Nominal-S7a-DelayedRelease``              S6's perception plus a 0-2 s held ball, then release
+``-Nominal-S7b-VariableHold``                S7a's hold with a 0.10-0.40 m release height
 ==========================================  ==============================================
 
 ``...-Ball3-Pelvis-Nominal-S1-15Hz`` is the first rung. It is the
@@ -640,6 +641,23 @@ held, or a 2 s wait would consume 80 % of its 2.5 s window before the release.
 The hold height is fixed at 0.40 m, which is the energy target, so the release energy equals
 ``E*`` and any change is attributable to waiting. Randomising the hold height changes the drop
 energy as well, and is a separate rung.
+
+``...-Nominal-S7b-VariableHold`` restores the randomisation S7a removed. S6 released the ball
+at rest from a uniform 0.0-0.40 m; S7a replaced that with a fixed 0.40 m hold, so its difference
+from S6 mixed the hold with the loss of the height range. S7b keeps the hold and carries the
+range, which makes S7b - S6 the hold alone and S7b - S7a the height range alone; it therefore
+resumes an **S6** checkpoint rather than S7a's. The floor is 0.10 m, not 0.0, because a hold at
+0.0 means the ball rests on the strings: that is a plate start, not something an operator can
+hold without touching them, and ``held_ball_contact`` would fire at reset. The 0-0.10 band is
+expressible as a drop, not as a hold, and that limit is stated rather than hidden.
+
+Two measured properties of the hold are worth recording, because both are easy to get wrong.
+The height is sampled **once**, by ``reset_ball``, and ``hold_ball`` is given
+``hold_height_m=None`` so it follows that sample: measured over six environments the pin height
+equals the reported start height to **0.0 m**, so ``ball_start_height_m`` cannot report a height
+the ball was never held at. And ``ball_release_alignment_m`` records the plate-frame horizontal
+distance between the plate centre and the ball at the instant of release, which is the measured
+answer to "did it get under the ball" — otherwise only visible by watching.
 
 A rung is trained by resuming the previous rung with the same environment count and
 seed, so the two runs differ in the input condition only. S1 and S2 are **trained**;

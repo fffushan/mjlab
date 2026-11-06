@@ -27,6 +27,8 @@ See ``docs/source/x2_tennis_ball_juggle.rst``.
 
 from __future__ import annotations
 
+import os
+
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_HOLD_DELAY_S,
   JUGGLE_HOLD_HEIGHT_M,
@@ -50,6 +52,26 @@ from mjlab.tasks.velocity.config.agibot_x2.tennis_ball_env_cfg import (
 from mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_nominal_env_cfg import (
   agibot_x2_tennis_juggle_nominal_env_cfg,
 )
+
+_HOLD_HEIGHT_ENV = "MJLAB_JUGGLE_HOLD_HEIGHT_M"
+
+
+def _hold_height() -> float:
+  """Hold height for the delayed-release rung, in metres.
+
+  Defaults to :data:`JUGGLE_HOLD_HEIGHT_M`, so a run that does not set
+  ``MJLAB_JUGGLE_HOLD_HEIGHT_M`` is byte-identical to the committed rung. The
+  override exists because ``play`` has no ``--env.*`` flags: watching one policy
+  released from several heights would otherwise need a source edit per height.
+  Both the reset and the hold read this one value, so they cannot disagree and the
+  start-height metric stays true.
+
+  This is a viewing and ablation knob, not a training condition. A rung that
+  randomises the height belongs in the stage table, not in an environment variable.
+  """
+  raw = os.environ.get(_HOLD_HEIGHT_ENV, "")
+  return float(raw) if raw not in ("", None) else JUGGLE_HOLD_HEIGHT_M
+
 
 STAGE_DELTAS: dict[str, dict[str, object]] = {
   "s1-15hz": {
@@ -195,11 +217,42 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "reset": {
       # S0 already releases every episode as a drop start (plate_start_fraction is 0),
       # so only the height, the extra fall time and the lateral spread move.
-      "drop_height_range": (JUGGLE_HOLD_HEIGHT_M, JUGGLE_HOLD_HEIGHT_M),
+      "drop_height_range": (_hold_height(), _hold_height()),
       "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
     "hold": {
-      "hold_height_m": JUGGLE_HOLD_HEIGHT_M,
+      "hold_height_m": _hold_height(),
+      "hold_delay_s": JUGGLE_HOLD_DELAY_S,
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+  },
+  # S7b restores the randomisation S7a removed. S6 released the ball at rest from a
+  # uniform 0.0-0.40 m; S7a replaced that with a fixed 0.40 m hold, so its difference
+  # from S6 mixed the hold with the loss of the height range. S7b keeps S7a's hold and
+  # carries the height range, which makes S7b - S6 the hold alone and S7b - S7a the
+  # height range alone. It resumes an S6 checkpoint, not S7a's, for the same reason.
+  #
+  # The floor is 0.10 m, not 0.0: a hold at 0.0 means the ball rests on the strings,
+  # which is a plate start rather than something an operator can hold without touching
+  # them, and `held_ball_contact` would fire at reset. The 0-0.10 band is expressible
+  # as a drop, not as a hold, and that limit is stated rather than hidden.
+  #
+  # The height is sampled ONCE, by `reset_ball`: `hold_ball` is given
+  # `hold_height_m: None` and follows that sample, so the pin and
+  # `ball_start_height_m` cannot disagree.
+  "s7b-variable-hold": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": (0.10, 0.40),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": None,
       "hold_delay_s": JUGGLE_HOLD_DELAY_S,
       "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
@@ -267,7 +320,12 @@ def _apply_delayed_release(cfg: ManagerBasedRlEnvCfg, hold: dict[str, object]) -
   cfg.events["hold_ball"] = EventTermCfg(
     mode="reset",
     func=mdp.hold_ball,
-    params={"asset_cfg": ball_cfg, **hold},
+    params={
+      "asset_cfg": ball_cfg,
+      # The waiting-alignment record needs the plate frame at the release instant.
+      "plate_cfg": SceneEntityCfg("robot", body_names=("tennis_racket",)),
+      **hold,
+    },
   )
   cfg.events["advance_ball_hold"] = EventTermCfg(
     mode="step",
@@ -311,6 +369,11 @@ def _apply_delayed_release(cfg: ManagerBasedRlEnvCfg, hold: dict[str, object]) -
   cfg.metrics["ball_hold_delay_s"] = MetricsTermCfg(
     func=mdp.ball_hold_state,
     params={"hold_event": "hold_ball", "field": "release_after_s"},
+    reduce="last",
+  )
+  cfg.metrics["ball_release_alignment_m"] = MetricsTermCfg(
+    func=mdp.ball_hold_state,
+    params={"hold_event": "hold_ball", "field": "release_alignment_m"},
     reduce="last",
   )
 
