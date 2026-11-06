@@ -138,6 +138,11 @@ no usable signal.
 Ball reward set
 ---------------
 
+**Current resolved configuration (2026-11-05 +08):** ``racket_lift`` has weight
+``0.0`` and is skipped. The derivation below describes the earlier penalty design,
+not an active penalty in the current tasks. The `nominal six-run comparison
+<../reports/x2_tennis_nominal_comparison_20261105.md>`_ uses the saved run settings.
+
 .. list-table:: Ball reward terms
    :header-rows: 1
 
@@ -151,8 +156,8 @@ Ball reward set
      - 0.25
      - horizontal distance from the plate centre; plateau 20 mm, sigma 40 mm
    * - ``racket_lift``
-     - ``11.2196`` per m
-     - maximum-slope penalty on the plate rising above its nominal world height, 30 mm deadband
+     - ``0.0`` (disabled)
+     - earlier maximum-slope design: 11.2196 per m; not charged by current configs
    * - ``ball_in_fov``
      - 0.2
      - soft camera constraint, unchanged
@@ -354,6 +359,47 @@ retain their plate-frame input. Use the separate task and experiment for new tra
 do not assume an old checkpoint is compatible merely because its input width matches.
 Learning improvement and controller deployment are **not tested**.
 
+The Nominal variant: the pilot's randomization-free settings
+------------------------------------------------------------
+
+``...-Ball3-Pelvis-Nominal`` is the pelvis variant with every randomization axis the
+nominal juggling pilot holds fixed switched off. It is built by wrapping the pelvis
+task, so the scene, the 1 ms contact physics, the vendor gains, the actuator limits,
+the reward weights, the loss and no-bounce terminations and the widths
+(29 / 112 / 121) are that task's. The wrapping code is
+``tennis_juggle_nominal_env_cfg.py``; the pilot is
+``docs/design/x2_tennis_nominal_pilot.md``.
+
+Resolved settings:
+
+* Pushes, physics randomization, and encoder bias: removed.
+* Actor corruption: disabled. Ball history also has zero internal position noise,
+  bias, latency, and stalls. It keeps three samples at 50 Hz.
+* Head, right arm, and waist resets: fixed default pose.
+* Ball reset: 0.20 m drop, lateral jitter ±0.005 m, zero initial velocity,
+  zero extra fall time, and no plate starts.
+* Command: zero linear and angular velocity; no curriculum.
+* Energy target: ``MJLAB_JUGGLE_ENERGY_TARGET_HEIGHT_M`` sets the reward and both
+  energy metrics together.
+
+Two details are load-bearing. First, **disabling the observation manager's corruption
+is not sufficient to make the actor's ball input noise-free**: the history term applies
+its own per-sample noise, bias, latency and stalls. The term now takes
+``position_noise_m`` (default :data:`BALL_POSITION_NOISE_M`), and this task sets it to
+zero with the other stream magnitudes. Second, **zero command ranges alone do not give
+a zero command**: ``rel_forward_envs`` lifts a forward environment's ``lin_vel_x`` to at
+least 0.3 m/s after sampling the ranges, so the task clears it as well. A third
+detail is smaller: a zero-width head reset band writes the default pose directly,
+because the model's soft head limits (+-0.27 rad) are narrower than the default yaw
+(0.276 rad) and the sampled band would be empty.
+
+A 0.20 m and a 0.40 m arm differ only in ``MJLAB_JUGGLE_ENERGY_TARGET_HEIGHT_M``, which
+reaches the reward and both energy metrics together. Unset, the shipped 0.40 m is used.
+``tests/test_x2_tennis_nominal_task.py`` pins the resolved settings, the shipped
+defaults of the pelvis task, the zero-noise history and the drop placement. Whether a
+policy learns under these settings is **not tested** here: the pilot's training runs are
+separate, and no hardware claim is made.
+
 Terminations
 ------------
 
@@ -474,3 +520,129 @@ Not implemented
   drop height is free. The contact metrics are the intended check. This is deliberately
   deferred, because the arm's impedance has a sim-to-real gap and should be tuned from
   hardware behaviour rather than fitted in simulation.
+
+Staged fine-tune rungs
+----------------------
+
+A rung is the nominal pilot with **one** physical condition changed, trained by resuming
+the previous rung's checkpoint with the same environment count and seed, so a rung
+differs from its parent in the input condition only. There is no scheduler: the
+checkpoint is the whole handoff, and each run's ``params/env.yaml`` records exactly one
+condition.
+
+==========================================  ==============================================
+task suffix                                 condition
+==========================================  ==============================================
+``-Nominal-S1-15Hz``                        ball history at 15 Hz, 0-40 ms delay
+``-Nominal-S2-80-100ms``                    15 Hz, 80-100 ms delay
+``-Nominal-S3-40-140ms``                    15 Hz, 40-140 ms delay, redrawn per sample
+``-Nominal-S3b-80-140ms``                   15 Hz, 80-140 ms delay, redrawn per sample
+``-Nominal-S3c-0-140ms``                    15 Hz, 0-140 ms delay, redrawn per sample
+``-Nominal-S4-Stalls``                       S3's band plus the assumed stall model
+``-Nominal-S4b-Stalls``                      S3's band plus the measured (clip) stall model
+``-Nominal-S5-Noise``                        S4b plus +-(10, 10, 15) mm position noise
+``-Nominal-S6-Release``                      S5 plus a release-position distribution
+``-Nominal-S7a-DelayedRelease``              S6's perception plus a 0-2 s held ball, then release
+==========================================  ==============================================
+
+``...-Ball3-Pelvis-Nominal-S1-15Hz`` is the first rung. It is the
+nominal pilot with the ball history arriving at
+15 Hz with 0 to 40 ms of uniform transport delay, so the estimator samples are
+asynchronous with the 50 Hz control clock. Rewards, terminations, resets, the zero
+command, the locked head, the action width 29, the actor width 112 and the critic
+width 121 are the nominal pilot's. Three samples are still stored, so the actor stays
+112 wide and an earlier checkpoint resumes with its optimizer state. The stage code is
+``tennis_juggle_stage_env_cfg.py``; the term parameters it moves are ``stream_rate_hz``
+and ``stream_latency_s`` on ``ball_hist_pelvis``, and nothing else.
+
+The term quantises both values to whole control steps, which are 20 ms here. The
+requested 15 Hz runs one sample every 3 steps, so the realised rate is **16.67 Hz**, and
+the 0-40 ms delay becomes 0, 20 or 40 ms with probabilities 0.25 / 0.5 / 0.25. A true
+15 Hz is not representable at this control rate; the nearest rates are 16.67 Hz and
+12.5 Hz, and this stage takes the faster one. Read a pass here as mildly optimistic, and
+run 12.5 Hz if the answer has to be conservative.
+
+``...-Nominal-S2-80-100ms`` keeps S1's rate and moves the delay to 80-100 ms. That is a
+different order of magnitude from S1, and it is a target for an improved estimator rather
+than a measurement of the current one: the deployed chain costs 26.1 ms of adapter, about
+65 ms of stereo inference and 2.2 ms of estimator before transport, and was measured end
+to end at 110-141 ms. Latency in this term is **capture to consumption**, not capture to
+publish: it includes the frame phase, transport and the control-tick quantisation.
+
+``...-Nominal-S3-40-140ms`` draws the delay from 40 to 140 ms on every acquisition, i.e.
+2 to 7 control steps, so the delay changes inside an episode. A fixed delay can be
+compensated once with a single learned lead; a varying one has to be read from the
+per-sample age that the observation already carries. This is the rung that tests whether
+that age is usable, and it is the rung whose condition covers both the best estimator we
+could build and the measured 110-141 ms chain.
+
+``...-Nominal-S3b-80-140ms`` is a **sibling** of S3, not its successor: the same wide band
+shifted up, mean 110 ms instead of 90 ms. Both resume S2's checkpoint and run the same
+budget, so the pair isolates the effect of the band's **centre**. The measured chain's mean
+is about 125 ms, so S3b brackets what the current pipeline delivers while S3 brackets what a
+better estimator could. ``...-Nominal-S3c-0-140ms`` is the third sibling: the whole band,
+mean 70 ms, which also includes zero delay, where the S2 policy collapses to streaks of
+five flights. The three curves differ only in the band's centre, so together they say
+whether a wide band teaches the policy to use the per-sample age or only to sit on the
+band's mean.
+
+``...-Nominal-S4-Stalls`` changes the condition rather than the delay: S3's 40-140 ms band
+plus the measured stall model (2 % of acquisitions stall for 0.1-0.6 s). A stall is a longer
+gap before the next acquisition, so the newest sample is simply absent and its age keeps
+growing - 10 to 30 control steps on top of 2 to 7 steps of transport lag. S3 showed the
+policy reads that age; S4 asks whether it stays correct once the ball must be extrapolated
+rather than observed. Per the curriculum plan, rate, latency and stalls are separate
+substeps, and stalls is the third.
+
+``...-Nominal-S4b-Stalls`` is a sibling of S4 that replaces S4's assumed stall parameters with
+measured ones: a recorded hardware clip shows the ball leaving the camera field of view when it
+is raised high, for about 0.1 s, on about 10 % of frames. The gap is therefore 5-10 control
+steps recurring every ~0.6 s, against S4's 5-30 steps every ~3 s. The worst age the actor sees
+falls from 0.74 s to 0.34 s while the fraction of time the newest sample is stale rises from
+about 10 % to about 20 %. S4 trained against gaps the camera does not produce and degraded to
+0.38 s flights with five drops per 4096 environments; S4b tests the gap that occurs.
+
+``...-Nominal-S5-Noise`` adds measurement error on top of S4b's whole condition: the rate, the
+latency band and the stall model all repeat, because a stage carries the complete condition and
+not only its own increment. Position noise is per axis and per acquisition, drawn uniformly in
++-10 mm laterally and +-15 mm vertically, so the three history samples carry independent error,
+which is what a real estimator gives. The ages stay exact; only the positions are wrong. The bias
+is deliberately zero: a per-episode offset is not measurable with the current rig, and a bias
+drawn in the wrong direction would train a compensation for a fault that may not exist.
+
+``...-Nominal-S6-Release`` stops varying what the estimator reports and varies what the operator
+does: the release. The ball leaves the hand anywhere from rest on the strings to 0.40 m above them,
+sampled uniformly, and within +-20 mm of the plate centre in both lateral axes. The target apex
+stays 0.40 m, so a release at the target height must be caught and re-bounced rather than lifted,
+and a release at zero has no fall energy at all. Everything S5 added still applies. The ranges are
+the operator's stated intent; they are not yet a measurement of a real hand release, and the
+curriculum plan asks for that measurement before the ranges are treated as final. A stage declares
+these with a ``reset`` sub-entry, which the factory applies to ``events["reset_ball"]``; every other
+event term must still equal S0's, and the one-delta test enforces that.
+
+``...-Nominal-S7a-DelayedRelease`` is the first rung that changes the episode **structure**
+rather than a perception condition. The ball is pinned in world space 0.40 m above its resting
+height and released after a uniform 0 to 2 s wait, so the policy must place a level, quiet racket
+under it and be ready before the ball moves. S5's whole perception condition still applies: a
+deferred release must be seen through the same delayed, stalled, noisy chain, and the actor is
+never told that the ball is held.
+
+Three additions come with the hold, and each closes a measured loophole rather than adding skill.
+The energy reward is gated to the post-release phase, because a held ball is world-fixed with zero
+velocity, so its energy is a per-episode constant the policy cannot influence: at a 0.40 m hold it
+equals the target exactly and would pay a full 1.0 on every waiting step for doing nothing.
+``racket_under_ball`` pays for a level, quiet racket under the held ball, because ``ball_centred``
+is plate-frame horizontal only and a tilted plate can satisfy it without the racket being below the
+ball. ``held_ball_contact`` ends an episode in which the racket touches the held ball, so a wait
+cannot become an early strike or a preload. The no-bounce deadline is paused while the ball is
+held, or a 2 s wait would consume 80 % of its 2.5 s window before the release.
+
+The hold height is fixed at 0.40 m, which is the energy target, so the release energy equals
+``E*`` and any change is attributable to waiting. Randomising the hold height changes the drop
+energy as well, and is a separate rung.
+
+A rung is trained by resuming the previous rung with the same environment count and
+seed, so the two runs differ in the input condition only. S1 and S2 are **trained**;
+S1 passed its screen unchanged against the nominal pilot, and S2 passed at its own
+condition, where the S1 policy scores 61 qualified flights and 1085 drops in closed loop.
+S3 is **not trained**: no result is claimed for it here.

@@ -1572,3 +1572,38 @@ __all__ = [
   "juggle_racket_lift_weight",
   "measure_bat_carry_state",
 ]
+
+
+# --- S7 delayed release -------------------------------------------------------
+#
+# The operator holds the ball over the racket and lets go after a wait. These are
+# the first delayed-release rung's values: a fixed 0.40 m hold, so the release energy
+# equals the 0.40 m energy target and any change is attributable to waiting rather
+# than to a different drop energy. Widening the hold height is a separate rung.
+JUGGLE_HOLD_HEIGHT_M = 0.40
+"""Ball-centre height above its resting state while held, in metres."""
+
+JUGGLE_HOLD_DELAY_S = (0.0, 2.0)
+"""Uniform hold duration before release, in seconds. Includes 0.0 on purpose: an
+immediate release must stay in the distribution, or stillness becomes a
+precondition and the policy can learn a countdown instead of watching the ball."""
+
+JUGGLE_HOLD_LATERAL_RANGE_M = 0.02
+"""Half-width of the world x/y hold offset, in metres. The same +-20 mm spread the
+S6 release uses, centred on the nominal bed point."""
+
+JUGGLE_WAIT_ALIGN_WEIGHT = 0.4
+"""Weight of the waiting-alignment reward ``racket_under_ball``. Paid only while
+the ball is held. Kept below the juggling terms: waiting is a means, not the task."""
+
+JUGGLE_WAIT_PLATEAU_M = 0.010
+"""Plate-frame offset inside which waiting alignment is exactly 1, in metres."""
+
+JUGGLE_WAIT_SIGMA_M = 0.030
+"""Falloff of the waiting alignment beyond the plateau, in metres."""
+
+JUGGLE_WAIT_LEVEL_POWER = 2.0
+"""Exponent on the plate normal's world-z component in the waiting alignment."""
+
+JUGGLE_WAIT_SPEED_SIGMA_MPS = 0.5
+"""Scale of the quiet factor in the waiting alignment, in metres per second."""

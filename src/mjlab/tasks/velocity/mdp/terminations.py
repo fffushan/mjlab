@@ -306,11 +306,24 @@ class ball_no_bounce(ManagerTermBase):
       raise ValueError(msg)
     self._prev_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     self._steps_since = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    # Optional hold pause: the waiting phase must not consume the deadline, or a
+    # 2 s wait eats 80 % of a 2.5 s clock before the ball is even released.
+    hold_event = cfg.params.get("hold_event")
+    self._hold = None
+    if hold_event is not None:
+      self._hold = env.event_manager.get_term_cfg(str(hold_event)).func
+      assert hasattr(self._hold, "held"), (
+        f"'{hold_event}' must be a hold_ball event term exposing 'held'"
+      )
 
   def __call__(
-    self, env: ManagerBasedRlEnv, sensor_name: str, timeout_s: float
+    self,
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    timeout_s: float,
+    hold_event: str | None = None,
   ) -> torch.Tensor:
-    del sensor_name  # Resolved in ``__init__``.
+    del sensor_name, hold_event  # Resolved in ``__init__``.
     sensor: ContactSensor = env.scene[self._sensor_name]
     contact = step_contact(sensor.data)
     rising = contact & ~self._prev_contact
@@ -322,6 +335,11 @@ class ball_no_bounce(ManagerTermBase):
       torch.zeros_like(self._steps_since),
       self._steps_since + 1,
     )
+    if self._hold is not None:
+      # Paused, not reset: the deadline starts counting at release.
+      self._steps_since = torch.where(
+        self._hold.held, torch.zeros_like(self._steps_since), self._steps_since
+      )
     elapsed = self._steps_since.float() * self._step_dt
     return elapsed >= timeout_s
 
@@ -330,3 +348,39 @@ class ball_no_bounce(ManagerTermBase):
       env_ids = slice(None)
     self._prev_contact[env_ids] = False
     self._steps_since[env_ids] = 0
+
+
+class held_ball_contact(ManagerTermBase):
+  """End an episode in which the racket touches the ball while it is still held.
+
+  The wait must be a wait, not an early strike or a preload. The hold pins the
+  ball's ``qpos``/``qvel`` so an impact cannot move it, but the constraint pushes
+  back on the racket: a policy could lean on the held ball, or use it as a support,
+  and the energy reward would never see it because it is gated off while held.
+
+  Contact is read through :func:`~mjlab.tasks.velocity.mdp.ball_contact.step_contact`,
+  so a 9-10 ms touch between two control steps is still caught.
+
+  Args:
+    sensor_name: Scene name of the racket-ball contact sensor.
+    hold_event: Name of the ``hold_ball`` event term that owns the hold state.
+
+  Returns:
+    Shape ``(num_envs,)`` bool.
+  """
+
+  def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._sensor_name = str(cfg.params["sensor_name"])
+    self._hold_event = str(cfg.params["hold_event"])
+    self._hold = env.event_manager.get_term_cfg(self._hold_event).func
+    assert hasattr(self._hold, "held"), (
+      f"'{self._hold_event}' must be a hold_ball event term exposing 'held'"
+    )
+
+  def __call__(
+    self, env: ManagerBasedRlEnv, sensor_name: str, hold_event: str
+  ) -> torch.Tensor:
+    del sensor_name, hold_event  # Resolved in ``__init__``.
+    sensor: ContactSensor = env.scene[self._sensor_name]
+    return step_contact(sensor.data) & self._hold.held

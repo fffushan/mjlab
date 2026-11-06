@@ -344,8 +344,9 @@ class ball_history_samples(ManagerTermBase):
   The term applies its own delay and its own noise, so its
   :class:`~mjlab.managers.observation_manager.ObservationTermCfg` must set neither
   ``noise`` nor any ``delay_*`` field. The noise is uniform with the per-axis
-  half-widths :data:`BALL_POSITION_NOISE_M`, the same placeholders and the same
-  distribution the rest of the velocity task uses.
+  half-widths ``position_noise_m``, which defaults to
+  :data:`BALL_POSITION_NOISE_M`: the same placeholders and the same distribution
+  the rest of the velocity task uses. A zero triple makes the samples exact.
 
   **The reference frame is chosen once, and a sample keeps the frame it was
   captured in.** ``reference_frame="plate"`` is the shipped behaviour and
@@ -363,6 +364,9 @@ class ball_history_samples(ManagerTermBase):
     reference_frame: ``"plate"`` (default) or ``"pelvis"``.
     bias_half_width_m: Half-width of the constant per-episode offset, in metres on
       each frame axis. 0.0 disables it.
+    position_noise_m: Per-axis half-widths of the per-sample position noise, in
+      metres. Defaults to :data:`BALL_POSITION_NOISE_M`; ``(0.0, 0.0, 0.0)``
+      disables it.
 
   Returns:
     Tensor of shape ``(num_envs, 12)``: ``[x0, y0, z0, t0, x1, y1, z1, t1, x2, y2,
@@ -372,6 +376,9 @@ class ball_history_samples(ManagerTermBase):
   def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedRlEnv):
     super().__init__(env)
     self._bias_half_width_m = float(cfg.params.get("bias_half_width_m", 0.0) or 0.0)
+    noise_half_m = tuple(
+      float(v) for v in cfg.params.get("position_noise_m", BALL_POSITION_NOISE_M)
+    )
     self._step_dt = float(env.step_dt)
     # The ring must cover the longest latency plus the three-sample span at the
     # slowest stream rate, with margin. The epsilon keeps float dust in
@@ -400,9 +407,7 @@ class ball_history_samples(ManagerTermBase):
     self._step = torch.zeros(n, dtype=torch.long, device=device)
     self._last_buf: torch.Tensor | None = None
     self._last_out: torch.Tensor | None = None
-    self._noise_half = torch.tensor(
-      BALL_POSITION_NOISE_M, dtype=torch.float32, device=device
-    )
+    self._noise_half = torch.tensor(noise_half_m, dtype=torch.float32, device=device)
 
   def __call__(
     self,
@@ -412,12 +417,14 @@ class ball_history_samples(ManagerTermBase):
     pelvis_cfg: SceneEntityCfg | None = None,
     reference_frame: str = "plate",
     bias_half_width_m: float = 0.0,
+    position_noise_m: tuple[float, float, float] = BALL_POSITION_NOISE_M,
     stream_rate_hz: tuple[float, float] = BALL_STREAM_RATE_RANGE_HZ,
     stream_latency_s: tuple[float, float] = BALL_STREAM_LATENCY_RANGE_S,
     stall_prob: float = BALL_STREAM_STALL_PROB,
     stall_range_s: tuple[float, float] = BALL_STREAM_STALL_RANGE_S,
   ) -> torch.Tensor:
     del bias_half_width_m  # Drawn once per episode in ``reset``/``__init__``.
+    del position_noise_m  # Resolved once per term in ``__init__``.
     # The stream magnitudes are parameters, not module globals, so an ablation arm can
     # vary them from the configuration and the value a run used is recorded in the
     # run's own params/env.yaml. They default to the measured constants.

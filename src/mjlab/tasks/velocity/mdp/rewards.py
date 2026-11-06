@@ -1310,3 +1310,121 @@ class ball_contact_metric(ManagerTermBase):
     self._contact_run[env_ids] = 0
     self._flight_sum[env_ids] = 0.0
     self._flight_count[env_ids] = 0
+
+
+def _held_mask(env: ManagerBasedRlEnv, hold_event: str | None) -> torch.Tensor | None:
+  """The per-environment hold flag of a ``hold_ball`` event term, or None.
+
+  Duck-typed on purpose: the hold term lives in :mod:`mjlab.tasks.velocity.mdp.events`,
+  which imports this module, so importing it back would be circular. Any term that
+  exposes a boolean ``held`` buffer works, and the assertion names the expected
+  term rather than silently reading nothing.
+  """
+  if hold_event is None:
+    return None
+  term = env.event_manager.get_term_cfg(hold_event).func
+  held = getattr(term, "held", None)
+  assert held is not None, (
+    f"'{hold_event}' must be a hold_ball event term exposing a 'held' buffer"
+  )
+  return held
+
+
+def ball_energy_after_release(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+  target_height: float,
+  sigma: float,
+  ball_rest_z: float,
+  hold_event: str = "hold_ball",
+) -> torch.Tensor:
+  """``ball_energy``, scored only after the ball has been released.
+
+  The formula is unchanged; this term gates it to the post-release phase. While
+  the ball is held it is world-fixed with zero velocity, so ``E`` is a per-episode
+  constant that the policy cannot influence: at a 0.40 m hold it is exactly
+  :math:`E^*` and the term would pay a full 1.0 on every waiting step for doing
+  nothing, and with a randomised hold height a high release would be worth more
+  than a low one for no reason a skill explains. Gating removes both.
+
+  Args:
+    plate_cfg: Accepted so the ball terms share one parameter dict.
+    ball_cfg: Ball entity.
+    target_height: Target apex above the resting state, in metres.
+    sigma: Gaussian falloff in J/kg.
+    ball_rest_z: ``z_rest``, the resting ball centre's absolute world z.
+    hold_event: Name of the ``hold_ball`` event term that owns the hold state.
+
+  Returns:
+    Shape ``(num_envs,)``, between 0 and 1, zero while held.
+  """
+  reward = ball_energy(env, plate_cfg, ball_cfg, target_height, sigma, ball_rest_z)
+  held = _held_mask(env, hold_event)
+  if held is None:
+    return reward
+  return torch.where(held, torch.zeros_like(reward), reward)
+
+
+def racket_under_ball(
+  env: ManagerBasedRlEnv,
+  plate_cfg: SceneEntityCfg,
+  ball_cfg: SceneEntityCfg,
+  hold_event: str = "hold_ball",
+  plateau: float = 0.010,
+  sigma: float = 0.030,
+  level_power: float = 2.0,
+  speed_sigma: float = 0.5,
+) -> torch.Tensor:
+  r"""Reward putting a level, quiet racket under the held ball.
+
+  .. math::
+
+    r = \exp(-(\max(0, d - p) / \sigma)^2) \; \cos^{k}\!\theta \; e^{-(v/\sigma_v)^2}
+
+  with ``d`` the ball's plate-frame horizontal offset from the plate centre,
+  :math:`\cos\theta` the world-z component of the plate normal (so a tilted plate
+  cannot satisfy the alignment by leaning toward the ball), and ``v`` the ball's
+  speed relative to the plate. While the ball is held it does not move, so ``v`` is
+  the plate's own speed: this factor is the "wait quietly" part.
+
+  This is the term ``ball_centred`` cannot be: its offset is plate-frame only, so
+  tilting the plate toward an elevated ball improves it without placing the racket
+  below the ball, and nothing in the reward set specifies a waiting posture. The
+  term is gated to the hold phase, so it cannot pay for anything after release.
+
+  Args:
+    plate_cfg: Racket body; the plate frame is defined by it.
+    ball_cfg: Ball entity.
+    hold_event: Name of the ``hold_ball`` event term that owns the hold state.
+    plateau: Offset inside which the positioning factor is exactly 1, in metres.
+    sigma: Positioning falloff beyond the plateau, in metres.
+    level_power: Exponent on the plate normal's world-z component.
+    speed_sigma: Scale of the quiet factor, in metres per second.
+
+  Returns:
+    Shape ``(num_envs,)``, between 0 and 1, zero after release.
+  """
+  position, velocity = plate_relative_ball_state(env, plate_cfg, ball_cfg)
+  distance = torch.linalg.norm(position[:, :2], dim=1)
+  outside = torch.clamp(distance - plateau, min=0.0)
+  aligned = torch.exp(-torch.square(outside / sigma))
+
+  plate: Entity = env.scene[plate_cfg.name]
+  body_id = plate_cfg.body_ids
+  if isinstance(body_id, list):
+    body_id = body_id[0]
+  normal_w = quat_apply(
+    plate.data.body_link_quat_w[:, body_id],
+    torch.tensor((0.0, 0.0, 1.0), device=env.device).expand(env.num_envs, 3),
+  )
+  level = torch.clamp(normal_w[:, 2], min=0.0).pow(level_power)
+
+  speed = torch.linalg.norm(velocity, dim=1)
+  quiet = torch.exp(-torch.square(speed / speed_sigma))
+
+  reward = aligned * level * quiet
+  held = _held_mask(env, hold_event)
+  if held is None:
+    return reward
+  return torch.where(held, reward, torch.zeros_like(reward))

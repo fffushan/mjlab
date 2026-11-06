@@ -48,7 +48,7 @@ class reset_ball_release(ManagerTermBase):
   """Place the ball in one of the two stage-1 release states.
 
   Each environment draws one release type with probability
-  :data:`JUGGLE_PLATE_START_FRACTION`:
+  ``plate_start_fraction``, which defaults to :data:`JUGGLE_PLATE_START_FRACTION`:
 
   * **Plate start.** The ball centre is one radius plus
     :data:`BALL_SPAWN_CLEARANCE` above the **actual** post-reset plate surface,
@@ -88,6 +88,20 @@ class reset_ball_release(ManagerTermBase):
     asset_cfg: The ball entity, which must be a floating base.
     plate_cfg: The robot's ``face_center`` site; the plate frame is the site
       frame, whose +z is the bed normal.
+    plate_start_fraction: Probability that an environment draws a plate start
+      instead of a drop start. Defaults to
+      :data:`JUGGLE_PLATE_START_FRACTION`; ``0.0`` gives drop starts only.
+    drop_height_range: ``(low, high)`` release height above the bed in metres.
+      Defaults to :data:`JUGGLE_DROP_HEIGHT_RANGE_M`; ``(h, h)`` releases every
+      drop from one height.
+    drop_extra_time_s: ``(low, high)`` extra fall time in seconds. Defaults to
+      :data:`JUGGLE_DROP_EXTRA_TIME_S`; ``(0.0, 0.0)`` releases the ball at rest
+      vertically.
+    drop_lateral_range_m: Half-width of the in-plane drop offset. Defaults to
+      :data:`JUGGLE_DROP_LATERAL_RANGE_M`.
+    drop_lateral_speed_range_mps: Half-width of the in-plane drop speed. Defaults
+      to :data:`JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS`; ``0.0`` drops the ball with
+      no lateral speed.
   """
 
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -106,6 +120,11 @@ class reset_ball_release(ManagerTermBase):
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
     plate_cfg: SceneEntityCfg,
+    plate_start_fraction: float = JUGGLE_PLATE_START_FRACTION,
+    drop_height_range: tuple[float, float] = JUGGLE_DROP_HEIGHT_RANGE_M,
+    drop_extra_time_s: tuple[float, float] = JUGGLE_DROP_EXTRA_TIME_S,
+    drop_lateral_range_m: float = JUGGLE_DROP_LATERAL_RANGE_M,
+    drop_lateral_speed_range_mps: float = JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS,
   ) -> None:
     env_ids = resolve_env_ids(env, env_ids)
     asset: Entity = env.scene[asset_cfg.name]
@@ -113,30 +132,30 @@ class reset_ball_release(ManagerTermBase):
     device = env.device
 
     gravity = abs(float(env.sim.mj_model.opt.gravity[2]))
-    plate = torch.rand(num_envs, device=device) < JUGGLE_PLATE_START_FRACTION
+    plate = torch.rand(num_envs, device=device) < plate_start_fraction
     self.start_plate[env_ids] = plate.float()
 
     drop_height = sample_uniform(
-      JUGGLE_DROP_HEIGHT_RANGE_M[0],
-      JUGGLE_DROP_HEIGHT_RANGE_M[1],
+      drop_height_range[0],
+      drop_height_range[1],
       (num_envs,),
       device,
     )
     extra_time = sample_uniform(
-      JUGGLE_DROP_EXTRA_TIME_S[0],
-      JUGGLE_DROP_EXTRA_TIME_S[1],
+      drop_extra_time_s[0],
+      drop_extra_time_s[1],
       (num_envs,),
       device,
     )
     drop_lateral = sample_uniform(
-      -JUGGLE_DROP_LATERAL_RANGE_M,
-      JUGGLE_DROP_LATERAL_RANGE_M,
+      -drop_lateral_range_m,
+      drop_lateral_range_m,
       (num_envs, 2),
       device,
     )
     drop_lateral_speed = sample_uniform(
-      -JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS,
-      JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS,
+      -drop_lateral_speed_range_mps,
+      drop_lateral_speed_range_mps,
       (num_envs, 2),
       device,
     )
@@ -220,7 +239,8 @@ def reset_head_pose(
     env: The environment.
     env_ids: Environments to reset, or None for all.
     position_range: Symmetric half-width of the offset about the default pose, in
-      radians, applied to every joint in ``asset_cfg``.
+      radians, applied to every joint in ``asset_cfg``. ``(0.0, 0.0)`` writes the
+      default pose, which is the fixed-pose option.
     asset_cfg: The head joints. Must resolve to the head body's two joints.
   """
   env_ids = resolve_env_ids(env, env_ids)
@@ -232,15 +252,22 @@ def reset_head_pose(
 
   default = default_joint_pos[env_ids][:, asset_cfg.joint_ids]
   limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
-  # Sample uniformly inside the *feasible* band rather than about the default followed
-  # by a clamp. A clamp piles environments onto whichever limit the band ends at, and
-  # this band is narrow: the model allows +-0.3 rad for head yaw while its default
-  # sits at 0.276, so most of a +-0.5 offset would land on the same number. Uniform
-  # over the intersection keeps the poses spread and never oversamples a limit.
   half = max(abs(position_range[0]), abs(position_range[1]))
-  lo = torch.maximum(limits[..., 0], default - half)
-  hi = torch.minimum(limits[..., 1], default + half)
-  joint_pos = lo + (hi - lo) * torch.rand(default.shape, device=env.device)
+  if half == 0.0:
+    # A zero half-width is the default pose. The band is not computed here because
+    # it can be empty: the model's soft head limits are +-0.27 rad while the default
+    # yaw is 0.276, so ``lo`` would pass ``hi`` and the draw would land between them.
+    joint_pos = default.clone()
+  else:
+    # Sample uniformly inside the *feasible* band rather than about the default
+    # followed by a clamp. A clamp piles environments onto whichever limit the band
+    # ends at, and this band is narrow: the model allows +-0.3 rad for head yaw while
+    # its default sits at 0.276, so most of a +-0.5 offset would land on the same
+    # number. Uniform over the intersection keeps the poses spread and never
+    # oversamples a limit.
+    lo = torch.maximum(limits[..., 0], default - half)
+    hi = torch.minimum(limits[..., 1], default + half)
+    joint_pos = lo + (hi - lo) * torch.rand(default.shape, device=env.device)
 
   joint_ids = asset_cfg.joint_ids
   if isinstance(joint_ids, list):
@@ -367,3 +394,214 @@ class ball_first_lift_time(ManagerTermBase):
     env_ids = _reset_env_ids(env_ids)
     self._first_lift_s[env_ids] = -1.0
     self._steps[env_ids] = 0
+
+
+class hold_ball(ManagerTermBase):
+  """Hold the ball world-fixed above the plate, then let go of it at rest.
+
+  The deployment condition this emulates: the operator holds the ball over the
+  racket, waits, and releases it. The waiting time is not something the policy
+  can influence, so the delay is sampled uniformly per environment and the ball
+  is pinned at a world-fixed point until that delay elapses.
+
+  **Why a pin and not a weld.** MuJoCo welds are model-level; this scene runs
+  thousands of environments with independent release times. Writing the ball's
+  ``qpos``/``qvel`` back to the hold point on every control step is per-environment
+  and needs no model change. The write lands in the sim state directly, so the
+  observation computed later in the same step sees the exact hold point with zero
+  velocity.
+
+  **The residual sag is hidden.** A control step is four physics substeps, so the
+  ball falls ``g (4 dt)^2 / 2 = 1.96 mm`` and reaches 0.196 m/s *inside* each held
+  step, and the next hold write erases it. Reward and termination terms that run
+  before the event manager therefore see that sagged state; the energy term is
+  gated off while held (:func:`~mjlab.tasks.velocity.mdp.rewards.ball_energy_after_release`)
+  so the 0.019 J/kg it contributes is not scored.
+
+  **Release is exact.** The release write sets the sampled hold point and zero
+  velocity, so the ball starts from rest at the intended place: no position jump
+  and no impulse. Nothing else writes the ball between the release and the next
+  ``sim.step()``.
+
+  The hold point uses the *nominal* bed anchor plus the measured bed normal, the
+  same convention as :class:`reset_ball_release`'s drop branch: an operator's hand
+  is world-fixed, it does not follow a perturbed plate. Height is measured above
+  the ball's resting state on the plate, so ``0.40`` is the same 0.40 m the energy
+  target uses.
+
+  Args:
+    asset_cfg: The ball entity, which must be a floating base.
+    hold_height_m: Ball-centre height above its resting state, in metres.
+    hold_delay_s: ``(low, high)`` uniform hold duration before release. Include
+      ``0.0`` so an immediate release stays in the distribution and stillness
+      never becomes a precondition.
+    lateral_range_m: Half-width of the world x/y hold offset, in metres.
+  """
+
+  def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self._asset_name = cfg.params["asset_cfg"].name
+    self._step_dt = env.step_dt
+    num_envs, device = env.num_envs, env.device
+    self.hold_point = torch.zeros(num_envs, 3, device=device)
+    """World hold point of every environment, in metres."""
+    self.release_after_s = torch.zeros(num_envs, device=device)
+    """Sampled hold duration of the current episode, in seconds."""
+    self.elapsed_s = torch.zeros(num_envs, device=device)
+    """Time spent held in the current episode, in seconds."""
+    self.held = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    """True while the ball is still pinned."""
+    self.released = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    """True once the current episode has released the ball."""
+    self._released_this_step = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    hold_height_m: float,
+    hold_delay_s: tuple[float, float],
+    lateral_range_m: float,
+  ) -> None:
+    env_ids = resolve_env_ids(env, env_ids)
+    asset: Entity = env.scene[asset_cfg.name]
+    num_envs = len(env_ids)
+    device = env.device
+
+    anchor = torch.tensor(ball_spawn_init_pos(0.0), device=device, dtype=torch.float32)
+    normal = torch.tensor(BALL_SPAWN_FACE_NORMAL, device=device, dtype=torch.float32)
+    anchor = anchor.expand(num_envs, 3)
+    normal = normal.expand(num_envs, 3)
+    lateral = sample_uniform(-lateral_range_m, lateral_range_m, (num_envs, 2), device)
+    point = anchor + normal * hold_height_m
+    point[:, :2] += lateral
+    point += env.scene.env_origins[env_ids]
+
+    self.hold_point[env_ids] = point
+    self.release_after_s[env_ids] = sample_uniform(
+      hold_delay_s[0], hold_delay_s[1], (num_envs,), device
+    )
+    self.elapsed_s[env_ids] = 0.0
+    self.held[env_ids] = True
+    self.released[env_ids] = False
+    self._released_this_step[env_ids] = False
+    self._pin(env, asset, env_ids)
+
+  def advance(self, env: ManagerBasedRlEnv, asset: Entity) -> None:
+    """Advance the hold clock one control step and release the due environments."""
+    self._released_this_step.fill_(False)
+    if not bool(self.held.any()):
+      return
+    self.elapsed_s += self._step_dt
+    due = self.held & (self.elapsed_s >= self.release_after_s)
+    still_held = self.held & ~due
+    if bool(still_held.any()):
+      self._pin(env, asset, still_held.nonzero(as_tuple=False).squeeze(-1))
+    if bool(due.any()):
+      due_ids = due.nonzero(as_tuple=False).squeeze(-1)
+      self._pin(env, asset, due_ids)
+      self.held[due_ids] = False
+      self.released[due_ids] = True
+      self._released_this_step[due_ids] = True
+      # Start the post-release clock at the release: every environment then gets
+      # the same full window regardless of how long the operator waited.
+      env.episode_length_buf[due_ids] = 0
+
+  def _pin(
+    self,
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+    env_ids: torch.Tensor,
+  ) -> None:
+    if env_ids.numel() == 0:
+      return
+    count = env_ids.numel()
+    orientation = torch.zeros((count, 4), device=env.device)
+    orientation[:, 0] = 1.0
+    zeros = torch.zeros((count, 3), device=env.device)
+    asset.write_root_state_to_sim(
+      torch.cat([self.hold_point[env_ids], orientation, zeros, zeros], dim=-1),
+      env_ids=env_ids,
+    )
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    """Clear only the per-step release flag.
+
+    The sampled hold state is **not** cleared here on purpose.
+    ``ManagerBasedRlEnv._reset_idx`` applies the ``reset``-mode events *before* it
+    calls ``event_manager.reset(env_ids)``, so a destructive reset would wipe the
+    hold that :meth:`__call__` just sampled and every episode would start
+    released. The reset-mode call is the authority for the sampled state.
+    """
+    env_ids = _reset_env_ids(env_ids)
+    self._released_this_step[env_ids] = False
+
+
+def advance_ball_hold(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  hold_event: str,
+  asset_cfg: SceneEntityCfg,
+) -> None:
+  """Per-step companion to :class:`hold_ball`: keep pinning, release when due.
+
+  A ``reset``-mode event only fires on environment resets, so the hold needs a
+  second ``step``-mode term to advance every control step. Both terms share one
+  state object, the same way the start metrics share
+  :class:`reset_ball_release`'s instance.
+
+  ``env_ids`` is the step-mode manager's positional ``None`` and is ignored: the
+  term advances every environment and works from its own ``held`` mask.
+
+  Args:
+    env_ids: Unused; a ``step``-mode event receives ``None`` for all environments.
+    hold_event: Name of the :class:`hold_ball` reset event that owns the state.
+    asset_cfg: The ball entity.
+  """
+  del env_ids
+  term = hold_term(env, hold_event)
+  term.advance(env, env.scene[asset_cfg.name])
+
+
+def hold_term(env: ManagerBasedRlEnv, hold_event: str) -> hold_ball:
+  """The live :class:`hold_ball` instance, which owns the per-episode hold state."""
+  term = env.event_manager.get_term_cfg(hold_event).func
+  assert isinstance(term, hold_ball), (
+    f"term needs a class-based '{hold_event}' event term"
+  )
+  return term
+
+
+class ball_hold_state(ManagerTermBase):
+  """Logging-only metrics for the hold phase, read from the hold term.
+
+  ``held`` is 1.0 while the ball is pinned and 0.0 after release, so
+  ``reduce="mean"`` reports the held fraction of the episode. ``release_after_s``
+  is the sampled hold duration and is constant per episode, so it is logged with
+  ``reduce="last"``. Both are simulator-side facts used for accounting only; the
+  actor never sees them.
+
+  Args:
+    hold_event: Name of the :class:`hold_ball` event term.
+    field: ``"held"`` or ``"release_after_s"``.
+  """
+
+  def __init__(self, cfg: MetricsTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    term = hold_term(env, cfg.params["hold_event"])
+    field = str(cfg.params.get("field", "held"))
+    assert field in ("held", "release_after_s"), f"unknown hold field '{field}'"
+    # Keep the buffer itself, never a converted copy: ``held`` is a bool tensor, so
+    # ``.float()`` allocates and a cached copy would report the values from
+    # construction time for the whole run. The conversion happens on read instead.
+    self._source = term.held if field == "held" else term.release_after_s
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    hold_event: str,
+    field: str = "held",
+  ) -> torch.Tensor:
+    del env, hold_event, field  # The hold term writes this buffer in place.
+    return self._source.float()

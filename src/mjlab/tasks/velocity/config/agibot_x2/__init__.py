@@ -8,6 +8,8 @@ from .env_cfgs import agibot_x2_flat_velocity_env_cfg
 from .rl_cfg import agibot_x2_velocity_ppo_runner_cfg
 from .tennis_ball_env_cfg import agibot_x2_tennis_ball_env_cfg
 from .tennis_juggle_env_cfg import agibot_x2_tennis_juggle_env_cfg
+from .tennis_juggle_nominal_env_cfg import agibot_x2_tennis_juggle_nominal_env_cfg
+from .tennis_juggle_stage_env_cfg import agibot_x2_tennis_juggle_stage_env_cfg
 from .tennis_recovery_env_cfg import agibot_x2_tennis_recovery_env_cfg
 from .tennis_recovery_rl_cfg import agibot_x2_tennis_recovery_ppo_runner_cfg
 
@@ -113,6 +115,202 @@ register_mjlab_task(
   ),
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
     experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Opt-in nominal pilot. The pelvis task with the pushes, the physics/encoder
+# randomization, the actor input corruption and the sampled resets removed, a
+# centred 0.20 m drop start and a zero command. Widths stay 29 / 112 / 121. The
+# target apex height stays on the existing MJLAB_JUGGLE_ENERGY_TARGET_HEIGHT_M
+# override. See docs/design/x2_tennis_nominal_pilot.md.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_nominal_env_cfg(),
+  play_env_cfg=agibot_x2_tennis_juggle_nominal_env_cfg(play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S1 of the staged fine-tune. One input condition moves against the nominal pilot,
+# so an S0 checkpoint resumes with its optimizer state. The ball history arrives at
+# 15 Hz with 0-40 ms of uniform delay, so the estimator samples are asynchronous with
+# the 50 Hz control clock; the screen needs no scheduler and no contract change.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S1-15Hz"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(play=True),
+  # The S0 experiment name is deliberate: the run resumes with --agent.load-run
+  # pointing at an S0 run directory inside the same log root, so no checkpoint copy is
+  # needed.
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S2 of the staged fine-tune: the S1 rate with the latency a real estimator
+# chain has (80-100 ms). Resumes an S1 run's checkpoint, so it keeps S1's
+# experiment name and the same 112 / 29 / 121 contract. See
+# docs/source/x2_tennis_ball_juggle.rst.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S2-80-100ms"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s2-80-100ms"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s2-80-100ms", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S3 of the staged fine-tune: 15 Hz with the latency drawn across the whole
+# plausible band, 40-140 ms. Resumes an S2 run's checkpoint and keeps the same
+# 112 / 29 / 121 contract; the delay varies within an episode, so the policy has to
+# use the per-sample age rather than a single learned lead. See
+# docs/source/x2_tennis_ball_juggle.rst.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S3-40-140ms"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s3-40-140ms"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s3-40-140ms", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S3b, a sibling of S3: the same wide band shifted up to 80-140 ms, mean 110 ms,
+# which brackets the measured chain's mean instead of a hypothetical better estimator.
+# Same contract and the same S2 parent checkpoint as S3, so the pair isolates the
+# band's centre.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S3b-80-140ms"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s3b-80-140ms"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s3b-80-140ms", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S3c, the third sibling of S3: the whole band, 0-140 ms, mean 70 ms. Same
+# contract and the same S2 parent checkpoint as S3 and S3b, so the three curves differ
+# only in the band's centre and together say whether a wide band teaches the policy to
+# use the per-sample age or only to sit on the band's mean.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S3c-0-140ms"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s3c-0-140ms"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s3c-0-140ms", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S4: S3's condition plus the measured stream stall model. A stall is a longer
+# gap before the next acquisition, so the newest sample is absent and the ball must be
+# extrapolated from a growing age. Same contract and the same per-seed S3 parent
+# checkpoint, so the only change is the stall.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S4-Stalls"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s4-stalls"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s4-stalls", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S4b, a sibling of S4 with the stall measured from a recorded clip instead of assumed:
+# 10 % of acquisitions stall for 0.1-0.2 s, because the ball leaves the camera field of view
+# when it is raised. Same contract and the same per-seed S3 parent checkpoint as S4, so the
+# pair isolates the stall parameters.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S4b-Stalls"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s4b-stalls"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s4b-stalls", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S5: S4b's full condition plus per-acquisition position noise of +-(10, 10, 15) mm and
+# no bias. The three history samples then carry independent error, which is what a real
+# estimator gives, while the ages stay exact. Bias stays zero because it is not measurable
+# here and a wrong-direction offset would train a compensation for a fault that may not exist.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S5-Noise"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s5-noise"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s5-noise", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S6: S5's whole condition plus a release-position distribution - uniform height from
+# rest on the strings to 0.40 m above them, and +-20 mm laterally. The target apex stays
+# 0.40 m. This is the rung the plan asks for once the real hand release is characterised;
+# until it is, the ranges are the operator's stated intent, not a measurement.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S6-Release"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s6-release"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s6-release", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Rung S7a: the operator holds the ball 0.40 m above the strings and releases it after a
+# uniform 0-2 s wait, so the policy must align a level, quiet racket under it and be ready
+# before the ball moves. S5's whole perception condition still applies, because a deferred
+# release must be seen through the same delayed, stalled, noisy chain. The hold height is
+# fixed at the energy target on purpose: the release energy then equals E* and any change
+# is attributable to waiting rather than to a different drop energy.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S7a-DelayedRelease"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s7a-delayed-release"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(
+    stage="s7a-delayed-release", play=True
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
   ),
   runner_cls=VelocityOnPolicyRunner,
 )

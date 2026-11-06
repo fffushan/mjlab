@@ -4,6 +4,30 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **Delayed release is now a training condition, not only a design goal.** The task
+  ``...-Ball3-Pelvis-Nominal-S7a-DelayedRelease`` holds the ball in world space 0.40 m
+  above its resting height and releases it after a uniform 0-2 s wait, with S5's whole
+  perception condition carried, so the policy must place a level, quiet racket under
+  the ball and be ready before it moves. The actor is never told that the ball is held.
+  Four parts exist because each closes a measured loophole: the energy reward is gated
+  to the post-release phase (a held ball is world-fixed, so its energy is a per-episode
+  constant the policy cannot influence, and at 0.40 m it equals the target exactly);
+  ``racket_under_ball`` pays for a level, quiet racket under the ball while held,
+  because ``ball_centred`` is plate-frame horizontal only and a tilted plate satisfies
+  it; ``held_ball_contact`` ends an episode in which the racket touches the held ball;
+  and the no-bounce deadline is paused while held, or a 2 s wait consumes 80 % of its
+  2.5 s window. Measured on four environments with zero action: the pinned ball's
+  observed position error is 0.0000 mm and its speed 0.000000 m/s, the energy reward is
+  exactly 0 while held and 1.0000 at release, the release has a 0.0000 mm position jump
+  and 0.000000 m/s velocity, and at a forced 3.0 s hold ``ball_no_bounce`` never fires
+  while the same term without the pause fires at 2.48 s. What is not claimed: that a
+  policy learns to wait, and that the 0.40 m hold matches a real hand release.
+
+- Revised the `X2 juggling curriculum implementation plan
+  <../design/x2_tennis_nominal_curriculum.md>`_ to use real-robot results as the
+  decisive acceptance gate. Controller-contract parity and measured sensor/reset
+  conditions precede physical trials. This is a plan, not an implemented change.
+
 - **The two plate-frame rewards are now bounded below.** ``ball_centred`` measures the
   ball's horizontal distance from the plate centre and ``ball_height`` clamped its
   height excursion from above only, so a ball that had left the plate downward scored
@@ -119,6 +143,35 @@ Removed
 
 Added
 ^^^^^
+
+- **Nominal 15 Hz stage.**
+  ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3-Pelvis-Nominal-S1-15Hz``
+  keeps the nominal pilot and moves one input condition: the ball history arrives at
+  15 Hz with 0-40 ms of uniform transport delay. Three samples are still stored, so the
+  actor stays 112 wide and an earlier checkpoint resumes with its optimizer state. It is
+  the first rung of a staged fine-tune: one input condition per rung, each starting from
+  the previous rung's checkpoint.
+
+- Added a standalone nominal juggling evaluator under
+  ``scripts/experiments/x2_tennis_nominal_eval/``. It records first-episode
+  trajectories and substep contact histories for six policies and two zero-action
+  controls. Synthetic scoring, recorder and launch-guard checks passed.
+  The `completed E0 evaluation <../reports/x2_tennis_nominal_evaluation_20261105.md>`_
+  accepted all three 0.40 m policies: 34 consecutive qualified flights in each of
+  96 nominal simulation episodes. The 0.20 m policies carried the ball; controls lost it.
+  The batch is separate from training and provides no hardware validation.
+
+- Added the `six-run nominal X2 juggling comparison
+  <../reports/x2_tennis_nominal_comparison_20261105.md>`_ and an
+  `evaluation-gated curriculum plan <../design/x2_tennis_nominal_curriculum.md>`_.
+  The analysis compares three seeds at each target. Training curves do not verify
+  consecutive juggles. No additional training or policy rollout was started.
+
+- Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3-Pelvis-Nominal``.
+  This pilot uses zero movement commands, no pushes or physics randomization,
+  noise-free ball history, and centred drop starts. Physical limits and old task
+  defaults are unchanged. See :doc:`x2_tennis_ball_juggle` and
+  ``docs/design/x2_tennis_nominal_pilot.md``.
 
 - Added ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3-Pelvis``.
   Its ``ball_hist_pelvis`` actor term stores three capture-time pelvis-relative positions
