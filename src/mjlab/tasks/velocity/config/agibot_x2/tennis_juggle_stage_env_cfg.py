@@ -30,9 +30,13 @@ from __future__ import annotations
 import os
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_DROP_GRACE_S,
+  BALL_LOST_MIN_WORLD_Z_M,
   JUGGLE_HOLD_DELAY_S,
   JUGGLE_HOLD_LONG_DELAY_S,
   JUGGLE_HOLD_OFFSET_SPEED_MPS,
+  JUGGLE_BALL_LOST_PENALTY_WEIGHT,
+  JUGGLE_TORSO_ANG_VEL_WEIGHT,
   JUGGLE_HOLD_HEIGHT_M,
   JUGGLE_HOLD_LATERAL_RANGE_M,
   JUGGLE_WAIT_ALIGN_WEIGHT,
@@ -47,6 +51,12 @@ from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
+from copy import deepcopy
+
+from mjlab.tasks.tracking.config.agibot_x2.env_cfgs import (
+  apply_x2_tracking_robot_randomization,
+)
+from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.config.agibot_x2.tennis_ball_env_cfg import (
   BAT_BALL_CONTACT_SENSOR,
@@ -360,6 +370,54 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
       "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
     },
   },
+  # S9a - S8 isolates the safety behaviour. A lost ball no longer ends the episode:
+  # the tail is charged while the ball is gone and ``ball_no_bounce`` ends it 2.5 s
+  # after the last strike. The torso rotation rate is priced high enough to outvote
+  # the ball reward, because the motion that broke a connector was a rate, not a
+  # tilt, and the shipped weight was 1/550th of the tilt reward.
+  "s9a-drop-tail": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
+    },
+    "drop_tail": True,
+  },
+  # S9b - S9a isolates the randomisation: the tracking family's full sim-to-real set,
+  # definitions and ranges copied from the validated Multi-Motion task, including the
+  # push disturbance. The stage's own condition (stream, hold, offset, drop tail) is
+  # unchanged, so a difference in behaviour is the randomisation alone.
+  "s9b-sim-to-real": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
+    },
+    "drop_tail": True,
+    "sim_to_real": True,
+  },
 }
 """The one condition each stage changes, as ``ball_hist_pelvis`` term parameters.
 
@@ -403,13 +461,107 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
   delta = dict(STAGE_DELTAS[stage])
   reset_delta = delta.pop("reset", None)
   hold_delta = delta.pop("hold", None)
+  # Structural sections are popped before the update below, or they would arrive as
+  # unknown parameters of the ball-history observation term.
+  drop_tail = bool(delta.pop("drop_tail", False))
+  sim_to_real = bool(delta.pop("sim_to_real", False))
   cfg = agibot_x2_tennis_juggle_nominal_env_cfg(play=play)
   cfg.observations["actor"].terms["ball_hist_pelvis"].params.update(delta)
   if reset_delta:
     cfg.events["reset_ball"].params.update(reset_delta)
   if hold_delta:
     _apply_delayed_release(cfg, hold_delta)
+  if drop_tail:
+    _apply_drop_tail(cfg, cfg.sim.mujoco.timestep * cfg.decimation)
+  # Play mode is a viewing and evaluation view: it keeps the nominal robot, exactly
+  # as it already drops the push and the corruption. Randomising it would make the
+  # same checkpoint behave differently every launch.
+  if sim_to_real and not play:
+    _apply_sim_to_real(cfg)
   return cfg
+
+
+FULL_DR_EVENT_NAMES = (
+  # The five the velocity base task carries and the nominal pilot removes.
+  "base_com",
+  "encoder_bias",
+  "foot_friction",
+  "push_robot",
+  "randomize_pd_gains",
+  # The tracking family's physics axes, in their install order.
+  "randomize_inertia",
+  "randomize_armature",
+  "randomize_effort_limits",
+  "randomize_joint_friction",
+  "randomize_joint_damping",
+  "randomize_foot_size",
+)
+"""Every domain-randomisation term the tracking family runs, by name.
+
+Definitions come from ``make_tracking_env_cfg()``, never from this module, so there is
+one definition of every range. ``randomize_effort_limits_wrist`` is absent on purpose:
+``apply_x2_tracking_robot_randomization`` adds it after ``randomize_effort_limits``
+because both write the same actuator fields and only the last writer takes effect.
+
+The tracking family's observation-delay axis is not here: it changes the actor's input
+timing contract, which the ball-history term already owns.
+"""
+
+
+def _apply_sim_to_real(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Install the tracking family's full domain randomisation on this config.
+
+  The nominal pilot removes twelve randomisation events so the juggle can be learned
+  on an exactly modelled robot. This puts them back, with the definitions and ranges
+  the validated ``Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion`` task runs -- that is
+  the set with dynamic tennis motions behind it, so nothing here is invented.
+
+  ``push_robot`` is part of the set: it is the disturbance axis, applied as a root
+  velocity every 1-3 s, and it is what makes the juggle survive a hand on the ball
+  rather than only an exactly modelled one.
+  """
+  source = make_tracking_env_cfg().events
+  for name in FULL_DR_EVENT_NAMES:
+    term = source.get(name)
+    if term is None:
+      # ``MJLAB_DR_AXES`` can switch an axis off; a missing axis is not an error.
+      continue
+    cfg.events[name] = deepcopy(term)
+  apply_x2_tracking_robot_randomization(cfg)
+
+
+def _apply_drop_tail(cfg: ManagerBasedRlEnvCfg, step_dt: float) -> None:
+  """Replace the drop termination with a lost-ball cost (S9a).
+
+  ``ball_lost`` ends the episode the instant the ball falls. That trains the robot up
+  to the loss and never afterwards, so the state that damaged hardware - ball gone,
+  nothing left to juggle - had no learned behaviour. Removing the termination and
+  pricing the state keeps the episode alive for the aftermath, which ``ball_no_bounce``
+  bounds at 2.5 s after the last strike.
+
+  Two changes, both ball-level or whole-body: no new sensor, no per-joint term.
+
+  * ``ball_lost_penalty`` charges while the ball is lost, at the weight the measured
+    reward budget supports.
+  * ``body_ang_vel`` on the torso goes from -0.05 to -0.5. At the shipped weight the
+    term was worth 1/550th of ``upright``, so no rotation rate was ever discouraged.
+  """
+  cfg.terminations.pop("ball_dropped", None)
+  cfg.rewards["ball_lost_penalty"] = RewardTermCfg(
+    func=mdp.ball_lost_penalty,
+    weight=JUGGLE_BALL_LOST_PENALTY_WEIGHT,
+    params={
+      "ball_cfg": SceneEntityCfg("ball"),
+      "min_world_z": BALL_LOST_MIN_WORLD_Z_M,
+      "grace_steps": round(BALL_DROP_GRACE_S / step_dt),
+    },
+  )
+  cfg.rewards["body_ang_vel"].weight = JUGGLE_TORSO_ANG_VEL_WEIGHT
+  cfg.metrics["ball_lost_events"] = MetricsTermCfg(
+    func=mdp.lost_ball_state,
+    params={"reward_term": "ball_lost_penalty", "field": "lost_events"},
+    reduce="max",
+  )
 
 
 def _apply_delayed_release(cfg: ManagerBasedRlEnvCfg, hold: dict[str, object]) -> None:

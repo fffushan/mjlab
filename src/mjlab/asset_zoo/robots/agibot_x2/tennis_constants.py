@@ -716,6 +716,28 @@ BALL_LOST_MIN_WORLD_Z_M = 0.5
 # with an honest signal, and a policy that recovers gets to continue.
 BALL_DROP_GRACE_S = 0.5
 
+# The lost-ball cost that replaces the drop termination (S9a).
+#
+# Episode reward is ``sum(raw * weight * dt) / max_episode_length_s``, so a weight
+# applied every control step is worth ``weight / 20`` per second of episode. The
+# measured positive intake of an S8 episode is +0.351 per second (probe: 16 envs,
+# 300 steps, reward manager's own per-term buffer), so -4.0 while lost costs
+# 0.20 per second, about 57 % of everything the policy earns. -0.15 would have cost
+# 0.0075 per second, which is nothing: the factor is 20, not 1.
+JUGGLE_BALL_LOST_PENALTY_WEIGHT = -4.0
+"""Reward weight while the ball counts as lost, per second of episode."""
+
+# Torso angular-velocity weight for the drop-tail rung.
+#
+# The measured contribution at the shipped -0.05 was -0.0017 per step, which is
+# 1/550th of ``upright``: a 17.6 rad/s torso rotation, the motion that broke a
+# connector, cost half a percent of a single velocity-tracking step. At -0.5 a
+# 1 rad/s twist costs 0.5 per step, half an ``upright`` step, and 2 rad/s costs 2.0.
+# The unusual magnitude is the point: the term has to be able to outvote the ball
+# reward, or it cannot forbid anything.
+JUGGLE_TORSO_ANG_VEL_WEIGHT = -0.5
+"""Weight of ``body_ang_vel`` on the torso for the drop-tail rung."""
+
 # Reward weights. Centring is the task, so it carries the same order of magnitude
 # as the base task's velocity terms (2.0 each). The height term exists only to
 # stop "throw the ball straight up and stay centred" from being a cheap strategy;

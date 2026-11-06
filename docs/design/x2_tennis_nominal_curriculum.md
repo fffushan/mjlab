@@ -299,6 +299,21 @@ against a plate half-extent of 0.157 x 0.117 m. No reward term changes: the expo
 waiting kernel is deliberately left to reveal whether long-offset episodes collect
 anything, and a bounded linear term is the fix if they do not.
 
+`S9a` (`s9a-drop-tail`, suffix `-Nominal-S9a-DropTail`) changes what a lost ball costs.
+The drop termination is removed and replaced by a continuous lost-ball penalty, so the episode
+survives the loss and the robot is scored on the aftermath until `ball_no_bounce` ends it 2.5 s
+after the last strike. The torso angular-velocity weight goes from -0.05 to -0.5 because a
+measured probe showed it was worth 1/550th of the upright reward, and the motion that broke a
+connector was a rate, not a tilt.
+
+`S9b` (`s9b-sim-to-real`, suffix `-Nominal-S9b-SimToReal`) restores the full domain
+randomisation the nominal pilot removed, using the definitions and ranges of the validated
+`Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion` task: base COM, encoder bias, foot friction,
+push, PD gains, inertia, armature, effort limits, joint friction, joint damping, foot size
+and the wrist effort re-derate. `push_robot` supplies the disturbance. Play mode skips the
+set. The stock encoder bias (+-0.01 rad) is smaller than the measured hardware error
+(3.4 deg mean, 14.5 deg max), which remains an open item.
+
 Open: no measured hand release exists yet, and the "no release" evaluation case is
 not built.
 

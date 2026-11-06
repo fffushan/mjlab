@@ -546,6 +546,8 @@ task suffix                                 condition
 ``-Nominal-S7b-VariableHold``                S7a's hold with a 0.10-0.40 m release height
 ``-Nominal-S7c-LongHold``                    S7b with the wait lengthened to a 0-6 s hold
 ``-Nominal-S8-OffsetHold``                   S7c with the ball placed up to 0.30 m off the plate
+``-Nominal-S9a-DropTail``                    S8 with a lost ball priced instead of ending the episode
+``-Nominal-S9b-SimToReal``                   S9a with the tracking family's full randomisation
 ==========================================  ==============================================
 
 ``...-Ball3-Pelvis-Nominal-S1-15Hz`` is the first rung. It is the
@@ -670,6 +672,47 @@ numerically zero and a policy that has not arrived collects nothing. That is a m
 to make rather than a defect to paper over, so this rung adds no new reward term; if the
 learning curve shows long-offset episodes collecting nothing, the fix is a bounded linear
 term, which is one addition and not a redesign.
+
+``...-Nominal-S9a-DropTail`` changes what happens when the ball is lost. Until S8 the ball
+falling below 0.5 m ended the episode, so the robot was trained up to the instant of loss and
+never afterwards -- and that aftermath is the state that damaged hardware: the ball gone, the
+policy left with nothing to juggle, and a torso that rotated until the racket struck the robot.
+The rung removes the drop termination and prices the state instead: ``ball_lost_penalty``
+charges while the ball is lost, and ``ball_no_bounce`` still ends the episode 2.5 s after the
+last strike, so the cost prices the tail and the terminator bounds it.
+
+The weights were set from a measured budget rather than a guess. Episode reward is
+``sum(raw * weight * dt) / max_episode_length_s``, so a weight paid every step is worth
+``weight / 20`` per second of episode. A probe of an S8 episode (16 environments, 300 steps,
+the reward manager's own per-term buffer) gave a positive intake of **+0.351 per second**,
+of which ``ball_energy`` was 13.4 %, ``upright`` 13.8 %, and the two tracking terms 55 %.
+``body_ang_vel`` on the torso contributed **-0.00009 per second**, which is 1/550th of
+``upright``: no rotation rate was ever discouraged, which is why a 17.6 rad/s swing had no
+counter-gradient. The rung therefore takes ``body_ang_vel`` from -0.05 to **-0.5** and prices
+a lost ball at **-4.0**, i.e. 0.20 per second, about 57 % of everything the policy earns.
+
+``...-Nominal-S9b-SimToReal`` puts the domain randomisation back. The nominal pilot removes
+twelve randomisation events so the juggle can be learned on an exactly modelled robot, which is
+why a 28 s old ball sample once produced an action of |a| = 25: the policy had never met a
+disturbance, a gain error or a biased joint reading. This rung restores every one of them, and it
+takes the definitions and ranges from the validated
+``Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion`` task rather than inventing values:
+
+``base_com``, ``encoder_bias``, ``foot_friction``, ``push_robot``, ``randomize_pd_gains``,
+``randomize_inertia``, ``randomize_armature``, ``randomize_effort_limits``,
+``randomize_joint_friction``, ``randomize_joint_damping``, ``randomize_foot_size``, plus the
+wrist effort re-derate that ``apply_x2_tracking_robot_randomization`` adds after the whole-robot
+effort term. The terms are deep-copied from ``make_tracking_env_cfg()``, so there is one
+definition of every range, and ``MJLAB_DR_AXES`` still selects axes exactly as it does for the
+tracking tasks. Play mode skips the whole set, as it already skips the push and the corruption,
+so one checkpoint behaves identically on every viewing launch.
+
+``push_robot`` is the disturbance axis and the reason the rung matters: a root velocity of up to
+0.5 m/s and 0.78 rad/s of yaw every 1-3 s is what makes a juggle survive a hand on the ball
+rather than only an exactly modelled one. Note one measured gap that this rung does **not**
+close: ``encoder_bias`` draws +-0.01 rad (0.57 deg) on the tracking task's values, while the
+hardware command-to-measured error measured on the robot is 3.4 deg mean and 14.5 deg maximum.
+That is a separate decision, recorded here rather than silently rescaled.
 
 Two measured properties of the hold are worth recording, because both are easy to get wrong.
 The height is sampled **once**, by ``reset_ball``, and ``hold_ball`` is given

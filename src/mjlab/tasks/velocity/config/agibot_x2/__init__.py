@@ -365,6 +365,39 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# S9a: a lost ball is priced instead of ending the episode, so the aftermath is
+# trained; and the torso rotation rate is priced high enough to outvote the ball
+# reward, because the motion that broke a connector was a rate, not a tilt.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S9a-DropTail"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9a-drop-tail"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9a-drop-tail", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# S9b: S9a with the tracking family's full sim-to-real randomisation, definitions and
+# ranges copied from the validated Multi-Motion task, including the push disturbance.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S9b-SimToReal"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9b-sim-to-real"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(
+    stage="s9b-sim-to-real", play=True
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

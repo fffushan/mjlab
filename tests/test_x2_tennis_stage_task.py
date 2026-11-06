@@ -33,6 +33,7 @@ from mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_nominal_env_cfg import 
   agibot_x2_tennis_juggle_nominal_env_cfg,
 )
 from mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_stage_env_cfg import (
+  FULL_DR_EVENT_NAMES,
   STAGE_DELTAS,
   agibot_x2_tennis_juggle_stage_env_cfg,
 )
@@ -125,18 +126,53 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   # written out here rather than read from the factory, so adding a second reward or
   # termination change to the hold path fails until this list is deliberately edited.
   hold_declared = "hold" in declared
+  drop_tail_declared = bool(declared.get("drop_tail"))
+  sim_to_real_declared = bool(declared.get("sim_to_real"))
   assert stage.actions == nominal.actions
   assert stage.commands == nominal.commands
-  if not hold_declared:
-    for name in ("rewards", "terminations", "metrics"):
-      assert getattr(stage, name) == getattr(nominal, name), name
-  else:
-    # Rewards: only the energy term may be gated, and only one term may be added.
-    assert set(stage.rewards) == set(nominal.rewards) | {"racket_under_ball"}
-    for name in nominal.rewards:
-      if name == "ball_energy":
-        continue
-      assert stage.rewards[name] == nominal.rewards[name], name
+
+  # Expected sets are assembled from the declared sections, so an undeclared addition
+  # or removal fails here rather than being absorbed by a permissive check.
+  expected_rewards = set(nominal.rewards)
+  expected_terminations = set(nominal.terminations)
+  expected_metrics = set(nominal.metrics)
+  if hold_declared:
+    expected_rewards |= {"racket_under_ball"}
+    expected_terminations |= {"held_ball_contact"}
+    expected_metrics |= {
+      "ball_held",
+      "ball_hold_delay_s",
+      "ball_release_alignment_m",
+      "ball_hold_offset_m",
+    }
+  if drop_tail_declared:
+    expected_rewards |= {"ball_lost_penalty"}
+    expected_terminations -= {"ball_dropped"}
+    expected_metrics |= {"ball_lost_events"}
+  assert set(stage.rewards) == expected_rewards
+  assert set(stage.terminations) == expected_terminations
+  assert set(stage.metrics) == expected_metrics
+
+  # Named terms a declared section is allowed to rewrite, and the reason for each.
+  reward_diff = set()
+  termination_diff = set()
+  if hold_declared:
+    reward_diff.add("ball_energy")  # gated to post-release
+    termination_diff.add("ball_no_bounce")  # deadline paused while held
+  if drop_tail_declared:
+    reward_diff.add("body_ang_vel")  # torso rate priced high enough to matter
+  for name in nominal.rewards:
+    if name in reward_diff:
+      continue
+    assert stage.rewards[name] == nominal.rewards[name], name
+  for name in nominal.terminations:
+    if name in termination_diff or name not in stage.terminations:
+      continue
+    assert stage.terminations[name] == nominal.terminations[name], name
+  for name in nominal.metrics:
+    assert stage.metrics[name] == nominal.metrics[name], name
+
+  if hold_declared:
     gated = stage.rewards["ball_energy"]
     assert gated.func is mdp.ball_energy_after_release
     assert gated.weight == nominal.rewards["ball_energy"].weight
@@ -144,13 +180,6 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert gated_params.pop("hold_event") == "hold_ball"
     assert gated_params == nominal.rewards["ball_energy"].params
     assert stage.rewards["racket_under_ball"].params["hold_event"] == "hold_ball"
-
-    # Terminations: one added term, and the hold pause on the no-bounce deadline.
-    assert set(stage.terminations) == set(nominal.terminations) | {"held_ball_contact"}
-    for name in nominal.terminations:
-      if name == "ball_no_bounce":
-        continue
-      assert stage.terminations[name] == nominal.terminations[name], name
     contact = stage.terminations["held_ball_contact"]
     assert contact.func is mdp.held_ball_contact
     assert contact.params["hold_event"] == "hold_ball"
@@ -158,33 +187,47 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert paused.pop("hold_event") == "hold_ball"
     assert paused == nominal.terminations["ball_no_bounce"].params
 
-    # Metrics: the two hold facts, logging only.
-    assert set(stage.metrics) == set(nominal.metrics) | {
-      "ball_held",
-      "ball_hold_delay_s",
-      "ball_release_alignment_m",
-      "ball_hold_offset_m",
-    }
-    for name in nominal.metrics:
-      assert stage.metrics[name] == nominal.metrics[name], name
+  if drop_tail_declared:
+    assert "ball_dropped" not in stage.terminations
+    lost = stage.rewards["ball_lost_penalty"]
+    assert lost.func is mdp.ball_lost_penalty
+    assert lost.weight < 0.0
+    assert lost.params["min_world_z"] > 0.0
+    assert lost.params["grace_steps"] >= 1
+    assert (
+      stage.rewards["body_ang_vel"].weight != nominal.rewards["body_ang_vel"].weight
+    )
+    assert stage.rewards["body_ang_vel"].weight < nominal.rewards["body_ang_vel"].weight
 
   # Events: a stage may declare a ``reset`` section, which moves ``events["reset_ball"]``
   # and nothing else. Every other event term must still equal S0's, and inside
   # ``reset_ball`` only the declared keys may differ - an undeclared reset change would
   # alter what the episode starts from and could not be read as a stream experiment.
   hold_events = {"hold_ball", "advance_ball_hold"}
+  # A stage that declares the sim-to-real section installs the tracking family's
+  # randomisation terms, so they appear as extra events and cannot equal S0's.
+  dr_events = set(FULL_DR_EVENT_NAMES) if sim_to_real_declared else set()
+  if sim_to_real_declared:
+    # Added by ``apply_x2_tracking_robot_randomization`` after the whole-robot
+    # effort term, so it is not in the name list.
+    dr_events.add("randomize_effort_limits_wrist")
   if hold_declared:
-    assert set(stage.events) == set(nominal.events) | hold_events
+    assert set(stage.events) == set(nominal.events) | hold_events | dr_events
     assert stage.events["hold_ball"].mode == "reset"
     assert stage.events["advance_ball_hold"].mode == "step"
     # The hold beat must be sampled after the reset that seats the ball.
     order = list(stage.events)
     assert order.index("hold_ball") > order.index("reset_ball")
   else:
-    assert set(stage.events) == set(nominal.events)
+    assert set(stage.events) == set(nominal.events) | dr_events
+  if sim_to_real_declared:
+    assert "push_robot" in stage.events
+    assert "encoder_bias" in stage.events
+    assert "randomize_pd_gains" in stage.events
+    assert stage.events["push_robot"].params["velocity_range"]["yaw"] != (0.0, 0.0)
   reset_declared = declared.get("reset", {})
   for name in stage.events:
-    if name in hold_events:
+    if name in hold_events or name in dr_events:
       continue
     if name != "reset_ball":
       assert stage.events[name] == nominal.events[name], name

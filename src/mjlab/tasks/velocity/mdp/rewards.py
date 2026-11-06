@@ -1428,3 +1428,74 @@ def racket_under_ball(
   if held is None:
     return reward
   return torch.where(held, reward, torch.zeros_like(reward))
+
+
+class ball_lost_penalty(ManagerTermBase):
+  """The lost-ball cost that replaces ending the episode when the ball falls.
+
+  ``ball_lost`` ends an episode the moment the ball drops below a fixed world
+  height. That is the right detector and the wrong ending: the robot is trained up
+  to the instant the ball is lost and never afterwards, so the state that actually
+  hurts hardware - the ball gone and the policy left with nothing to juggle - has no
+  learned behaviour at all.
+
+  This term prices that state instead. While the ball has stayed below
+  ``min_world_z`` for ``grace_steps`` consecutive control steps the term returns 1.0,
+  so its weight is a cost per second of being lost. ``ball_no_bounce`` still ends the
+  episode 2.5 s after the last strike, which bounds the tail: the cost prices the
+  aftermath, and the terminator bounds it.
+
+  The grace is the same consecutive-step count ``ball_lost`` uses, so a ball that
+  dips below the threshold during a strike is not charged. The counter is per
+  environment and clears on reset.
+
+  Args:
+    ball_cfg: Ball entity.
+    min_world_z: Ball-centre height above the ground at or below which the ball
+      counts as lost, in metres.
+    grace_steps: Consecutive control steps below the threshold before charging.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    n, device = env.num_envs, env.device
+    self._lost_steps = torch.zeros(n, dtype=torch.long, device=device)
+    self.lost = torch.zeros(n, dtype=torch.bool, device=device)
+    """True while the ball counts as lost."""
+    self.lost_events = torch.zeros(n, device=device)
+    """Lost-ball transitions in the current episode, logging only."""
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    ball_cfg: SceneEntityCfg,
+    min_world_z: float,
+    grace_steps: int,
+  ) -> torch.Tensor:
+    ball: Entity = env.scene[ball_cfg.name]
+    lost = ball.data.root_link_pos_w[:, 2] <= min_world_z
+    self._lost_steps = torch.where(
+      lost, self._lost_steps + 1, torch.zeros_like(self._lost_steps)
+    )
+    now_lost = self._lost_steps >= max(int(grace_steps), 1)
+    self.lost_events += (now_lost & ~self.lost).float()
+    self.lost = now_lost
+    return now_lost.float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self._lost_steps[env_ids] = 0
+    self.lost[env_ids] = False
+    self.lost_events[env_ids] = 0.0
+
+
+def lost_ball_state(
+  env: ManagerBasedRlEnv, reward_term: str, field: str = "lost"
+) -> torch.Tensor:
+  """Logging-only read of a :class:`ball_lost_penalty` instance's state."""
+  term = env.reward_manager.get_term_cfg(reward_term).func
+  assert isinstance(term, ball_lost_penalty), (
+    f"'{reward_term}' must be a class-based ball_lost_penalty reward term"
+  )
+  return getattr(term, field).float()
