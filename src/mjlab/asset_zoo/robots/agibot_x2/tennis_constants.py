@@ -1588,6 +1588,18 @@ JUGGLE_HOLD_DELAY_S = (0.0, 2.0)
 immediate release must stay in the distribution, or stillness becomes a
 precondition and the policy can learn a countdown instead of watching the ball."""
 
+JUGGLE_HOLD_OFFSET_SPEED_MPS = 0.05
+"""Metres of world x/y displacement per second of hold, for the offset rung.
+
+The ball is placed ``offset_speed * hold_duration`` away from the nominal hold
+point along one uniformly drawn direction, held there, then released. Coupling the
+distance to the duration keeps the required reach speed constant at 5 cm/s: the
+target is further away exactly when more time exists to reach it. Over a uniform
+0-6 s hold the displacement is uniform on 0-0.30 m, mean 0.15 m, against a plate
+half-extent of 0.157 x 0.117 m, so most offsets put the ball clear of the plate and
+the plate has to travel.
+"""
+
 JUGGLE_HOLD_LONG_DELAY_S = (0.0, 6.0)
 """Uniform hold duration for the long-wait rung, in seconds.
 

@@ -32,6 +32,7 @@ import os
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_HOLD_DELAY_S,
   JUGGLE_HOLD_LONG_DELAY_S,
+  JUGGLE_HOLD_OFFSET_SPEED_MPS,
   JUGGLE_HOLD_HEIGHT_M,
   JUGGLE_HOLD_LATERAL_RANGE_M,
   JUGGLE_WAIT_ALIGN_WEIGHT,
@@ -55,10 +56,47 @@ from mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_nominal_env_cfg import 
 )
 
 _HOLD_HEIGHT_ENV = "MJLAB_JUGGLE_HOLD_HEIGHT_M"
+_HOLD_DELAY_ENV = "MJLAB_JUGGLE_HOLD_DELAY_S"
 
 
-def _hold_height() -> float:
-  """Hold height for the delayed-release rung, in metres.
+def _hold_delay(
+  default: tuple[float, float] = JUGGLE_HOLD_DELAY_S,
+) -> tuple[float, float]:
+  """Hold duration range for the delayed-release rung, in seconds.
+
+  Defaults to the stage's own value, so a run that does not set
+  ``MJLAB_JUGGLE_HOLD_DELAY_S`` keeps the committed condition. The override exists
+  because an acceptance cell must fix the wait instead of sampling it: a height by
+  delay sweep sets one pair per cell, and a no-release control pins the wait past the
+  horizon. It takes ``SECONDS`` or ``MIN,MAX``.
+
+  This is an evaluation knob, not a training condition. A rung that changes the
+  duration belongs in the stage table.
+  """
+  raw = os.environ.get(_HOLD_DELAY_ENV, "")
+  if raw in ("", None):
+    return default
+  parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+  if len(parts) == 1:
+    parts = [parts[0], parts[0]]
+  if len(parts) != 2:
+    raise ValueError(f"{_HOLD_DELAY_ENV} must be SECONDS or MIN,MAX, got {raw!r}")
+  low, high = float(parts[0]), float(parts[1])
+  if low < 0.0 or high < low:
+    raise ValueError(
+      f"{_HOLD_DELAY_ENV} must satisfy 0 <= min <= max, got ({low}, {high})"
+    )
+  return (low, high)
+
+
+def _hold_height_override() -> float | None:
+  """The requested fixed hold height, or ``None`` when nothing was requested."""
+  raw = os.environ.get(_HOLD_HEIGHT_ENV, "")
+  return float(raw) if raw not in ("", None) else None
+
+
+def _hold_height(default: float = JUGGLE_HOLD_HEIGHT_M) -> float:
+  """Hold height for the fixed-height rung, in metres.
 
   Defaults to :data:`JUGGLE_HOLD_HEIGHT_M`, so a run that does not set
   ``MJLAB_JUGGLE_HOLD_HEIGHT_M`` is byte-identical to the committed rung. The
@@ -70,8 +108,29 @@ def _hold_height() -> float:
   This is a viewing and ablation knob, not a training condition. A rung that
   randomises the height belongs in the stage table, not in an environment variable.
   """
-  raw = os.environ.get(_HOLD_HEIGHT_ENV, "")
-  return float(raw) if raw not in ("", None) else JUGGLE_HOLD_HEIGHT_M
+  value = _hold_height_override()
+  return default if value is None else value
+
+
+def _hold_height_range(default: tuple[float, float]) -> tuple[float, float]:
+  """The reset's height range, collapsed to one value when a height is requested.
+
+  The randomising rungs sample a range per environment. An acceptance cell has to
+  fix the height instead of sampling it, and it must fix the same value in the
+  reset and in the pin, or ``ball_start_height_m`` would report a height the ball
+  was never held at.
+  """
+  value = _hold_height_override()
+  return default if value is None else (value, value)
+
+
+def _pinned_hold_height() -> float | None:
+  """The pinned height, or ``None`` to follow the reset's sample.
+
+  ``None`` is the training condition: one sampler, one authority, so the pin and
+  the reported start height cannot disagree.
+  """
+  return _hold_height_override()
 
 
 STAGE_DELTAS: dict[str, dict[str, object]] = {
@@ -223,7 +282,7 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     },
     "hold": {
       "hold_height_m": _hold_height(),
-      "hold_delay_s": JUGGLE_HOLD_DELAY_S,
+      "hold_delay_s": _hold_delay(),
       "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
   },
@@ -249,12 +308,12 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "position_noise_m": (0.010, 0.010, 0.015),
     "bias_half_width_m": 0.0,
     "reset": {
-      "drop_height_range": (0.10, 0.40),
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
       "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
     "hold": {
-      "hold_height_m": None,
-      "hold_delay_s": JUGGLE_HOLD_DELAY_S,
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(),
       "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
   },
@@ -270,13 +329,35 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "position_noise_m": (0.010, 0.010, 0.015),
     "bias_half_width_m": 0.0,
     "reset": {
-      "drop_height_range": (0.10, 0.40),
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
       "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
     },
     "hold": {
-      "hold_height_m": None,
-      "hold_delay_s": JUGGLE_HOLD_LONG_DELAY_S,
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
       "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+  },
+  # S8 - S7c isolates the placement: the ball is put down away from the plate by
+  # 0.05 m per second of hold, along a random direction, and stays there until the
+  # release. The plate has to travel to it. Everything else is S7c's, so a
+  # difference in behaviour is the displacement alone.
+  "s8-offset-hold": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
     },
   },
 }
@@ -396,6 +477,11 @@ def _apply_delayed_release(cfg: ManagerBasedRlEnvCfg, hold: dict[str, object]) -
   cfg.metrics["ball_release_alignment_m"] = MetricsTermCfg(
     func=mdp.ball_hold_state,
     params={"hold_event": "hold_ball", "field": "release_alignment_m"},
+    reduce="last",
+  )
+  cfg.metrics["ball_hold_offset_m"] = MetricsTermCfg(
+    func=mdp.ball_hold_state,
+    params={"hold_event": "hold_ball", "field": "offset_m"},
     reduce="last",
   )
 

@@ -163,6 +163,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
       "ball_held",
       "ball_hold_delay_s",
       "ball_release_alignment_m",
+      "ball_hold_offset_m",
     }
     for name in nominal.metrics:
       assert stage.metrics[name] == nominal.metrics[name], name

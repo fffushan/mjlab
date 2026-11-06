@@ -14,6 +14,7 @@ per-episode facts and the two start metrics read them from its instance.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -441,6 +442,13 @@ class hold_ball(ManagerTermBase):
       ``0.0`` so an immediate release stays in the distribution and stillness
       never becomes a precondition.
     lateral_range_m: Half-width of the world x/y hold offset, in metres.
+    offset_speed_mps: Metres of additional world x/y displacement per second of
+      hold. The displacement is ``offset_speed_mps * hold_duration`` along one
+      uniformly drawn direction, applied at the moment the ball is placed and then
+      held fixed, so the plate must travel to the ball rather than follow it.
+      ``0.0`` keeps the rung that places the ball over the plate. Coupling the
+      distance to the duration makes the required speed constant whatever the
+      wait: the target is further away exactly when more time exists to reach it.
     release_event: Name of the :class:`reset_ball_release` term whose sampled
       height is followed when ``hold_height_m`` is ``None``.
     plate_cfg: Racket body, used only to record the waiting alignment at release.
@@ -462,6 +470,8 @@ class hold_ball(ManagerTermBase):
     self.released = torch.zeros(num_envs, dtype=torch.bool, device=device)
     """True once the current episode has released the ball."""
     self._released_this_step = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    self.offset_m = torch.zeros(num_envs, device=device)
+    """Sampled world x/y displacement from the nominal hold point, in metres."""
     self.release_alignment_m = torch.zeros(num_envs, device=device)
     """Plate-frame horizontal distance from the plate centre to the ball at the
     instant of release, in metres. Written once per episode, logging only."""
@@ -476,6 +486,7 @@ class hold_ball(ManagerTermBase):
     hold_height_m: float | None,
     hold_delay_s: tuple[float, float],
     lateral_range_m: float,
+    offset_speed_mps: float = 0.0,
     release_event: str = "reset_ball",
     plate_cfg: SceneEntityCfg | None = None,
   ) -> None:
@@ -496,14 +507,23 @@ class hold_ball(ManagerTermBase):
       height = _release_term(env, release_event).start_height[env_ids].clone()
     else:
       height = torch.full((num_envs,), float(hold_height_m), device=device)
+    hold_s = sample_uniform(hold_delay_s[0], hold_delay_s[1], (num_envs,), device)
+    # The offset draws nothing when it is disabled, so a rung without it consumes
+    # exactly the random numbers it consumed before and a seeded replay is
+    # unchanged to the bit.
+    offset = torch.zeros(num_envs, device=device)
     point = anchor + normal * height[:, None]
     point[:, :2] += lateral
+    if offset_speed_mps > 0.0:
+      angle = sample_uniform(0.0, 2.0 * math.pi, (num_envs,), device)
+      offset = float(offset_speed_mps) * hold_s
+      point[:, 0] += offset * torch.cos(angle)
+      point[:, 1] += offset * torch.sin(angle)
     point += env.scene.env_origins[env_ids]
 
     self.hold_point[env_ids] = point
-    self.release_after_s[env_ids] = sample_uniform(
-      hold_delay_s[0], hold_delay_s[1], (num_envs,), device
-    )
+    self.release_after_s[env_ids] = hold_s
+    self.offset_m[env_ids] = offset
     self.elapsed_s[env_ids] = 0.0
     self.held[env_ids] = True
     self.released[env_ids] = False
@@ -617,14 +637,15 @@ class ball_hold_state(ManagerTermBase):
 
   Args:
     hold_event: Name of the :class:`hold_ball` event term.
-    field: ``"held"``, ``"release_after_s"`` or ``"release_alignment_m"``.
+    field: ``"held"``, ``"release_after_s"``, ``"release_alignment_m"`` or
+      ``"offset_m"``.
   """
 
   def __init__(self, cfg: MetricsTermCfg, env: ManagerBasedRlEnv):
     super().__init__(env)
     term = hold_term(env, cfg.params["hold_event"])
     field = str(cfg.params.get("field", "held"))
-    assert field in ("held", "release_after_s", "release_alignment_m"), (
+    assert field in ("held", "release_after_s", "release_alignment_m", "offset_m"), (
       f"unknown hold field '{field}'"
     )
     # Keep the buffer itself, never a converted copy: ``held`` is a bool tensor, so

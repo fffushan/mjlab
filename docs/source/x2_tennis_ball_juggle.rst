@@ -545,6 +545,7 @@ task suffix                                 condition
 ``-Nominal-S7a-DelayedRelease``              S6's perception plus a 0-2 s held ball, then release
 ``-Nominal-S7b-VariableHold``                S7a's hold with a 0.10-0.40 m release height
 ``-Nominal-S7c-LongHold``                    S7b with the wait lengthened to a 0-6 s hold
+``-Nominal-S8-OffsetHold``                   S7c with the ball placed up to 0.30 m off the plate
 ==========================================  ==============================================
 
 ``...-Ball3-Pelvis-Nominal-S1-15Hz`` is the first rung. It is the
@@ -651,6 +652,24 @@ resumes an **S6** checkpoint rather than S7a's. The floor is 0.10 m, not 0.0, be
 0.0 means the ball rests on the strings: that is a plate start, not something an operator can
 hold without touching them, and ``held_ball_contact`` would fire at reset. The 0-0.10 band is
 expressible as a drop, not as a hold, and that limit is stated rather than hidden.
+
+``...-Nominal-S8-OffsetHold`` changes one thing again: where the ball is put down. At reset
+the ball is placed ``0.05 m/s x hold duration`` away from the nominal hold point along a
+uniformly drawn world direction, pinned there for the whole wait, and released from there.
+The plate has to travel to the ball rather than stay under it. Coupling the distance to the
+duration keeps the required reach speed constant at 5 cm/s, so the task is equally hard at
+every wait length instead of getting easier with a longer one. Over a uniform 0-6 s hold the
+displacement is uniform on 0-0.30 m, mean 0.15 m, against a plate half-extent of
+0.157 x 0.117 m, so most offsets put the ball clear of the rim. With the speed at 0.0 the
+draw consumes no random numbers, so a rung without the offset replays a seeded run to the
+bit.
+
+The displacement exposes the far-field weakness of the waiting reward on purpose:
+``racket_under_ball`` is ``exp(-(d/sigma)^2)`` with ``sigma = 0.03 m``, so at 0.30 m it is
+numerically zero and a policy that has not arrived collects nothing. That is a measurement
+to make rather than a defect to paper over, so this rung adds no new reward term; if the
+learning curve shows long-offset episodes collecting nothing, the fix is a bounded linear
+term, which is one addition and not a redesign.
 
 Two measured properties of the hold are worth recording, because both are easy to get wrong.
 The height is sampled **once**, by ``reset_ball``, and ``hold_ball`` is given

@@ -349,6 +349,22 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# S8: S7c with the ball placed away from the plate by 5 cm per second of hold,
+# along a random direction, and held there until release. The plate must travel to
+# the ball; the displacement alone distinguishes it from S7c.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S8-OffsetHold"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s8-offset-hold"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s8-offset-hold", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

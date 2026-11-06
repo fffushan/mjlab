@@ -290,6 +290,15 @@ episode is 20 s and episode reward is normalised by that maximum, so a mean 3 s
 wait still leaves 14 s of juggling and 70 % of the reachable return, while 10 s
 would halve the ceiling and turn the rung into an endurance test.
 
+`S8` (`s8-offset-hold`, suffix `-Nominal-S8-OffsetHold`) moves the placement. The ball is
+put down `0.05 m/s x hold duration` from the nominal hold point along a random world
+direction, held there, and released from there, so the plate must travel to it. The
+distance is tied to the duration to keep the reach speed constant at 5 cm/s, which makes
+the task equally hard at every wait length. Displacement is uniform 0-0.30 m, mean 0.15 m,
+against a plate half-extent of 0.157 x 0.117 m. No reward term changes: the exponential
+waiting kernel is deliberately left to reveal whether long-offset episodes collect
+anything, and a bounded linear term is the fix if they do not.
+
 Open: no measured hand release exists yet, and the "no release" evaluation case is
 not built.
 
