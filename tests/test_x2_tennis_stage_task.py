@@ -94,13 +94,31 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   without being declared would fail here.
   """
   declared = STAGE_DELTAS[stage]
+  visibility_gate_declared = bool(declared.get("visibility_gate"))
   stage_cfg = agibot_x2_tennis_juggle_stage_env_cfg(stage=stage)
   nominal = agibot_x2_tennis_juggle_nominal_env_cfg()
   stage = stage_cfg
   stage_params = stage.observations["actor"].terms["ball_hist_pelvis"].params
   nominal_params = nominal.observations["actor"].terms["ball_hist_pelvis"].params
 
-  assert set(stage_params) == set(nominal_params)
+  # The visibility gate is the one declared condition that adds parameters rather than
+  # moving them: the term must receive its camera geometry only when the stage says so.
+  visibility_keys = {
+    "visibility_head_cfg",
+    "visibility_mount_xyz",
+    "visibility_mount_quat",
+    "visibility_half_angles",
+    "visibility_min_range_m",
+    "visibility_max_range_m",
+    "visibility_dropout_prob",
+  }
+  if visibility_gate_declared:
+    assert visibility_keys <= set(stage_params), visibility_keys - set(stage_params)
+    assert not (visibility_keys & set(nominal_params)), (
+      "the nominal pilot must stay ungated"
+    )
+  else:
+    assert set(stage_params) == set(nominal_params)
   for key in STAGE_KEYS:
     assert stage_params[key] != nominal_params[key], key
   # A stage may move the stall model, but only by declaring it: a stall key it does
@@ -109,9 +127,16 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     if key in declared:
       continue
     assert stage_params[key] == nominal_params[key], key
-  stage_rest = {k: v for k, v in stage_params.items() if k not in STAGE_MOVABLE_KEYS}
+  gate_keys = visibility_keys if visibility_gate_declared else set()
+  stage_rest = {
+    k: v
+    for k, v in stage_params.items()
+    if k not in STAGE_MOVABLE_KEYS and k not in gate_keys
+  }
   nominal_rest = {
-    k: v for k, v in nominal_params.items() if k not in STAGE_MOVABLE_KEYS
+    k: v
+    for k, v in nominal_params.items()
+    if k not in STAGE_MOVABLE_KEYS and k not in gate_keys
   }
   assert stage_rest == nominal_rest
 
@@ -128,6 +153,8 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   hold_declared = "hold" in declared
   drop_tail_declared = bool(declared.get("drop_tail"))
   sim_to_real_declared = bool(declared.get("sim_to_real"))
+  pose_quad_declared = bool(declared.get("pose_quad"))
+  dead_ball_declared = bool(declared.get("dead_ball"))
   assert stage.actions == nominal.actions
   assert stage.commands == nominal.commands
 
@@ -149,6 +176,22 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     expected_rewards |= {"ball_lost_penalty"}
     expected_terminations -= {"ball_dropped"}
     expected_metrics |= {"ball_lost_events"}
+  if pose_quad_declared:
+    expected_rewards |= {"pose_quadratic"}
+  if dead_ball_declared:
+    expected_rewards -= {
+      "ball_energy",
+      "ball_centred",
+      "ball_in_fov",
+      "racket_under_ball",
+      "ball_lost_penalty",
+    }
+    expected_terminations -= {
+      "ball_dropped",
+      "ball_no_bounce",
+      "ball_not_lifted",
+      "held_ball_contact",
+    }
   assert set(stage.rewards) == expected_rewards
   assert set(stage.terminations) == expected_terminations
   assert set(stage.metrics) == expected_metrics
@@ -162,7 +205,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   if drop_tail_declared:
     reward_diff.add("body_ang_vel")  # torso rate priced high enough to matter
   for name in nominal.rewards:
-    if name in reward_diff:
+    if name in reward_diff or name not in stage.rewards:
       continue
     assert stage.rewards[name] == nominal.rewards[name], name
   for name in nominal.terminations:
@@ -186,6 +229,38 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     paused = dict(stage.terminations["ball_no_bounce"].params)
     assert paused.pop("hold_event") == "hold_ball"
     assert paused == nominal.terminations["ball_no_bounce"].params
+
+  if visibility_gate_declared:
+    params = stage.observations["actor"].terms["ball_hist_pelvis"].params
+    assert params["visibility_head_cfg"] is not None
+    assert params["visibility_dropout_prob"] == 0.0
+    # The claim this rung makes is "the previous rung plus the gate, nothing else", so
+    # compare against that rung directly rather than against the nominal pilot: the
+    # declared hold and drop-tail sections legitimately move rewards.
+    previous = agibot_x2_tennis_juggle_stage_env_cfg(stage="s9b-sim-to-real")
+    assert stage.rewards == previous.rewards, "the gate rung must not move a reward"
+    assert stage.terminations == previous.terminations, "nor a termination"
+    assert stage.metrics == previous.metrics, "nor a metric"
+    previous_params = previous.observations["actor"].terms["ball_hist_pelvis"].params
+    assert {k: v for k, v in params.items() if k not in visibility_keys} == (
+      previous_params
+    )
+
+  if dead_ball_declared:
+    # No ball-caused episode end may survive: the episode must run to time_out so the
+    # robot spends the surviving seconds standing beside a ball it cannot rescue.
+    assert not [n for n in stage.terminations if "ball" in n]
+    assert {"fell_over", "time_out"} <= set(stage.terminations)
+    low, high = stage.events["reset_ball"].params["drop_height_range"]
+    assert high < 0.0, (low, high)
+    assert stage.events["reset_ball"].params["plate_start_fraction"] == 0.0
+
+  if pose_quad_declared:
+    quad = stage.rewards["pose_quadratic"]
+    assert quad.func is mdp.pose_quadratic
+    assert quad.weight < 0.0
+    assert quad.params["std"] > 0.0
+    assert stage.rewards["pose"] == nominal.rewards["pose"]
 
   if drop_tail_declared:
     assert "ball_dropped" not in stage.terminations

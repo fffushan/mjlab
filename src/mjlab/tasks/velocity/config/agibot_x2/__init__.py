@@ -398,6 +398,53 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# S9c: S9b plus a quadratic pose penalty beside the saturating exponential one, so a
+# twisted posture is pulled back from any distance instead of costing nothing.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S9c-PoseQuad"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9c-pose-quad"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9c-pose-quad", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# S9d: the ball starts below the plate and no ball-caused termination exists, so the
+# episode runs the full 20 s and the robot learns to stay upright beside a dead ball.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S9d-DeadBall"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9d-dead-ball"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s9d-dead-ball", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# S10: S9b with the ball stream gated on what the camera can actually see. One delta
+# against S9b, so an arm trained here measures the cost of truthful measurements.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S10-VisibleBall"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s10-visible-ball"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(
+    stage="s10-visible-ball", play=True
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

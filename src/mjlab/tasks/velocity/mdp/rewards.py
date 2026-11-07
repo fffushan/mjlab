@@ -1499,3 +1499,36 @@ def lost_ball_state(
     f"'{reward_term}' must be a class-based ball_lost_penalty reward term"
   )
   return getattr(term, field).float()
+
+
+def pose_quadratic(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg,
+  std: float = 0.05,
+) -> torch.Tensor:
+  """Mean squared joint deviation from the default pose, in units of ``std``.
+
+  The shipped ``pose`` term is ``exp(-mean((q - q*)^2 / std^2))``. It is a
+  fine-tolerance term: at a 30 degree deviation on ten joints the exponent is about
+  -32, so the value and its gradient are both numerically zero. A policy that has
+  learned a twisted posture therefore pays nothing and, more importantly, is pulled
+  by nothing -- which is exactly the pose in the S9b2 frame, where the torso is
+  yawed and the racket arm is carried across the body.
+
+  This term is the negative log of the same quantity, i.e. the same reference and the
+  same tolerance, but with a gradient that never vanishes:
+
+  ``mean_j((q_j - q*_j)^2 / std_j^2)``
+
+  With a negative weight it pulls from any distance. It agrees with ``pose`` near the
+  default pose and keeps pulling far away, where ``pose`` has saturated.
+
+  Args:
+    asset_cfg: Robot with the joints to score.
+    std: Tolerance in radians, one value for every joint. 0.05 matches the shipped
+      ``pose`` term's ``std_standing``, so the two terms describe the same target.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  current = asset.data.joint_pos[:, asset_cfg.joint_ids]
+  reference = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+  return torch.mean(torch.square((current - reference) / float(std)), dim=1)

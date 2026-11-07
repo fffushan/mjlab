@@ -37,6 +37,15 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_HOLD_OFFSET_SPEED_MPS,
   JUGGLE_BALL_LOST_PENALTY_WEIGHT,
   JUGGLE_TORSO_ANG_VEL_WEIGHT,
+  JUGGLE_POSE_QUAD_WEIGHT,
+  JUGGLE_POSE_QUAD_STD_RAD,
+  JUGGLE_DEAD_BALL_DROP_RANGE_M,
+  BALL_VISIBLE_HALF_ANGLES_RAD,
+  BALL_VISIBLE_MIN_RANGE_M,
+  BALL_VISIBLE_MAX_RANGE_M,
+  BALL_VISIBILITY_DROPOUT_PROB,
+  CAMERA_MOUNT_XYZ,
+  CAMERA_MOUNT_QUAT,
   JUGGLE_HOLD_HEIGHT_M,
   JUGGLE_HOLD_LATERAL_RANGE_M,
   JUGGLE_WAIT_ALIGN_WEIGHT,
@@ -418,6 +427,74 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "drop_tail": True,
     "sim_to_real": True,
   },
+  # S9c - S9b isolates the posture: a quadratic penalty beside the saturating
+  # exponential pose term, same reference and same 0.05 rad tolerance, weighted so a
+  # 30 degree twist costs about a fifth of the whole reward intake.
+  "s9c-pose-quad": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
+    },
+    "drop_tail": True,
+    "sim_to_real": True,
+    "pose_quad": True,
+  },
+  # S9d - the ball starts below the plate, where the racket cannot reach it, and no
+  # ball-caused termination exists. The episode runs the full 20 s, so the robot learns
+  # to stay upright and square while the ball lies on the floor instead of lunging at a
+  # ball it cannot rescue. This is the posture rung the S9b2 screenshot asked for: it
+  # must be followed by a re-juggle rung, because a dead ball gives no juggle gradient.
+  "s9d-dead-ball": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      # Negative: the ball starts below the plate, where the racket cannot reach it.
+      "drop_height_range": JUGGLE_DEAD_BALL_DROP_RANGE_M,
+    },
+    "dead_ball": True,
+    "sim_to_real": True,
+    "pose_quad": True,
+  },
+  # S10 - S9b with the ball stream gated on what the camera can see. One delta: the
+  # measurement. Rewards, physics, randomisation and resets are S9b's, so a comparison
+  # against an S9b arm isolates the cost of not being told where an unseen ball is.
+  "s10-visible-ball": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+    },
+    "hold": {
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
+    },
+    "drop_tail": True,
+    "sim_to_real": True,
+    "visibility_gate": True,
+  },
 }
 """The one condition each stage changes, as ``ball_hist_pelvis`` term parameters.
 
@@ -465,6 +542,9 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
   # unknown parameters of the ball-history observation term.
   drop_tail = bool(delta.pop("drop_tail", False))
   sim_to_real = bool(delta.pop("sim_to_real", False))
+  pose_quad = bool(delta.pop("pose_quad", False))
+  dead_ball = bool(delta.pop("dead_ball", False))
+  visibility_gate = bool(delta.pop("visibility_gate", False))
   cfg = agibot_x2_tennis_juggle_nominal_env_cfg(play=play)
   cfg.observations["actor"].terms["ball_hist_pelvis"].params.update(delta)
   if reset_delta:
@@ -478,6 +558,12 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
   # same checkpoint behave differently every launch.
   if sim_to_real and not play:
     _apply_sim_to_real(cfg)
+  if pose_quad:
+    _apply_pose_quad(cfg)
+  if dead_ball:
+    _apply_dead_ball(cfg)
+  if visibility_gate:
+    _apply_visibility_gate(cfg)
   return cfg
 
 
@@ -528,6 +614,100 @@ def _apply_sim_to_real(cfg: ManagerBasedRlEnvCfg) -> None:
       continue
     cfg.events[name] = deepcopy(term)
   apply_x2_tracking_robot_randomization(cfg)
+
+
+def _apply_dead_ball(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Remove every episode end and every reward that involves the ball (S9d).
+
+  The dead-ball start places the ball below the plate, where the racket cannot reach
+  it, so the ball is lost from the first step. In that situation the three
+  ball-caused terminations are harmful, not merely useless:
+
+  * ``ball_no_bounce`` and ``ball_not_lifted`` end the episode a second or two in, so
+    the robot never spends time standing while a ball lies on the floor -- which is
+    the behaviour this rung exists to teach;
+  * ``held_ball_contact`` has no held phase to protect.
+
+  What remains is ``fell_over`` (70 degree tilt) and ``time_out`` (the full 20 s), so
+  the only way an episode ends early is by falling. That is the signal we want.
+
+  The ball rewards go with them. ``ball_lost_penalty`` in particular must not stay: it
+  charges per step while the ball is lost, and a fall would then *end* the charge, so
+  the policy would learn that falling is cheaper than standing upright with a dead
+  ball. ``ball_energy``, ``ball_centred``, ``ball_in_fov`` and ``racket_under_ball``
+  are all identically zero here and only cost evaluation.
+
+  Policy, critic, action widths and the observation layout do not change, so this rung
+  resumes an S9c checkpoint with its optimizer state.
+  """
+  for name in (
+    "ball_dropped",
+    "ball_no_bounce",
+    "ball_not_lifted",
+    "held_ball_contact",
+  ):
+    cfg.terminations.pop(name, None)
+  for name in (
+    "ball_energy",
+    "ball_centred",
+    "ball_in_fov",
+    "racket_under_ball",
+    "ball_lost_penalty",
+  ):
+    cfg.rewards.pop(name, None)
+
+
+def _apply_visibility_gate(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Make the ball stream refuse frames the camera could not have measured (S10).
+
+  The estimator publishes nothing for a frame in which the ball was not detected, and
+  the simulator had no equivalent: ``ball_history_samples`` wrote the true ball position
+  at every step, so the actor could rely on a measurement that the robot cannot make.
+  This stage turns the gate on. It changes only what the actor measures; the reward
+  manager and the metrics keep reading the true state.
+
+  Geometry is the delivered image, not the raw sensor: a 480x288 rectified pinhole with
+  half-angles 65.7 / 67.2 / 53.9 / 54.1 degrees and a 0.1-1.0 m straight-line range gate
+  about the left camera centre. The mount is the training value, and the measurement
+  stays unbiased: the estimator's measured +8.3 % range overestimate is not modelled.
+
+  The dropout probability stays at its default of zero, so this stage is pure geometry.
+  A measured 4.8-5.2 % of frames are rejected as ``ambiguous`` inside the region; that is
+  recorded in the plan and deliberately left out here, so the stage moves one thing.
+  """
+  cfg.observations["actor"].terms["ball_hist_pelvis"].params.update(
+    visibility_head_cfg=SceneEntityCfg("robot", body_names=("head_pitch_link",)),
+    visibility_mount_xyz=CAMERA_MOUNT_XYZ,
+    visibility_mount_quat=CAMERA_MOUNT_QUAT,
+    visibility_half_angles=BALL_VISIBLE_HALF_ANGLES_RAD,
+    visibility_min_range_m=BALL_VISIBLE_MIN_RANGE_M,
+    visibility_max_range_m=BALL_VISIBLE_MAX_RANGE_M,
+    visibility_dropout_prob=BALL_VISIBILITY_DROPOUT_PROB,
+  )
+
+
+def _apply_pose_quad(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Add a quadratic pose penalty beside the saturating exponential one (S9c).
+
+  ``pose`` is ``exp(-mean((q-q*)^2/std^2))`` with ``std = 0.05`` rad. At the
+  deviations a twisted juggle posture reaches -- 30 degrees on ten joints -- the
+  exponent is about -32, so both the value and its gradient are numerically zero and
+  the policy is neither charged nor pulled back. ``pose_quadratic`` is the negative
+  log of the same quantity: same reference, same tolerance, gradient at any distance.
+
+  Weight -0.04 is sized against the measured reward budget. Positive intake is
+  +0.351 per second, so a term worth 1.28 per step at that posture is about 18 % of
+  everything the policy earns: enough to pull the torso back, not enough to stop the
+  juggle. The existing exponential term stays, so nothing is removed.
+  """
+  cfg.rewards["pose_quadratic"] = RewardTermCfg(
+    func=mdp.pose_quadratic,
+    weight=JUGGLE_POSE_QUAD_WEIGHT,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
+      "std": JUGGLE_POSE_QUAD_STD_RAD,
+    },
+  )
 
 
 def _apply_drop_tail(cfg: ManagerBasedRlEnvCfg, step_dt: float) -> None:

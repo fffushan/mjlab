@@ -736,6 +736,32 @@ JUGGLE_BALL_LOST_PENALTY_WEIGHT = -4.0
 # The unusual magnitude is the point: the term has to be able to outvote the ball
 # reward, or it cannot forbid anything.
 JUGGLE_TORSO_ANG_VEL_WEIGHT = -0.5
+
+JUGGLE_POSE_QUAD_WEIGHT = -0.04
+"""Weight of the quadratic pose penalty (S9c), sized against the measured budget.
+
+The term returns the mean squared joint deviation in units of ``std``. A twisted
+posture costs about 32 in those units, so this weight is worth ~1.28 per step, which
+is roughly 18 % of the policy's measured +0.351 per second of positive intake: enough
+to pull the torso back, not enough to stop the juggle.
+"""
+
+JUGGLE_POSE_QUAD_STD_RAD = 0.05
+"""Tolerance of the quadratic pose penalty, in radians.
+
+Matches the shipped ``pose`` term's ``std_standing`` of 0.05 rad, so the two terms
+describe the same target and only their shapes differ.
+"""
+
+JUGGLE_DEAD_BALL_DROP_RANGE_M = (-0.40, -0.15)
+"""Height range for the S9d dead-ball start, in metres above the plate.
+
+Negative means **below** the plate. The robot carries the racket at about 1.15 m, so a
+ball released 0.15-0.40 m lower is already under the strings and, from the reset, on a
+path the racket cannot intercept: the ball is lost by construction. S9d uses this to
+train the resignation behaviour -- stay upright and square while the ball falls to the
+floor -- without any ball-caused episode end to rescue the episode early.
+"""
 """Weight of ``body_ang_vel`` on the torso for the drop-tail rung."""
 
 # Reward weights. Centring is the task, so it carries the same order of magnitude
@@ -974,6 +1000,69 @@ CAMERA_HALF_ANGLE_Y = 1.1168
 (1024.451 / 687.245 and 767.497 / 687.245), i.e. 85.4 and 64.0 deg. The fisheye's
 true corner angle is larger; the per-axis edge angle is what a rectangular frame
 test needs.
+"""
+
+##
+# Visibility gate for the ball stream.
+#
+# The real estimator publishes **nothing** for a frame in which it did not detect the
+# ball (Rule 0 of ``TENNIS-BALL-ESTIMATOR-CONTRACT.md``). The simulator had no
+# equivalent, so the actor could be trained against a ball position at every step. The
+# constants below describe the region the estimator can actually deliver, and
+# :func:`~mjlab.tasks.velocity.mdp.ball_visibility.ball_in_camera_region` is the pure
+# geometry test built from them.
+#
+# The estimator sees a **480x288 rectified pinhole**, not the raw fisheye frame, so these
+# are *not* :data:`CAMERA_HALF_ANGLE_X` / :data:`CAMERA_HALF_ANGLE_Y` above: those are the
+# raw fisheye edge angles the field-of-view reward uses. In tan space that fisheye cone is
+# 5.43x wider horizontally and 1.49x wider vertically than the delivered image. The two
+# pairs are deliberately different numbers and neither is derived from the other.
+#
+# **Most values below are priors from the estimator's shipped code, not a
+# calibration.** Two are not: :data:`BALL_MIN_VALIDATED_RANGE_M` comes from a hardware
+# validation session, and :data:`BALL_VISIBILITY_DROPOUT_PROB` is a stage choice.
+##
+
+BALL_VISIBLE_HALF_ANGLES_RAD = (1.1469, 1.1728, 0.9407, 0.9443)
+"""Angle from the optical axis to the delivered image edge: left, right, up, down.
+
+Radians, as half-widths of the delivered 480x288 pinhole image and not of the raw fisheye
+frame: 65.7, 67.2, 53.9 and 54.1 deg for the ``.147`` calibration at 516x388. Four values
+and not one pair because the rectified image is not symmetric about the optical axis.
+``.162`` differs by under 1.5 deg per side. A prior from the estimator's shipped code, not
+an operator calibration.
+"""
+
+BALL_VISIBLE_MIN_RANGE_M = 0.1
+"""Closest ball-to-camera distance the estimator reports, in metres.
+
+Hard floor in the estimator's reach mask, measured from the left camera centre. A prior
+from the estimator's shipped code, not a calibration.
+"""
+
+BALL_VISIBLE_MAX_RANGE_M = 1.0
+"""Farthest ball-to-camera distance the estimator reports, in metres.
+
+A **sphere** of this radius about the left camera centre, not a forward-depth limit: a
+ball 0.7 m ahead and 1.2 m from the centre is outside it. A prior from the estimator's
+shipped code, not a calibration.
+"""
+
+BALL_MIN_VALIDATED_RANGE_M = 0.412
+"""Smallest range at which the estimator was validated on hardware, in metres.
+
+Documented only: nothing in this repository enforces it. A ball closer than this is
+untested, not forbidden, which is why it is not the gate's lower limit. A prior from the
+estimator session, not a calibration.
+"""
+
+BALL_VISIBILITY_DROPOUT_PROB = 0.0
+"""Probability that an otherwise-visible frame is marked invisible at write time.
+
+Dimensionless, per control step, and 0.0 for this stage because the gate is pure
+geometry. At 0.0 no random number is drawn at all, so a zero-dropout run consumes exactly
+the randomness it did before the gate existed. :data:`BALL_DROPOUT_PROB` is a different
+model - the fixed-delay path's frame rejection - and is not reused here.
 """
 
 BALL_FOV_PLATEAU = 0.60

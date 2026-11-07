@@ -148,6 +148,10 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_STREAM_RATE_RANGE_HZ,
   BALL_STREAM_STALL_PROB,
   BALL_STREAM_STALL_RANGE_S,
+  BALL_VISIBILITY_DROPOUT_PROB,
+  BALL_VISIBLE_HALF_ANGLES_RAD,
+  BALL_VISIBLE_MAX_RANGE_M,
+  BALL_VISIBLE_MIN_RANGE_M,
   CAMERA_HALF_ANGLE_X,
   CAMERA_HALF_ANGLE_Y,
   CAMERA_MOUNT_QUAT,
@@ -243,6 +247,65 @@ def _ablation_value(name: str, default: float | None = None) -> float | None:
   if raw in (None, ""):
     return default
   return float(raw)
+
+
+_VISIBILITY_GATE_ENV = _ABLATION_ENV_PREFIX + "VISIBILITY_GATE"
+
+
+def _visibility_gate_enabled() -> bool:
+  """Whether the ball stream's visibility gate is on, from ``MJLAB_JUGGLE_VISIBILITY_GATE``.
+
+  Off by default, and on only for the exact value ``1``: the value is a switch, not a
+  magnitude, so a near-miss such as ``0.99`` stays off. An existing stage therefore runs
+  the ungated stream it was trained on, byte for byte and draw for draw, until a stage
+  delta turns the gate on deliberately. It is an environment variable rather than a
+  factory argument because it changes what the actor measures, not how the task is
+  laid out.
+  """
+  return os.environ.get(_VISIBILITY_GATE_ENV) == "1"
+
+
+def _ball_history_params(
+  ball_cfg: SceneEntityCfg,
+  frame_params: dict,
+  bias_half_width_m: float,
+) -> dict:
+  """Parameters of the actor's :class:`mdp.ball_history_samples` term.
+
+  The stream magnitudes default to the measured constants and an arm may vary them
+  through ``MJLAB_JUGGLE_*``. The visibility gate's constants are added **only** when
+  :func:`_visibility_gate_enabled` is true, so with the gate off the term receives the
+  ungated parameter set and takes its gate-off path.
+  """
+  params = dict(
+    ball_cfg=ball_cfg,
+    **frame_params,
+    bias_half_width_m=bias_half_width_m,
+    stream_rate_hz=(
+      _ablation_value("BALL_STREAM_RATE_MIN_HZ", BALL_STREAM_RATE_RANGE_HZ[0]),
+      _ablation_value("BALL_STREAM_RATE_MAX_HZ", BALL_STREAM_RATE_RANGE_HZ[1]),
+    ),
+    stream_latency_s=(
+      _ablation_value("BALL_STREAM_LATENCY_MIN_S", BALL_STREAM_LATENCY_RANGE_S[0]),
+      _ablation_value("BALL_STREAM_LATENCY_MAX_S", BALL_STREAM_LATENCY_RANGE_S[1]),
+    ),
+    stall_prob=_ablation_value("BALL_STREAM_STALL_PROB", BALL_STREAM_STALL_PROB),
+    stall_range_s=(
+      _ablation_value("BALL_STREAM_STALL_MIN_S", BALL_STREAM_STALL_RANGE_S[0]),
+      _ablation_value("BALL_STREAM_STALL_MAX_S", BALL_STREAM_STALL_RANGE_S[1]),
+    ),
+  )
+  if _visibility_gate_enabled():
+    params.update(
+      visibility_head_cfg=SceneEntityCfg("robot", body_names=("head_pitch_link",)),
+      visibility_mount_xyz=CAMERA_MOUNT_XYZ,
+      visibility_mount_quat=CAMERA_MOUNT_QUAT,
+      visibility_half_angles=BALL_VISIBLE_HALF_ANGLES_RAD,
+      visibility_min_range_m=BALL_VISIBLE_MIN_RANGE_M,
+      visibility_max_range_m=BALL_VISIBLE_MAX_RANGE_M,
+      visibility_dropout_prob=BALL_VISIBILITY_DROPOUT_PROB,
+    )
+  return params
 
 
 _ZERO_POSE_RANGE = {
@@ -589,23 +652,10 @@ def agibot_x2_tennis_juggle_env_cfg(
       )
     cfg.observations["actor"].terms[term_name] = ObservationTermCfg(
       func=mdp.ball_history_samples,
-      params=dict(
+      params=_ball_history_params(
         ball_cfg=ball_cfg,
-        **frame_params,
+        frame_params=frame_params,
         bias_half_width_m=ball_bias_half_m,
-        stream_rate_hz=(
-          _ablation_value("BALL_STREAM_RATE_MIN_HZ", BALL_STREAM_RATE_RANGE_HZ[0]),
-          _ablation_value("BALL_STREAM_RATE_MAX_HZ", BALL_STREAM_RATE_RANGE_HZ[1]),
-        ),
-        stream_latency_s=(
-          _ablation_value("BALL_STREAM_LATENCY_MIN_S", BALL_STREAM_LATENCY_RANGE_S[0]),
-          _ablation_value("BALL_STREAM_LATENCY_MAX_S", BALL_STREAM_LATENCY_RANGE_S[1]),
-        ),
-        stall_prob=_ablation_value("BALL_STREAM_STALL_PROB", BALL_STREAM_STALL_PROB),
-        stall_range_s=(
-          _ablation_value("BALL_STREAM_STALL_MIN_S", BALL_STREAM_STALL_RANGE_S[0]),
-          _ablation_value("BALL_STREAM_STALL_MAX_S", BALL_STREAM_STALL_RANGE_S[1]),
-        ),
       ),
     )
   else:

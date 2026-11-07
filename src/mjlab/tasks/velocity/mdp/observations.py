@@ -14,6 +14,12 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_STREAM_STALL_PROB,
   BALL_STREAM_STALL_RANGE_S,
   BALL_TRUE_HISTORY_S,
+  BALL_VISIBILITY_DROPOUT_PROB,
+  BALL_VISIBLE_HALF_ANGLES_RAD,
+  BALL_VISIBLE_MAX_RANGE_M,
+  BALL_VISIBLE_MIN_RANGE_M,
+  CAMERA_MOUNT_QUAT,
+  CAMERA_MOUNT_XYZ,
   FACE_SITE_POS,
 )
 from mjlab.entity import Entity
@@ -22,6 +28,7 @@ from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
+from mjlab.tasks.velocity.mdp.ball_visibility import ball_in_camera_region
 from mjlab.utils.lab_api.math import quat_apply_inverse
 
 if TYPE_CHECKING:
@@ -341,6 +348,26 @@ class ball_history_samples(ManagerTermBase):
   **with its own age**, so the duplicate is self-evident rather than a fabricated
   fresh measurement.
 
+  **The visibility gate is off unless a head is given.** The real estimator publishes
+  nothing for a frame in which the ball was not detected, so a simulator stream that
+  always delivers a position lets the actor rely on a measurement the robot could not
+  have made. When ``visibility_head_cfg`` is an entity config, the term:
+
+  1. writes a boolean **visibility ring** entry per control step, from the camera pose
+     at that step, using
+     :func:`~mjlab.tasks.velocity.mdp.ball_visibility.ball_in_camera_region`;
+  2. admits a due acquisition **only if** the frame at ``capture_step`` was visible,
+     after the latency draw, so the draws of a seeded replay stay in the same order;
+  3. inserts nothing when the frame was refused and retries on the next control step,
+     so the history ages grow: that is the silence the estimator shows;
+  4. emits **all twelve numbers zero** while nothing has been admitted, because there
+     is no measurement to report, instead of a reset-origin position at a growing age;
+  5. draws a dropout random number **only** when ``visibility_dropout_prob`` is
+     positive, so a zero-dropout run consumes the same randomness as before.
+
+  The gate is pure geometry plus that optional dropout. Range bias, occlusion and
+  ghost rejection are not modelled.
+
   The term applies its own delay and its own noise, so its
   :class:`~mjlab.managers.observation_manager.ObservationTermCfg` must set neither
   ``noise`` nor any ``delay_*`` field. The noise is uniform with the per-axis
@@ -367,6 +394,19 @@ class ball_history_samples(ManagerTermBase):
     position_noise_m: Per-axis half-widths of the per-sample position noise, in
       metres. Defaults to :data:`BALL_POSITION_NOISE_M`; ``(0.0, 0.0, 0.0)``
       disables it.
+    visibility_head_cfg: The camera-carrying head body. ``None`` (default) leaves the
+      gate off and the stream identical to the ungated one. Must resolve to one body
+      when given.
+    visibility_mount_xyz: Camera position in the head body frame, metres.
+    visibility_mount_quat: Camera orientation in the head body frame, wxyz.
+    visibility_half_angles: ``(left, right, up, down)`` half-angles of the delivered
+      image, radians. Defaults to :data:`BALL_VISIBLE_HALF_ANGLES_RAD`.
+    visibility_min_range_m: Near limit of the region, straight-line from the camera
+      centre.
+    visibility_max_range_m: Far limit of the region, also straight-line, so the
+      region it closes is a sphere.
+    visibility_dropout_prob: Probability that an otherwise-visible frame is marked
+      invisible at write time. 0.0 (default) draws no random number.
 
   Returns:
     Tensor of shape ``(num_envs, 12)``: ``[x0, y0, z0, t0, x1, y1, z1, t1, x2, y2,
@@ -408,6 +448,34 @@ class ball_history_samples(ManagerTermBase):
     self._last_buf: torch.Tensor | None = None
     self._last_out: torch.Tensor | None = None
     self._noise_half = torch.tensor(noise_half_m, dtype=torch.float32, device=device)
+    # Visibility gate. ``None`` means off, and then no ring exists, no geometry is
+    # evaluated and no random number is drawn beyond the ungated stream's own draws.
+    self._visibility_head_cfg: SceneEntityCfg | None = cfg.params.get(
+      "visibility_head_cfg"
+    )
+    self._visibility_mount_xyz = tuple(
+      cfg.params.get("visibility_mount_xyz", CAMERA_MOUNT_XYZ)
+    )
+    self._visibility_mount_quat = tuple(
+      cfg.params.get("visibility_mount_quat", CAMERA_MOUNT_QUAT)
+    )
+    self._visibility_half_angles = tuple(
+      cfg.params.get("visibility_half_angles", BALL_VISIBLE_HALF_ANGLES_RAD)
+    )
+    self._visibility_min_range_m = float(
+      cfg.params.get("visibility_min_range_m", BALL_VISIBLE_MIN_RANGE_M)
+    )
+    self._visibility_max_range_m = float(
+      cfg.params.get("visibility_max_range_m", BALL_VISIBLE_MAX_RANGE_M)
+    )
+    self._visibility_dropout_prob = float(
+      cfg.params.get("visibility_dropout_prob", BALL_VISIBILITY_DROPOUT_PROB)
+    )
+    self._vis_ring: torch.Tensor | None = (
+      torch.zeros(n, self._ring_len, dtype=torch.bool, device=device)
+      if self._visibility_head_cfg is not None
+      else None
+    )
 
   def __call__(
     self,
@@ -422,9 +490,25 @@ class ball_history_samples(ManagerTermBase):
     stream_latency_s: tuple[float, float] = BALL_STREAM_LATENCY_RANGE_S,
     stall_prob: float = BALL_STREAM_STALL_PROB,
     stall_range_s: tuple[float, float] = BALL_STREAM_STALL_RANGE_S,
+    visibility_head_cfg: SceneEntityCfg | None = None,
+    visibility_mount_xyz: tuple[float, float, float] = CAMERA_MOUNT_XYZ,
+    visibility_mount_quat: tuple[float, float, float, float] = CAMERA_MOUNT_QUAT,
+    visibility_half_angles: tuple[float, float, float, float] = (
+      BALL_VISIBLE_HALF_ANGLES_RAD
+    ),
+    visibility_min_range_m: float = BALL_VISIBLE_MIN_RANGE_M,
+    visibility_max_range_m: float = BALL_VISIBLE_MAX_RANGE_M,
+    visibility_dropout_prob: float = BALL_VISIBILITY_DROPOUT_PROB,
   ) -> torch.Tensor:
     del bias_half_width_m  # Drawn once per episode in ``reset``/``__init__``.
     del position_noise_m  # Resolved once per term in ``__init__``.
+    del visibility_head_cfg  # Resolved once per term in ``__init__``.
+    del visibility_mount_xyz
+    del visibility_mount_quat
+    del visibility_half_angles
+    del visibility_min_range_m
+    del visibility_max_range_m
+    del visibility_dropout_prob
     # The stream magnitudes are parameters, not module globals, so an ablation arm can
     # vary them from the configuration and the value a run used is recorded in the
     # run's own params/env.yaml. They default to the measured constants.
@@ -448,7 +532,11 @@ class ball_history_samples(ManagerTermBase):
     # place and the guard below would then match on every step and freeze the term at
     # its reset-time output.
     buf = env.episode_length_buf.to(device=device).long().clone()
-    if self._last_out is not None and torch.equal(buf, self._last_buf):
+    if (
+      self._last_out is not None
+      and self._last_buf is not None
+      and torch.equal(buf, self._last_buf)
+    ):
       return self._last_out
 
     now_step = self._step
@@ -470,6 +558,31 @@ class ball_history_samples(ManagerTermBase):
     # makes a repeated call at the same step idempotent, and makes the ring read
     # below a direct lookup of a known step.
     self._ring[rows, now_step % self._ring_len] = true_pos
+    if self._vis_ring is not None:
+      # Whether the camera could see the ball at this step, from the camera pose at
+      # this step. Written before the admission test, so the frame a sample is captured
+      # from is always already in the ring - including the reset step's, which
+      # ``reset`` clears for a new episode.
+      head_cfg = self._visibility_head_cfg
+      assert head_cfg is not None  # guarded by ``self._vis_ring`` above
+      visible = ball_in_camera_region(
+        env,
+        ball_cfg,
+        head_cfg,
+        self._visibility_mount_xyz,
+        self._visibility_mount_quat,
+        self._visibility_half_angles,
+        self._visibility_min_range_m,
+        self._visibility_max_range_m,
+      )
+      if self._visibility_dropout_prob > 0.0:
+        # Drawn only when the probability is positive: a zero-dropout run consumes
+        # exactly the randomness it did before the gate existed.
+        dropped = (
+          torch.rand(self.num_envs, device=device) < self._visibility_dropout_prob
+        )
+        visible = visible & ~dropped
+      self._vis_ring[rows, now_step % self._ring_len] = visible
 
     due = now_step >= self._next_acq
 
@@ -483,6 +596,14 @@ class ball_history_samples(ManagerTermBase):
     # Before the episode has enough true history the latency cannot be honoured.
     # Clamping to the reset step keeps the sample a real state of this episode.
     capture_step = (now_step - lag_steps).clamp(min=0)
+    # Admit the frame only if the camera could see the ball at its capture step. The
+    # latency draw above happens whether or not the frame is admitted, so a seeded
+    # replay consumes the same draws in the same order.
+    admitted = (
+      due
+      if self._vis_ring is None
+      else due & self._vis_ring[rows, capture_step % self._ring_len]
+    )
     measured = self._ring[rows, capture_step % self._ring_len] + self._bias
     measured = measured + (torch.rand(self.num_envs, 3, device=device) * 2.0 - 1.0) * (
       self._noise_half
@@ -504,15 +625,17 @@ class ball_history_samples(ManagerTermBase):
       dim=1, descending=True
     )[:, :BALL_HISTORY_DEPTH]
     self._hist_pos = torch.where(
-      due[:, None, None],
+      admitted[:, None, None],
       all_pos.gather(1, keep[:, :, None].expand(-1, -1, 3)),
       self._hist_pos,
     )
     self._hist_step = torch.where(
-      due[:, None], all_steps.gather(1, keep), self._hist_step
+      admitted[:, None], all_steps.gather(1, keep), self._hist_step
     )
     self._hist_count = torch.where(
-      due, (self._hist_count + 1).clamp(max=BALL_HISTORY_DEPTH), self._hist_count
+      admitted,
+      (self._hist_count + 1).clamp(max=BALL_HISTORY_DEPTH),
+      self._hist_count,
     )
 
     # Schedule the next acquisition: one interval at the drawn stream rate, plus a
@@ -533,6 +656,10 @@ class ball_history_samples(ManagerTermBase):
       + torch.where(stall, stall_steps, torch.zeros_like(stall_steps))
     )
     self._next_acq = torch.where(due, next_acq, self._next_acq)
+    if self._vis_ring is not None:
+      # A refused frame inserts nothing and the next control step is due again, so the
+      # gaps that follow are the silent stretches the estimator produces.
+      self._next_acq = torch.where(due & ~admitted, now_step + 1, self._next_acq)
 
     # Repeat the oldest available slot in the unfilled slots, with that slot's own
     # age, so a duplicate cannot be mistaken for a fresh sample.
@@ -543,6 +670,11 @@ class ball_history_samples(ManagerTermBase):
     ages = (now_step[:, None] - steps).to(torch.float32) * self._step_dt
     ages = ages.clamp(min=0.0, max=BALL_HISTORY_AGE_CLIP_S)
     out = torch.cat([positions, ages.unsqueeze(-1)], dim=-1).reshape(self.num_envs, -1)
+    if self._vis_ring is not None:
+      # Nothing admitted yet: no measurement exists, so every number is zero. Without
+      # this the unfilled slots would serve the reset zero position at a growing age,
+      # which reads as a fresh sample at the pelvis origin.
+      out = torch.where((self._hist_count == 0)[:, None], torch.zeros_like(out), out)
     self._step += 1
     self._last_buf = buf
     self._last_out = out
@@ -552,6 +684,10 @@ class ball_history_samples(ManagerTermBase):
     if env_ids is None:
       env_ids = slice(None)
     self._ring[env_ids] = 0.0
+    if self._vis_ring is not None:
+      # A cleared ring is what stops a previous episode's visibility from admitting a
+      # sample in this one.
+      self._vis_ring[env_ids] = False
     self._hist_pos[env_ids] = 0.0
     self._hist_step[env_ids] = 0
     self._hist_count[env_ids] = 0

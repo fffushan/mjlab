@@ -40,6 +40,12 @@ NO_CORRUPTION_TRAINING_TASKS = frozenset(
     "-Ball3-Pelvis-Nominal-S9a-DropTail",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S9b-SimToReal",
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S9c-PoseQuad",
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S9d-DeadBall",
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S10-VisibleBall",
   }
 )
 """Training tasks whose actor input is deliberately noise-free.
