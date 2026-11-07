@@ -33,32 +33,14 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 # The 12 collision spheres per foot live in the ankle-roll body.
 _FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
 
-# The carry-pose reward split: ``pose`` keeps the legs and head, the added
-# quadratic term holds the arms and waist. Every joint is in exactly one group.
-_CARRY_POSE_LEG_HEAD_JOINTS = (
-  r".*_hip_.*",
-  r".*_knee.*",
-  r".*_ankle_.*",
-  r".*head.*",
-)
+# The joints the carry task holds with the added quadratic term. ``pose`` already scores
+# every joint; this group is the racket arm and the waist, where the inherited tolerances
+# are loose enough at walking speed that the racket could wander.
 _CARRY_POSE_ARM_WAIST_JOINTS = (
   r".*_shoulder_.*",
   r".*_elbow.*",
   r".*_wrist_.*",
   r".*waist_.*",
-)
-
-# The base ``pose`` tables use one key per joint role. These are the leg and head
-# keys; the arm and waist keys must be dropped, because
-# ``resolve_matching_names_values`` raises when a pattern matches no joint.
-_CARRY_POSE_STD_LEG_HEAD_KEYS = (
-  r".*_hip_pitch.*",
-  r".*_hip_roll.*",
-  r".*_hip_yaw.*",
-  r".*_knee.*",
-  r".*_ankle_pitch.*",
-  r".*_ankle_roll.*",
-  r".*head.*",
 )
 
 # Foot-site pose in the ankle-roll body frame: the centroid of the 12 foot
@@ -299,10 +281,10 @@ def agibot_x2_flat_velocity_carry_env_cfg(
 
   Builds on :func:`agibot_x2_flat_velocity_env_cfg`: the robot is the tennis
   entity (welded racket and ``BAT_CARRY_POSE``) with the velocity foot sites
-  layered on, and the ``pose`` reward is split into a leg/head tolerance term
-  and a quadratic arm/waist term so the held arms never saturate. Everything
-  else -- observations, actions, terminations, events and episode length -- is
-  inherited unchanged.
+  layered on. ``pose`` is inherited unchanged over all 31 joints; a quadratic
+  term is added over the arms and waist so the held racket never relies on the
+  saturating ``pose`` term alone. Everything else -- observations, actions,
+  terminations, events and episode length -- is inherited unchanged.
 
   Args:
     play: If True, applies the base task's play-mode overrides first, then the
@@ -327,15 +309,10 @@ def agibot_x2_flat_velocity_carry_env_cfg(
   # landing impulse with the racket in hand.
   cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.02)
 
-  pose_cfg = cfg.rewards["pose"]
-  pose_cfg.params["asset_cfg"].joint_names = _CARRY_POSE_LEG_HEAD_JOINTS
-  pose_cfg.params["std_walking"] = {
-    key: pose_cfg.params["std_walking"][key] for key in _CARRY_POSE_STD_LEG_HEAD_KEYS
-  }
-  pose_cfg.params["std_running"] = {
-    key: pose_cfg.params["std_running"][key] for key in _CARRY_POSE_STD_LEG_HEAD_KEYS
-  }
-
+  # ``pose`` stays exactly as the base task defines it: all 31 joints with the speed
+  # dependent tolerances. Restricting it to the legs would divide its mean by 14 instead of
+  # 31 and make the same leg error cost 2.214 times more, which would silently retune a
+  # baseline we want to compare against. The arm hold is added *on top* instead.
   cfg.rewards["pose_quadratic"] = RewardTermCfg(
     func=mdp.pose_quadratic,
     weight=-0.4,

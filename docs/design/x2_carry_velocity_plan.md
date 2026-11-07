@@ -55,25 +55,33 @@ run one gain set at a time, so training under different gains would leave a disc
 the handover. The config probe asserts equality with the tennis juggle task on all 29 vendor
 joints.
 
-## 3. Pose reward split by joint group
+## 3. Pose reward: keep `pose` over all joints, add a quadratic arm term
 
 The shipped `pose` term is `exp(-mean((q - q*)^2 / std^2))` with a speed-dependent
 per-joint tolerance. It saturates: at a 0.52 rad deviation with std 0.15 the exponent is
 about -12 per joint, so the value and the gradient both vanish. A stance may use a
 tolerance term; a held arm may not.
 
+The fix is **additive**, not a split:
+
 | Term | Joints | Form | Weight | Tolerance |
 |---|---|---|---|---|
-| `pose` | legs and head | `variable_posture` | 1.0 (unchanged) | existing per-speed table, pruned to these joints |
+| `pose` | **all 31**, inherited unchanged | `variable_posture` | 1.0 | the base task's three tables, byte-identical |
 | `pose_quadratic` | arms and waist, 17 joints | `mean((q - q*)^2 / std^2)` | -0.4 | std 0.10 rad |
 
-- Disjoint groups, full coverage of all 31 joints.
-- The `pose` std dictionaries (`std_standing`, `std_walking`, `std_running`) must be pruned
-  to the leg and head patterns. `resolve_matching_names_values` rejects a pattern that
-  matches no joint, so an arm entry left behind is a load-time error.
-- Starting weight -0.4 with std 0.10 rad: a 5.7 degree arm error on every joint costs
-  -0.4 per step, against a tracking maximum of 4.0. The probe reports the cost at 0, 5, 10
-  and 20 degrees so the weight can be changed with numbers instead of intuition.
+- `pose` keeps its mean over 31 joints, so the same leg error costs what it costs in the
+  base task. There is no hidden retune, and reward can be compared against the base run.
+- `pose_quadratic` is a **subset** of `pose`. The arms and waist are scored twice, which is
+  the point: `pose` supplies the inherited tolerance behaviour, and the quadratic term
+  supplies a gradient at any distance so the racket never depends on a saturated term.
+- The overlap is deliberate and asserted. An earlier draft restricted `pose` to legs and
+  head; that divides its mean by 14 instead of 31 and makes an equal leg error cost
+  **2.214 times** more (0.368 against 0.636 for a uniform 0.05 rad error), which would have
+  silently retuned the baseline the run has to be compared against. Rejected.
+- Starting weight -0.4 with std 0.10 rad: a 5.7 degree arm error on every joint costs -0.4
+  per step, against a tracking maximum of 4.0. `pose_quadratic` is a mean over 17 joints, so
+  one wrist 20 degrees off costs -0.287 while all seven racket-arm joints at 10 degrees cost
+  -0.502. If the racket must be locked by the wrist, the reduction has to change.
 
 ## 4. Command range
 
@@ -96,8 +104,8 @@ Both are cheap: `num_envs <= 8`, `steps <= 100`.
    - Actor observation width equals the existing no-state-estimation velocity task's.
    - Action count is 31. A pattern-list length is not an action count: the 16 actuator
      groups expand to 31 joints.
-   - `pose` covers legs and head only; `pose_quadratic` covers arms and waist; the two sets
-     are disjoint and cover all 31 joints.
+   - `pose` covers all 31 joints and matches the base task's joint set and tolerance tables;
+     `pose_quadratic` covers arms and waist and is a subset of `pose`.
    - Command ranges and the empty curriculum as in section 4.
    - `pose_quadratic` cost at 0, 5, 10 and 20 degrees of arm offset.
 2. `scripts/experiments/x2_carry_velocity/probe_carry_stand.py`
@@ -161,31 +169,9 @@ correct without them; none is a defect in this task alone.
 2. ~~Physics step is 5 ms with a 1 ms-fitted bed contact.~~ **Closed as no risk.** There is
    no ball in this task and the racket is rigid, so the 1 ms-fitted string bed is never
    loaded. The 5 ms step is inherited unchanged.
-3. **The ``pose`` mean now covers 14 joints, not 31.** Kept deliberately, and the arithmetic
-   is here so the weight is not tuned against the wrong baseline.
-
-   ``pose`` is ``exp(-mean_over_its_joints((q - q*)^2 / std^2))``. The divide is by the number
-   of joints **in the term's own group**, so removing joints from the group raises the
-   exponent for the joints that remain. Take a uniform 0.05 rad error on all 14 leg and head
-   joints with ``std_standing = 0.05``:
-
-   | group | per-joint term | mean | value |
-   |---|---:|---:|---:|
-   | 31 joints (base task) | 1.0 each | 14/31 = 0.452 | 0.636 |
-   | 14 joints (this task) | 1.0 each | 14/14 = 1.000 | 0.368 |
-
-   So one unit of leg or head error costs 2.214 times more reward than in the base task, and
-   the effective pull on those joints is 2.2 times stronger at an unchanged weight of 1.0.
-   Saturation also arrives sooner: with ``std_standing = 0.05``, a 0.10 rad error on every
-   joint gives an exponent of 4.0, so the term is at 0.018 and its gradient is nearly gone.
-   That is the same fine-tolerance behaviour the base task always had for standing; it is
-   only reached at a smaller error now.
-
-   The intent is that the legs are the term's only subject. The cost to watch is stride: a
-   stronger leg pull can shorten the gait, so the first evaluation must report
-   ``track_linear_velocity`` error and stride length at 0.6 m/s, not only reward. If the gait
-   degrades, the compensation is a weight of 0.45 (1.0 x 14/31), which restores the base
-   task's per-joint sensitivity.
+3. ~~The ``pose`` mean now covers 14 joints, not 31.~~ **Rejected.** `pose` keeps all 31
+   joints, so the base task's per-joint sensitivity is preserved. The arithmetic that made
+   the restricted variant unattractive is kept in section 3.
 4. **``pose_quadratic`` uses a mean over 17 joints.** A single wrist off by 20 degrees costs
    only -0.287; the 7 racket-arm joints off by 10 degrees costs -0.502. That is a global
    posture pull, not a per-joint racket lock. If the racket must be held tightly by the

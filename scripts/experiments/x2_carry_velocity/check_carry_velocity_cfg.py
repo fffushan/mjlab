@@ -147,6 +147,12 @@ def main() -> int:
   try:
     base_actor_dim = tuple(base_env.observation_manager.group_obs_dim["actor"])
     base_action_dim = int(base_env.action_manager.total_action_dim)
+    base_pose_names = set(_resolved_joint_names(base_env, "pose"))
+    base_pose_params = base_env.reward_manager.get_term_cfg("pose").params
+    base_std_tables = {
+      group: base_pose_params[group]
+      for group in ("std_standing", "std_walking", "std_running")
+    }
     _print_base_fingerprint(base_env)
   finally:
     base_env.close()
@@ -212,16 +218,20 @@ def main() -> int:
       f"carry={action_dim} base={base_action_dim}",
     )
 
-    print("[3] reward joint split")
+    print("[3] reward joint groups")
     pose_names = _resolved_joint_names(env, "pose")
     quad_names = _resolved_joint_names(env, "pose_quadratic")
-    leg_head_ids, arm_waist_ids = _group_joint_ids(robot)
-    expected_leg_head = {names[index] for index in leg_head_ids}
+    _, arm_waist_ids = _group_joint_ids(robot)
     expected_arm_waist = {names[index] for index in arm_waist_ids}
     checks.check(
-      "pose covers legs and head only",
-      set(pose_names) == expected_leg_head,
-      f"{len(pose_names)} joints: {', '.join(pose_names)}",
+      "pose scores all 31 joints",
+      set(pose_names) == set(names),
+      f"{len(pose_names)} joints",
+    )
+    checks.check(
+      "pose covers the same joints as the base velocity task",
+      set(pose_names) == base_pose_names,
+      f"carry={len(pose_names)} base={len(base_pose_names)}",
     )
     checks.check(
       "pose_quadratic covers arms and waist",
@@ -229,27 +239,19 @@ def main() -> int:
       f"{len(quad_names)} joints: {', '.join(quad_names)}",
     )
     checks.check(
-      "the two groups are disjoint and cover all 31 joints",
-      not (set(pose_names) & set(quad_names))
-      and set(pose_names) | set(quad_names) == set(names),
-      f"pose={len(pose_names)} pose_quadratic={len(quad_names)} total={len(names)}",
+      "pose_quadratic is a subset of pose, so the arm pull is added on top",
+      set(quad_names) <= set(pose_names),
+      f"quadratic={len(quad_names)} pose={len(pose_names)}",
     )
     pose_params = env.reward_manager.get_term_cfg("pose").params
-    std_keys = {
-      group: sorted(pose_params[group])
+    same_tables = all(
+      pose_params[group] == base_std_tables[group]
       for group in ("std_standing", "std_walking", "std_running")
-    }
-    arm_waist_tags = ("waist", "shoulder", "elbow", "wrist")
-    unpruned = [
-      f"{group}:{key}"
-      for group, keys in std_keys.items()
-      for key in keys
-      if any(tag in key for tag in arm_waist_tags)
-    ]
+    )
     checks.check(
-      "pose std tables carry no arm or waist key",
-      not unpruned,
-      f"sizes={ {group: len(keys) for group, keys in std_keys.items()} }",
+      "pose keeps the base task's three tolerance tables unchanged",
+      same_tables,
+      f"sizes={ {g: len(pose_params[g]) for g in ('std_standing', 'std_walking', 'std_running')} }",
     )
 
     print("[4] command range and reset")
