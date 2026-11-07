@@ -15,6 +15,7 @@ See docs/design/x2_carry_velocity_plan.md section 5.
 from __future__ import annotations
 
 import math
+import re
 
 import torch
 
@@ -26,10 +27,15 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
 )
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
+from mjlab.tasks.tracking.config.agibot_x2.vendor_gains import X2_VENDOR_RL_GAINS
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 
 TASK_ID = "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-CarryVelocity"
+JUGGLE_TASK_ID = (
+  "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+  "-Ball3-Pelvis-Nominal-S9c-PoseQuad"
+)
 BASE_TASK_ID = "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation"
 EXPERIMENT_NAME = "agibot_x2_velocity_carry_pose"
 
@@ -86,6 +92,20 @@ class _Checks:
     print(f"  {status}  {label}{suffix}")
     if not ok:
       self.failures.append(label)
+
+
+def _vendor_gains_by_joint(entity_cfg) -> dict[str, tuple[float, float]]:
+  """Per-joint (kp, kd) for every joint the vendor table names.
+
+  mjlab sets gains per actuator group and the vendor table is per joint, so each
+  joint takes the gain of the group whose target expressions match it.
+  """
+  gains: dict[str, tuple[float, float]] = {}
+  for group in entity_cfg.articulation.actuators:
+    for name in X2_VENDOR_RL_GAINS:
+      if any(re.fullmatch(p, name) for p in group.target_names_expr):
+        gains[name] = (float(group.stiffness), float(group.damping))
+  return gains
 
 
 def _print_base_fingerprint(env: ManagerBasedRlEnv) -> None:
@@ -307,6 +327,31 @@ def main() -> int:
     env.close()
 
   print()
+  print("[6] PD gains match the juggle family")
+  carry_gains = _vendor_gains_by_joint(cfg.scene.entities["robot"])
+  juggle_cfg, juggle_env = _build(JUGGLE_TASK_ID)
+  try:
+    juggle_gains = _vendor_gains_by_joint(juggle_cfg.scene.entities["robot"])
+  finally:
+    juggle_env.close()
+  differing = {
+    name: (carry_gains.get(name), juggle_gains.get(name))
+    for name in set(carry_gains) | set(juggle_gains)
+    if carry_gains.get(name) != juggle_gains.get(name)
+  }
+  checks.check(
+    "PD gains equal the tennis juggle task on every vendor joint",
+    not differing,
+    f"{len(carry_gains)} joints, differing={differing}",
+  )
+  checks.check(
+    "shoulder and wrist use the vendor RL gains, not the velocity task's",
+    carry_gains.get("right_shoulder_pitch_joint") == (50.0, 3.0)
+    and carry_gains.get("right_wrist_yaw_joint") == (20.0, 2.0),
+    f"shoulder={carry_gains.get('right_shoulder_pitch_joint')} "
+    f"wrist={carry_gains.get('right_wrist_yaw_joint')}",
+  )
+
   if checks.failures:
     print(f"RESULT: FAIL ({len(checks.failures)} checks)")
     for failure in checks.failures:

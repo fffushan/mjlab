@@ -48,6 +48,13 @@ Starting point for training is **from scratch**. No checkpoint is resumed, becau
 target is `default + scale * action`, so zero action now means "hold the carry pose".
 The deployed controller config must use the same default pose and root height.
 
+PD gains are the **vendor reference-policy gains** (shoulder 50/3, elbow 50/3, wrist 20/2,
+ankle 40/2, hip pitch 120/5), applied with `apply_vendor_rl_gains`, not the velocity task's
+gains. The juggle policy this task hands over to runs the vendor set, and the robot can only
+run one gain set at a time, so training under different gains would leave a discontinuity at
+the handover. The config probe asserts equality with the tennis juggle task on all 29 vendor
+joints.
+
 ## 3. Pose reward split by joint group
 
 The shipped `pose` term is `exp(-mean((q - q*)^2 / std^2))` with a speed-dependent
@@ -148,19 +155,37 @@ Consequences, measured and not fixed here:
 Four findings from review that need an operator decision before a long run. The code is
 correct without them; none is a defect in this task alone.
 
-1. **PD gains do not match the juggle family.** This task uses the velocity robot config's
-   gains (shoulder 30/1, wrist 50/1). The tennis ball family overrides them with the vendor
-   RL gains (shoulder 50/3, wrist 20/2). A handover from this policy to the juggle policy
-   assumes the robot runs one gain set, so the deployed controller's choice must be stated.
-2. **Physics step is 5 ms with a 1 ms-fitted bed contact.** The string bed's
-   ``BED_SOLREF = (-100000, -22)`` is valid near 1 ms; the tennis ball task switches to 1 ms
-   for this reason. The probes measured zero bed contact, but a learned policy that puts the
-   racket on the ground at 5 ms would use an out-of-range contact. Options: keep 5 ms,
-   switch to 1 ms, or disable bed-ground collision.
-3. **The ``pose`` mean now covers 14 joints, not 31.** The exponent for an equal leg or head
-   error is 2.214 times larger than in the base task: a uniform 0.05 rad error scores 0.368
-   instead of 0.636. The weight is unchanged, so the leg and head pull is about twice as
-   strong. Recorded here so the weight is not tuned against the wrong baseline.
+1. ~~PD gains do not match the juggle family.~~ **Resolved.** The task now applies the
+   vendor reference-policy gains, the same set the juggle policy runs. The config probe
+   asserts equality with the tennis juggle task on all 29 vendor joints.
+2. ~~Physics step is 5 ms with a 1 ms-fitted bed contact.~~ **Closed as no risk.** There is
+   no ball in this task and the racket is rigid, so the 1 ms-fitted string bed is never
+   loaded. The 5 ms step is inherited unchanged.
+3. **The ``pose`` mean now covers 14 joints, not 31.** Kept deliberately, and the arithmetic
+   is here so the weight is not tuned against the wrong baseline.
+
+   ``pose`` is ``exp(-mean_over_its_joints((q - q*)^2 / std^2))``. The divide is by the number
+   of joints **in the term's own group**, so removing joints from the group raises the
+   exponent for the joints that remain. Take a uniform 0.05 rad error on all 14 leg and head
+   joints with ``std_standing = 0.05``:
+
+   | group | per-joint term | mean | value |
+   |---|---:|---:|---:|
+   | 31 joints (base task) | 1.0 each | 14/31 = 0.452 | 0.636 |
+   | 14 joints (this task) | 1.0 each | 14/14 = 1.000 | 0.368 |
+
+   So one unit of leg or head error costs 2.214 times more reward than in the base task, and
+   the effective pull on those joints is 2.2 times stronger at an unchanged weight of 1.0.
+   Saturation also arrives sooner: with ``std_standing = 0.05``, a 0.10 rad error on every
+   joint gives an exponent of 4.0, so the term is at 0.018 and its gradient is nearly gone.
+   That is the same fine-tolerance behaviour the base task always had for standing; it is
+   only reached at a smaller error now.
+
+   The intent is that the legs are the term's only subject. The cost to watch is stride: a
+   stronger leg pull can shorten the gait, so the first evaluation must report
+   ``track_linear_velocity`` error and stride length at 0.6 m/s, not only reward. If the gait
+   degrades, the compensation is a weight of 0.45 (1.0 x 14/31), which restores the base
+   task's per-joint sensitivity.
 4. **``pose_quadratic`` uses a mean over 17 joints.** A single wrist off by 20 degrees costs
    only -0.287; the 7 racket-arm joints off by 10 degrees costs -0.502. That is a global
    posture pull, not a per-joint racket lock. If the racket must be held tightly by the

@@ -22,6 +22,9 @@ from mjlab.sensor import (
   RingPatternCfg,
   TerrainHeightSensorCfg,
 )
+from mjlab.tasks.tracking.config.agibot_x2.vendor_gains import (
+  apply_vendor_rl_gains,
+)
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
@@ -312,6 +315,11 @@ def agibot_x2_flat_velocity_carry_env_cfg(
   cfg = agibot_x2_flat_velocity_env_cfg(play=play)
 
   robot_cfg = get_x2_tennis_robot_cfg()
+  # The vendor reference-policy gains, not the velocity task's. The juggle policy this
+  # task hands over to runs these, and the robot can only run one gain set at a time, so
+  # training under different gains would leave a step at the handover. This is the same
+  # composition ``_tennis_robot_cfg`` uses for the tennis ball family.
+  apply_vendor_rl_gains(robot_cfg)
   robot_cfg.spec_fn = lambda: add_velocity_foot_sites(get_tennis_spec())
   cfg.scene.entities = {"robot": robot_cfg}
 
