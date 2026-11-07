@@ -3,6 +3,10 @@
 import mujoco
 
 from mjlab.asset_zoo.robots import X2_ACTION_SCALE, get_x2_robot_cfg
+from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  get_tennis_spec,
+  get_x2_tennis_robot_cfg,
+)
 from mjlab.asset_zoo.robots.agibot_x2.x2_constants import get_spec
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -25,6 +29,34 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 # The 12 collision spheres per foot live in the ankle-roll body.
 _FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
+
+# The carry-pose reward split: ``pose`` keeps the legs and head, the added
+# quadratic term holds the arms and waist. Every joint is in exactly one group.
+_CARRY_POSE_LEG_HEAD_JOINTS = (
+  r".*_hip_.*",
+  r".*_knee.*",
+  r".*_ankle_.*",
+  r".*head.*",
+)
+_CARRY_POSE_ARM_WAIST_JOINTS = (
+  r".*_shoulder_.*",
+  r".*_elbow.*",
+  r".*_wrist_.*",
+  r".*waist_.*",
+)
+
+# The base ``pose`` tables use one key per joint role. These are the leg and head
+# keys; the arm and waist keys must be dropped, because
+# ``resolve_matching_names_values`` raises when a pattern matches no joint.
+_CARRY_POSE_STD_LEG_HEAD_KEYS = (
+  r".*_hip_pitch.*",
+  r".*_hip_roll.*",
+  r".*_hip_yaw.*",
+  r".*_knee.*",
+  r".*_ankle_pitch.*",
+  r".*_ankle_roll.*",
+  r".*head.*",
+)
 
 # Foot-site pose in the ankle-roll body frame: the centroid of the 12 foot
 # spheres (0.0298, 0, -0.0638). The vendored XML carries no foot sites, so the
@@ -253,5 +285,65 @@ def agibot_x2_flat_velocity_env_cfg(
 
     twist_cmd.ranges.lin_vel_x = (-1.5, 2.0)
     twist_cmd.ranges.ang_vel_z = (-0.7, 0.7)
+
+  return cfg
+
+
+def agibot_x2_flat_velocity_carry_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Velocity task that stands and walks while holding the tennis carry pose.
+
+  Builds on :func:`agibot_x2_flat_velocity_env_cfg`: the robot is the tennis
+  entity (welded racket and ``BAT_CARRY_POSE``) with the velocity foot sites
+  layered on, and the ``pose`` reward is split into a leg/head tolerance term
+  and a quadratic arm/waist term so the held arms never saturate. Everything
+  else -- observations, actions, terminations, events and episode length -- is
+  inherited unchanged.
+
+  Args:
+    play: If True, applies the base task's play-mode overrides first, then the
+      carry-pose command ranges, as for training.
+
+  Returns:
+    A ``ManagerBasedRlEnvCfg`` with 31 actions and the base task's observation
+    width.
+  """
+  cfg = agibot_x2_flat_velocity_env_cfg(play=play)
+
+  robot_cfg = get_x2_tennis_robot_cfg()
+  robot_cfg.spec_fn = lambda: add_velocity_foot_sites(get_tennis_spec())
+  cfg.scene.entities = {"robot": robot_cfg}
+
+  # The carry stance has 2 mm of ground clearance; a 1-5 cm drop would add a
+  # landing impulse with the racket in hand.
+  cfg.events["reset_base"].params["pose_range"]["z"] = (0.0, 0.02)
+
+  pose_cfg = cfg.rewards["pose"]
+  pose_cfg.params["asset_cfg"].joint_names = _CARRY_POSE_LEG_HEAD_JOINTS
+  pose_cfg.params["std_walking"] = {
+    key: pose_cfg.params["std_walking"][key] for key in _CARRY_POSE_STD_LEG_HEAD_KEYS
+  }
+  pose_cfg.params["std_running"] = {
+    key: pose_cfg.params["std_running"][key] for key in _CARRY_POSE_STD_LEG_HEAD_KEYS
+  }
+
+  cfg.rewards["pose_quadratic"] = RewardTermCfg(
+    func=mdp.pose_quadratic,
+    weight=-0.4,
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=_CARRY_POSE_ARM_WAIST_JOINTS),
+      "std": 0.10,
+    },
+  )
+
+  twist_cmd = cfg.commands["twist"]
+  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
+  twist_cmd.ranges.lin_vel_x = (-0.6, 0.6)
+  twist_cmd.ranges.lin_vel_y = (-0.3, 0.3)
+  twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
+  twist_cmd.rel_standing_envs = 0.25
+  # The base ramp reaches 3 m/s, which this task does not train.
+  cfg.curriculum = {}
 
   return cfg

@@ -144,6 +144,14 @@ Removed
 Added
 ^^^^^
 
+- **Carry-pose velocity task.**
+  ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-CarryVelocity`` (factory
+  ``agibot_x2_flat_velocity_carry_env_cfg``) uses the tennis robot in
+  ``BAT_CARRY_POSE`` with the welded racket. It splits the ``pose`` reward into a
+  leg/head tolerance term and a quadratic arm/waist term, and uses carry-pose command
+  ranges with no curriculum. It starts from scratch because ``default_joint_pos``
+  changes the meaning of a zero action. See ``docs/design/x2_carry_velocity_plan.md``.
+
 - **Nominal 15 Hz stage.**
   ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF-Ball3-Pelvis-Nominal-S1-15Hz``
   keeps the nominal pilot and moves one input condition: the ball history arrives at

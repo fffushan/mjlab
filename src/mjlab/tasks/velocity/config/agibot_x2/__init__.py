@@ -4,7 +4,10 @@ from mjlab.tasks.velocity.rl import (
   VelocityOnPolicyRunner,
 )
 
-from .env_cfgs import agibot_x2_flat_velocity_env_cfg
+from .env_cfgs import (
+  agibot_x2_flat_velocity_carry_env_cfg,
+  agibot_x2_flat_velocity_env_cfg,
+)
 from .rl_cfg import agibot_x2_velocity_ppo_runner_cfg
 from .tennis_ball_env_cfg import agibot_x2_tennis_ball_env_cfg
 from .tennis_juggle_env_cfg import agibot_x2_tennis_juggle_env_cfg
@@ -18,6 +21,21 @@ register_mjlab_task(
   env_cfg=agibot_x2_flat_velocity_env_cfg(),
   play_env_cfg=agibot_x2_flat_velocity_env_cfg(play=True),
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# Carry-pose velocity task: the same no-state-estimation contract, but the robot
+# is the tennis entity in BAT_CARRY_POSE with the welded racket, the ``pose``
+# reward keeps only the legs and head, and a quadratic arm/waist term holds the
+# racket steady. It starts from scratch because ``default_joint_pos`` changes
+# what a zero action means. See docs/design/x2_carry_velocity_plan.md.
+register_mjlab_task(
+  task_id=("Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-CarryVelocity"),
+  env_cfg=agibot_x2_flat_velocity_carry_env_cfg(),
+  play_env_cfg=agibot_x2_flat_velocity_carry_env_cfg(play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_carry_pose"
+  ),
   runner_cls=VelocityOnPolicyRunner,
 )
 
