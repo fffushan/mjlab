@@ -478,11 +478,15 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "sim_to_real": True,
     "pose_quad": True,
   },
-  # S10 - S9b with the ball stream gated on what the camera can see, plus the
-  # mixed safety cases. The gate is the measurement condition; the mixture, the
-  # loss-charge and termination changes and the 30 s budget are the safety
-  # condition. That makes S10 S9b plus two declared sections, not a one-delta rung;
-  # a pure gate effect is no longer measurable from S10 alone.
+  # S10 - S9c with the ball stream gated on what the camera can see, plus the mixed
+  # safety cases. The gate is the measurement condition; the mixture, the loss-charge
+  # and termination changes and the 30 s budget are the safety condition. That makes S10
+  # S9c plus two declared sections, not a one-delta rung, so a pure gate effect is not
+  # measurable from S10 alone.
+  #
+  # It descends from S9c rather than S9b because the posture S9c fixed came from a
+  # reward term: dropping ``pose_quadratic`` while resuming an S9c checkpoint would hand
+  # back the twist that term removed, so ``pose_quad`` is declared here too.
   "s10-visible-ball": {
     "stream_rate_hz": (15.0, 15.0),
     "stream_latency_s": (0.040, 0.140),
@@ -504,6 +508,7 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     },
     "drop_tail": True,
     "sim_to_real": True,
+    "pose_quad": True,
     "visibility_gate": True,
     "safety_mix": True,
   },

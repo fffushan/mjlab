@@ -254,7 +254,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert params["visibility_dropout_prob"] == 0.0
     # Compare against the previous rung directly rather than against the nominal
     # pilot: the declared hold and drop-tail sections legitimately move rewards.
-    previous = agibot_x2_tennis_juggle_stage_env_cfg(stage="s9b-sim-to-real")
+    previous = agibot_x2_tennis_juggle_stage_env_cfg(stage="s9c-pose-quad")
     if not safety_mix_declared:
       assert stage.rewards == previous.rewards, "the gate rung must not move a reward"
       assert stage.terminations == previous.terminations, "nor a termination"

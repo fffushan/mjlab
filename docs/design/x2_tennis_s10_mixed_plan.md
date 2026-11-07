@@ -7,10 +7,17 @@ This document adds the §4.2, §4.3 and §5 halves of the
 [mixed safety curriculum](x2_tennis_mixed_safety_curriculum.md) to stage **S10**, which
 already carries the §4.1 measurement gate ([first half](x2_tennis_visibility_plan.md)).
 
-S10 therefore stops being a one-delta rung. It becomes: S9b **plus** the visibility gate,
+S10 therefore stops being a one-delta rung. It becomes: **S9c plus** the visibility gate,
 **plus** the mixture, **plus** the loss-cost and termination changes. A pure gate effect is
 no longer measurable from S10 alone. That is the operator's decision and is recorded here
 so nobody reads an S10 result as a gate-only result.
+
+**Parent: S9c, `model_34498.pt`** (operator decision, 2026-11-07 +08, after evaluating both
+candidates). S9c beats S9b arm 1 on the axes that matter here: impacts 25.9 / 28.6 / 36.3
+against 21.9 / 22.9 / 28.6, alignment 38.8-44.0 mm against 46.9-50.5 mm, and a normalised
+pose error of 2.20 / 4.40 / 6.69 against 57.1 / 79.7 / 94.2. S10 keeps
+`pose_quadratic`: that term is what untwisted the posture, and resuming an S9c checkpoint
+without it would hand the twist back.
 
 ## 1. Decisions
 
@@ -26,6 +33,7 @@ so nobody reads an S10 result as a gate-only result.
 | one-shot loss charge | implemented as `ball_lost_event`, weight **0.0** by default | §4.3 allows it, does not require it; a live ball that becomes lost is charged once, ground and never-seen starts never are |
 | ball rewards for dead cases | **masked to zero** | §4.3: do not reward pursuit of an unreachable ball through FOV or alignment terms |
 | ball-caused terminations | `ball_no_bounce` and `ball_not_lifted` **removed**; `held_ball_contact` **kept, masked to live** | §4.2: they must not discard the standing interval; the operator-held restriction still applies where a hold phase exists |
+| parent | **S9c `model_34498.pt`**, keeping `pose_quadratic` | best verified juggling checkpoint, and the term that fixed the posture |
 | unchanged | every other reward weight, the physics, the randomisation family, the actor width 112 | one change at a time after the contract |
 
 The `+8.3 %` range bias and the 4.8–5.2 % `ambiguous` dropout stay out, as decided for the
