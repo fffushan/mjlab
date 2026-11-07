@@ -27,7 +27,7 @@ import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   HEAD_JOINT_NAMES,
-  JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
+  JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD,
   JUGGLE_TILT_HALF_RANGE_RAD,
 )
 from mjlab.envs import ManagerBasedRlEnv
@@ -342,7 +342,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   if tilted_start_declared:
     # S11 adds exactly the two tilt resets, and they must sit between the carry-pose
     # reset and the ball reset so the ball is placed relative to the tilted pose.
-    tilt_events = {"reset_tilt_body", "reset_tilt_ankle"}
+    tilt_events = {"reset_tilt_body", "reset_tilt_ankle_pitch"}
     assert (
       set(stage.events)
       - set(nominal.events)
@@ -355,15 +355,15 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert (
       order.index("reset_robot_juggle_joints")
       < order.index("reset_tilt_body")
-      < order.index("reset_tilt_ankle")
+      < order.index("reset_tilt_ankle_pitch")
       < order.index("reset_ball")
     )
     body = stage.events["reset_tilt_body"].params["position_range"]
-    ankle = stage.events["reset_tilt_ankle"].params["position_range"]
+    ankle = stage.events["reset_tilt_ankle_pitch"].params["position_range"]
     assert body == (-JUGGLE_TILT_HALF_RANGE_RAD, JUGGLE_TILT_HALF_RANGE_RAD)
     assert ankle == (
-      -JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
-      JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
+      -JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD,
+      JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD,
     )
     previous = agibot_x2_tennis_juggle_stage_env_cfg(stage="s10-visible-ball")
     assert stage.rewards == previous.rewards
@@ -374,7 +374,9 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   if hold_declared:
     assert set(stage.events) == (
       set(nominal.events) | hold_events | dr_events | safety_mix_events
-    ) | ({"reset_tilt_body", "reset_tilt_ankle"} if tilted_start_declared else set())
+    ) | (
+      {"reset_tilt_body", "reset_tilt_ankle_pitch"} if tilted_start_declared else set()
+    )
     assert stage.events["hold_ball"].mode == "reset"
     assert stage.events["advance_ball_hold"].mode == "step"
     # The hold beat must be sampled after the reset that seats the ball.
@@ -392,7 +394,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert stage.events["push_robot"].params["velocity_range"]["yaw"] != (0.0, 0.0)
   reset_declared = declared.get("reset", {})
   tilt_events_skip = (
-    {"reset_tilt_body", "reset_tilt_ankle"} if tilted_start_declared else set()
+    {"reset_tilt_body", "reset_tilt_ankle_pitch"} if tilted_start_declared else set()
   )
   for name in stage.events:
     if name in hold_events or name in dr_events or name in safety_mix_events:

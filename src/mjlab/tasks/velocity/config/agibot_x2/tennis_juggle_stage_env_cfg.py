@@ -44,8 +44,8 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_VISIBLE_MIN_RANGE_M,
   CAMERA_MOUNT_QUAT,
   CAMERA_MOUNT_XYZ,
-  JUGGLE_ANKLE_JOINT_PATTERNS,
-  JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
+  JUGGLE_ANKLE_PITCH_JOINT_PATTERNS,
+  JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD,
   JUGGLE_BALL_LOST_EVENT_WEIGHT,
   JUGGLE_BALL_LOST_PENALTY_WEIGHT,
   JUGGLE_DEAD_BALL_DROP_RANGE_M,
@@ -721,8 +721,10 @@ def _apply_tilted_start(cfg: ManagerBasedRlEnvCfg) -> None:
   Two reset terms are inserted **after** the carry-pose reset and **before** the ball
   reset, so the ball is placed relative to the resulting pose:
 
-  * waist, hip and knee joints get a uniform offset of plus or minus 15 degrees;
-  * both ankles get a uniform offset of plus or minus 30 degrees.
+  * waist, hip, knee and ankle roll joints get a uniform offset of plus or minus
+    5 degrees;
+  * both ankle pitches get a uniform offset of plus or minus 15 degrees. Ankle pitch is
+    the joint that turns a joint offset into a lean, so it keeps the larger draw.
 
   :func:`reset_joints_by_offset` clamps each sampled value to the joint's soft limits, so
   a joint with less than 15 degrees of travel in one direction saturates there. The
@@ -744,14 +746,16 @@ def _apply_tilted_start(cfg: ManagerBasedRlEnvCfg) -> None:
     )
 
   body = tilt_term(JUGGLE_TILT_JOINT_PATTERNS, JUGGLE_TILT_HALF_RANGE_RAD)
-  ankle = tilt_term(JUGGLE_ANKLE_JOINT_PATTERNS, JUGGLE_ANKLE_TILT_HALF_RANGE_RAD)
+  ankle_pitch = tilt_term(
+    JUGGLE_ANKLE_PITCH_JOINT_PATTERNS, JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD
+  )
 
   events: dict = {}
   for name, term in cfg.events.items():
     events[name] = term
     if name == "reset_robot_juggle_joints":
       events["reset_tilt_body"] = body
-      events["reset_tilt_ankle"] = ankle
+      events["reset_tilt_ankle_pitch"] = ankle_pitch
   if "reset_tilt_body" not in events:
     raise ValueError("tilted start needs a reset_robot_juggle_joints term to follow")
   cfg.events = events

@@ -1748,20 +1748,22 @@ JUGGLE_WAIT_SPEED_SIGMA_MPS = 0.5
 # ball, or a live juggle with a forced loss. The shares are the starting proposal
 # from the mixed safety curriculum, not a validated proportion, and they refer to
 # episode starts. The two waiting cases split the 15 % group evenly.
-JUGGLE_TILT_HALF_RANGE_RAD = 0.2617993877991494
-"""Half-width of the S11 uniform reset offset on waist, hip and knee joints.
+JUGGLE_TILT_HALF_RANGE_RAD = 0.08726646259971647
+"""Half-width of the S11 uniform reset offset on waist, hip, knee and ankle roll.
 
-15 degrees, in radians. The offset is added to the carry pose at reset and then clamped
-to the joint's soft limits by :func:`reset_joints_by_offset`, so a joint that cannot move
-15 degrees in one direction does not reach 15 degrees: the sampled distribution is
-truncated by the machine's own range, not by this constant.
+5 degrees, in radians. The offset is added to the carry pose at reset and then clamped to
+the joint's soft limits by :func:`reset_joints_by_offset`. At 5 degrees no joint of this
+group reaches a limit, so the sampled distribution is uniform as drawn: the knee's soft
+minimum is 6.9 degrees but its carry pose is 17.2 degrees, and ankle roll has 13.5 degrees
+of travel against a 5 degree draw.
 """
 
-JUGGLE_ANKLE_TILT_HALF_RANGE_RAD = 0.5235987755982988
-"""Half-width of the S11 uniform reset offset on ankle joints: 30 degrees, in radians.
+JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD = 0.2617993877991494
+"""Half-width of the S11 uniform reset offset on ankle pitch: 15 degrees, in radians.
 
-Twice the body offset, because an ankle moves the whole body over its foot and the point
-of the rung is to start the robot already leaning.
+Three times the body offset. Ankle pitch moves the whole body over the foot, so it is the
+joint that turns a joint offset into a lean; the carry pose sits at -8.6 degrees inside a
+soft range of -42.4 to +22.4 degrees, so a 15 degree draw never clamps.
 """
 
 JUGGLE_TILT_JOINT_PATTERNS = (
@@ -1772,11 +1774,12 @@ JUGGLE_TILT_JOINT_PATTERNS = (
   r".*_hip_roll.*",
   r".*_hip_yaw.*",
   r".*_knee.*",
+  r".*_ankle_roll.*",
 )
-"""Joints that receive the 15 degree offset: waist, hips and knees."""
+"""Joints that receive the 5 degree offset: waist, hips, knees and both ankle rolls."""
 
-JUGGLE_ANKLE_JOINT_PATTERNS = (r".*_ankle_pitch.*", r".*_ankle_roll.*")
-"""Joints that receive the 30 degree offset: both ankles."""
+JUGGLE_ANKLE_PITCH_JOINT_PATTERNS = (r".*_ankle_pitch.*",)
+"""Joints that receive the 15 degree offset: both ankle pitches."""
 
 BALL_CASE_SHARES = (0.70, 0.075, 0.075, 0.15)
 """Episode-start shares of (live, ground, never-seen, induced), in case order."""

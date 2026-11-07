@@ -24,24 +24,27 @@ Two reset terms are inserted **after** `reset_robot_juggle_joints` and **before*
 
 | term | joints | offset | distribution |
 |---|---|---|---|
-| `reset_tilt_body` | waist yaw/roll/pitch, both hip pitch/roll/yaw, both knees | **±15°** | uniform |
-| `reset_tilt_ankle` | both ankle pitch and roll | **±30°** | uniform |
+| `reset_tilt_body` | waist yaw/roll/pitch, both hip pitch/roll/yaw, both knees, both ankle rolls | **±5°** | uniform |
+| `reset_tilt_ankle_pitch` | both ankle pitches | **±15°** | uniform |
 
-`reset_joints_by_offset` clamps each sample to the joint's soft limits, so the realised
-distribution is truncated by the machine. Measured over 1280 resets:
+Ankle pitch keeps three times the body offset because it is the joint that turns a joint
+offset into a lean: rotating the ankle moves the whole body over the foot, whereas a hip or
+knee offset mostly re-shapes the leg.
+
+`reset_joints_by_offset` clamps each sample to the joint's soft limits. Measured over 1280
+resets:
 
 | group | p50 | p95 | max |
 |---|---|---|---|
-| waist / hip / knee | 6.77° | 14.07° | **15.00°** |
-| ankle | 13.51° | 27.02° | **29.99°** |
+| waist, hip, knee, ankle roll (13 joints) | 2.51° | 4.72° | **5.00°** |
+| ankle pitch (2 joints) | 3.69° | 13.45° | **14.99°** |
 
-Two truncations matter and are expected, not defects:
-
-- **Knee** cannot take the full negative offset: its soft minimum is +6.9°, so a −15°
-  draw lands at −10.3° from the carry pose and stops there.
-- **Ankle roll** saturates at **±13.5°**, its soft limit. Only ankle **pitch** reaches the
-  full ±30°. If 30° of lateral ankle tilt is the intent, the joint range is the
-  constraint, not the constant.
+**One truncation remains, and it is small.** `right_hip_roll_joint` has a soft upper limit of
++4.5° against a 0° carry pose, so the positive half of its draw clamps there: 5 % of resets
+land on +4.47° instead of up to +5°. Measured 64 of 1280 resets touch a limit, all from this
+joint. At the previous 15°/30° setting two joints truncated badly — the knee could only take
+−10.3° because its soft minimum is +6.9°, and ankle roll saturated at ±13.5° — so this
+setting is both smaller and cleaner.
 
 ## 3. What is preserved
 
