@@ -25,7 +25,11 @@ from typing import cast
 import pytest
 import torch
 
-from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import HEAD_JOINT_NAMES
+from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  HEAD_JOINT_NAMES,
+  JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
+  JUGGLE_TILT_HALF_RANGE_RAD,
+)
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
 from mjlab.tasks.velocity import mdp
@@ -95,6 +99,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   """
   declared = STAGE_DELTAS[stage]
   visibility_gate_declared = bool(declared.get("visibility_gate"))
+  tilted_start_declared = bool(declared.get("tilted_start"))
   stage_cfg = agibot_x2_tennis_juggle_stage_env_cfg(stage=stage)
   nominal = agibot_x2_tennis_juggle_nominal_env_cfg()
   stage = stage_cfg
@@ -334,10 +339,42 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     # Added by ``apply_x2_tracking_robot_randomization`` after the whole-robot
     # effort term, so it is not in the name list.
     dr_events.add("randomize_effort_limits_wrist")
+  if tilted_start_declared:
+    # S11 adds exactly the two tilt resets, and they must sit between the carry-pose
+    # reset and the ball reset so the ball is placed relative to the tilted pose.
+    tilt_events = {"reset_tilt_body", "reset_tilt_ankle"}
+    assert (
+      set(stage.events)
+      - set(nominal.events)
+      - hold_events
+      - dr_events
+      - (safety_mix_events)
+      == tilt_events
+    )
+    order = list(stage.events)
+    assert (
+      order.index("reset_robot_juggle_joints")
+      < order.index("reset_tilt_body")
+      < order.index("reset_tilt_ankle")
+      < order.index("reset_ball")
+    )
+    body = stage.events["reset_tilt_body"].params["position_range"]
+    ankle = stage.events["reset_tilt_ankle"].params["position_range"]
+    assert body == (-JUGGLE_TILT_HALF_RANGE_RAD, JUGGLE_TILT_HALF_RANGE_RAD)
+    assert ankle == (
+      -JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
+      JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
+    )
+    previous = agibot_x2_tennis_juggle_stage_env_cfg(stage="s10-visible-ball")
+    assert stage.rewards == previous.rewards
+    assert stage.terminations == previous.terminations
+    assert stage.metrics == previous.metrics
+    assert stage.episode_length_s == previous.episode_length_s
+
   if hold_declared:
     assert set(stage.events) == (
       set(nominal.events) | hold_events | dr_events | safety_mix_events
-    )
+    ) | ({"reset_tilt_body", "reset_tilt_ankle"} if tilted_start_declared else set())
     assert stage.events["hold_ball"].mode == "reset"
     assert stage.events["advance_ball_hold"].mode == "step"
     # The hold beat must be sampled after the reset that seats the ball.
@@ -354,8 +391,13 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert "randomize_pd_gains" in stage.events
     assert stage.events["push_robot"].params["velocity_range"]["yaw"] != (0.0, 0.0)
   reset_declared = declared.get("reset", {})
+  tilt_events_skip = (
+    {"reset_tilt_body", "reset_tilt_ankle"} if tilted_start_declared else set()
+  )
   for name in stage.events:
     if name in hold_events or name in dr_events or name in safety_mix_events:
+      continue
+    if name in tilt_events_skip:
       continue
     if name != "reset_ball":
       assert stage.events[name] == nominal.events[name], name

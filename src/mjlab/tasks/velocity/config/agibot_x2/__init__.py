@@ -447,6 +447,23 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# S11: S10 with a tilted start, so a lean becomes a state the policy can act from
+# instead of one that only ever appears on the way to a fall.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S11-TiltedStart"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(stage="s11-tilted-start"),
+  play_env_cfg=agibot_x2_tennis_juggle_stage_env_cfg(
+    stage="s11-tilted-start", play=True
+  ),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments

@@ -1748,6 +1748,36 @@ JUGGLE_WAIT_SPEED_SIGMA_MPS = 0.5
 # ball, or a live juggle with a forced loss. The shares are the starting proposal
 # from the mixed safety curriculum, not a validated proportion, and they refer to
 # episode starts. The two waiting cases split the 15 % group evenly.
+JUGGLE_TILT_HALF_RANGE_RAD = 0.2617993877991494
+"""Half-width of the S11 uniform reset offset on waist, hip and knee joints.
+
+15 degrees, in radians. The offset is added to the carry pose at reset and then clamped
+to the joint's soft limits by :func:`reset_joints_by_offset`, so a joint that cannot move
+15 degrees in one direction does not reach 15 degrees: the sampled distribution is
+truncated by the machine's own range, not by this constant.
+"""
+
+JUGGLE_ANKLE_TILT_HALF_RANGE_RAD = 0.5235987755982988
+"""Half-width of the S11 uniform reset offset on ankle joints: 30 degrees, in radians.
+
+Twice the body offset, because an ankle moves the whole body over its foot and the point
+of the rung is to start the robot already leaning.
+"""
+
+JUGGLE_TILT_JOINT_PATTERNS = (
+  r".*waist_yaw.*",
+  r".*waist_roll.*",
+  r".*waist_pitch.*",
+  r".*_hip_pitch.*",
+  r".*_hip_roll.*",
+  r".*_hip_yaw.*",
+  r".*_knee.*",
+)
+"""Joints that receive the 15 degree offset: waist, hips and knees."""
+
+JUGGLE_ANKLE_JOINT_PATTERNS = (r".*_ankle_pitch.*", r".*_ankle_roll.*")
+"""Joints that receive the 30 degree offset: both ankles."""
+
 BALL_CASE_SHARES = (0.70, 0.075, 0.075, 0.15)
 """Episode-start shares of (live, ground, never-seen, induced), in case order."""
 

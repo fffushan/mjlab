@@ -44,6 +44,8 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_VISIBLE_MIN_RANGE_M,
   CAMERA_MOUNT_QUAT,
   CAMERA_MOUNT_XYZ,
+  JUGGLE_ANKLE_JOINT_PATTERNS,
+  JUGGLE_ANKLE_TILT_HALF_RANGE_RAD,
   JUGGLE_BALL_LOST_EVENT_WEIGHT,
   JUGGLE_BALL_LOST_PENALTY_WEIGHT,
   JUGGLE_DEAD_BALL_DROP_RANGE_M,
@@ -55,6 +57,8 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_POSE_QUAD_STD_RAD,
   JUGGLE_POSE_QUAD_WEIGHT,
   JUGGLE_S10_EPISODE_LENGTH_S,
+  JUGGLE_TILT_HALF_RANGE_RAD,
+  JUGGLE_TILT_JOINT_PATTERNS,
   JUGGLE_TORSO_ANG_VEL_WEIGHT,
   JUGGLE_WAIT_ALIGN_WEIGHT,
   JUGGLE_WAIT_LEVEL_POWER,
@@ -512,6 +516,32 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "visibility_gate": True,
     "safety_mix": True,
   },
+  "s11-tilted-start": {
+    "stream_rate_hz": (15.0, 15.0),
+    "stream_latency_s": (0.040, 0.140),
+    "stall_prob": 0.10,
+    "stall_range_s": (0.1, 0.2),
+    "position_noise_m": (0.010, 0.010, 0.015),
+    "bias_half_width_m": 0.0,
+    "reset": {
+      "drop_height_range": _hold_height_range((0.10, 0.40)),
+      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "case_shares": BALL_CASE_SHARES,
+      "loss_time_range_s": BALL_CASE_LOSS_TIME_RANGE_S,
+    },
+    "hold": {
+      "hold_height_m": _pinned_hold_height(),
+      "hold_delay_s": _hold_delay(JUGGLE_HOLD_LONG_DELAY_S),
+      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "offset_speed_mps": JUGGLE_HOLD_OFFSET_SPEED_MPS,
+    },
+    "drop_tail": True,
+    "sim_to_real": True,
+    "pose_quad": True,
+    "visibility_gate": True,
+    "safety_mix": True,
+    "tilted_start": True,
+  },
 }
 """The one condition each stage changes, as ``ball_hist_pelvis`` term parameters.
 
@@ -562,6 +592,7 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
   pose_quad = bool(delta.pop("pose_quad", False))
   dead_ball = bool(delta.pop("dead_ball", False))
   visibility_gate = bool(delta.pop("visibility_gate", False))
+  tilted_start = bool(delta.pop("tilted_start", False))
   safety_mix = bool(delta.pop("safety_mix", False))
   cfg = agibot_x2_tennis_juggle_nominal_env_cfg(play=play)
   cfg.observations["actor"].terms["ball_hist_pelvis"].params.update(delta)
@@ -584,6 +615,8 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
     _apply_visibility_gate(cfg)
   if safety_mix:
     _apply_safety_mix(cfg, play)
+  if tilted_start:
+    _apply_tilted_start(cfg)
   return cfg
 
 
@@ -675,6 +708,53 @@ def _apply_dead_ball(cfg: ManagerBasedRlEnvCfg) -> None:
     "ball_lost_penalty",
   ):
     cfg.rewards.pop(name, None)
+
+
+def _apply_tilted_start(cfg: ManagerBasedRlEnvCfg) -> None:
+  """Start the robot already leaning, so a tilt can be acted from (S11).
+
+  Every earlier rung resets the robot upright in the carry pose with zero velocity, so a
+  tilt could only be reached transiently by a push and became terminal at 70 degrees.
+  The policy therefore never had a tilted state to recover from: on hardware it stands
+  calmly but cannot come back once it leans.
+
+  Two reset terms are inserted **after** the carry-pose reset and **before** the ball
+  reset, so the ball is placed relative to the resulting pose:
+
+  * waist, hip and knee joints get a uniform offset of plus or minus 15 degrees;
+  * both ankles get a uniform offset of plus or minus 30 degrees.
+
+  :func:`reset_joints_by_offset` clamps each sampled value to the joint's soft limits, so
+  a joint with less than 15 degrees of travel in one direction saturates there. The
+  realised distribution is therefore truncated by the machine, not by the constant.
+
+  Nothing else changes: rewards, terminations, metrics, the mixture, the gate, the
+  observation layout and the 30 s budget are S10's.
+  """
+
+  def tilt_term(patterns, half_range):
+    return EventTermCfg(
+      mode="reset",
+      func=mdp.reset_joints_by_offset,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=patterns),
+        "position_range": (-half_range, half_range),
+        "velocity_range": (0.0, 0.0),
+      },
+    )
+
+  body = tilt_term(JUGGLE_TILT_JOINT_PATTERNS, JUGGLE_TILT_HALF_RANGE_RAD)
+  ankle = tilt_term(JUGGLE_ANKLE_JOINT_PATTERNS, JUGGLE_ANKLE_TILT_HALF_RANGE_RAD)
+
+  events: dict = {}
+  for name, term in cfg.events.items():
+    events[name] = term
+    if name == "reset_robot_juggle_joints":
+      events["reset_tilt_body"] = body
+      events["reset_tilt_ankle"] = ankle
+  if "reset_tilt_body" not in events:
+    raise ValueError("tilted start needs a reset_robot_juggle_joints term to follow")
+  cfg.events = events
 
 
 def _apply_visibility_gate(cfg: ManagerBasedRlEnvCfg) -> None:
