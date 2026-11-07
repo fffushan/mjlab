@@ -428,8 +428,10 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
-# S10: S9b with the ball stream gated on what the camera can actually see. One delta
-# against S9b, so an arm trained here measures the cost of truthful measurements.
+# S10: S9b with the ball stream gated on what the camera can actually see, plus
+# the mixed safety cases (ground, never-seen, induced loss), the 30 s budget and
+# the no-ball-termination contract. It is no longer a one-delta gate rung; see
+# docs/design/x2_tennis_s10_mixed_plan.md.
 register_mjlab_task(
   task_id=(
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"

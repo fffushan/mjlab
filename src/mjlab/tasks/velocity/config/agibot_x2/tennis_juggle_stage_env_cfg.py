@@ -7,7 +7,9 @@ and the observation layout stay the previous stage's by construction, so the
 actor/critic/action widths do not move and a stage is trained by resuming the
 previous stage's checkpoint with its optimizer state, at the same environment
 count and seed. A stage exists so one condition can be screened on its own,
-without a scheduler and without changing the contract.
+without a scheduler and without changing the contract. S10 is the documented
+exception: it carries the visibility gate and the mixed safety contract together,
+so a pure gate effect is not measurable from it alone.
 
 The stages build on
 :func:`~mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_nominal_env_cfg.
@@ -28,26 +30,32 @@ See ``docs/source/x2_tennis_ball_juggle.rst``.
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_CASE_INDUCED_SPEED_MPS,
+  BALL_CASE_LOSS_TIME_RANGE_S,
+  BALL_CASE_SHARES,
   BALL_DROP_GRACE_S,
   BALL_LOST_MIN_WORLD_Z_M,
-  JUGGLE_HOLD_DELAY_S,
-  JUGGLE_HOLD_LONG_DELAY_S,
-  JUGGLE_HOLD_OFFSET_SPEED_MPS,
-  JUGGLE_BALL_LOST_PENALTY_WEIGHT,
-  JUGGLE_TORSO_ANG_VEL_WEIGHT,
-  JUGGLE_POSE_QUAD_WEIGHT,
-  JUGGLE_POSE_QUAD_STD_RAD,
-  JUGGLE_DEAD_BALL_DROP_RANGE_M,
-  BALL_VISIBLE_HALF_ANGLES_RAD,
-  BALL_VISIBLE_MIN_RANGE_M,
-  BALL_VISIBLE_MAX_RANGE_M,
   BALL_VISIBILITY_DROPOUT_PROB,
-  CAMERA_MOUNT_XYZ,
+  BALL_VISIBLE_HALF_ANGLES_RAD,
+  BALL_VISIBLE_MAX_RANGE_M,
+  BALL_VISIBLE_MIN_RANGE_M,
   CAMERA_MOUNT_QUAT,
+  CAMERA_MOUNT_XYZ,
+  JUGGLE_BALL_LOST_EVENT_WEIGHT,
+  JUGGLE_BALL_LOST_PENALTY_WEIGHT,
+  JUGGLE_DEAD_BALL_DROP_RANGE_M,
+  JUGGLE_HOLD_DELAY_S,
   JUGGLE_HOLD_HEIGHT_M,
   JUGGLE_HOLD_LATERAL_RANGE_M,
+  JUGGLE_HOLD_LONG_DELAY_S,
+  JUGGLE_HOLD_OFFSET_SPEED_MPS,
+  JUGGLE_POSE_QUAD_STD_RAD,
+  JUGGLE_POSE_QUAD_WEIGHT,
+  JUGGLE_S10_EPISODE_LENGTH_S,
+  JUGGLE_TORSO_ANG_VEL_WEIGHT,
   JUGGLE_WAIT_ALIGN_WEIGHT,
   JUGGLE_WAIT_LEVEL_POWER,
   JUGGLE_WAIT_PLATEAU_M,
@@ -60,8 +68,6 @@ from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
-from copy import deepcopy
-
 from mjlab.tasks.tracking.config.agibot_x2.env_cfgs import (
   apply_x2_tracking_robot_randomization,
 )
@@ -73,6 +79,7 @@ from mjlab.tasks.velocity.config.agibot_x2.tennis_ball_env_cfg import (
 from mjlab.tasks.velocity.config.agibot_x2.tennis_juggle_nominal_env_cfg import (
   agibot_x2_tennis_juggle_nominal_env_cfg,
 )
+from mjlab.tasks.velocity.mdp.ball_cases import GROUND, INDUCED, LIVE, NEVER_SEEN
 
 _HOLD_HEIGHT_ENV = "MJLAB_JUGGLE_HOLD_HEIGHT_M"
 _HOLD_DELAY_ENV = "MJLAB_JUGGLE_HOLD_DELAY_S"
@@ -471,9 +478,11 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "sim_to_real": True,
     "pose_quad": True,
   },
-  # S10 - S9b with the ball stream gated on what the camera can see. One delta: the
-  # measurement. Rewards, physics, randomisation and resets are S9b's, so a comparison
-  # against an S9b arm isolates the cost of not being told where an unseen ball is.
+  # S10 - S9b with the ball stream gated on what the camera can see, plus the
+  # mixed safety cases. The gate is the measurement condition; the mixture, the
+  # loss-charge and termination changes and the 30 s budget are the safety
+  # condition. That makes S10 S9b plus two declared sections, not a one-delta rung;
+  # a pure gate effect is no longer measurable from S10 alone.
   "s10-visible-ball": {
     "stream_rate_hz": (15.0, 15.0),
     "stream_latency_s": (0.040, 0.140),
@@ -484,6 +493,8 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "reset": {
       "drop_height_range": _hold_height_range((0.10, 0.40)),
       "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
+      "case_shares": BALL_CASE_SHARES,
+      "loss_time_range_s": BALL_CASE_LOSS_TIME_RANGE_S,
     },
     "hold": {
       "hold_height_m": _pinned_hold_height(),
@@ -494,6 +505,7 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
     "drop_tail": True,
     "sim_to_real": True,
     "visibility_gate": True,
+    "safety_mix": True,
   },
 }
 """The one condition each stage changes, as ``ball_hist_pelvis`` term parameters.
@@ -545,6 +557,7 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
   pose_quad = bool(delta.pop("pose_quad", False))
   dead_ball = bool(delta.pop("dead_ball", False))
   visibility_gate = bool(delta.pop("visibility_gate", False))
+  safety_mix = bool(delta.pop("safety_mix", False))
   cfg = agibot_x2_tennis_juggle_nominal_env_cfg(play=play)
   cfg.observations["actor"].terms["ball_hist_pelvis"].params.update(delta)
   if reset_delta:
@@ -564,6 +577,8 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
     _apply_dead_ball(cfg)
   if visibility_gate:
     _apply_visibility_gate(cfg)
+  if safety_mix:
+    _apply_safety_mix(cfg, play)
   return cfg
 
 
@@ -742,6 +757,73 @@ def _apply_drop_tail(cfg: ManagerBasedRlEnvCfg, step_dt: float) -> None:
     params={"reward_term": "ball_lost_penalty", "field": "lost_events"},
     reduce="max",
   )
+
+
+def _apply_safety_mix(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
+  """Add the mixed safety cases and the no-ball-termination contract (S10).
+
+  Four pieces, all reachable from the stage flag:
+
+  * the case draw itself is declared in the stage's ``reset`` section, so
+    ``reset_ball`` receives ``case_shares`` and ``loss_time_range_s`` and stores
+    the per-episode case that every other term reads;
+  * ``induce_loss`` is a step event that applies one horizontal impulse at the
+    sampled time to an induced episode only;
+  * ``ball_no_bounce`` and ``ball_not_lifted`` are removed, so a lost or dead ball
+    cannot discard the standing interval. ``held_ball_contact`` stays and is
+    masked to the live cases in the termination itself;
+  * the per-step ``ball_lost_penalty`` is replaced by the one-shot
+    ``ball_lost_event`` at weight :data:`JUGGLE_BALL_LOST_EVENT_WEIGHT` (0.0), and
+    the episode budget becomes :data:`JUGGLE_S10_EPISODE_LENGTH_S`.
+
+  The four logging metrics report the realized episode-start shares beside the
+  declared ones. ``ball_lost_events`` is removed with the per-step term it
+  reported; the one-shot event is a reward output, not a per-step state.
+
+  Play mode keeps the infinite episode length that every play config uses, but
+  keeps the mixture itself so an evaluation sees the same cases as training.
+  """
+  if not play:
+    cfg.episode_length_s = JUGGLE_S10_EPISODE_LENGTH_S
+
+  ball_cfg = SceneEntityCfg("ball")
+  cfg.events["induce_loss"] = EventTermCfg(
+    mode="step",
+    func=mdp.induce_loss,
+    params={
+      "asset_cfg": ball_cfg,
+      "release_event": "reset_ball",
+      "hold_event": "hold_ball",
+      "speed_mps": BALL_CASE_INDUCED_SPEED_MPS,
+    },
+  )
+
+  for name in ("ball_no_bounce", "ball_not_lifted"):
+    cfg.terminations.pop(name, None)
+
+  cfg.rewards.pop("ball_lost_penalty", None)
+  cfg.rewards["ball_lost_event"] = RewardTermCfg(
+    func=mdp.ball_lost_event,
+    weight=JUGGLE_BALL_LOST_EVENT_WEIGHT,
+    params={
+      "ball_cfg": ball_cfg,
+      "min_world_z": BALL_LOST_MIN_WORLD_Z_M,
+      "release_event": "reset_ball",
+    },
+  )
+
+  cfg.metrics.pop("ball_lost_events", None)
+  for name, case in (
+    ("ball_case_live", LIVE),
+    ("ball_case_ground", GROUND),
+    ("ball_case_never_seen", NEVER_SEEN),
+    ("ball_case_induced", INDUCED),
+  ):
+    cfg.metrics[name] = MetricsTermCfg(
+      func=mdp.ball_case_share,
+      params={"release_event": "reset_ball", "case": case},
+      reduce="mean",
+    )
 
 
 def _apply_delayed_release(cfg: ManagerBasedRlEnvCfg, hold: dict[str, object]) -> None:

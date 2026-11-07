@@ -155,6 +155,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   sim_to_real_declared = bool(declared.get("sim_to_real"))
   pose_quad_declared = bool(declared.get("pose_quad"))
   dead_ball_declared = bool(declared.get("dead_ball"))
+  safety_mix_declared = bool(declared.get("safety_mix"))
   assert stage.actions == nominal.actions
   assert stage.commands == nominal.commands
 
@@ -192,6 +193,19 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
       "ball_not_lifted",
       "held_ball_contact",
     }
+  if safety_mix_declared:
+    # The mixed stage replaces the per-step cost with a one-shot event and removes
+    # the two ball-caused terminations that would discard the standing interval.
+    expected_rewards -= {"ball_lost_penalty"}
+    expected_rewards |= {"ball_lost_event"}
+    expected_terminations -= {"ball_no_bounce", "ball_not_lifted"}
+    expected_metrics -= {"ball_lost_events"}
+    expected_metrics |= {
+      "ball_case_live",
+      "ball_case_ground",
+      "ball_case_never_seen",
+      "ball_case_induced",
+    }
   assert set(stage.rewards) == expected_rewards
   assert set(stage.terminations) == expected_terminations
   assert set(stage.metrics) == expected_metrics
@@ -213,6 +227,9 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
       continue
     assert stage.terminations[name] == nominal.terminations[name], name
   for name in nominal.metrics:
+    if name not in stage.metrics:
+      assert safety_mix_declared and name == "ball_lost_events", name
+      continue
     assert stage.metrics[name] == nominal.metrics[name], name
 
   if hold_declared:
@@ -226,25 +243,52 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     contact = stage.terminations["held_ball_contact"]
     assert contact.func is mdp.held_ball_contact
     assert contact.params["hold_event"] == "hold_ball"
-    paused = dict(stage.terminations["ball_no_bounce"].params)
-    assert paused.pop("hold_event") == "hold_ball"
-    assert paused == nominal.terminations["ball_no_bounce"].params
+    if not safety_mix_declared:
+      paused = dict(stage.terminations["ball_no_bounce"].params)
+      assert paused.pop("hold_event") == "hold_ball"
+      assert paused == nominal.terminations["ball_no_bounce"].params
 
   if visibility_gate_declared:
     params = stage.observations["actor"].terms["ball_hist_pelvis"].params
     assert params["visibility_head_cfg"] is not None
     assert params["visibility_dropout_prob"] == 0.0
-    # The claim this rung makes is "the previous rung plus the gate, nothing else", so
-    # compare against that rung directly rather than against the nominal pilot: the
-    # declared hold and drop-tail sections legitimately move rewards.
+    # Compare against the previous rung directly rather than against the nominal
+    # pilot: the declared hold and drop-tail sections legitimately move rewards.
     previous = agibot_x2_tennis_juggle_stage_env_cfg(stage="s9b-sim-to-real")
-    assert stage.rewards == previous.rewards, "the gate rung must not move a reward"
-    assert stage.terminations == previous.terminations, "nor a termination"
-    assert stage.metrics == previous.metrics, "nor a metric"
+    if not safety_mix_declared:
+      assert stage.rewards == previous.rewards, "the gate rung must not move a reward"
+      assert stage.terminations == previous.terminations, "nor a termination"
+      assert stage.metrics == previous.metrics, "nor a metric"
     previous_params = previous.observations["actor"].terms["ball_hist_pelvis"].params
     assert {k: v for k, v in params.items() if k not in visibility_keys} == (
       previous_params
     )
+
+  if safety_mix_declared:
+    assert stage.episode_length_s == 30.0
+    lost = stage.rewards["ball_lost_event"]
+    assert lost.func is mdp.ball_lost_event
+    assert lost.weight == 0.0
+    assert lost.params["min_world_z"] > 0.0
+    assert "ball_lost_penalty" not in stage.rewards
+    assert "ball_no_bounce" not in stage.terminations
+    assert "ball_not_lifted" not in stage.terminations
+    assert stage.terminations["held_ball_contact"].func is mdp.held_ball_contact
+    assert stage.events["induce_loss"].mode == "step"
+    assert stage.events["reset_ball"].params["case_shares"] == (
+      0.70,
+      0.075,
+      0.075,
+      0.15,
+    )
+    assert stage.events["reset_ball"].params["loss_time_range_s"] == (5.0, 20.0)
+    for name in (
+      "ball_case_live",
+      "ball_case_ground",
+      "ball_case_never_seen",
+      "ball_case_induced",
+    ):
+      assert stage.metrics[name].reduce == "mean"
 
   if dead_ball_declared:
     # No ball-caused episode end may survive: the episode must run to time_out so the
@@ -264,11 +308,14 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
 
   if drop_tail_declared:
     assert "ball_dropped" not in stage.terminations
-    lost = stage.rewards["ball_lost_penalty"]
-    assert lost.func is mdp.ball_lost_penalty
-    assert lost.weight < 0.0
-    assert lost.params["min_world_z"] > 0.0
-    assert lost.params["grace_steps"] >= 1
+    if safety_mix_declared:
+      assert "ball_lost_penalty" not in stage.rewards
+    else:
+      lost = stage.rewards["ball_lost_penalty"]
+      assert lost.func is mdp.ball_lost_penalty
+      assert lost.weight < 0.0
+      assert lost.params["min_world_z"] > 0.0
+      assert lost.params["grace_steps"] >= 1
     assert (
       stage.rewards["body_ang_vel"].weight != nominal.rewards["body_ang_vel"].weight
     )
@@ -279,6 +326,7 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
   # ``reset_ball`` only the declared keys may differ - an undeclared reset change would
   # alter what the episode starts from and could not be read as a stream experiment.
   hold_events = {"hold_ball", "advance_ball_hold"}
+  safety_mix_events = {"induce_loss"} if safety_mix_declared else set()
   # A stage that declares the sim-to-real section installs the tracking family's
   # randomisation terms, so they appear as extra events and cannot equal S0's.
   dr_events = set(FULL_DR_EVENT_NAMES) if sim_to_real_declared else set()
@@ -287,12 +335,17 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     # effort term, so it is not in the name list.
     dr_events.add("randomize_effort_limits_wrist")
   if hold_declared:
-    assert set(stage.events) == set(nominal.events) | hold_events | dr_events
+    assert set(stage.events) == (
+      set(nominal.events) | hold_events | dr_events | safety_mix_events
+    )
     assert stage.events["hold_ball"].mode == "reset"
     assert stage.events["advance_ball_hold"].mode == "step"
     # The hold beat must be sampled after the reset that seats the ball.
     order = list(stage.events)
     assert order.index("hold_ball") > order.index("reset_ball")
+    if safety_mix_declared:
+      assert stage.events["induce_loss"].mode == "step"
+      assert order.index("induce_loss") > order.index("advance_ball_hold")
   else:
     assert set(stage.events) == set(nominal.events) | dr_events
   if sim_to_real_declared:
@@ -302,18 +355,19 @@ def test_the_stage_changes_nothing_but_the_declared_condition(stage: str) -> Non
     assert stage.events["push_robot"].params["velocity_range"]["yaw"] != (0.0, 0.0)
   reset_declared = declared.get("reset", {})
   for name in stage.events:
-    if name in hold_events or name in dr_events:
+    if name in hold_events or name in dr_events or name in safety_mix_events:
       continue
     if name != "reset_ball":
       assert stage.events[name] == nominal.events[name], name
       continue
     stage_reset = stage.events["reset_ball"].params
     nominal_reset = nominal.events["reset_ball"].params
-    assert set(stage_reset) == set(nominal_reset)
+    assert set(stage_reset) == set(nominal_reset) | set(reset_declared)
     for key in stage_reset:
       if key in reset_declared:
         assert stage_reset[key] == reset_declared[key], key
-        assert stage_reset[key] != nominal_reset[key], key
+        if key in nominal_reset:
+          assert stage_reset[key] != nominal_reset[key], key
       else:
         assert stage_reset[key] == nominal_reset[key], key
   assert stage.observations["critic"] == nominal.observations["critic"]

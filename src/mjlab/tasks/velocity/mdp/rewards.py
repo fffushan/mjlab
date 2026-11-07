@@ -12,6 +12,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
 from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
+from mjlab.tasks.velocity.mdp.ball_cases import case_of, live_mask
 from mjlab.tasks.velocity.mdp.ball_contact import (
   history_length_or_raise,
   step_contact,
@@ -487,6 +488,7 @@ def ball_centred(
   sink: float,
   plate_cfg: SceneEntityCfg,
   ball_cfg: SceneEntityCfg,
+  release_event: str = "reset_ball",
 ) -> torch.Tensor:
   r"""Reward the ball being near the middle of the plate.
 
@@ -506,16 +508,19 @@ def ball_centred(
       downward, and paying it there paid full credit for a lost ball.
     plate_cfg: Racket body; the plate frame is defined by it.
     ball_cfg: Ball entity.
+    release_event: Name of the ``reset_ball`` term that owns the case tensor. A
+      stage without the mixture has no case tensor and this term is unchanged.
 
   Returns:
-    Shape ``(num_envs,)``, between 0 and 1.
+    Shape ``(num_envs,)``, between 0 and 1, zero for a ground or never-seen start.
   """
   position, _ = plate_relative_ball_state(env, plate_cfg, ball_cfg)
   distance = torch.linalg.norm(position[:, :2], dim=1)
   outside = torch.clamp(distance - plateau, min=0.0)
   centred = torch.exp(-torch.square(outside / sigma))
   height = position[:, 2] - ball_radius
-  return torch.where(height > -sink, centred, torch.zeros_like(centred))
+  reward = torch.where(height > -sink, centred, torch.zeros_like(centred))
+  return _mask_to_live(env, release_event, reward)
 
 
 def ball_height(
@@ -560,6 +565,7 @@ def ball_in_camera_fov(
   half_angle_y: float,
   head_cfg: SceneEntityCfg,
   ball_cfg: SceneEntityCfg,
+  release_event: str = "reset_ball",
 ) -> torch.Tensor:
   r"""Reward the ball being inside the head camera's field of view.
 
@@ -590,10 +596,12 @@ def ball_in_camera_fov(
     half_angle_y: The same, vertical.
     head_cfg: The head body the camera is mounted on. Must resolve to one body.
     ball_cfg: Ball entity.
+    release_event: Name of the ``reset_ball`` term that owns the case tensor. A
+      stage without the mixture has no case tensor and this term is unchanged.
 
   Returns:
     Shape ``(num_envs,)``, between 0 and 1. A ball at or behind the camera plane
-    scores 0.
+    scores 0, and so does every ground or never-seen start.
   """
   head: Entity = env.scene[head_cfg.name]
   ball: Entity = env.scene[ball_cfg.name]
@@ -626,7 +634,8 @@ def ball_in_camera_fov(
   )
   outside = torch.clamp(radius - plateau, min=0.0)
   reward = torch.exp(-torch.square(outside / sigma))
-  return torch.where(in_front, reward, torch.zeros_like(reward))
+  reward = torch.where(in_front, reward, torch.zeros_like(reward))
+  return _mask_to_live(env, release_event, reward)
 
 
 def head_joint_motion(
@@ -1330,6 +1339,22 @@ def _held_mask(env: ManagerBasedRlEnv, hold_event: str | None) -> torch.Tensor |
   return held
 
 
+def _mask_to_live(
+  env: ManagerBasedRlEnv, release_event: str, reward: torch.Tensor
+) -> torch.Tensor:
+  """Zero a ball reward for the ground and never-seen starts.
+
+  The case tensor is read from the ``reset_ball`` event instance, never inferred
+  from the ball state, so the reward cannot disagree with the hold or the
+  terminations. A stage without the mixture has no case tensor and the reward is
+  returned unchanged.
+  """
+  cases = case_of(env, release_event)
+  if cases is None:
+    return reward
+  return torch.where(live_mask(cases), reward, torch.zeros_like(reward))
+
+
 def ball_energy_after_release(
   env: ManagerBasedRlEnv,
   plate_cfg: SceneEntityCfg,
@@ -1338,6 +1363,7 @@ def ball_energy_after_release(
   sigma: float,
   ball_rest_z: float,
   hold_event: str = "hold_ball",
+  release_event: str = "reset_ball",
 ) -> torch.Tensor:
   """``ball_energy``, scored only after the ball has been released.
 
@@ -1355,15 +1381,18 @@ def ball_energy_after_release(
     sigma: Gaussian falloff in J/kg.
     ball_rest_z: ``z_rest``, the resting ball centre's absolute world z.
     hold_event: Name of the ``hold_ball`` event term that owns the hold state.
+    release_event: Name of the ``reset_ball`` term that owns the case tensor. A
+      stage without the mixture has no case tensor and this term is unchanged.
 
   Returns:
-    Shape ``(num_envs,)``, between 0 and 1, zero while held.
+    Shape ``(num_envs,)``, between 0 and 1, zero while held and zero for every
+    ground or never-seen start.
   """
   reward = ball_energy(env, plate_cfg, ball_cfg, target_height, sigma, ball_rest_z)
   held = _held_mask(env, hold_event)
-  if held is None:
-    return reward
-  return torch.where(held, torch.zeros_like(reward), reward)
+  if held is not None:
+    reward = torch.where(held, torch.zeros_like(reward), reward)
+  return _mask_to_live(env, release_event, reward)
 
 
 def racket_under_ball(
@@ -1375,6 +1404,7 @@ def racket_under_ball(
   sigma: float = 0.030,
   level_power: float = 2.0,
   speed_sigma: float = 0.5,
+  release_event: str = "reset_ball",
 ) -> torch.Tensor:
   r"""Reward putting a level, quiet racket under the held ball.
 
@@ -1401,9 +1431,12 @@ def racket_under_ball(
     sigma: Positioning falloff beyond the plateau, in metres.
     level_power: Exponent on the plate normal's world-z component.
     speed_sigma: Scale of the quiet factor, in metres per second.
+    release_event: Name of the ``reset_ball`` term that owns the case tensor. A
+      stage without the mixture has no case tensor and this term is unchanged.
 
   Returns:
-    Shape ``(num_envs,)``, between 0 and 1, zero after release.
+    Shape ``(num_envs,)``, between 0 and 1, zero after release and zero for every
+    ground or never-seen start.
   """
   position, velocity = plate_relative_ball_state(env, plate_cfg, ball_cfg)
   distance = torch.linalg.norm(position[:, :2], dim=1)
@@ -1425,9 +1458,9 @@ def racket_under_ball(
 
   reward = aligned * level * quiet
   held = _held_mask(env, hold_event)
-  if held is None:
-    return reward
-  return torch.where(held, reward, torch.zeros_like(reward))
+  if held is not None:
+    reward = torch.where(held, reward, torch.zeros_like(reward))
+  return _mask_to_live(env, release_event, reward)
 
 
 class ball_lost_penalty(ManagerTermBase):
@@ -1488,6 +1521,57 @@ class ball_lost_penalty(ManagerTermBase):
     self._lost_steps[env_ids] = 0
     self.lost[env_ids] = False
     self.lost_events[env_ids] = 0.0
+
+
+class ball_lost_event(ManagerTermBase):
+  """Charge one event when a live ball becomes physically lost.
+
+  The mixed stage removes the per-step lost-ball cost: a charge on every lost step
+  plus an episode end that bounds it is the defect the earlier probes measured.
+  This term charges once, on the first control step the ball is at or below
+  ``min_world_z``, and never again in the same episode.
+
+  A *live* case means the episode's reset case is ``LIVE`` or ``INDUCED``. A
+  ground or never-seen start is dead from the first step and is never charged, and
+  an induced loss is eligible exactly like a live one. The case is read from the
+  ``reset_ball`` event instance, the same tensor the hold and the masking use.
+
+  The default weight is :data:`JUGGLE_BALL_LOST_EVENT_WEIGHT`, which is 0.0: the
+  mixed stage allows the charge but does not require it. The class still resets
+  cleanly, and a later arm can give it a weight without changing this code.
+
+  Args:
+    ball_cfg: Ball entity.
+    min_world_z: Ball-centre height at or below which the ball counts as lost, in
+      metres.
+    release_event: Name of the :class:`reset_ball_release` term that owns the
+      per-environment case.
+  """
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    self.applied = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    """True once the current episode has fired its one loss event."""
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    ball_cfg: SceneEntityCfg,
+    min_world_z: float,
+    release_event: str = "reset_ball",
+  ) -> torch.Tensor:
+    ball: Entity = env.scene[ball_cfg.name]
+    lost = ball.data.root_link_pos_w[:, 2] <= min_world_z
+    cases = case_of(env, release_event)
+    live = torch.ones_like(lost) if cases is None else live_mask(cases)
+    fire = lost & ~self.applied & live
+    self.applied |= fire
+    return fire.float()
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self.applied[env_ids] = False
 
 
 def lost_ball_state(

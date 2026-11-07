@@ -20,10 +20,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_CASE_GROUND_AHEAD_M,
+  BALL_CASE_GROUND_LATERAL_RANGE_M,
+  BALL_CASE_LOSS_TIME_RANGE_S,
+  BALL_CASE_NEVER_SEEN_BEHIND_M,
   BALL_RADIUS,
-  HEAD_JOINT_NAMES,
   BALL_SPAWN_CLEARANCE,
   BALL_SPAWN_FACE_NORMAL,
+  HEAD_JOINT_NAMES,
   JUGGLE_DROP_EXTRA_TIME_S,
   JUGGLE_DROP_HEIGHT_RANGE_M,
   JUGGLE_DROP_LATERAL_RANGE_M,
@@ -38,12 +42,21 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.tasks.velocity.mdp.ball_cases import (
+  GROUND,
+  INDUCED,
+  NEVER_SEEN,
+  case_of,
+)
 from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
 from mjlab.utils.lab_api.math import quat_apply, sample_uniform
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
+
+_HEAD_JOINTS_CFG = SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES)
+"""Default head-joint selection, resolved once so the default is not a call."""
 
 
 class reset_ball_release(ManagerTermBase):
@@ -86,6 +99,13 @@ class reset_ball_release(ManagerTermBase):
   metrics need the sampled facts. :attr:`start_height` and :attr:`start_plate`
   are per-environment and are overwritten on every reset of that environment.
 
+  **The mixed stage adds a case draw.** When ``case_shares`` is given, one
+  integer per environment is drawn **after** every live placement draw, so a
+  stage without the mixture consumes exactly the random numbers it did before.
+  The case is stored on this instance and is the single authority every other
+  term reads: :class:`hold_ball`, the masked rewards, the terminations and the
+  ``induce_loss`` step event.
+
   Args:
     asset_cfg: The ball entity, which must be a floating base.
     plate_cfg: The robot's ``face_center`` site; the plate frame is the site
@@ -104,6 +124,13 @@ class reset_ball_release(ManagerTermBase):
     drop_lateral_speed_range_mps: Half-width of the in-plane drop speed. Defaults
       to :data:`JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS`; ``0.0`` drops the ball with
       no lateral speed.
+    case_shares: Episode-start shares of ``(live, ground, never-seen, induced)``,
+      or ``None`` for a stage without the mixture. Defaults to ``None`` so every
+      earlier stage draws exactly the numbers it drew before this parameter
+      existed.
+    loss_time_range_s: ``(low, high)`` induced-loss time in seconds after release.
+      Defaults to :data:`BALL_CASE_LOSS_TIME_RANGE_S`; read only when
+      ``case_shares`` is given.
   """
 
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -115,6 +142,14 @@ class reset_ball_release(ManagerTermBase):
     self.start_plate = torch.zeros(env.num_envs, device=env.device)
     """1.0 for a plate start, 0.0 for a drop start. Public for the start-type
     metric."""
+    self.case: torch.Tensor | None = None
+    """Per-environment case id, or ``None`` when the stage has no mixture.
+    Public because the hold, rewards, terminations and ``induce_loss`` read it."""
+    self.loss_at_s: torch.Tensor | None = None
+    """Per-environment induced-loss time after release, in seconds, or ``None``.
+
+    Allocated with :attr:`case`; the value for a non-induced environment is
+    drawn but unused."""
 
   def __call__(
     self,
@@ -127,6 +162,8 @@ class reset_ball_release(ManagerTermBase):
     drop_extra_time_s: tuple[float, float] = JUGGLE_DROP_EXTRA_TIME_S,
     drop_lateral_range_m: float = JUGGLE_DROP_LATERAL_RANGE_M,
     drop_lateral_speed_range_mps: float = JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS,
+    case_shares: tuple[float, float, float, float] | None = None,
+    loss_time_range_s: tuple[float, float] = BALL_CASE_LOSS_TIME_RANGE_S,
   ) -> None:
     env_ids = resolve_env_ids(env, env_ids)
     asset: Entity = env.scene[asset_cfg.name]
@@ -209,6 +246,58 @@ class reset_ball_release(ManagerTermBase):
     # One release is a placement and the other a fall; neither imparts spin.
     angular_velocity = torch.zeros((num_envs, 3), device=device)
 
+    # The mixed stage draws its case last, after every live placement sample, so a
+    # stage without the mixture consumes exactly the random numbers it did before.
+    if case_shares is not None:
+      if self.case is None:
+        self.case = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        self.loss_at_s = torch.zeros(env.num_envs, device=device)
+      shares = torch.tensor(case_shares, device=device, dtype=torch.float32)
+      if shares.numel() != 4 or not bool(
+        torch.isclose(shares.sum(), torch.ones_like(shares.sum()))
+      ):
+        raise ValueError(
+          f"case_shares must have four entries that sum to 1, got {case_shares}"
+        )
+      case = torch.bucketize(
+        torch.rand(num_envs, device=device), torch.cumsum(shares, 0)[:-1]
+      )
+      self.case[env_ids] = case
+      if self.loss_at_s is None:
+        raise RuntimeError("loss_at_s missing with a case tensor")
+      self.loss_at_s[env_ids] = sample_uniform(
+        loss_time_range_s[0], loss_time_range_s[1], (num_envs,), device
+      )
+
+      # The dead starts rest on the floor, relative to the pelvis origin and the
+      # pelvis heading. The ball has no spin and no velocity there.
+      ground_lateral = sample_uniform(
+        -BALL_CASE_GROUND_LATERAL_RANGE_M,
+        BALL_CASE_GROUND_LATERAL_RANGE_M,
+        (num_envs,),
+        device,
+      )
+      pelvis_position = robot.data.root_link_pos_w[env_ids]
+      pelvis_quat = robot.data.root_link_quat_w[env_ids]
+      forward = quat_apply(pelvis_quat, local_x)
+      sideways = quat_apply(pelvis_quat, local_y)
+      ground_position = (
+        pelvis_position
+        + forward * BALL_CASE_GROUND_AHEAD_M
+        + sideways * ground_lateral[:, None]
+      )
+      never_position = pelvis_position - forward * BALL_CASE_NEVER_SEEN_BEHIND_M
+      ground_position[:, 2] = BALL_RADIUS
+      never_position[:, 2] = BALL_RADIUS
+      dead_position = torch.where(
+        (case == GROUND)[:, None], ground_position, never_position
+      )
+      dead = (case == GROUND) | (case == NEVER_SEEN)
+      position = torch.where(dead[:, None], dead_position, position)
+      linear_velocity = torch.where(
+        dead[:, None], torch.zeros_like(linear_velocity), linear_velocity
+      )
+
     orientation = torch.zeros((num_envs, 4), device=device)
     orientation[:, 0] = 1.0
     asset.write_root_state_to_sim(
@@ -221,7 +310,7 @@ def reset_head_pose(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None,
   position_range: tuple[float, float],
-  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=HEAD_JOINT_NAMES),
+  asset_cfg: SceneEntityCfg = _HEAD_JOINTS_CFG,
 ) -> None:
   """Put the head at a random pose and make its actuator hold it there.
 
@@ -431,6 +520,12 @@ class hold_ball(ManagerTermBase):
   the ball's resting state on the plate, so ``0.40`` is the same 0.40 m the energy
   target uses.
 
+  **Dead cases are not held.** When the reset term owns a case tensor and the case
+  is ``GROUND`` or ``NEVER_SEEN``, the ball is already resting on the floor where
+  the reset placed it. This term releases immediately: it writes no pin and leaves
+  ``held`` false, so the dead ball cannot be lifted into the air or reported as a
+  successful wait.
+
   Args:
     asset_cfg: The ball entity, which must be a floating base.
     hold_height_m: Ball-centre height above its resting state, in metres, or
@@ -497,6 +592,12 @@ class hold_ball(ManagerTermBase):
     self._asset_cfg = asset_cfg
     self._plate_cfg = plate_cfg
 
+    cases = case_of(env, release_event)
+    if cases is None:
+      dead = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    else:
+      dead = (cases[env_ids] == GROUND) | (cases[env_ids] == NEVER_SEEN)
+
     anchor = torch.tensor(ball_spawn_init_pos(0.0), device=device, dtype=torch.float32)
     normal = torch.tensor(BALL_SPAWN_FACE_NORMAL, device=device, dtype=torch.float32)
     anchor = anchor.expand(num_envs, 3)
@@ -522,13 +623,16 @@ class hold_ball(ManagerTermBase):
     point += env.scene.env_origins[env_ids]
 
     self.hold_point[env_ids] = point
-    self.release_after_s[env_ids] = hold_s
-    self.offset_m[env_ids] = offset
+    self.release_after_s[env_ids] = torch.where(dead, torch.zeros_like(hold_s), hold_s)
+    self.offset_m[env_ids] = torch.where(dead, torch.zeros_like(offset), offset)
     self.elapsed_s[env_ids] = 0.0
-    self.held[env_ids] = True
-    self.released[env_ids] = False
+    # A dead start is released at once: the reset already placed the ball on the
+    # floor, and the hold must not move it. Every other case is pinned as before.
+    self.held[env_ids] = ~dead
+    self.released[env_ids] = dead
     self._released_this_step[env_ids] = False
-    self._pin(env, asset, env_ids)
+    self.release_alignment_m[env_ids[dead]] = 0.0
+    self._pin(env, asset, env_ids[~dead])
 
   def advance(self, env: ManagerBasedRlEnv, asset: Entity) -> None:
     """Advance the hold clock one control step and release the due environments."""
@@ -624,6 +728,82 @@ def hold_term(env: ManagerBasedRlEnv, hold_event: str) -> hold_ball:
   return term
 
 
+class induce_loss(ManagerTermBase):
+  """Give an induced-loss ball one horizontal velocity impulse.
+
+  The mixed stage draws an :data:`~mjlab.tasks.velocity.mdp.ball_cases.INDUCED`
+  case and a loss time at reset. When the episode reaches that time this term
+  writes a horizontal speed of ``speed_mps`` in a freshly drawn random direction
+  into the ball's root velocity. The vertical and angular components are left as
+  they are, so the ball's position does not jump: an impulse, not a teleport.
+
+  **The clock starts at release, and the impulse waits for the release.**
+  ``hold_ball`` resets ``episode_length_buf`` at release, so the buffer is the
+  post-release episode time. Before release it still counts from the reset, and a
+  sampled loss time can fall inside a long hold: S10 draws a 0-6 s hold and a 5-20 s
+  loss time, and the two ranges overlap on [5, 6). Writing a velocity into a pinned
+  ball would be erased by the next hold write, and latching ``applied`` first would
+  silently drop that episode's impulse. The due test is therefore masked by the hold
+  state: an environment that is still held waits, and fires on the first step after
+  release, which is when its loss time can be measured on the right clock.
+
+  ``applied`` is per environment and is cleared on reset. It latches after the
+  first impulse, so one induced episode gets exactly one impulse even if the
+  episode continues past the sampled time. A non-induced case is never touched.
+
+  Args:
+    asset_cfg: The ball entity.
+    speed_mps: Horizontal speed after the impulse, in metres per second.
+    release_event: Name of the :class:`reset_ball_release` term that owns the
+      case and the sampled loss time.
+    hold_event: Name of the hold term whose ``held`` state defers the impulse.
+  """
+
+  def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
+    super().__init__(env)
+    del cfg  # The release event is resolved on the first call; see __call__.
+    self.applied = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    """True once the current episode has received its impulse."""
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    speed_mps: float,
+    release_event: str = "reset_ball",
+    hold_event: str = "hold_ball",
+  ) -> None:
+    del env_ids  # A step-mode event advances every environment.
+    cases = case_of(env, release_event)
+    if cases is None:
+      return
+    release = env.event_manager.get_term_cfg(release_event).func
+    loss_at_s = release.loss_at_s
+    assert loss_at_s is not None  # Allocated with the case tensor.
+    elapsed = env.episode_length_buf.float() * env.step_dt
+    due = (cases == INDUCED) & ~self.applied & (elapsed >= loss_at_s)
+    held = getattr(env.event_manager.get_term_cfg(hold_event).func, "held", None)
+    if held is not None:
+      # Still pinned: a velocity written now would be erased by the next hold write.
+      due = due & ~held
+    if not bool(due.any()):
+      return
+    ids = due.nonzero(as_tuple=False).squeeze(-1)
+    ball: Entity = env.scene[asset_cfg.name]
+    angle = torch.rand(ids.numel(), device=env.device) * (2.0 * math.pi)
+    velocity = ball.data.root_link_vel_w[ids].clone()
+    velocity[:, 0] = speed_mps * torch.cos(angle)
+    velocity[:, 1] = speed_mps * torch.sin(angle)
+    ball.write_root_link_velocity_to_sim(velocity, env_ids=ids)
+    self.applied[ids] = True
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if env_ids is None:
+      env_ids = slice(None)
+    self.applied[env_ids] = False
+
+
 class ball_hold_state(ManagerTermBase):
   """Logging-only metrics for the hold phase, read from the hold term.
 
@@ -661,3 +841,29 @@ class ball_hold_state(ManagerTermBase):
   ) -> torch.Tensor:
     del env, hold_event, field  # The hold term writes this buffer in place.
     return self._source.float()
+
+
+def ball_case_share(
+  env: ManagerBasedRlEnv,
+  release_event: str,
+  case: int,
+) -> torch.Tensor:
+  """Logging-only metric: 1.0 where the episode started in ``case``.
+
+  The case is constant per episode, so ``reduce="mean"`` over the episode and the
+  batch reports the realized episode-start share next to the declared one.
+
+  Args:
+    release_event: Name of the :class:`reset_ball_release` term that owns the
+      per-environment case tensor.
+    case: The case id to report, from
+      :mod:`mjlab.tasks.velocity.mdp.ball_cases`.
+
+  Returns:
+    Shape ``(num_envs,)``, 1.0 or 0.0.
+  """
+  cases = case_of(env, release_event)
+  assert cases is not None, (
+    f"'{release_event}' has no case tensor; the stage does not declare a mixture"
+  )
+  return (cases == int(case)).float()

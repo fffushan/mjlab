@@ -34,9 +34,13 @@ are for `.147` at 516×388; `.162` differs by under 1.5° per side.
 | smallest range validated on hardware | 0.412 m; anything closer is untested, not forbidden |
 
 The existing reward constants `CAMERA_HALF_ANGLE_X = 1.4907` (85.4°) and
-`CAMERA_HALF_ANGLE_Y = 1.1168` (64.0°) are the **raw fisheye** half-angles. In tan space
-that cone is 5.43× wider horizontally and 1.49× wider vertically than the delivered
-image. **This plan does not change them.** The mismatch is recorded here; changing a
+`CAMERA_HALF_ANGLE_Y = 1.1168` (64.0°) are the **raw fisheye** half-angles, and they are
+numerically correct for that sensor: the vendor fisheye calibration is `fx = fy = 687.2`
+px at 2048×1536, giving `1024 / 687.2 = 1.490` and `768 / 687.25 = 1.1175` rad. They are
+simply not the image the estimator delivers. The vendor rectified stream covers 66.4° by
+59.9° at full frame, and our adapter's 480×288 output keeps the full width and crops
+vertically to 53.5°. So the delivered cone is 66.4° by 53.5°, and in tan space the
+trained cone is **5.46× wider horizontally and 1.52× wider vertically**. **This plan does not change them.** The mismatch is recorded here; changing a
 reward cone is a reward decision and is out of scope.
 
 ## 3. Work items

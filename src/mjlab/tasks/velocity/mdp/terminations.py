@@ -9,6 +9,7 @@ from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactSensor
+from mjlab.tasks.velocity.mdp.ball_cases import case_of, live_mask
 from mjlab.tasks.velocity.mdp.ball_contact import step_contact
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
 
@@ -361,9 +362,14 @@ class held_ball_contact(ManagerTermBase):
   Contact is read through :func:`~mjlab.tasks.velocity.mdp.ball_contact.step_contact`,
   so a 9-10 ms touch between two control steps is still caught.
 
+  The mixed stage gives the reset term a case tensor. A ``GROUND`` or
+  ``NEVER_SEEN`` start has no hold phase to protect, so this term returns false
+  there; a stage without the mixture has no case tensor and behaves as before.
+
   Args:
     sensor_name: Scene name of the racket-ball contact sensor.
     hold_event: Name of the ``hold_ball`` event term that owns the hold state.
+    release_event: Name of the ``reset_ball`` term that owns the case tensor.
 
   Returns:
     Shape ``(num_envs,)`` bool.
@@ -373,6 +379,7 @@ class held_ball_contact(ManagerTermBase):
     super().__init__(env)
     self._sensor_name = str(cfg.params["sensor_name"])
     self._hold_event = str(cfg.params["hold_event"])
+    self._release_event = str(cfg.params.get("release_event", "reset_ball"))
     self._hold = env.event_manager.get_term_cfg(self._hold_event).func
     assert hasattr(self._hold, "held"), (
       f"'{self._hold_event}' must be a hold_ball event term exposing 'held'"
@@ -383,4 +390,8 @@ class held_ball_contact(ManagerTermBase):
   ) -> torch.Tensor:
     del sensor_name, hold_event  # Resolved in ``__init__``.
     sensor: ContactSensor = env.scene[self._sensor_name]
-    return step_contact(sensor.data) & self._hold.held
+    contact = step_contact(sensor.data) & self._hold.held
+    cases = case_of(env, self._release_event)
+    if cases is None:
+      return contact
+    return contact & live_mask(cases)

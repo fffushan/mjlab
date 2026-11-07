@@ -1741,3 +1741,62 @@ JUGGLE_WAIT_LEVEL_POWER = 2.0
 
 JUGGLE_WAIT_SPEED_SIGMA_MPS = 0.5
 """Scale of the quiet factor in the waiting alignment, in metres per second."""
+
+# --- S10 mixed safety cases ---------------------------------------------------
+#
+# One per-episode case is drawn at reset: a live juggle, a ground ball, a never-seen
+# ball, or a live juggle with a forced loss. The shares are the starting proposal
+# from the mixed safety curriculum, not a validated proportion, and they refer to
+# episode starts. The two waiting cases split the 15 % group evenly.
+BALL_CASE_SHARES = (0.70, 0.075, 0.075, 0.15)
+"""Episode-start shares of (live, ground, never-seen, induced), in case order."""
+
+BALL_CASE_LOSS_TIME_RANGE_S = (5.0, 20.0)
+"""Uniform range of the induced-loss time, in seconds after release.
+
+Measured from the release, not from reset: an induced episode may still be held at
+5 s, and an impulse written into a pinned ball would be erased by the next hold
+write. The S10 budget is 30 s, so the latest loss leaves at least 10 s of episode.
+"""
+
+BALL_CASE_GROUND_AHEAD_M = 0.55
+"""Distance in front of the pelvis origin of the ground-ball start, in metres.
+
+The ball is reachable only by a deep bend, which is the do-not-chase case. It rests
+on the floor at :data:`BALL_RADIUS` above the ground plane.
+"""
+
+BALL_CASE_GROUND_LATERAL_RANGE_M = 0.25
+"""Half-width of the ground ball's lateral offset, in metres."""
+
+BALL_CASE_NEVER_SEEN_BEHIND_M = 1.2
+"""Distance behind the pelvis origin of the never-seen start, in metres.
+
+Outside the delivered 66 degree cone and beyond the 1.0 m range from the camera
+centre, so the visibility gate admits no measurement for the whole episode.
+"""
+
+BALL_CASE_INDUCED_SPEED_MPS = 2.0
+"""Horizontal speed written into the ball at the induced loss, in metres per second.
+
+A bounded, physical impulse rather than a teleport: the ball leaves racket reach in
+about 0.2-0.3 s and never acquires an unphysical position jump. The vertical
+velocity and the angular velocity are left as they were.
+"""
+
+JUGGLE_BALL_LOST_EVENT_WEIGHT = 0.0
+"""Weight of the one-shot ``ball_lost_event`` reward in the mixed stage.
+
+The mixed stage removes the per-step lost-ball cost. A live ball that becomes lost
+may be charged once; this default is zero because section 4.3 of the curriculum
+allows that charge but does not require it. A live start and an induced loss are
+eligible; ground and never-seen starts never are.
+"""
+
+JUGGLE_S10_EPISODE_LENGTH_S = 30.0
+"""Episode budget of the mixed stage, in seconds.
+
+Twenty seconds would leave less than 10 s of standing exposure after a loss at
+20 s. The hold phase resets the episode clock at release, as every hold stage does,
+so the budget is measured from the release.
+"""
