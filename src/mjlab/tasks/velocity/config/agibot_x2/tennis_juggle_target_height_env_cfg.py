@@ -82,12 +82,29 @@ a zero-height release into the task. 0.05 m is 25 mm of release height and a
 STAGE_TARGET_HEIGHT_RANGE_M: dict[str, tuple[float, float]] = {
   "s1": S1_TARGET_HEIGHT_RANGE_M,
   "s1a": S1A_TARGET_HEIGHT_RANGE_M,
+  "s2": S1A_TARGET_HEIGHT_RANGE_M,
 }
 """The target range each stage runs.
 
 S1 is fixed at the reference height, so it reproduces the shipped reward, sigma,
 threshold and spawn exactly. S1a resumes S1 and draws the range instead, which is
-the only difference between the two.
+the only difference between the two. S2 resumes S1a and carries its range unchanged,
+which is the stage discipline: a rung carries the complete condition and adds one
+thing, so S2 differs from S1a only in the perception band.
+"""
+
+STAGE_BASE_STAGE: dict[str, str] = {
+  "s1": "s1-15hz",
+  "s1a": "s1-15hz",
+  "s2": "s2-80-100ms",
+}
+"""The ladder stage each target-height stage is built on.
+
+The latency, stall and noise conditions are not redefined here: they come from the
+stage table in :mod:`~mjlab.tasks.velocity.config.agibot_x2.
+tennis_juggle_stage_env_cfg`, so there is one definition of every range and the two
+families cannot drift apart. ``s2-80-100ms`` is the shipped second rung: 15 Hz, an
+80-100 ms transport band.
 """
 
 
@@ -194,8 +211,9 @@ def agibot_x2_tennis_juggle_target_height_env_cfg(
     )
   # The stage factory builds the 29-DOF family: its nominal parent passes
   # ``head_actuated=False``, so the actions stay 29 and the head stays an
-  # observation.
-  cfg = agibot_x2_tennis_juggle_stage_env_cfg(stage="s1-15hz", play=play)
+  # observation. The base stage carries the perception condition; this family adds
+  # the target machinery on top of it.
+  cfg = agibot_x2_tennis_juggle_stage_env_cfg(stage=STAGE_BASE_STAGE[stage], play=play)
   _apply_target_height(cfg, _target_height_range(STAGE_TARGET_HEIGHT_RANGE_M[stage]))
   return cfg
 
@@ -203,6 +221,7 @@ def agibot_x2_tennis_juggle_target_height_env_cfg(
 __all__ = [
   "S1A_TARGET_HEIGHT_RANGE_M",
   "S1_TARGET_HEIGHT_RANGE_M",
+  "STAGE_BASE_STAGE",
   "STAGE_TARGET_HEIGHT_RANGE_M",
   "TARGET_HEIGHT_RANGE_ENV",
   "agibot_x2_tennis_juggle_target_height_env_cfg",

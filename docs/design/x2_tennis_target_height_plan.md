@@ -103,6 +103,14 @@ family, or they will command an apex the ball cannot reach. Not implemented here
 |---|---|---|---|---|
 | `s1` | the shipped `s1-15hz`: 15 Hz stream, 0–40 ms latency | fixed 0.40 m | none, from scratch | 6000 iterations |
 | `s1a` | S1 | uniform 0.05–0.40 m | S1 | 6000 iterations |
+| `s2` | the shipped `s2-80-100ms`: 15 Hz, **80–100 ms** latency | uniform 0.05–0.40 m | S1a | 6000 iterations |
+
+The perception condition of each stage comes from the ladder's own stage table:
+`STAGE_BASE_STAGE` maps `s1` and `s1a` to `s1-15hz` and `s2` to `s2-80-100ms`, so the
+latency, stall and noise ranges have one definition in the repository. S2 carries S1a's
+target range unchanged, because a rung carries the complete condition and adds one
+thing. The probe asserts that S1a and S2 differ in exactly one parameter,
+`actor/ball_hist_pelvis/stream_latency_s`.
 
 The condition is the existing stage factory's `s1-15hz`, so this family is a replay of the
 ladder with the height axis inserted. Later rungs port one at a time into this family; they

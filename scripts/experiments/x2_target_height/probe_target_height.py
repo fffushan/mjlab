@@ -77,6 +77,12 @@ S1A_TASK = (
   "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
   "-Ball3-Pelvis-Nominal-S1a-TargetHeight"
 )
+S2_TASK = (
+  "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+  "-Ball3-Pelvis-Nominal-S2-TargetHeight"
+)
+LADDER_S2_STAGE = "s2-80-100ms"
+"""The shipped rung S2 is built on: 15 Hz, an 80-100 ms transport band."""
 
 NUM_ENVS = 8
 """Environments per build. CPU only, so small; every check is per-environment."""
@@ -231,6 +237,47 @@ def _last_column(obs: dict[str, torch.Tensor], group: str) -> torch.Tensor:
 ##
 
 
+def _strip_target_machinery(cfg) -> Any:
+  """A copy of ``cfg`` with exactly the declared target additions removed.
+
+  The family is defined as "the ladder stage plus these additions", so the way to
+  test that is to remove the additions and require field-for-field equality with
+  the ladder stage. Anything the family changed beyond the additions shows up as a
+  difference.
+  """
+  stripped = deepcopy(cfg)
+  stripped.commands.pop(TARGET_HEIGHT_COMMAND)
+  for group in ("actor", "critic"):
+    _require(
+      list(stripped.observations[group].terms)[-1] == TARGET_HEIGHT_COMMAND,
+      f"the target-height observation is not last in the {group} group: "
+      f"{list(stripped.observations[group].terms)}",
+    )
+    stripped.observations[group].terms.pop(TARGET_HEIGHT_COMMAND)
+  stripped.rewards["ball_energy"].params.pop("command_name")
+  stripped.terminations["ball_not_lifted"].params.pop("command_name")
+  for name in ("ball_energy", "ball_energy_error", "ball_first_lift_s"):
+    stripped.metrics[name].params.pop("command_name")
+  stripped.events["reset_ball"].params.pop("target_height_command_name")
+  return stripped
+
+
+def _neutralise_scene(*sides) -> None:
+  """Make two configs comparable on their scene.
+
+  ``spec_fn`` is a fresh closure on every factory call, so two identical scenes never
+  compare equal on the callable; the environment constructor also mirrors the
+  scene's environment count into the terrain.
+  """
+  for side in sides:
+    side.scene.num_envs = 1
+    if side.scene.terrain is not None:
+      side.scene.terrain.spec_fn = None
+      side.scene.terrain.num_envs = 1
+    for entity in side.scene.entities.values():
+      entity.spec_fn = None
+
+
 def check_1_widths() -> str:
   tasks = list_tasks()
   _require(S1_TASK in tasks, f"{S1_TASK} is not registered")
@@ -267,7 +314,7 @@ def check_1_widths() -> str:
   # Both registered tasks must carry the stage's own target range and a resampling
   # timer that cannot expire inside an episode. Without this the probe would prove
   # the machinery works and not that the two launched conditions ask for it.
-  for stage, task_id in (("s1", S1_TASK), ("s1a", S1A_TASK)):
+  for stage, task_id in (("s1", S1_TASK), ("s1a", S1A_TASK), ("s2", S2_TASK)):
     registered = load_env_cfg(task_id)
     command = registered.commands.get(TARGET_HEIGHT_COMMAND)
     _require(command is not None, f"{task_id} has no target-height command")
@@ -286,33 +333,8 @@ def check_1_widths() -> str:
   # The family is the shipped rung plus the target machinery: remove exactly the
   # declared additions and the two configs must be identical field for field.
   ladder = agibot_x2_tennis_juggle_stage_env_cfg(stage="s1-15hz")
-  stripped = deepcopy(cfg)
-  stripped.commands.pop(TARGET_HEIGHT_COMMAND)
-  for group in ("actor", "critic"):
-    _require(
-      list(stripped.observations[group].terms)[-1] == TARGET_HEIGHT_COMMAND,
-      f"the target-height observation is not last in the {group} group: "
-      f"{list(stripped.observations[group].terms)}",
-    )
-    stripped.observations[group].terms.pop(TARGET_HEIGHT_COMMAND)
-  stripped.rewards["ball_energy"].params.pop("command_name")
-  stripped.terminations["ball_not_lifted"].params.pop("command_name")
-  for name in ("ball_energy", "ball_energy_error", "ball_first_lift_s"):
-    stripped.metrics[name].params.pop("command_name")
-  stripped.events["reset_ball"].params.pop("target_height_command_name")
-
-  # ``spec_fn`` is a fresh closure on every factory call, so two identical scenes
-  # never compare equal on the callable; neutralise it and the environment counts on
-  # both sides and every other scene field is compared field for field.
-  for side in (stripped, ladder):
-    side.scene.num_envs = 1
-    if side.scene.terrain is not None:
-      side.scene.terrain.spec_fn = None
-      # The environment constructor mirrors the scene's environment count into the
-      # terrain, so the built copy carries 8 here and the ladder factory default 1.
-      side.scene.terrain.num_envs = 1
-    for entity in side.scene.entities.values():
-      entity.spec_fn = None
+  stripped = _strip_target_machinery(cfg)
+  _neutralise_scene(stripped, ladder)
 
   sections = (
     "observations",
@@ -340,13 +362,112 @@ def check_1_widths() -> str:
   )
   ranges = " and ".join(
     f"{stage} {load_env_cfg(task_id).commands[TARGET_HEIGHT_COMMAND].height_range_m}"
-    for stage, task_id in (("s1", S1_TASK), ("s1a", S1A_TASK))
+    for stage, task_id in (("s1", S1_TASK), ("s1a", S1A_TASK), ("s2", S2_TASK))
   )
   return (
-    f"both task ids registered with their stage range ({ranges}); actor {actor} "
+    f"all three task ids registered with their stage range ({ranges}); actor {actor} "
     f"(ladder {LADDER_ACTOR_WIDTH}), critic {critic} "
     f"(ladder {LADDER_CRITIC_WIDTH}), actions {actions}; the config stripped of the "
     f"declared target additions equals s1-15hz in {', '.join(sections)}"
+  )
+
+
+##
+# Check 1b. S2 is S1a plus the perception band, and nothing else.
+##
+
+
+def check_1b_s2_is_s1a_plus_latency() -> str:
+  """S2 must differ from S1a in one condition: the transport band.
+
+  Two independent statements, both worth having. Against its own ladder rung, S2 is
+  the shipped ``s2-80-100ms`` stage plus the target machinery, field for field.
+  Against S1a, the only differing parameter anywhere in the config is the ball
+  history's latency band -- which is what makes the pair an experiment rather than
+  two unrelated runs.
+  """
+  s2_cfg = load_env_cfg(S2_TASK)
+  command = s2_cfg.commands.get(TARGET_HEIGHT_COMMAND)
+  _require(command is not None, f"{S2_TASK} has no target-height command")
+  _require(
+    command.height_range_m == S1A_TARGET_HEIGHT_RANGE_M,
+    f"S2 draws {command.height_range_m}, expected S1a's range "
+    f"{S1A_TARGET_HEIGHT_RANGE_M}: a rung carries the complete condition",
+  )
+
+  ladder_s2 = agibot_x2_tennis_juggle_stage_env_cfg(stage=LADDER_S2_STAGE)
+  stripped_s2 = _strip_target_machinery(s2_cfg)
+  _neutralise_scene(stripped_s2, ladder_s2)
+  sections = (
+    "observations",
+    "rewards",
+    "terminations",
+    "metrics",
+    "events",
+    "commands",
+    "actions",
+    "curriculum",
+    "scene",
+    "episode_length_s",
+    "decimation",
+    "sim",
+  )
+  for section in sections:
+    _require(
+      getattr(stripped_s2, section) == getattr(ladder_s2, section),
+      f"{section} of S2 differs from the shipped {LADDER_S2_STAGE} stage beyond the "
+      "target machinery",
+    )
+
+  # S2 - S1a: exactly one parameter may move.
+  s1a_cfg = load_env_cfg(S1A_TASK)
+  stripped_s1a = _strip_target_machinery(s1a_cfg)
+  _neutralise_scene(stripped_s1a, stripped_s2)
+  latency_key = "stream_latency_s"
+  s2_latency = (
+    stripped_s2.observations["actor"].terms["ball_hist_pelvis"].params[latency_key]
+  )
+  s1a_latency = (
+    stripped_s1a.observations["actor"].terms["ball_hist_pelvis"].params[latency_key]
+  )
+  _require(
+    s1a_latency == (0.0, 0.040),
+    f"S1a does not carry S1's 0-40 ms band: {s1a_latency}",
+  )
+  _require(
+    s2_latency == (0.080, 0.100),
+    f"S2 does not carry the shipped {LADDER_S2_STAGE} band: {s2_latency}",
+  )
+  for section in sections:
+    left = getattr(stripped_s1a, section)
+    right = getattr(stripped_s2, section)
+    if section == "observations":
+      continue  # Holds the latency band, compared below on its own.
+    _require(
+      left == right,
+      f"{section} differs between S1a and S2: the pair is supposed to isolate the "
+      "band alone",
+    )
+
+  # The observation section differs only in that one parameter.
+  a = stripped_s1a.observations
+  b = stripped_s2.observations
+  differing = [
+    (group, term, key)
+    for group in ("actor", "critic")
+    for term in a[group].terms
+    for key in set(a[group].terms[term].params) | set(b[group].terms[term].params)
+    if a[group].terms[term].params.get(key) != b[group].terms[term].params.get(key)
+  ]
+  _require(
+    differing == [("actor", "ball_hist_pelvis", latency_key)],
+    f"S1a and S2 differ in more than the ball history's latency band: {differing}",
+  )
+  return (
+    f"S2 is {LADDER_S2_STAGE} plus the target machinery in {len(sections)} sections, "
+    f"and differs from S1a in exactly one parameter: actor/ball_hist_pelvis/"
+    f"{latency_key} {s1a_latency} -> {s2_latency}; S2 keeps S1a's target range "
+    f"{S1A_TARGET_HEIGHT_RANGE_M}"
   )
 
 
@@ -896,6 +1017,7 @@ def check_7_target_survives_a_reset() -> str:
 
 CHECKS = (
   ("1 widths", check_1_widths),
+  ("1b S2 is S1a plus the band", check_1b_s2_is_s1a_plus_latency),
   ("2 per-environment command", check_2_per_environment),
   ("3 equals the constant-0.40 path", check_3_matches_the_old_path),
   ("4 peaks at the commanded apex", check_4_peaks_at_the_command),

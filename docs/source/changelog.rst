@@ -4,6 +4,15 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **Target-height S2: the height-conditioned policy at an 80-100 ms perception band.**
+  ``...-Ball3-Pelvis-Nominal-S2-TargetHeight`` carries S1a's uniform 0.05-0.40 m target
+  range and changes one condition: the ball-history latency band moves from 0-40 ms to
+  80-100 ms. The perception ranges are not redefined in this family; a
+  ``STAGE_BASE_STAGE`` map points each stage at the ladder's own stage table, so there is
+  one definition of every range. The probe asserts the pair is an experiment rather than
+  two runs: S2 equals the shipped ``s2-80-100ms`` stage plus the target machinery in
+  twelve config sections, and S1a and S2 differ in exactly one parameter,
+  ``actor/ball_hist_pelvis/stream_latency_s``.
 - **The carry-pose velocity task no longer collides the string bed.** The tennis entity
   keeps its calibrated bed contact in the juggle family, where a ball loads it, but the
   carry task has no ball and runs a 5 ms physics step that the bed's ``solref`` was never

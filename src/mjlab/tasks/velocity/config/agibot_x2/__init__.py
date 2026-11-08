@@ -526,6 +526,24 @@ register_mjlab_task(
   runner_cls=VelocityOnPolicyRunner,
 )
 
+# S2 carries S1a's target range and changes one condition: the perception band moves
+# from 0-40 ms to 80-100 ms. Nothing about the target machinery moves, so the pair
+# isolates the band's centre on top of a height-conditioned policy.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S2-TargetHeight"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s2"),
+  play_env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s2", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name=(
+      "agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal_s1_target_height"
+    )
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
 # Tennis-end recovery fine-tuning task. Builds on the no-state-estimation
 # velocity config, replacing the twist command with the recovery-specialized
 # command and adding the paired recovery reset event. Recovery environments
