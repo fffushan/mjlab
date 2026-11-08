@@ -4,6 +4,17 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **The carry-pose velocity task no longer collides the string bed.** The tennis entity
+  keeps its calibrated bed contact in the juggle family, where a ball loads it, but the
+  carry task has no ball and runs a 5 ms physics step that the bed's ``solref`` was never
+  fitted for. Two arms of that task died with a NaN in the actor observation, at
+  iterations 8206 and 15781, with healthy metrics immediately before and no warning in any
+  logged term. ``TENNIS_BED_COLLISION_DISABLED`` zeroes ``contype``/``conaffinity`` on
+  ``string_bed`` and leaves the geometry, the face site and the ``solref`` in the model.
+  The bed is the racket's only collider, so the racket now has no contact at all in that
+  task; that is the intended state where the racket is held clear of the ground, and the
+  probe asserts it. Not claimed: that this removes the NaN -- no run has completed the
+  budget under the change yet.
 - **Delayed release is now a training condition, not only a design goal.** The task
   ``...-Ball3-Pelvis-Nominal-S7a-DelayedRelease`` holds the ball in world space 0.40 m
   above its resting height and releases it after a uniform 0-2 s wait, with S5's whole

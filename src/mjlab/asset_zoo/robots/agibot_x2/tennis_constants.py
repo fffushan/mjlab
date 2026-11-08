@@ -318,6 +318,43 @@ TENNIS_BED_COLLISION = CollisionCfg(
   disable_other_geoms=False,
 )
 
+TENNIS_BED_COLLISION_DISABLED = CollisionCfg(
+  geom_names_expr=(rf"^{BED_GEOM}$",),
+  contype=0,
+  conaffinity=0,
+  condim=CONTACT_CONDIM,
+  priority=0,
+  disable_other_geoms=False,
+)
+"""The bed as geometry only, for a task that has no ball.
+
+:data:`TENNIS_BED_COLLISION` is calibrated contact for a ball: a negative
+``solref`` that was fitted at a 1 ms physics step. ``tests/test_x2_tennis_ball_task.py``
+shows the same parameters inject energy at mjlab's 5 ms default, so where the bed
+cannot be useful it is a hazard rather than a neutral body.
+
+The carry-pose velocity task has no ball, so the bed serves nothing there and is the
+one thing the racket can hit that was never modelled at that step size. Two training
+arms of that task died with a NaN in the actor observation -- at iteration 8206 from
+scratch and 15781 after a resume, both after thousands of healthy iterations and with
+no warning in any logged term -- which is the signature of a contact blow-up rather
+than a divergence. This config removes the bed from collision without removing the
+geometry: the mesh still renders, the face site is untouched, and every other geom
+keeps its bits because ``disable_other_geoms`` stays False.
+
+Applied *after* :data:`~.x2_constants.FULL_COLLISION`, which zeroes the bed as an
+unmatched geom. The juggle family keeps :data:`TENNIS_BED_COLLISION`: it has a ball,
+and the fit applies to the step it trains at.
+
+**Consequence, measured:** the bed is the racket's *only* collider. Every other racket
+geom is visual-only (``racket_clamp_a_visual``, ``racket_clamp_b_visual``,
+``tennis_racket_visual``), so switching the bed off leaves the racket with no contact
+at all -- it can pass through the floor and through the robot. That is acceptable
+where there is no ball and the racket is held clear of the ground, and
+``scripts/experiments/x2_carry_velocity/check_carry_velocity_cfg.py`` asserts both
+halves: no racket collider in the carry task, exactly the bed in the juggle family.
+"""
+
 
 ##
 # Spec builders.
@@ -1705,6 +1742,7 @@ __all__ = [
   "JUGGLE_RESET_JOINT_NAMES",
   "RACKET_BODY",
   "TENNIS_BED_COLLISION",
+  "TENNIS_BED_COLLISION_DISABLED",
   "WRIST_BODY",
   "attach_tennis_assembly",
   "get_tennis_ball_cfg",

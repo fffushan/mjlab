@@ -21,6 +21,8 @@ import torch
 
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BAT_CARRY_POSE,
+  BED_GEOM,
+  BED_SOLREF,
   CLAMP_BODY,
   FACE_SITE,
   RACKET_BODY,
@@ -199,6 +201,56 @@ def main() -> int:
       ", ".join(FOOT_SITES),
     )
 
+    print("[1b] string-bed contact")
+    # The bed is geometry here, not a contact body: no ball, and its calibrated solref
+    # was fitted at a 1 ms step while this task runs 5 ms. Two arms died with a NaN in the
+    # actor observation with no metric warning, so the bits are asserted rather than
+    # assumed. The geometry, the face site and the contact parameters stay in the model:
+    # only contype/conaffinity/priority move, which is what removes the contact pair.
+    bed = [g for g in range(mj_model.ngeom) if BED_GEOM in mj_model.geom(g).name]
+    checks.check(
+      "the bed geom is still in the compiled spec",
+      len(bed) == 1,
+      f"matches={[mj_model.geom(g).name for g in bed]}",
+    )
+    if len(bed) == 1:
+      bed_id = bed[0]
+      checks.check(
+        "the bed generates no contact in the carry task",
+        int(mj_model.geom_contype[bed_id]) == 0
+        and int(mj_model.geom_conaffinity[bed_id]) == 0,
+        f"contype={int(mj_model.geom_contype[bed_id])} "
+        f"conaffinity={int(mj_model.geom_conaffinity[bed_id])}",
+      )
+      checks.check(
+        "only the contact bits moved: the bed keeps its calibrated solref",
+        tuple(float(v) for v in mj_model.geom_solref[bed_id])
+        == tuple(float(v) for v in BED_SOLREF),
+        f"solref={tuple(float(v) for v in mj_model.geom_solref[bed_id])}",
+      )
+    # Consequence, stated rather than hidden: the bed is the racket's ONLY collider --
+    # every other racket geom is visual-only -- so switching the bed off leaves the racket
+    # with no contact at all. That is what this task wants (no ball, and the racket is
+    # held clear of the ground), but it is a property of the asset, not of this config,
+    # so it is measured here and again on the juggle model in section [7].
+    racket_geoms = [
+      g
+      for g in range(mj_model.ngeom)
+      if any(
+        key in mj_model.geom(g).name for key in (RACKET_BODY, CLAMP_BODY, BED_GEOM)
+      )
+    ]
+    colliding_racket = [
+      mj_model.geom(g).name
+      for g in racket_geoms
+      if int(mj_model.geom_contype[g]) != 0 or int(mj_model.geom_conaffinity[g]) != 0
+    ]
+    checks.check(
+      "the racket has no collider left in the carry task",
+      bool(racket_geoms) and not colliding_racket,
+      f"{len(racket_geoms)} racket geoms, still colliding={colliding_racket}",
+    )
+
     print("[2] observation and action contract")
     actor_dim = tuple(env.observation_manager.group_obs_dim["actor"])
     action_dim = int(env.action_manager.total_action_dim)
@@ -334,6 +386,29 @@ def main() -> int:
   juggle_cfg, juggle_env = _build(JUGGLE_TASK_ID)
   try:
     juggle_gains = _vendor_gains_by_joint(juggle_cfg.scene.entities["robot"])
+    juggle_model = juggle_env.sim.mj_model
+    juggle_bed = [
+      g for g in range(juggle_model.ngeom) if BED_GEOM in juggle_model.geom(g).name
+    ]
+    juggle_bed_bits = (
+      (
+        int(juggle_model.geom_contype[juggle_bed[0]]),
+        int(juggle_model.geom_conaffinity[juggle_bed[0]]),
+      )
+      if len(juggle_bed) == 1
+      else None
+    )
+    juggle_colliding_racket = [
+      juggle_model.geom(g).name
+      for g in range(juggle_model.ngeom)
+      if any(
+        key in juggle_model.geom(g).name for key in (RACKET_BODY, CLAMP_BODY, BED_GEOM)
+      )
+      and (
+        int(juggle_model.geom_contype[g]) != 0
+        or int(juggle_model.geom_conaffinity[g]) != 0
+      )
+    ]
   finally:
     juggle_env.close()
   differing = {
@@ -352,6 +427,18 @@ def main() -> int:
     and carry_gains.get("right_wrist_yaw_joint") == (20.0, 2.0),
     f"shoulder={carry_gains.get('right_shoulder_pitch_joint')} "
     f"wrist={carry_gains.get('right_wrist_yaw_joint')}",
+  )
+
+  print("[7] the change is scoped to the carry task")
+  checks.check(
+    "the juggle family keeps a colliding bed",
+    juggle_bed_bits == (1, 1),
+    f"juggle bed contype/conaffinity={juggle_bed_bits}",
+  )
+  checks.check(
+    "the bed is the racket's only collider, so the juggle family still has one",
+    juggle_colliding_racket == ["robot/string_bed"],
+    f"juggle colliding racket geoms={juggle_colliding_racket}",
   )
 
   if checks.failures:

@@ -4,10 +4,11 @@ import mujoco
 
 from mjlab.asset_zoo.robots import X2_ACTION_SCALE, get_x2_robot_cfg
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  TENNIS_BED_COLLISION_DISABLED,
   get_tennis_spec,
   get_x2_tennis_robot_cfg,
 )
-from mjlab.asset_zoo.robots.agibot_x2.x2_constants import get_spec
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import FULL_COLLISION, get_spec
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -297,6 +298,13 @@ def agibot_x2_flat_velocity_carry_env_cfg(
   cfg = agibot_x2_flat_velocity_env_cfg(play=play)
 
   robot_cfg = get_x2_tennis_robot_cfg()
+  # The bed is geometry here, not a contact body. This task has no ball, and the bed's
+  # calibrated ``solref`` was fitted at a 1 ms step -- at the 5 ms step this task runs it
+  # injects energy, and two arms died with a NaN in the actor observation with no metric
+  # warning. Removing it changes nothing else: the mesh stays, the face site stays, and
+  # every other geom keeps its collision bits. The juggle family needs the bed and keeps
+  # it. See ``TENNIS_BED_COLLISION_DISABLED``.
+  robot_cfg.collisions = (FULL_COLLISION, TENNIS_BED_COLLISION_DISABLED)
   # The vendor reference-policy gains, not the velocity task's. The juggle policy this
   # task hands over to runs these, and the robot can only run one gain set at a time, so
   # training under different gains would leave a step at the handover. This is the same

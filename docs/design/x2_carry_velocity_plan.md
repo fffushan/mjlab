@@ -238,3 +238,43 @@ Verification run: `pytest tests/test_task_configs.py -q` 9 passed; `ruff format 
 and `ruff check` pass on every touched file; resolved-config fingerprints of
 `Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation` and the S10 stage are identical before
 and after the change. No training run, no hardware activity, no commit.
+
+## 11. Change: the string bed does not collide
+
+Date: 2026-11-08 (+08). Applies to this task only; the juggle family keeps the bed.
+
+The carry task had the tennis entity's calibrated bed contact, on the reasoning that a
+task with no ball never loads it. That reasoning was wrong: the bed is geometry, not the
+ball, and it collides with the floor and with the robot's own bodies. Its
+``solref = (-100000, -22)`` was fitted at a 1 ms physics step, and
+``tests/test_x2_tennis_ball_task.py`` shows the same pair injects energy at mjlab's
+default 5 ms -- which is the step this task runs, because it never needed the 1 ms fit.
+
+Two arms of this task died with the same failure:
+
+| arm | died at | iterations completed | log evidence |
+|---|---|---:|---|
+| `carry-vel-s7` | 2026-11-07 23:01 | 8206 | `actor` observation NaN |
+| `carry-vel-s7-resume1` | 2026-11-08 13:51 | 15781 | `actor` observation NaN |
+
+Both died mid-rollout with healthy metrics immediately before (reward 77.9,
+`error_vel_xy` 0.43, `pose` 0.7958, `fell_over` 0.0) and no warning in any logged term.
+That is the signature of a contact blow-up, not of a divergence.
+
+The fix is :data:`TENNIS_BED_COLLISION_DISABLED`, applied after ``FULL_COLLISION`` in
+``agibot_x2_flat_velocity_carry_env_cfg``. It zeroes ``contype``/``conaffinity`` on
+``string_bed`` and leaves every other geom alone. The geometry, the face site and the
+bed's ``solref`` stay in the model, so nothing that reads the racket's pose changes.
+
+**Measured consequence:** the bed is the racket's only collider, so the racket now has no
+contact at all in this task. The three other racket geoms are visual-only by
+construction. For a task with no ball and a racket held clear of the ground that is the
+intended state; it is asserted in the probe rather than left implicit.
+
+**Not claimed:** that this removes the NaN. The mechanism is consistent with the evidence
+and the offending contact is now impossible, but no run has yet completed 20 000
+iterations under the change. Treat the next resume as the test.
+
+Probe: `scripts/experiments/x2_carry_velocity/check_carry_velocity_cfg.py` sections
+[1b] and [7] -- bed present, bed contact-free, bed ``solref`` unchanged, no racket
+collider in this task, exactly the bed in the juggle family. RESULT: PASS.
