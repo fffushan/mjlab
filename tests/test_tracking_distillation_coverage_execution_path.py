@@ -223,7 +223,9 @@ def test_coverage_gate_refuses_evidence_for_another_reference_width(tmp_path) ->
   preview_schema = _cohort_schema(preview=True)
   policy = resolve_coverage_policy("difficult-state-coverage", schema=preview_schema)
   legacy_evidence = tmp_path / "legacy.json"
-  legacy_evidence.write_text(_parity_evidence(coverage_schema_payload(_cohort_schema(False))))
+  legacy_evidence.write_text(
+    _parity_evidence(coverage_schema_payload(_cohort_schema(False)))
+  )
   with pytest.raises(ValueError, match="describes schema"):
     require_coverage_execution(
       policy,
@@ -234,9 +236,7 @@ def test_coverage_gate_refuses_evidence_for_another_reference_width(tmp_path) ->
   # And the version-1 layout still refuses the preview evidence, so the gate is not
   # merely permissive in one direction.
   preview_evidence = tmp_path / "preview.json"
-  preview_evidence.write_text(
-    _parity_evidence(coverage_schema_payload(preview_schema))
-  )
+  preview_evidence.write_text(_parity_evidence(coverage_schema_payload(preview_schema)))
   with pytest.raises(ValueError, match="describes schema"):
     require_coverage_execution(policy, preview_evidence, manifest_sha256="manifest")
 

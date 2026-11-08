@@ -1141,7 +1141,9 @@ def test_factory_takes_the_preview_from_the_cohort_not_the_base_task(
   )
 
 
-def test_factory_leaves_an_agreeing_preview_unrecorded(tiny_cohort, monkeypatch) -> None:
+def test_factory_leaves_an_agreeing_preview_unrecorded(
+  tiny_cohort, monkeypatch
+) -> None:
   """No override, no record: an agreeing base task is not an override."""
   assert tiny_cohort.lookahead_s == 0.0
   cfg = load_env_cfg(tiny_cohort.manifest.base_task)
@@ -1153,7 +1155,9 @@ def test_factory_leaves_an_agreeing_preview_unrecorded(tiny_cohort, monkeypatch)
       self.cfg = cfg
 
   monkeypatch.setattr("mjlab.envs.ManagerBasedRlEnv", _BuiltEnvironment)
-  env = build_multi_motion_environment(tiny_cohort, ("tiny_000", "tiny_001"), num_envs=2)
+  env = build_multi_motion_environment(
+    tiny_cohort, ("tiny_000", "tiny_001"), num_envs=2
+  )
   env_cfg = cast(Any, env.cfg)
   assert cast(Any, env_cfg.commands["motion"]).lookahead_s == 0.0
 
