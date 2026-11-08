@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import BALL_RADIUS, FACE_SITE_POS
+from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  BALL_RADIUS,
+  FACE_SITE_POS,
+  JUGGLE_ENERGY_SIGMA_J_PER_M,
+)
 from mjlab.entity import Entity
 from mjlab.managers.manager_base import ManagerTermBase, ManagerTermBaseCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -19,6 +23,7 @@ from mjlab.tasks.velocity.mdp.ball_contact import (
   substep_contact,
 )
 from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
+from mjlab.tasks.velocity.mdp.target_height_command import commanded_target_height
 from mjlab.tasks.velocity.mdp.terrain_utils import terrain_normal_from_sensors
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_mul
 from mjlab.utils.lab_api.string import (
@@ -766,9 +771,9 @@ def ball_vertical_energy(
 def _ball_energy_and_target(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg,
-  target_height: float,
+  target_height: float | torch.Tensor,
   ball_rest_z: float,
-) -> tuple[torch.Tensor, float]:
+) -> tuple[torch.Tensor, float | torch.Tensor]:
   r"""The ball's energy per unit mass, and the energy of the target apex.
 
   .. math::
@@ -818,15 +823,34 @@ def _ball_energy_and_target(
   Args:
     ball_cfg: Ball entity.
     target_height: Height of the target apex above the resting state, in metres.
+      A tensor is one height per environment, which the target-height family reads
+      from its command; a float is the shipped single target.
     ball_rest_z: ``z_rest``, the ball centre's absolute world z when the ball rests
       on the plate in the carry pose, in metres.
 
   Returns:
-    ``(energy, target)``: shape ``(num_envs,)`` in J/kg, and a scalar in J/kg.
+    ``(energy, target)``: shape ``(num_envs,)`` in J/kg, and the target in J/kg,
+    a scalar when ``target_height`` is a float and shape ``(num_envs,)`` when it is
+    a tensor.
   """
   energy = ball_vertical_energy(env, ball_cfg, ball_rest_z)
   gravity = abs(float(env.sim.mj_model.opt.gravity[2]))
   return energy, gravity * target_height
+
+
+def _consumer_target_height(
+  env: ManagerBasedRlEnv,
+  target_height: float,
+  command_name: str | None,
+) -> float | torch.Tensor:
+  """The target height a consumer scores against: the command, or the scalar.
+
+  One resolution for every consumer, so the reward and the two metrics cannot read
+  different numbers.
+  """
+  if command_name is None:
+    return target_height
+  return commanded_target_height(env, command_name)
 
 
 def ball_energy(
@@ -836,6 +860,7 @@ def ball_energy(
   target_height: float,
   sigma: float,
   ball_rest_z: float,
+  command_name: str | None = None,
 ) -> torch.Tensor:
   r"""Reward the ball's energy matching a bounce to ``target_height``.
 
@@ -855,6 +880,16 @@ def ball_energy(
   is the opposite: zero on every step except the apex, so it gives no gradient while
   the ball is in flight.
 
+  **Per-environment target (``command_name``).** When a command is named, both the
+  target and the sigma come from that command, in every environment, and the scalar
+  ``target_height`` and ``sigma`` arguments are ignored. The sigma becomes
+  ``JUGGLE_ENERGY_SIGMA_J_PER_M * h``, i.e. a constant *relative* tolerance. A fixed
+  1.5 J/kg is 153 mm of height at every target, which is 6 % of a 0.40 m apex and
+  48 % of a 0.05 m one: the same policy would face an eightfold different tolerance
+  across the range, so the tolerance has to scale with the target. With the command
+  at 0.40 m the two forms are equal to float precision, which is what makes the
+  reference condition unchanged.
+
   Args:
     plate_cfg: Accepted so the ball terms share one parameter dict; the energy
       datum is a fixed world height, so this term does not read the robot.
@@ -862,12 +897,18 @@ def ball_energy(
     target_height: Height of the target apex above the resting state, in metres.
     sigma: Falloff of the Gaussian in energy, in J/kg, the same units as ``E``.
     ball_rest_z: ``z_rest``, the resting ball centre's absolute world z, in metres.
+    command_name: Key of a target-height command term, or ``None`` to use the scalar
+      ``target_height`` and ``sigma`` as the shipped task does.
 
   Returns:
     Shape ``(num_envs,)``, between 0 and 1.
   """
-  energy, target = _ball_energy_and_target(env, ball_cfg, target_height, ball_rest_z)
-  return torch.exp(-torch.square((energy - target) / sigma))
+  height = _consumer_target_height(env, target_height, command_name)
+  width: float | torch.Tensor = (
+    sigma if command_name is None else JUGGLE_ENERGY_SIGMA_J_PER_M * height
+  )
+  energy, target = _ball_energy_and_target(env, ball_cfg, height, ball_rest_z)
+  return torch.exp(-torch.square((energy - target) / width))
 
 
 def ball_energy_value(
@@ -876,6 +917,7 @@ def ball_energy_value(
   ball_cfg: SceneEntityCfg,
   target_height: float,
   ball_rest_z: float,
+  command_name: str | None = None,
 ) -> torch.Tensor:
   r"""The ball's energy per unit mass :math:`E`, for a metrics term.
 
@@ -884,17 +926,26 @@ def ball_energy_value(
   the current simulation state, exactly like :func:`ball_energy`, so it cannot read
   a stale flag: there is no reward-term state to go stale.
 
+  ``command_name`` does not enter the returned number, which is :math:`E` alone, and
+  so it does not need :math:`E^*`. It is accepted and resolved so that the metric is
+  wired to the same command the reward reads and a missing command term fails here
+  as well as there, instead of one taking a per-environment target and the other a
+  constant.
+
   Args:
     plate_cfg: Accepted so the ball terms share one parameter dict; the energy
       datum is a fixed world height, so this term does not read the robot.
     ball_cfg: Ball entity.
     target_height: Height of the target apex above the resting state, in metres.
     ball_rest_z: ``z_rest``, the resting ball centre's absolute world z, in metres.
+    command_name: Key of a target-height command term, or ``None`` for the scalar
+      ``target_height``.
 
   Returns:
     Shape ``(num_envs,)``, in J/kg.
   """
-  energy, _ = _ball_energy_and_target(env, ball_cfg, target_height, ball_rest_z)
+  height = _consumer_target_height(env, target_height, command_name)
+  energy, _ = _ball_energy_and_target(env, ball_cfg, height, ball_rest_z)
   return energy
 
 
@@ -904,6 +955,7 @@ def ball_energy_error(
   ball_cfg: SceneEntityCfg,
   target_height: float,
   ball_rest_z: float,
+  command_name: str | None = None,
 ) -> torch.Tensor:
   """The distance :math:`|E - E^*|` in J/kg, for a metrics term.
 
@@ -912,10 +964,16 @@ def ball_energy_error(
   physical number. Like :func:`ball_energy`, it is recomputed from the current
   state, so it cannot go stale.
 
+  ``command_name`` gives one target per environment, like :func:`ball_energy`. The
+  target enters this number, so a metric that kept the constant 0.40 m target would
+  report a distance from a target the reward does not use whenever the command is
+  not 0.40 m.
+
   Returns:
     Shape ``(num_envs,)``, in J/kg, zero when the energy is exactly on target.
   """
-  energy, target = _ball_energy_and_target(env, ball_cfg, target_height, ball_rest_z)
+  height = _consumer_target_height(env, target_height, command_name)
+  energy, target = _ball_energy_and_target(env, ball_cfg, height, ball_rest_z)
   return torch.abs(energy - target)
 
 

@@ -32,6 +32,8 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_DROP_HEIGHT_RANGE_M,
   JUGGLE_DROP_LATERAL_RANGE_M,
   JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS,
+  JUGGLE_ENERGY_TARGET_HEIGHT_M,
+  JUGGLE_LIFT_ENERGY_J_PER_M,
   JUGGLE_PLATE_START_FRACTION,
   JUGGLE_PLATE_START_LATERAL_RANGE_M,
   ball_spawn_init_pos,
@@ -50,6 +52,10 @@ from mjlab.tasks.velocity.mdp.ball_cases import (
 )
 from mjlab.tasks.velocity.mdp.observations import plate_relative_ball_state
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
+from mjlab.tasks.velocity.mdp.target_height_command import (
+  commanded_target_height,
+  draw_commanded_target_height,
+)
 from mjlab.utils.lab_api.math import quat_apply, sample_uniform
 
 if TYPE_CHECKING:
@@ -131,6 +137,14 @@ class reset_ball_release(ManagerTermBase):
     loss_time_range_s: ``(low, high)`` induced-loss time in seconds after release.
       Defaults to :data:`BALL_CASE_LOSS_TIME_RANGE_S`; read only when
       ``case_shares`` is given.
+    target_height_command_name: Key of a target-height command term, or ``None``.
+      When set, the sampled release height is multiplied by ``h / reference``, so
+      the whole episode is the reference one scaled with the commanded apex: a
+      0.05 m target releases the ball 25 mm above the bed, not 200 mm. The lateral
+      offset and speed are **not** scaled, on purpose: they are an absolute
+      operator error, and a +-20 mm offset on a 50 mm apex is proportionally four
+      times harder than on a 400 mm apex. At a 0.40 m target the factor is 1.0, so
+      the reference condition is unchanged.
   """
 
   def __init__(self, cfg: EventTermCfg, env: ManagerBasedRlEnv):
@@ -164,6 +178,7 @@ class reset_ball_release(ManagerTermBase):
     drop_lateral_speed_range_mps: float = JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS,
     case_shares: tuple[float, float, float, float] | None = None,
     loss_time_range_s: tuple[float, float] = BALL_CASE_LOSS_TIME_RANGE_S,
+    target_height_command_name: str | None = None,
   ) -> None:
     env_ids = resolve_env_ids(env, env_ids)
     asset: Entity = env.scene[asset_cfg.name]
@@ -180,6 +195,16 @@ class reset_ball_release(ManagerTermBase):
       (num_envs,),
       device,
     )
+    if target_height_command_name is not None:
+      # Scale the release with the commanded apex, after the stage's own draw so a
+      # stage range is scaled rather than replaced. The target is drawn here, not
+      # read: the environment applies reset events before it resets the command
+      # manager, so this is the only point at which the episode's own target can be
+      # known, and the spawn must be built from the target the reward will score.
+      drop_height = drop_height * (
+        draw_commanded_target_height(env, target_height_command_name, env_ids)
+        / JUGGLE_ENERGY_TARGET_HEIGHT_M
+      )
     extra_time = sample_uniform(
       drop_extra_time_s[0],
       drop_extra_time_s[1],
@@ -455,6 +480,10 @@ class ball_first_lift_time(ManagerTermBase):
     ball_cfg: Ball entity.
     ball_rest_z: Ball centre's world z when it rests on the plate, in metres.
     threshold: Energy that counts as lifted, in J/kg.
+    command_name: Key of a target-height command term, or ``None``. When set, the
+      threshold becomes ``JUGGLE_LIFT_ENERGY_J_PER_M * h`` per environment, the same
+      rule ``ball_not_lifted`` applies, so the reported lift time and the termination
+      cannot disagree about what a lift is. At 0.40 m the two forms are equal.
   """
 
   def __init__(self, cfg: MetricsTermCfg, env: ManagerBasedRlEnv):
@@ -463,6 +492,7 @@ class ball_first_lift_time(ManagerTermBase):
     self._ball_cfg: SceneEntityCfg = cfg.params["ball_cfg"]
     self._ball_rest_z: float = cfg.params["ball_rest_z"]
     self._threshold: float = cfg.params["threshold"]
+    self._command_name: str | None = cfg.params.get("command_name")
     self._first_lift_s = torch.full((env.num_envs,), -1.0, device=env.device)
     self._steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
@@ -472,12 +502,18 @@ class ball_first_lift_time(ManagerTermBase):
     ball_cfg: SceneEntityCfg,
     ball_rest_z: float,
     threshold: float,
+    command_name: str | None = None,
   ) -> torch.Tensor:
-    del ball_cfg, ball_rest_z, threshold  # Read once in ``__init__``.
+    del ball_cfg, ball_rest_z, threshold, command_name  # Read in ``__init__``.
+    threshold_value: float | torch.Tensor = self._threshold
+    if self._command_name is not None:
+      threshold_value = JUGGLE_LIFT_ENERGY_J_PER_M * commanded_target_height(
+        env, self._command_name
+      )
     energy = ball_vertical_energy(env, self._ball_cfg, self._ball_rest_z)
     elapsed = self._steps.float() * self._step_dt
     self._steps += 1
-    lifted = (self._first_lift_s < 0.0) & (energy >= self._threshold)
+    lifted = (self._first_lift_s < 0.0) & (energy >= threshold_value)
     self._first_lift_s = torch.where(lifted, elapsed, self._first_lift_s)
     return self._first_lift_s
 

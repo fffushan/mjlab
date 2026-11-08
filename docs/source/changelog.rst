@@ -144,6 +144,32 @@ Removed
 Added
 ^^^^^
 
+- **Target-height juggling family, S1 and S1a.** Two tasks,
+  ``...-Ball3-Pelvis-Nominal-S1-TargetHeight`` and ``...-S1a-TargetHeight``, take the
+  target apex height as an **input** instead of a reward constant. A new command term
+  (``TargetHeightCommand``) holds one height per environment in metres and resamples it
+  on every episode reset; a new ``target_height`` observation is appended last to both
+  groups, divided by 0.40, and is not corrupted because a goal is not a measurement.
+  Five consumers read the command instead of a constant: the ``ball_energy`` target and
+  sigma (3.75 J/kg per m, so the tolerance stays a constant fraction of the target), the
+  ``ball_not_lifted`` and ``ball_first_lift_s`` thresholds (2.5 J/kg per m, so a low
+  target cannot classify a perfect juggle as "not lifted"), and the two energy metrics.
+  The ball's spawn scales as ``0.20 * h / 0.40``. S1 fixes the target at 0.40 m and is
+  the shipped ``s1-15hz`` condition with every rule a no-op at that height; S1a draws
+  uniformly from 0.05 to 0.40 m and resumes S1. The actor widens 112 to 113 and the
+  critic 121 to 122 with 29 actions, so no ladder checkpoint resumes strictly, and the
+  controller's 112-wide path does not apply. ``MJLAB_JUGGLE_TARGET_HEIGHT_RANGE_M``
+  (``H`` or ``LO,HI``) pins the range for an acceptance cell, and the target is logged
+  as the command metric ``Metrics/target_height/target_height`` so a run records the
+  heights it asked for. A CPU probe
+  (``scripts/experiments/x2_target_height/probe_target_height.py``) checks all seven
+  properties the plan asks for, including that the 0.40 m reward equals the old
+  constant-0.40 code path at 35 ball states (exactly in float64, to one float32 ulp of
+  the target energy in the shipped dtype), and that the reward peaks at the commanded
+  apex from a physics-derived energy. What is not claimed: that a policy uses the
+  input. The commanded-against-achieved apex table needs a trained run and is out of
+  scope. See ``docs/design/x2_tennis_target_height_plan.md``.
+
 - **Carry-pose velocity task.**
   ``Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-CarryVelocity`` (factory
   ``agibot_x2_flat_velocity_carry_env_cfg``) uses the tennis robot in

@@ -48,6 +48,14 @@ NO_CORRUPTION_TRAINING_TASKS = frozenset(
     "-Ball3-Pelvis-Nominal-S10-VisibleBall",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S11-TiltedStart",
+    # The target-height family: the s1-15hz condition with the target apex as a
+    # command. Its actor is the nominal pilot's, noise-free on purpose, and the new
+    # target input is a goal rather than a measurement, so it is not corrupted
+    # either. See docs/design/x2_tennis_target_height_plan.md.
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S1-TargetHeight",
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S1a-TargetHeight",
   }
 )
 """Training tasks whose actor input is deliberately noise-free.

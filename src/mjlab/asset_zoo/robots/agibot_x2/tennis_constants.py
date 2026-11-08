@@ -1520,6 +1520,35 @@ only 0.259 J/kg below this threshold. Re-measure that margin whenever
 ``JUGGLE_ENERGY_BALL_REST_Z`` changes: this threshold is coupled to the arm range.
 """
 
+# The two per-metre rates of the target-height family: the shipped value at the
+# 0.40 m reference target, expressed per metre of target. ``sigma = rate * h`` and
+# ``threshold = rate * h`` hold the RELATIVE tolerance constant across the range,
+# which is the property the fixed values do not have. At a constant 1.5 J/kg the
+# sigma is 153 mm of height at every target: 6 % of a 0.40 m apex but 48 % of a
+# 0.05 m one. At a constant 1.0 J/kg the lift threshold is 102 mm, so a 0.05 m
+# target would end every perfect episode as ``not lifted``. Both rates are computed
+# from the shipped pair rather than typed, so a change to either value at the
+# reference target moves them with it and the 0.40 m no-op cannot drift.
+JUGGLE_ENERGY_SIGMA_J_PER_M = (
+  JUGGLE_ENERGY_SIGMA_J_PER_KG / JUGGLE_ENERGY_TARGET_HEIGHT_M
+)
+"""Gaussian falloff per metre of target apex, in J/kg per m: 3.75.
+
+``sigma = JUGGLE_ENERGY_SIGMA_J_PER_M * h`` is 1.5 J/kg at the 0.40 m reference
+and 0.1875 J/kg at 0.05 m, i.e. a constant 38 % of the target energy.
+"""
+
+JUGGLE_LIFT_ENERGY_J_PER_M = (
+  JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG / JUGGLE_ENERGY_TARGET_HEIGHT_M
+)
+"""Lift threshold per metre of target apex, in J/kg per m: 2.5.
+
+``threshold = JUGGLE_LIFT_ENERGY_J_PER_M * h`` is 1.0 J/kg at the 0.40 m
+reference and 0.125 J/kg at 0.05 m: 25.5 % of the target energy at any target, so
+the 100-102 mm silent hole a fixed threshold would leave under a low target cannot
+exist.
+"""
+
 
 # Lowest foot contact point may be this far below z=0 before the pose counts as
 # penetrating the ground.
@@ -1661,8 +1690,10 @@ __all__ = [
   "JUGGLE_DROP_LATERAL_SPEED_RANGE_MPS",
   "JUGGLE_ENERGY_BALL_REST_Z",
   "JUGGLE_ENERGY_SIGMA_J_PER_KG",
+  "JUGGLE_ENERGY_SIGMA_J_PER_M",
   "JUGGLE_ENERGY_TARGET_HEIGHT_M",
   "JUGGLE_ENERGY_WEIGHT",
+  "JUGGLE_LIFT_ENERGY_J_PER_M",
   "JUGGLE_LIFT_ENERGY_THRESHOLD_J_PER_KG",
   "JUGGLE_NO_BOUNCE_TIMEOUT_S",
   "JUGGLE_NO_LIFT_TIMEOUT_S",

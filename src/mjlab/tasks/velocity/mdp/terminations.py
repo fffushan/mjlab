@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
+  JUGGLE_LIFT_ENERGY_J_PER_M,
+)
 from mjlab.entity import Entity
 from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -12,6 +15,7 @@ from mjlab.sensor import ContactSensor
 from mjlab.tasks.velocity.mdp.ball_cases import case_of, live_mask
 from mjlab.tasks.velocity.mdp.ball_contact import step_contact
 from mjlab.tasks.velocity.mdp.rewards import ball_vertical_energy
+from mjlab.tasks.velocity.mdp.target_height_command import commanded_target_height
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -196,6 +200,12 @@ class ball_not_lifted(ManagerTermBase):
     ball_rest_z: Ball centre's world z when it rests on the plate, in metres.
     threshold: Peak energy that counts as lifted, in J/kg.
     timeout_s: Control time after reset before the term may fire, in seconds.
+    command_name: Key of a target-height command term, or ``None``. When set, the
+      threshold becomes ``JUGGLE_LIFT_ENERGY_J_PER_M * h`` per environment and
+      ``threshold`` is ignored. A fixed 1.0 J/kg is 102 mm of height, so a 0.05 m
+      target would end every perfectly juggled episode as "not lifted"; expressed
+      as a fraction of the target the hole cannot exist at any target. At 0.40 m
+      the two forms are equal.
   """
 
   def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRlEnv):
@@ -211,12 +221,18 @@ class ball_not_lifted(ManagerTermBase):
     ball_rest_z: float,
     threshold: float,
     timeout_s: float,
+    command_name: str | None = None,
   ) -> torch.Tensor:
+    lift_threshold: float | torch.Tensor = (
+      threshold
+      if command_name is None
+      else JUGGLE_LIFT_ENERGY_J_PER_M * commanded_target_height(env, command_name)
+    )
     energy = ball_vertical_energy(env, ball_cfg, ball_rest_z)
     self._peak_energy = torch.maximum(self._peak_energy, energy)
     elapsed = self._steps.float() * self._step_dt
     self._steps += 1
-    return (elapsed >= timeout_s) & (self._peak_energy < threshold)
+    return (elapsed >= timeout_s) & (self._peak_energy < lift_threshold)
 
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     if env_ids is None:

@@ -13,6 +13,9 @@ from .tennis_ball_env_cfg import agibot_x2_tennis_ball_env_cfg
 from .tennis_juggle_env_cfg import agibot_x2_tennis_juggle_env_cfg
 from .tennis_juggle_nominal_env_cfg import agibot_x2_tennis_juggle_nominal_env_cfg
 from .tennis_juggle_stage_env_cfg import agibot_x2_tennis_juggle_stage_env_cfg
+from .tennis_juggle_target_height_env_cfg import (
+  agibot_x2_tennis_juggle_target_height_env_cfg,
+)
 from .tennis_recovery_env_cfg import agibot_x2_tennis_recovery_env_cfg
 from .tennis_recovery_rl_cfg import agibot_x2_tennis_recovery_ppo_runner_cfg
 
@@ -478,6 +481,47 @@ register_mjlab_task(
   ),
   rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
     experiment_name="agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal"
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+# The target-height family: a second family, not a rung of the ladder above. The
+# target apex is an actor and critic input here, so the observation widens to 113 /
+# 122 and no ladder checkpoint resumes strictly. S1 is the shipped `s1-15hz`
+# condition with the target fixed at 0.40 m, which reproduces that stage's reward,
+# threshold and spawn exactly; S1a draws the target uniformly from 0.05 to 0.40 m and
+# resumes S1, so it keeps S1's experiment name and the run is continued with
+# --agent.load-run pointing at an S1 run directory inside the same log root.
+# 29-DOF only, as the deployed ladder head. See
+# docs/design/x2_tennis_target_height_plan.md.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S1-TargetHeight"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s1"),
+  play_env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s1", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name=(
+      "agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal_s1_target_height"
+    )
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)
+
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S1a-TargetHeight"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s1a"),
+  play_env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s1a", play=True),
+  # S1's experiment name on purpose: S1a resumes an S1 checkpoint with its optimizer
+  # state, so both live in one log root and no checkpoint copy is needed.
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name=(
+      "agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal_s1_target_height"
+    )
   ),
   runner_cls=VelocityOnPolicyRunner,
 )
