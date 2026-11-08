@@ -113,10 +113,12 @@ def test_merge_rejects_a_namespace_with_a_slash() -> None:
 
 
 def test_require_mergeable_accepts_a_shard_without_branch_rows() -> None:
-  ticks, rows_per_tick = _require_mergeable(
-    [reply(ticks=2, rows_per_tick=3), reply(ticks=2, rows_per_tick=3, branch_rows=1)]
+  assert (
+    _require_mergeable(
+      [reply(ticks=2, rows_per_tick=3), reply(ticks=2, rows_per_tick=3, branch_rows=1)]
+    )
+    == 2
   )
-  assert (ticks, rows_per_tick) == (2, 3)
 
 
 def test_require_mergeable_rejects_branch_rows_that_do_not_match_their_metadata() -> (

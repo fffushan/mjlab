@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -33,6 +33,7 @@ from mjlab.tasks.tracking.distillation.motion_library import (
   BodySelection,
   MotionClipSpec,
   MotionLibrary,
+  MotionLibraryError,
 )
 from mjlab.tasks.tracking.distillation.reset_policy import (
   ResetPolicy,
@@ -49,7 +50,7 @@ from mjlab.utils.lab_api.math import (
 if TYPE_CHECKING:
   from mjlab.entity import Entity
   from mjlab.envs import ManagerBasedRlEnv
-  from mjlab.tasks.tracking.distillation.config import CohortContract
+  from mjlab.tasks.tracking.distillation.config import CohortContract, ResolvedTeacher
 
 PhasePolicy = Literal["uniform", "start"]
 
@@ -222,32 +223,52 @@ def stratified_slot_allocation(
   )
 
 
-def plan_multi_motion(
+def multi_motion_slots(
   cohort: CohortContract,
   teacher_ids: Sequence[str],
   num_envs: int,
   *,
   phase_policy: PhasePolicy = "uniform",
   slot_generator: torch.Generator | None = None,
-  device: str | torch.device = "cpu",
-) -> MultiMotionPlan:
-  """Select clips, pin rows, and validate the phase policy before any build.
+) -> MotionSlotAllocation:
+  """Select clips and pin rows to them, without loading a reference clip.
 
-  Selected teachers are ordered by the manifest, not by the request, so numeric
-  motion ids stay stable when a caller reorders its arguments; the ordered
-  mapping digest changes only when the cohort's own order changes.
+  Split from :func:`plan_multi_motion` for the one caller that needs the
+  run-level allocation but must not load the cohort's reference arrays: a
+  clip-sharded parent records the allocation its workers' rows were drawn from,
+  and materialising every clip to learn it would defeat the sharding.
 
   Raises:
     MultiMotionError: if the selection is empty, duplicated, unknown, or the
       phase policy is not implemented for mixed slots.
-    MotionLibraryError: if a selected reference motion cannot be loaded or
-      disagrees with the extent or rate its teacher declares.
   """
+  _require_phase_policy(phase_policy)
+  selected = selected_cohort_teachers(cohort, teacher_ids)
+  return stratified_slot_allocation(
+    [teacher.entry.sampling_weight for teacher in selected],
+    num_envs,
+    teacher_ids=[teacher.id for teacher in selected],
+    generator=slot_generator,
+  )
+
+
+def _require_phase_policy(phase_policy: PhasePolicy) -> None:
   if phase_policy not in _PHASE_POLICIES:
     raise MultiMotionError(
       f"multi-motion phase sampling supports {list(_PHASE_POLICIES)}, got "
       f"{phase_policy!r}"
     )
+
+
+def selected_cohort_teachers(
+  cohort: CohortContract, teacher_ids: Sequence[str]
+) -> tuple[ResolvedTeacher, ...]:
+  """Selected teachers in manifest order, rejecting unknown or repeated ids.
+
+  Manifest order, not request order, is what numeric motion ids follow: a
+  caller that reorders its arguments must not reinterpret an id a checkpoint
+  already recorded.
+  """
   requested = tuple(teacher_ids)
   if not requested:
     raise MultiMotionError("multi-motion needs at least one teacher id")
@@ -258,7 +279,40 @@ def plan_multi_motion(
   if unknown:
     raise MultiMotionError(f"cohort has no teacher(s) {unknown}")
   wanted = set(requested)
-  selected = tuple(teacher for teacher in cohort.teachers if teacher.id in wanted)
+  return tuple(teacher for teacher in cohort.teachers if teacher.id in wanted)
+
+
+def plan_multi_motion(
+  cohort: CohortContract,
+  teacher_ids: Sequence[str],
+  num_envs: int,
+  *,
+  phase_policy: PhasePolicy = "uniform",
+  slot_generator: torch.Generator | None = None,
+  device: str | torch.device = "cpu",
+  motion_ids: Mapping[str, int] | None = None,
+) -> MultiMotionPlan:
+  """Select clips, pin rows, and validate the phase policy before any build.
+
+  Selected teachers are ordered by the manifest, not by the request, so numeric
+  motion ids stay stable when a caller reorders its arguments; the ordered
+  mapping digest changes only when the cohort's own order changes.
+
+  ``motion_ids`` gives the clip id of each selected teacher.  Unset (the
+  default) keeps those ids positional, which is one library holding the whole
+  selection in manifest order.  A worker that owns one slice of a larger cohort
+  passes the cohort-wide ids instead, so its rows are labelled with the ids the
+  parent's replay partitions by rather than with its own local numbering.
+
+  Raises:
+    MultiMotionError: if the selection is empty, duplicated, unknown, or the
+      phase policy is not implemented for mixed slots.
+    MotionLibraryError: if a selected reference motion cannot be loaded or
+      disagrees with the extent or rate its teacher declares.
+  """
+  _require_phase_policy(phase_policy)
+  selected = selected_cohort_teachers(cohort, teacher_ids)
+  clip_ids = _clip_motion_ids(selected, motion_ids)
   codes = {teacher.id: index for index, teacher in enumerate(cohort.teachers)}
   library = MotionLibrary.from_clips(
     [
@@ -268,6 +322,7 @@ def plan_multi_motion(
         teacher_code=codes[teacher.id],
         expected_frames=teacher.reference.frames,
         expected_fps=teacher.reference.fps,
+        motion_id=clip_ids[teacher.id],
       )
       for teacher in selected
     ],
@@ -285,6 +340,42 @@ def plan_multi_motion(
     slots=slots,
     phase_policy=phase_policy,
   )
+
+
+def _clip_motion_ids(
+  selected: Sequence[ResolvedTeacher], motion_ids: Mapping[str, int] | None
+) -> dict[str, int]:
+  """Clip id per selected teacher, validated against the selection.
+
+  A mapping that names a teacher the plan did not select, or omits one it did,
+  means the caller's plan and its selection disagree; refusing here keeps a
+  mislabelled row from reaching the replay under another clip's partition.
+  """
+  if motion_ids is None:
+    return {teacher.id: position for position, teacher in enumerate(selected)}
+  ids: dict[str, int] = {}
+  for teacher in selected:
+    if teacher.id not in motion_ids:
+      raise MultiMotionError(
+        f"clip id mapping has no entry for selected teacher {teacher.id!r}; it "
+        f"covers {sorted(motion_ids)}"
+      )
+    motion_id = motion_ids[teacher.id]
+    if isinstance(motion_id, bool) or not isinstance(motion_id, int):
+      raise MultiMotionError(
+        f"clip id for {teacher.id!r} must be an integer, got {motion_id!r}"
+      )
+    if motion_id < 0:
+      raise MultiMotionError(
+        f"clip id for {teacher.id!r} must be non-negative, got {motion_id}"
+      )
+    ids[teacher.id] = motion_id
+  unknown = [key for key in motion_ids if key not in ids]
+  if unknown:
+    raise MultiMotionError(
+      f"clip id mapping names teachers this plan did not select: {unknown}"
+    )
+  return ids
 
 
 def make_multi_motion_cfg(
@@ -375,8 +466,16 @@ class MultiMotionCommand(SegmentMotionCommand):
       )
     )
     self.slot_allocation = cfg.slots
+    # The allocation numbers its motions by position, because it describes this
+    # build's own selection.  A row's *clip id* is the library's, which can be
+    # cohort-wide when this environment owns one slice of a larger cohort, so
+    # translating here is what lets every collected row carry the id the
+    # parent's replay partitions by.
+    self._clip_ids = tuple(clip.motion_id for clip in self.library.clips)
     self.motion_ids = torch.tensor(
-      list(cfg.slots.row_motion_ids), dtype=torch.long, device=self.device
+      [self._clip_ids[position] for position in cfg.slots.row_motion_ids],
+      dtype=torch.long,
+      device=self.device,
     )
     if self.motion_ids.numel() != self.num_envs:
       raise MultiMotionError(
@@ -474,9 +573,13 @@ class MultiMotionCommand(SegmentMotionCommand):
     ids = self._row_ids(env_ids, "env_ids")
     if ids.numel() == 0:
       raise MultiMotionError("select_motion_ids needs at least one row")
-    new_ids = self._row_ids(
-      motion_ids, "motion_ids", limit=self.library.num_motions, unique=False
-    )
+    new_ids = self._row_ids(motion_ids, "motion_ids", unique=False)
+    # Validate against the library's own id set: a row pointed at a clip this
+    # environment does not hold would resolve to a neighbour's reference.
+    try:
+      self.library.slots_for(new_ids)
+    except MotionLibraryError as exc:
+      raise MultiMotionError(str(exc)) from exc
     if new_ids.numel() != ids.numel():
       raise MultiMotionError(f"got {ids.numel()} rows but {new_ids.numel()} motion ids")
     self.motion_ids[ids] = new_ids
@@ -804,10 +907,11 @@ class MultiMotionCommand(SegmentMotionCommand):
 
   def _refresh_row_bindings(self) -> None:
     """Recompute every per-row value derived from the pinned motion ids."""
+    slots = self.library.slots_for(self.motion_ids)
     self._row_lengths = self.library.frame_counts_for(self.motion_ids)
     self._teacher_codes = self.library.teacher_codes_for(self.motion_ids)
-    self._row_lookahead_steps = self._motion_lookahead_steps[self.motion_ids]
-    self._row_bin_counts = self._motion_bin_counts[self.motion_ids]
+    self._row_lookahead_steps = self._motion_lookahead_steps[slots]
+    self._row_bin_counts = self._motion_bin_counts[slots]
 
   def _row_ids(
     self,
@@ -847,6 +951,8 @@ __all__ = [
   "MotionSlotAllocation",
   "PhasePolicy",
   "make_multi_motion_cfg",
+  "multi_motion_slots",
   "plan_multi_motion",
+  "selected_cohort_teachers",
   "stratified_slot_allocation",
 ]

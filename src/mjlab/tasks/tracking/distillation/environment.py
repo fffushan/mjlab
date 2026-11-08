@@ -491,6 +491,7 @@ def build_multi_motion_environment(
   reset_policy: ResetPolicy | None = None,
   coverage_policy: CoveragePolicy | None = None,
   coverage_parity_evidence: str | None = None,
+  motion_ids: Mapping[str, int] | None = None,
 ) -> ManagerBasedRlEnv:
   """Build one environment whose rows are pinned to different reference clips.
 
@@ -504,7 +505,9 @@ def build_multi_motion_environment(
   ``phase_policy`` is the private phase-sampling override recorded alongside
   the delay-timing overrides (``start`` for pinned evaluation, ``uniform`` for
   training).  ``seed`` seeds the environment and the row permutation of the
-  stratified slot allocation.
+  stratified slot allocation.  ``motion_ids`` gives each selected clip its
+  cohort-wide id; unset keeps them positional, which is a build that owns the
+  whole selection.
   """
   # Imported here because the multi-motion module builds on this module's
   # SegmentMotionCommand; module-level import would be circular.
@@ -561,6 +564,7 @@ def build_multi_motion_environment(
     phase_policy=cast(PhasePolicy, phase_policy),
     slot_generator=slot_generator,
     device=device,
+    motion_ids=motion_ids,
   )
   first_teacher = cohort.teacher(plan.teacher_ids[0])
   semantic_overrides = list(

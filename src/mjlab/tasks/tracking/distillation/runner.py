@@ -8,6 +8,10 @@ adapter reset; simulator bitwise continuation is never claimed.
 
 from __future__ import annotations
 
+import os
+import sys
+import time
+
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -244,6 +248,15 @@ class DistillationRunner:
     reset_required = (
       self._resume_reset_pending or self._reset_required or self.iteration == 0
     )
+    phase_start = time.perf_counter()
+    marks: list[str] = []
+
+    def mark(name: str) -> None:
+      nonlocal phase_start
+      now = time.perf_counter()
+      marks.append(f"{name}={now - phase_start:.2f}s")
+      phase_start = now
+
     if bootstrap:
       collection = self._collect(self.config.bootstrap_steps, 1.0, reset=True)
     else:
@@ -253,6 +266,7 @@ class DistillationRunner:
         reset=reset_required,
       )
     collection = self._rebase_collection(collection)
+    mark("collect")
     self._resume_reset_pending = False
     self._reset_required = False
     updates: list[TrainingUpdate] = []
@@ -268,10 +282,12 @@ class DistillationRunner:
       fresh = FreshTrainingData(combined, collector_iteration)
     if fresh is not None:
       self.trainer.begin_training(fresh)
+    mark("normalizers")
     if len(self.replay) > 0:
       for _ in range(self.config.updates_per_iteration):
         updates.append(self.trainer.train_update())
     self.trainer.freeze_normalizers()
+    mark("updates")
     evaluation = None
     if (
       self.config.evaluate_every
@@ -313,6 +329,15 @@ class DistillationRunner:
           # with a reset.
           self.collector.invalidate_snapshot()
           self._reset_required = True
+    mark("evaluation")
+    if os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1":
+      print(
+        f"[phase] runner iter={self.iteration} "
+        + " ".join(marks)
+        + f" total={sum(float(item.split('=')[1][:-1]) for item in marks):.2f}s",
+        file=sys.stderr,
+        flush=True,
+      )
     result = LifecycleIteration(
       self.iteration,
       collection,

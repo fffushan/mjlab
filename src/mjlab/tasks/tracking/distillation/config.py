@@ -107,6 +107,7 @@ class TeacherEntry:
   env_config: Path
   agent_config: Path
   onnx: Path
+  """Effective teacher export: this entry's own file, or the cohort's shared one."""
   sampling_weight: float
 
   def paths(self) -> dict[str, Path]:
@@ -132,6 +133,8 @@ class Manifest:
   robot: str
   base_task: str | None
   teachers: tuple[TeacherEntry, ...]
+  teacher_onnx: Path | None = None
+  """Cohort-wide teacher export used when a member names no ``onnx`` of its own."""
 
   def teacher(self, teacher_id: str) -> TeacherEntry:
     for entry in self.teachers:
@@ -169,7 +172,9 @@ def load_manifest(
     raise DistillationError(f"Manifest {path} must be a mapping")
 
   _reject_unknown_keys(
-    raw, ("version", "name", "robot", "base_task", "teachers"), "manifest"
+    raw,
+    ("version", "name", "robot", "base_task", "teachers", "teacher_onnx"),
+    "manifest",
   )
   version = _require_int(raw.get("version"), "manifest.version")
   if version != MANIFEST_VERSION:
@@ -181,6 +186,16 @@ def load_manifest(
   base_task = raw.get("base_task")
   if base_task is not None:
     base_task = _require_str(base_task, "manifest.base_task")
+
+  # One teacher export can serve the whole cohort: the weights and metadata are
+  # identical for every clip and only the embedded reference tables differed, and
+  # those now come from each member's motion file.  A per-entry ``onnx`` still
+  # wins when it is given, so every existing manifest keeps its own artifacts.
+  teacher_onnx: Path | None = None
+  if raw.get("teacher_onnx") is not None:
+    teacher_onnx = _resolve_path(raw.get("teacher_onnx"), root, "manifest.teacher_onnx")
+    if not teacher_onnx.is_file():
+      raise DistillationError(f"manifest.teacher_onnx -> {teacher_onnx} does not exist")
 
   raw_teachers = raw.get("teachers")
   if not isinstance(raw_teachers, list) or not raw_teachers:
@@ -218,16 +233,29 @@ def load_manifest(
         f"{where}.sampling_weight must be finite and positive, got {weight!r}"
       )
     resolved: dict[str, Path] = {}
-    for field in ("checkpoint", "motion", "env_config", "agent_config", "onnx"):
+    for field in ("checkpoint", "motion", "env_config", "agent_config"):
       resolved[field] = _resolve_path(raw_teacher.get(field), root, f"{where}.{field}")
       if not resolved[field].is_file():
         missing.append(f"{where}.{field} -> {resolved[field]}")
+    own_onnx = raw_teacher.get("onnx")
+    if own_onnx is None:
+      if teacher_onnx is None:
+        raise DistillationError(
+          f"{where} names no 'onnx' and the manifest declares no 'teacher_onnx'; "
+          "one of them is required"
+        )
+      resolved["onnx"] = teacher_onnx
+    else:
+      resolved["onnx"] = _resolve_path(own_onnx, root, f"{where}.onnx")
+      if not resolved["onnx"].is_file():
+        missing.append(f"{where}.onnx -> {resolved['onnx']}")
     entries.append(TeacherEntry(id=teacher_id, sampling_weight=weight, **resolved))
 
   if missing:
     raise DistillationError("Missing teacher artifacts:\n  " + "\n  ".join(missing))
 
   return Manifest(
+    teacher_onnx=teacher_onnx,
     path=path,
     sha256=sha256_file(path),
     repo_root=root,
@@ -576,6 +604,8 @@ class _ResolveCache:
     self._digests: dict[Path, str] = {}
     self._yaml: dict[Path, Mapping[str, Any]] = {}
     self._actors: dict[Path, dict[str, torch.Tensor]] = {}
+    self._onnx: dict[Path, OnnxArtifact] = {}
+    self._manifest_clips: dict[Path, frozenset[str]] = {}
 
   def digest(self, path: Path) -> str:
     key = Path(path)
@@ -591,6 +621,33 @@ class _ResolveCache:
     if value is None:
       value = load_saved_yaml(key)
       self._yaml[key] = value
+    return value
+
+  def onnx(self, path: Path, where: str) -> OnnxArtifact:
+    """Parse one teacher export once, however many members name it.
+
+    The artifact is read-only for every consumer, so a cohort that shares one
+    export must not pay a parse and an initializer conversion per member: at
+    3 261 members that cost 913 s and 52.9 GB of resident arrays.
+    """
+    key = Path(path)
+    value = self._onnx.get(key)
+    if value is None:
+      value = load_onnx_artifact(key, where)
+      self._onnx[key] = value
+    return value
+
+  def manifest_clip_names(self, path: str, label: str) -> frozenset[str]:
+    """Names a saved reference manifest declares, parsed once per resolution.
+
+    Every member of a multi-clip cohort names the same manifest.  Parsing it per
+    member cost 0.45 s of YAML each, which dominated resolution at 3 261 members.
+    """
+    key = Path(path)
+    value = self._manifest_clips.get(key)
+    if value is None:
+      value = _read_saved_manifest_clip_names(path, label)
+      self._manifest_clips[key] = value
     return value
 
   def actor_state(self, path: Path) -> dict[str, torch.Tensor]:
@@ -613,7 +670,7 @@ def _resolve_teacher(entry: TeacherEntry, cache: _ResolveCache) -> ResolvedTeach
   actor_state_dict = cache.actor_state(entry.checkpoint)
   actor = _resolve_actor(entry, agent_config, actor_state_dict)
   control = _resolve_control(entry, env_config)
-  onnx = load_onnx_artifact(entry.onnx, f"{entry.id} ONNX export")
+  onnx = cache.onnx(entry.onnx, f"{entry.id} ONNX export")
   unverified: list[str] = []
 
   motion_cfg = _saved_motion_cfg(entry, env_config)
@@ -628,7 +685,7 @@ def _resolve_teacher(entry: TeacherEntry, cache: _ResolveCache) -> ResolvedTeach
   )
   actions = _resolve_actions(entry, env_config, onnx, actor.action_dim)
   _require_onnx_interface(entry, onnx, actor.obs_dim, actor.action_dim)
-  reference = _resolve_reference(entry, env_config, actor.action_dim)
+  reference = _resolve_reference(entry, env_config, actor.action_dim, cache)
   _require_reference_cadence(entry, reference, control)
 
   anchor_body_name = _require_str(
@@ -1181,7 +1238,10 @@ def _resolve_actions(
 
 
 def _resolve_reference(
-  entry: TeacherEntry, env_config: Mapping[str, Any], joint_dim: int
+  entry: TeacherEntry,
+  env_config: Mapping[str, Any],
+  joint_dim: int,
+  cache: _ResolveCache,
 ) -> ReferenceSpec:
   with np.load(entry.motion, allow_pickle=False) as data:
     arrays = {name: data[name] for name in data.files}
@@ -1217,7 +1277,7 @@ def _resolve_reference(
     )
   fps = float(fps_values[0])
 
-  declared = _saved_reference_clip(entry, env_config)
+  declared = _saved_reference_clip(entry, env_config, cache)
   return ReferenceSpec(
     motion_path=entry.motion,
     declared_motion_file=declared,
@@ -1256,7 +1316,9 @@ def _saved_motion_cfg(
   return _require_mapping(commands.get("motion"), f"{entry.id} env.commands.motion")
 
 
-def _saved_reference_clip(entry: TeacherEntry, env_config: Mapping[str, Any]) -> str:
+def _saved_reference_clip(
+  entry: TeacherEntry, env_config: Mapping[str, Any], cache: _ResolveCache
+) -> str:
   """Return the clip the saved env config references, or "" for a manifest reference.
 
   A single-clip teacher names exactly one motion file, and that name must be the clip the
@@ -1291,7 +1353,7 @@ def _saved_reference_clip(entry: TeacherEntry, env_config: Mapping[str, Any]) ->
       "so its reference cannot be checked against the manifest clip"
     )
   path = _require_str(manifest, f"{entry.id} env.commands.motion.motion_manifest")
-  if entry.motion.name not in _saved_manifest_clip_names(entry, path):
+  if entry.motion.name not in cache.manifest_clip_names(path, entry.id):
     raise DistillationError(
       f"{entry.id} saved reference manifest {path!r} does not list "
       f"{entry.motion.name!r}; a manifest-based teacher may only be paired with a clip "
@@ -1300,7 +1362,7 @@ def _saved_reference_clip(entry: TeacherEntry, env_config: Mapping[str, Any]) ->
   return ""
 
 
-def _saved_manifest_clip_names(entry: TeacherEntry, manifest: str) -> frozenset[str]:
+def _read_saved_manifest_clip_names(manifest: str, label: str) -> frozenset[str]:
   """Names of the clips a saved reference manifest declares.
 
   The import is local because the multi-motion PPO command module imports this package,
@@ -1316,7 +1378,7 @@ def _saved_manifest_clip_names(entry: TeacherEntry, manifest: str) -> frozenset[
     clips = resolve_manifest_clips(manifest)
   except MultiMotionPpoError as exc:
     raise DistillationError(
-      f"{entry.id} saved reference manifest {manifest!r} cannot be read: {exc}"
+      f"{label} saved reference manifest {manifest!r} cannot be read: {exc}"
     ) from exc
   return frozenset(clip.name for clip in clips)
 

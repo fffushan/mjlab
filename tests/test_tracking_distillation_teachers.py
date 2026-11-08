@@ -21,6 +21,7 @@ from mjlab.tasks.tracking.distillation.teachers import (
   build_actor_model,
   build_frozen_teacher,
   load_frozen_teacher,
+  _equivalent_actor_groups,
 )
 
 OBS_DIM = 24
@@ -294,3 +295,77 @@ def test_load_frozen_teacher_reads_a_checkpoint(tmp_path: Path) -> None:
     teacher.label(observations), expected.mlp(expected.obs_normalizer(observations))
   )
   assert set(load_actor_state_dict(checkpoint)) == set(model.state_dict())
+
+
+def test_identical_actor_states_label_once_per_tick(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A shared export must not run the same actor once per member.
+
+  A clip-sharded cohort names one exported teacher for thousands of members, so
+  labeling per code ran the identical actor once per clip per tick (measured:
+  8.5 s of a 22.5 s worker iteration at 466 members x 32 ticks).  Members keep
+  their own module and id; only the labeling call is shared.
+  """
+  arch = make_architecture()
+  shared_state = make_actor(OBS_DIM, ACTION_DIM, seed=7).state_dict()
+  entries = [
+    _Entry(
+      f"member_{index}",
+      {name: value.clone() for name, value in shared_state.items()},
+      arch,
+    )
+    for index in range(3)
+  ]
+
+  groups = _equivalent_actor_groups(entries)
+
+  assert groups == [0, 0, 0]
+  bank = TeacherBank(
+    [build_frozen_teacher(entry.id, entry.actor_state_dict, arch) for entry in entries],
+    device="cpu",
+    codes=[0, 1, 2],
+    teacher_ids=["member_0", "member_1", "member_2"],
+    groups=groups,
+  )
+  calls: list[int] = []
+  for code in range(3):
+    original = bank.teacher(code).label
+
+    def counting(observations, original=original, code=code):
+      calls.append(code)
+      return original(observations)
+
+    monkeypatch.setattr(bank.teacher(code), "label", counting)
+  observations = sample_observations(6, seed=3)
+  sequence = [0, 1, 2, 1, 0, 2]
+
+  actions = bank.label(torch.tensor(sequence), observations)
+
+  assert len(calls) == 1
+  for row, code in enumerate(sequence):
+    expected = bank.teacher(code).label(observations[row : row + 1])
+    torch.testing.assert_close(actions[row : row + 1], expected)
+
+
+def test_distinct_actor_states_keep_separate_groups() -> None:
+  arch = make_architecture()
+  entries = [
+    _Entry(
+      f"member_{index}",
+      make_actor(OBS_DIM, ACTION_DIM, seed=index).state_dict(),
+      arch,
+    )
+    for index in range(3)
+  ]
+
+  assert _equivalent_actor_groups(entries) == [0, 1, 2]
+
+
+class _Entry:
+  """The part of a resolved cohort teacher the bank builder reads."""
+
+  def __init__(self, teacher_id: str, state: dict[str, torch.Tensor], arch) -> None:
+    self.id = teacher_id
+    self.actor_state_dict = state
+    self.actor = arch

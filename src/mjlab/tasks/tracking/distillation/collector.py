@@ -14,6 +14,10 @@ no optimizer, normalizer update, checkpoint, or CLI lifecycle.
 
 from __future__ import annotations
 
+import os
+import sys
+import time
+
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
@@ -654,9 +658,17 @@ class _MotionRecord:
     initialization_kind: torch.Tensor | None = None,
     segment_age: torch.Tensor | None = None,
     early_window_frames: int = 25,
+    owned: bool = False,
   ) -> None:
     # Keep owned PRE-step metadata until report construction. No per-frame,
     # per-kind CUDA scalar conversion belongs in the collection tick loop.
+    # ``owned`` marks tensors the caller already built for this tick (a slice of
+    # the sorted batch), so they are kept instead of copied again.
+    if owned:
+      self._pending_frames.append(
+        (frames, initialization_kind, segment_age, early_window_frames)
+      )
+      return
     self._pending_frames.append(
       (
         frames.detach().clone(),
@@ -755,44 +767,100 @@ def _observe_motion_tick(
   A motion that is labeled by two different teacher codes within one collection
   call is rejected: it means the motion-to-teacher mapping changed under the
   collector and the stored labels would no longer share one teacher.
+
+  One stable sort turns the batch into one contiguous segment per motion, so the
+  tick costs a fixed number of kernels and one segment table read per phase
+  instead of one mask, one gather set and two host reads per motion.
   """
-  motion_id = snapshot.motion_id.detach().clone().to(dtype=torch.int64)
-  reference_frame = snapshot.reference_frame.detach().clone().to(dtype=torch.int64)
-  for motion in torch.unique(motion_id).tolist():
-    rows = motion_id == motion
-    code = int(teacher_codes[rows][0].item())
+  motion_id = snapshot.motion_id.detach().to(dtype=torch.int64)
+  reference_frame = snapshot.reference_frame.detach().to(dtype=torch.int64)
+  batch = motion_id.numel()
+  if batch == 0:
+    return
+  device = motion_id.device
+  codes = teacher_codes.detach().to(dtype=torch.int64)
+  order = torch.argsort(motion_id, stable=True)
+  sorted_motion = motion_id[order]
+  boundary = torch.ones(batch, dtype=torch.bool, device=device)
+  boundary[1:] = sorted_motion[1:] != sorted_motion[:-1]
+  # ``counts`` is the segment length vector; ``segment_of_row`` names the
+  # segment of every sorted row, so per-segment reductions need no masks.
+  counts = torch.bincount(torch.cumsum(boundary.to(torch.int64), 0) - 1, minlength=1)
+  segments = counts.numel()
+  segment_of_row = torch.repeat_interleave(
+    torch.arange(segments, device=device), counts
+  )
+  segment_starts = torch.cumsum(counts, 0) - counts
+  sorted_codes = codes[order]
+  lowest_code = torch.full(
+    (segments,),
+    torch.iinfo(torch.int64).max,
+    dtype=torch.int64,
+    device=device,
+  )
+  lowest_code.scatter_reduce_(0, segment_of_row, sorted_codes, reduce="amin")
+  highest_code = torch.full((segments,), -1, dtype=torch.int64, device=device)
+  highest_code.scatter_reduce_(0, segment_of_row, sorted_codes, reduce="amax")
+  # One read carries the motion of every segment, the codes that labeled it and
+  # its row count.
+  motion_table = (
+    torch.stack(
+      (sorted_motion[segment_starts], lowest_code, highest_code, counts), dim=1
+    )
+    .cpu()
+    .tolist()
+  )
+  teacher_rows_sorted = teacher_rows.detach().to(torch.float64)[order]
+  disagreement_sorted = disagreement.detach()[order]
+  teacher_steps = torch.zeros(segments, dtype=torch.float64, device=device)
+  teacher_steps.index_add_(0, segment_of_row, teacher_rows_sorted)
+  # One float32 row sum per segment, grouped by segment length: every group is a
+  # block matrix whose rows are the segments of that length, so the reduction
+  # sees the values of one motion in row order, as the per-motion mask did.
+  length_of_row = torch.repeat_interleave(counts, counts)
+  disagreement_sum = torch.zeros(segments, dtype=torch.float64, device=device)
+  for length in sorted({count for *_, count in motion_table}):
+    selected = length_of_row == length
+    blocks = disagreement_sorted[selected].view(-1, length).sum(dim=1)
+    disagreement_sum[segment_of_row[selected][::length]] = blocks.to(torch.float64)
+  # Second read: one float64 pair per segment, kept as record views so a report
+  # merges them in tick order without another device read.
+  tick_values = torch.stack((teacher_steps, disagreement_sum), dim=1).cpu()
+  frames_sorted = reference_frame[order]
+  kinds = snapshot.initialization_kind
+  ages = snapshot.segment_age
+  kinds_sorted = None if kinds is None else kinds.detach()[order]
+  ages_sorted = None if ages is None else ages.detach()[order]
+  start = 0
+  for index, (motion, lowest, highest, count) in enumerate(motion_table):
+    if lowest != highest:
+      raise TeacherRoutingError(
+        f"motion {motion} was labeled by teacher codes {lowest} and {highest} in "
+        "one collection call; the motion-to-teacher mapping changed"
+      )
     record = records.get(motion)
     if record is None:
       record = _MotionRecord(
-        teacher_id=_motion_teacher_label(bank, snapshot, code), teacher_code=code
+        teacher_id=_motion_teacher_label(bank, snapshot, lowest), teacher_code=lowest
       )
       records[motion] = record
-    elif record.teacher_code != code:
+    elif record.teacher_code != lowest:
       raise TeacherRoutingError(
         f"motion {motion} was labeled by teacher codes {record.teacher_code} and "
-        f"{code} in one collection call; the motion-to-teacher mapping changed"
+        f"{lowest} in one collection call; the motion-to-teacher mapping changed"
       )
-    count = reference_frame[rows].numel()
+    stop = start + count
     record.samples += count
     record.disagreement_rows += count
-    record._pending_statistics.append(
-      torch.stack(
-        (
-          teacher_rows[rows].sum().to(torch.float64),
-          disagreement[rows].sum().detach().to(torch.float64),
-        )
-      )
-    )
+    record._pending_statistics.append(tick_values[index])
     record.observe_tick(
-      reference_frame[rows],
-      initialization_kind=(
-        None
-        if snapshot.initialization_kind is None
-        else snapshot.initialization_kind[rows]
-      ),
-      segment_age=None if snapshot.segment_age is None else snapshot.segment_age[rows],
+      frames_sorted[start:stop],
+      initialization_kind=None if kinds_sorted is None else kinds_sorted[start:stop],
+      segment_age=None if ages_sorted is None else ages_sorted[start:stop],
       early_window_frames=early_window_frames,
+      owned=True,
     )
+    start = stop
 
 
 def _observe_boundary(
@@ -1260,10 +1328,14 @@ class DAggerCollector:
       return CollectionResult(
         0, 0, 0, 0, tuple(boundaries), 0.0, tuple(diagnostics), None, ()
       )
+    _timing = os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1"
+    _acc = {"teacher": 0.0, "batch": 0.0, "student": 0.0, "observe": 0.0, "step": 0.0}
     for _ in range(config.steps):
+      _t_teacher = time.perf_counter()
       try:
         teacher_codes = _route_teacher_codes(snapshot, self.teacher)
         teacher_action = _teacher_action(self.teacher, snapshot, teacher_codes)
+        _acc["teacher"] += time.perf_counter() - _t_teacher
         _finite("packed reference", snapshot.packed.reference)
         _finite("packed conditioning", snapshot.packed.conditioning)
         # A valid pre-failure label is retained even if student inference below
@@ -1274,6 +1346,7 @@ class DAggerCollector:
           config.collector_iteration,
           teacher_codes=teacher_codes,
         )
+        _acc["batch"] += time.perf_counter() - _t_teacher
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
@@ -1284,6 +1357,7 @@ class DAggerCollector:
         self.replay.insert(fresh_batch)
       fresh_batches.append(fresh_batch)
       samples += snapshot.packed.batch_size
+      _t = time.perf_counter()
       try:
         student_action = _student_action(
           self.student, snapshot, config.rollout_latent, self._generator
@@ -1297,9 +1371,11 @@ class DAggerCollector:
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
+      _acc["student"] += time.perf_counter() - _t
       row_disagreement = (teacher_action - student_action).abs().mean(dim=-1)
       disagreements.append(row_disagreement.mean().detach())
       teacher_row_counts.append(use_teacher.sum())
+      _t = time.perf_counter()
       try:
         # Attributing before the step keeps every counter on the PRE-step state,
         # so a row that the step resampled into another clip is still counted
@@ -1316,11 +1392,14 @@ class DAggerCollector:
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
+      _acc["observe"] += time.perf_counter() - _t
+      _t = time.perf_counter()
       try:
         step = self.adapter.step(selected)
       except Exception as exc:
         self._invalidate_on_failure(exc)
         raise
+      _acc["step"] += time.perf_counter() - _t
       try:
         next_snapshot = step.snapshot
         terminated = _as_bool_vector(
@@ -1386,6 +1465,14 @@ class DAggerCollector:
       self._requires_reset = False
       ticks += 1
     self._snapshot = snapshot
+    if _timing:
+      print(
+        "[phase] step-loop "
+        + " ".join(f"{name}={value:.2f}s" for name, value in _acc.items())
+        + f" steps={config.steps} rows={samples}",
+        file=sys.stderr,
+        flush=True,
+      )
     fresh_batch = _concat_batches(fresh_batches)
     coverage_batch = _concat_batches(coverage_batches)
     fresh_data = (

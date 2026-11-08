@@ -108,17 +108,19 @@ def make_buffer(
 
 
 def retained_tags(buffer: BalancedReplayBuffer, motion_id: int) -> list[float]:
-  """Tags retained by one partition, read through the public persistence seam."""
+  """Tags retained by one motion, read through the public persistence seam."""
   state = buffer.state_dict()
   position = list(state["motion_ids"]).index(motion_id)
   partition = state["partitions"][position]
-  storage = partition["storage"]
-  if storage is None:
+  storage = state["fields"]
+  if storage is None or partition["size"] == 0:
     return []
   size, cursor, quota = partition["size"], partition["next"], partition["quota"]
   start = (cursor - size) % quota
   physical = [(index + start) % quota for index in range(size)]
-  return [float(storage["reference"][row, 0]) for row in physical]
+  base = sum(state["quotas"][:position])
+  reference = storage["reference"]
+  return [float(reference[base + row, 0]) for row in physical]
 
 
 def assert_state_equal(left: object, right: object) -> None:
@@ -526,19 +528,22 @@ def test_state_round_trip_preserves_partitions_weights_and_next_sample() -> None
 def test_state_snapshot_is_deterministic_and_ignores_unwritten_slots() -> None:
   buffer = make_buffer(capacity=8)
   buffer.insert(make_motion_batch([0, 1], start=0))
-  # Unwritten ring slots hold undefined memory, so a snapshot must not include
+  # Unwritten ring rows hold undefined memory, so a snapshot must not include
   # them; the same logical state therefore always snapshots identically.
   assert_state_equal(buffer.state_dict(), buffer.state_dict())
   for partition in buffer.state_dict()["partitions"]:
     assert partition["size"] == 1
-    unused = partition["storage"]["reference"][1:]
-    assert bool((unused == 0).all())
+  # Each motion occupies its own contiguous segment; the rows past its one
+  # retained record are outside every live window and must snapshot as zeros.
+  reference = buffer.state_dict()["fields"]["reference"]
+  assert bool((reference[1:4] == 0).all())
+  assert bool((reference[5:8] == 0).all())
 
-  # A snapshot that still carries undefined unwritten slots is accepted, because
-  # only the active window is restored.
+  # A snapshot that still carries undefined unwritten rows is accepted, because
+  # only the live windows are restored.
   dirty = buffer.state_dict()
-  for partition in dirty["partitions"]:
-    partition["storage"]["reference"][1:] = float("nan")
+  dirty["fields"]["reference"][1:4] = float("nan")
+  dirty["fields"]["reference"][5:8] = float("nan")
   restored = make_buffer(capacity=8)
   restored.load_state_dict(dirty)
   assert restored.size == 2
@@ -561,12 +566,10 @@ def test_state_restore_is_transactional_for_invalid_later_partition() -> None:
     return candidate
 
   def wrong_shape(state: dict) -> None:
-    storage = state["partitions"][1]["storage"]
-    storage["reference"] = storage["reference"][:1]
+    state["fields"]["reference"] = state["fields"]["reference"][:1]
 
   def non_finite(state: dict) -> None:
-    storage = state["partitions"][0]["storage"]
-    storage["reference"][0, 0] = float("inf")
+    state["fields"]["reference"][0, 0] = float("inf")
 
   def bad_cursor(state: dict) -> None:
     state["partitions"][1]["next"] = state["partitions"][1]["quota"]
@@ -597,8 +600,7 @@ def test_state_restore_is_transactional_for_invalid_later_partition() -> None:
     state["teacher_codes"] = [1, 0]
 
   def bad_metadata_dtype(state: dict) -> None:
-    storage = state["partitions"][0]["storage"]
-    storage["episode_id"] = storage["episode_id"].to(torch.float32)
+    state["fields"]["episode_id"] = state["fields"]["episode_id"].to(torch.float32)
 
   def unknown_field(state: dict) -> None:
     state["extra"] = 1
@@ -868,3 +870,161 @@ def test_next_sample_and_next_update_are_deterministic() -> None:
   assert left.samples_seen == right.samples_seen == 3 * 2 * 4
   for one, other in zip(model.parameters(), twin.parameters(), strict=True):
     torch.testing.assert_close(one, other, rtol=1e-6, atol=1e-8)
+
+
+def segment_buffer(quota: int, motions: int = 4) -> BalancedReplayBuffer:
+  """A balanced buffer of ``motions`` equally weighted segments of ``quota``."""
+  return BalancedReplayBuffer(
+    motions * quota,
+    DEFAULT_SCHEMA,
+    {motion: 1.0 for motion in range(motions)},
+    teacher_codes={motion: motion for motion in range(motions)},
+    frame_counts={motion: FRAMES[0] for motion in range(motions)},
+  )
+
+
+def test_every_drawn_row_comes_from_its_own_segments_live_window() -> None:
+  """A draw reads only the live window of each motion's own flat segment.
+
+  Five insertions into a quota-three segment leave rows 2..4 retained, so every
+  drawn tag must be one of those rows of its own motion: a row from another
+  segment, or one the wrap has already overwritten, would show up here.  A
+  second buffer keeps every segment half empty and poisons every row outside
+  the live windows, which proves the draw never reads a slot past a cursor.
+  """
+  motions = 4
+  wrapped = segment_buffer(quota=3, motions=motions)
+  for start in range(5):
+    for motion in range(motions):
+      wrapped.insert(make_motion_batch([motion], start=start))
+  assert [wrapped.retained(motion) for motion in range(motions)] == [3] * motions
+  for seed in range(4):
+    drawn = wrapped.sample(64, generator=torch.Generator().manual_seed(seed))
+    tags = tags_of(drawn)
+    assert bool(torch.tensor(tags).isfinite().all())
+    for tag, motion in zip(tags, drawn.motion_id.tolist(), strict=True):
+      assert int(tag) // 1000 == motion
+      assert int(tag) % 1000 in {2, 3, 4}
+
+  capacity = motions * 4
+  partial = segment_buffer(quota=4, motions=motions)
+  for start in range(2):
+    for motion in range(motions):
+      partial.insert(make_motion_batch([motion], start=start))
+  state = partial.state_dict()
+  live: set[int] = set()
+  base = 0
+  for partition in state["partitions"]:
+    quota, size, cursor = partition["quota"], partition["size"], partition["next"]
+    first = (cursor - size) % quota
+    live |= {base + (first + row) % quota for row in range(size)}
+    base += quota
+  outside = [row for row in range(capacity) if row not in live]
+  assert len(live) == 8 and len(outside) == 8
+  for value in state["fields"].values():
+    value[outside] = float("nan") if value.is_floating_point() else -1
+  poisoned = segment_buffer(quota=4, motions=motions)
+  poisoned.load_state_dict(state)
+  for seed in range(4):
+    drawn = poisoned.sample(64, generator=torch.Generator().manual_seed(seed))
+    tags = tags_of(drawn)
+    assert bool(torch.tensor(tags).isfinite().all())
+    for tag, motion in zip(tags, drawn.motion_id.tolist(), strict=True):
+      assert int(tag) // 1000 == motion
+      assert int(tag) % 1000 in {0, 1}
+
+
+def test_restored_segments_reproduce_the_same_draw_sequence() -> None:
+  """A saved and restored buffer draws the same rows for the same seed."""
+  buffer = make_buffer(capacity=10)
+  buffer.insert(make_motion_batch([0] * 4 + [1] * 2, start=0))
+  buffer.insert(make_motion_batch([0] * 2 + [1] * 3, start=10))
+  buffer.sample(5, generator=torch.Generator().manual_seed(2))
+  state = buffer.state_dict()
+
+  restored = make_buffer(capacity=10)
+  restored.load_state_dict(state)
+  assert restored.report().as_dict() == buffer.report().as_dict()
+  left = torch.Generator().manual_seed(21)
+  right = torch.Generator().manual_seed(21)
+  for size in (1, 3, 6, 9):
+    torch.testing.assert_close(
+      restored.sample(size, generator=left).reference,
+      buffer.sample(size, generator=right).reference,
+    )
+  # The restored cursors keep accepting insertions identically too.
+  restored.insert(make_motion_batch([0, 1], start=40))
+  buffer.insert(make_motion_batch([0, 1], start=40))
+  assert retained_tags(restored, 0) == retained_tags(buffer, 0)
+  assert retained_tags(restored, 1) == retained_tags(buffer, 1)
+  assert restored.report().as_dict() == buffer.report().as_dict()
+
+
+def phase_provenance_buffer() -> BalancedReplayBuffer:
+  """A provenance- and phase-enabled buffer for the checkpoint tallies."""
+  return BalancedReplayBuffer(
+    8,
+    DEFAULT_SCHEMA,
+    {0: 1.0, 1: 1.0},
+    teacher_codes=CODES,
+    frame_counts=FRAMES,
+    provenance_enabled=True,
+    coverage_sampling=True,
+    phase_bins=3,
+  )
+
+
+def test_kind_tallies_and_phase_counters_round_trip_through_a_checkpoint() -> None:
+  base = make_motion_batch([0, 0, 0, 1, 1, 1], start=0, frames=[0, 5, 9, 0, 5, 9])
+  batch = replace(
+    base,
+    initialization_kind=torch.tensor([1, 1, 0, 2, 1, 0], dtype=torch.int64),
+    segment_initial_reference_frame=torch.zeros(6, dtype=torch.int64),
+    segment_age=torch.zeros(6, dtype=torch.int64),
+  )
+  buffer = phase_provenance_buffer()
+  buffer.insert(batch)
+  buffer.sample(4, generator=torch.Generator().manual_seed(5))
+  before = buffer.report().as_dict()
+
+  restored = phase_provenance_buffer()
+  restored.load_state_dict(buffer.state_dict())
+  assert restored.report().as_dict() == before
+  # The tallies are nonzero, so the round trip above is a real assertion.
+  assert (
+    sum(
+      motion["inserted_by_initialization"].get("unknown", 0)
+      for motion in before["motions"]
+    )
+    == 2
+  )
+  assert sum(sum(motion["drawn_by_phase_bin"]) for motion in before["motions"]) == 4
+  left = torch.Generator().manual_seed(8)
+  right = torch.Generator().manual_seed(8)
+  torch.testing.assert_close(
+    restored.sample(6, generator=left).reference,
+    buffer.sample(6, generator=right).reference,
+  )
+
+
+def test_a_pre_flat_ring_checkpoint_is_refused_by_its_version() -> None:
+  """The flat rings are checkpoint version 2; version 1 is not readable.
+
+  Version 1 stored one ring per motion per field, so its ``partitions`` carry a
+  ``storage`` table and the state has no ``fields`` table.  It is refused on its
+  version, which is the change an operator needs to see, and the live buffer is
+  untouched.
+  """
+  buffer = make_buffer(capacity=8)
+  buffer.insert(make_motion_batch([0, 1], start=0))
+  before = buffer.state_dict()
+  legacy = dict(before)
+  legacy["version"] = 1
+  legacy.pop("fields")
+  legacy["partitions"] = [
+    {**partition, "storage": None} for partition in before["partitions"]
+  ]
+  with pytest.raises(ReplayValidationError, match="version is not supported"):
+    buffer.load_state_dict(legacy)
+  assert_state_equal(buffer.state_dict(), before)
+  assert buffer.size == 2

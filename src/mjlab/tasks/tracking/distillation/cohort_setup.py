@@ -107,6 +107,9 @@ class CohortSetup:
   Everything is data, so a worker receives the recipe itself instead of
   reconstructing it from its own command line, and the parent can resolve the
   same cohort for its own identity and replay without building an environment.
+  ``motion_ids`` pairs each of ``teacher_ids`` with its cohort-wide clip id, and
+  is empty for a build that owns the whole selection in manifest order; it is
+  carried by value so a shard cannot renumber the clips it happens to hold.
   """
 
   manifest: Path
@@ -120,6 +123,28 @@ class CohortSetup:
   numerical_controls: bool = False
   coverage_policy: CoveragePolicy | None = None
   coverage_parity_evidence: str | None = None
+  motion_ids: tuple[tuple[str, int], ...] = ()
+
+  def __post_init__(self) -> None:
+    if not self.motion_ids:
+      return
+    ids = tuple(teacher_id for teacher_id, _ in self.motion_ids)
+    if ids != tuple(self.teacher_ids):
+      raise ValueError(
+        f"setup clip ids {ids} do not align with its teacher ids "
+        f"{tuple(self.teacher_ids)}: one global clip id per selected teacher is "
+        "required, in the same order"
+      )
+    numbers = tuple(motion_id for _, motion_id in self.motion_ids)
+    if len(set(numbers)) != len(numbers) or any(
+      isinstance(motion_id, bool) or not isinstance(motion_id, int) or motion_id < 0
+      for motion_id in numbers
+    ):
+      raise ValueError(f"setup clip ids {numbers} must be non-negative and unique")
+
+  def clip_motion_ids(self) -> dict[str, int] | None:
+    """Cohort-wide clip id per selected teacher, or ``None`` when positional."""
+    return dict(self.motion_ids) if self.motion_ids else None
 
   def resolve(self) -> CohortContract:
     """Load and validate the cohort manifest this setup names."""
@@ -187,6 +212,7 @@ class CohortSetup:
       schema=schema,
       coverage_policy=self.coverage_policy,
       coverage_parity_evidence=self.coverage_parity_evidence,
+      motion_ids=self.clip_motion_ids(),
     )
 
   def build_student(

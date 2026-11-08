@@ -46,12 +46,15 @@ class MotionLibraryError(ValueError):
 class MotionClipSpec:
   """One clip declaration, loaded in the order it appears here.
 
-  ``motion_id`` is the clip's position in that order: it is the numeric clip
-  identity stored per environment row and persisted as cohort identity.
-  ``teacher_code`` is the frozen teacher's label code and defaults to the same
-  position.  ``expected_frames``/``expected_fps`` carry the teacher's declared
-  reference extent and are validated when given, so a clip that does not match
-  its teacher never loads silently.
+  ``motion_id`` is the numeric clip identity stored per environment row and
+  persisted as cohort identity.  It defaults to the clip's position in that
+  order; an explicit value is what lets one worker load a slice of a larger
+  cohort while still labelling its rows with the cohort-wide ids, instead of
+  renumbering them from zero per shard.  ``teacher_code`` is the frozen
+  teacher's label code and defaults to the same position.
+  ``expected_frames``/``expected_fps`` carry the teacher's declared reference
+  extent and are validated when given, so a clip that does not match its
+  teacher never loads silently.
   """
 
   teacher_id: str
@@ -59,6 +62,7 @@ class MotionClipSpec:
   teacher_code: int | None = None
   expected_frames: int | None = None
   expected_fps: float | None = None
+  motion_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,27 @@ class MotionClip:
   source_body_count: int
   body_indices: tuple[int, ...] | None = None
   """Source body indexes of the tracked subset, once it is resolved."""
+
+
+@dataclass(frozen=True, slots=True)
+class ClipMapping:
+  """The ordered clip identity of a cohort, without any reference storage.
+
+  A clip-sharded parent never holds its cohort's reference arrays: every worker
+  owns one slice, and the parent only needs clip identity to build the replay
+  partition and the cohort identity.  This carries exactly what those readers
+  use -- the ordered clip records, the audited body selection, and the source
+  body count -- so the parent can record the same mapping digest a
+  single-process run records while allocating no frame storage at all.
+  """
+
+  clips: tuple[MotionClip, ...]
+  source_body_count: int
+  body_selection: BodySelection | None = None
+
+  def mapping_digest(self) -> str:
+    """Digest of the ordered clip identity; see :func:`clip_mapping_digest`."""
+    return clip_mapping_digest(self.clips)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,11 +148,14 @@ class MotionLibrary:
     "_device",
     "_dtype",
     "_frame_counts",
+    "_identity_motion_ids",
     "_joint_pos",
     "_joint_vel",
+    "_motion_ids",
     "_offsets",
     "_selection",
     "_selection_index",
+    "_sorted_motion_ids",
     "_teacher_codes",
   )
 
@@ -151,6 +179,18 @@ class MotionLibrary:
   ) -> None:
     """Build from validated parts; use :meth:`from_clips` instead."""
     self._clips = clips
+    self._motion_ids = _require_motion_ids(clips)
+    # A library loaded in its own order has ``motion_id == position``, which is
+    # every single-process run.  The identity case then translates an id to a
+    # storage slot for free, so the per-gather path keeps its single host sync.
+    self._identity_motion_ids = self._motion_ids == tuple(range(len(self._motion_ids)))
+    self._sorted_motion_ids = (
+      None
+      if self._identity_motion_ids
+      else torch.tensor(
+        sorted(self._motion_ids), dtype=torch.long, device=joint_pos.device
+      )
+    )
     # Device aliases (cpu:0, cuda) resolve when tensors are allocated. Compare
     # future indices against the actual allocation, not the requested spelling.
     self._device = joint_pos.device
@@ -227,6 +267,7 @@ class MotionLibrary:
     clips: list[MotionClip] = []
     teacher_ids: set[str] = set()
     teacher_codes: set[int] = set()
+    motion_ids: set[int] = set()
     joint_dim: int | None = None
     body_count: int | None = None
     offset = 0
@@ -248,6 +289,20 @@ class MotionLibrary:
       if teacher_code in teacher_codes:
         raise MotionLibraryError(f"duplicate teacher code {teacher_code}")
       teacher_codes.add(teacher_code)
+      motion_id = position if spec.motion_id is None else spec.motion_id
+      if isinstance(motion_id, bool) or not isinstance(motion_id, int):
+        raise MotionLibraryError(
+          f"clip {position} needs an integer motion id, got {motion_id!r}"
+        )
+      if motion_id < 0:
+        raise MotionLibraryError(
+          f"clip {position} needs a non-negative motion id, got {motion_id}"
+        )
+      # A repeated clip id would put two clips behind one environment row label,
+      # so a row could resolve to a clip the caller never selected.
+      if motion_id in motion_ids:
+        raise MotionLibraryError(f"duplicate motion id {motion_id}")
+      motion_ids.add(motion_id)
 
       loaded, frames, fps = _load_clip(spec, position)
       joint_pos = loaded["joint_pos"]
@@ -293,7 +348,7 @@ class MotionLibrary:
         arrays[name].append(values)
       clips.append(
         MotionClip(
-          motion_id=position,
+          motion_id=motion_id,
           teacher_id=spec.teacher_id,
           teacher_code=teacher_code,
           motion_file=Path(spec.motion_file),
@@ -372,39 +427,33 @@ class MotionLibrary:
     """Return the clip entry for ``motion_id``."""
     if isinstance(motion_id, bool) or not isinstance(motion_id, int):
       raise MotionLibraryError(f"motion id must be an integer, got {motion_id!r}")
-    if not 0 <= motion_id < self.num_motions:
+    position = self._position_of(motion_id)
+    if position is None:
       raise MotionLibraryError(
         f"motion id {motion_id} is outside the {self.num_motions} loaded clips"
       )
-    return self._clips[motion_id]
+    return self._clips[position]
+
+  def _position_of(self, motion_id: int) -> int | None:
+    """Storage position of one clip id, or ``None`` when it is not loaded."""
+    if self._identity_motion_ids:
+      return motion_id if 0 <= motion_id < self.num_motions else None
+    if motion_id not in self._motion_ids:
+      return None
+    return self._motion_ids.index(motion_id)
+
+  @property
+  def motion_ids(self) -> tuple[int, ...]:
+    """Clip ids in library order, which need not be their storage positions."""
+    return self._motion_ids
 
   def ordered_mapping(self) -> tuple[MotionClip, ...]:
     """Return the ordered clip mapping that cohort identity must persist."""
     return self._clips
 
   def mapping_digest(self) -> str:
-    """Digest of the ordered clip identity that strict resume must reproduce.
-
-    Covers motion id, teacher id/code, source digest, frame count, and fps of
-    every clip in order.  Local file paths and the robot-derived body selection
-    are excluded: relocated assets are accepted by content digest, and the body
-    mapping is audited against the compiled robot instead.
-    """
-    payload = json.dumps(
-      [
-        {
-          "motion_id": clip.motion_id,
-          "teacher_id": clip.teacher_id,
-          "teacher_code": clip.teacher_code,
-          "source_hash": clip.source_hash,
-          "frames": clip.frames,
-          "fps": clip.fps,
-        }
-        for clip in self._clips
-      ],
-      sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Digest of the ordered clip identity; see :func:`clip_mapping_digest`."""
+    return clip_mapping_digest(self._clips)
 
   # Body mapping.
 
@@ -492,27 +541,58 @@ class MotionLibrary:
 
   # Per-row metadata.
 
+  def slots_for(self, motion_ids: torch.Tensor) -> torch.Tensor:
+    """Storage slots of the given clip ids, validated against this library.
+
+    A library loaded from explicit clip ids holds those ids, not their
+    positions: one worker owns a slice of a larger cohort, so its ids start
+    where the slice starts.  Callers that index a library-order table with a
+    row's clip id translate through here instead of assuming the id is a
+    position.
+
+    This is the validating entry point, and it costs one host Boolean
+    conversion per call.  Call it where ids enter -- construction, a reset, or
+    an explicit selection -- not per simulation step.  The per-row lookups
+    below take ids that a caller has already checked here.
+    """
+    ids = self._index_tensor(motion_ids, "motion_ids")
+    slots, unknown = self._slots(ids)
+    if ids.numel() and bool(unknown.any()):
+      raise MotionLibraryError(self._unknown_ids_message(ids, unknown))
+    return slots
+
   def frame_counts_for(self, motion_ids: torch.Tensor) -> torch.Tensor:
-    """Per-row clip length in frames, as a fresh ``int64`` tensor."""
-    return self._frame_counts[self._index_tensor(motion_ids, "motion_ids")]
+    """Per-row clip length in frames, as a fresh ``int64`` tensor.
+
+    Trusts ids validated by :meth:`slots_for`, so this stays a pure device
+    gather: it runs inside the per-step snapshot path, where a host Boolean
+    conversion would be a device sync.
+    """
+    return self._frame_counts[self._row_slots(motion_ids)]
 
   def teacher_codes_for(self, motion_ids: torch.Tensor) -> torch.Tensor:
-    """Per-row teacher label code, as a fresh ``int64`` tensor."""
-    return self._teacher_codes[self._index_tensor(motion_ids, "motion_ids")]
+    """Per-row teacher label code, as a fresh ``int64`` tensor.
+
+    Trusts ids validated by :meth:`slots_for`, for the same reason as
+    :meth:`frame_counts_for`.
+    """
+    return self._teacher_codes[self._row_slots(motion_ids)]
 
   def clamp_local_frames(
     self, motion_ids: torch.Tensor, local_frames: torch.Tensor
   ) -> torch.Tensor:
     """Clamp frames to the last frame of each row's own clip.
 
-    Endpoint lookahead uses this so a preview never reads the next clip.
+    Endpoint lookahead uses this so a preview never reads the next clip.  Clip
+    ids are trusted as in :meth:`frame_counts_for`; only the frame check below
+    converts a host Boolean, which is the one sync this path always had.
     """
-    ids = self._index_tensor(motion_ids, "motion_ids")
+    slots = self._row_slots(motion_ids)
     frames = self._index_tensor(local_frames, "local_frames")
-    self._require_same_shape(ids, frames)
+    self._require_same_shape(slots, frames)
     if frames.numel() and bool((frames < 0).any()):
       raise MotionLibraryError("local_frames must be non-negative")
-    return torch.minimum(frames, self._frame_counts[ids] - 1)
+    return torch.minimum(frames, self._frame_counts[slots] - 1)
 
   # Reference gathers.
 
@@ -581,22 +661,22 @@ class MotionLibrary:
     ids = self._index_tensor(motion_ids, "motion_ids")
     frames = self._index_tensor(local_frames, "local_frames")
     self._require_same_shape(ids, frames)
+    # Resolve ids to storage slots first. A library loaded in its own order
+    # returns the ids unchanged, so a single-process run pays nothing for the
+    # clip-id form a shard needs.
+    slots, unknown_ids = self._slots(ids)
     if ids.numel():
-      # Use safe ids for the speculative length gather. Invalid ids still fail
+      # Use safe slots for the speculative length gather. Invalid ids still fail
       # below before they can address reference storage. Combine all valid-path
       # checks into one host Boolean conversion instead of four CUDA waits.
-      invalid_ids = (ids < 0) | (ids >= self.num_motions)
-      counts = self._frame_counts[ids.clamp(0, self.num_motions - 1)]
+      counts = self._frame_counts[slots]
       negative_frames = frames < 0
       long_frames = frames >= counts
-      if bool((invalid_ids | negative_frames | long_frames).any()):
+      if bool((unknown_ids | negative_frames | long_frames).any()):
         # Keep detailed diagnostics and their historical precedence on the
         # exceptional path; optimization must not accept malformed inputs.
-        if bool(invalid_ids.any()):
-          raise MotionLibraryError(
-            f"motion_ids must be in [0, {self.num_motions}); ids "
-            f"[{int(ids.min())}, {int(ids.max())}] were requested"
-          )
+        if bool(unknown_ids.any()):
+          raise MotionLibraryError(self._unknown_ids_message(ids, unknown_ids))
         if bool(negative_frames.any()):
           raise MotionLibraryError("local_frames must be non-negative")
         offending = int(frames[long_frames][0])
@@ -604,7 +684,7 @@ class MotionLibrary:
           f"local frame {offending} is outside its clip; clip lengths are "
           "per-row and frames are never padded or carried into the next clip"
         )
-    return self._offsets[ids] + frames
+    return self._offsets[slots] + frames
 
   def __repr__(self) -> str:
     clips = ", ".join(
@@ -618,6 +698,44 @@ class MotionLibrary:
     )
 
   # Internals.
+
+  def _row_slots(self, ids: torch.Tensor) -> torch.Tensor:
+    """Storage slots of ids a caller has already validated.
+
+    No host Boolean conversion: an id this library does not hold is clamped
+    into range rather than raised on, because the per-step lookups must stay
+    pure device gathers.  :meth:`slots_for` is the checked entry point.
+    """
+    return self._slots(ids)[0]
+
+  def _slots(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Storage slots of ``ids``, plus a mask of ids this library does not hold.
+
+    Slots are clamped so an unknown id can never address another clip's
+    storage; the mask is what the caller raises on, so a speculative gather
+    stays safe while the check keeps its single host Boolean conversion.
+    """
+    if self._identity_motion_ids:
+      clamped = ids.clamp(0, self.num_motions - 1)
+      return clamped, (ids < 0) | (ids >= self.num_motions)
+    assert self._sorted_motion_ids is not None
+    slots = torch.searchsorted(self._sorted_motion_ids, ids).clamp(
+      0, self.num_motions - 1
+    )
+    return slots, ids != self._sorted_motion_ids[slots]
+
+  def _unknown_ids_message(self, ids: torch.Tensor, unknown: torch.Tensor) -> str:
+    """Name the requested ids and the id set this library holds."""
+    if self._identity_motion_ids:
+      return (
+        f"motion_ids must be in [0, {self.num_motions}); ids "
+        f"[{int(ids.min())}, {int(ids.max())}] were requested"
+      )
+    return (
+      f"motion_ids must be one of the {self.num_motions} clip ids this library "
+      f"holds; ids [{int(ids.min())}, {int(ids.max())}] were requested and "
+      f"{int(unknown.sum())} of them are not loaded"
+    )
 
   def _select(
     self, flat: torch.Tensor, motion_ids: torch.Tensor, local_frames: torch.Tensor
@@ -658,6 +776,54 @@ class MotionLibrary:
         f"{name} is on {value.device} but the library is on {self._device}"
       )
     return value.to(torch.int64)
+
+
+def clip_mapping_digest(clips: Sequence[MotionClip]) -> str:
+  """Digest of the ordered clip identity that strict resume must reproduce.
+
+  Covers motion id, teacher id/code, source digest, frame count, and fps of
+  every clip in order.  Local file paths and the robot-derived body selection
+  are excluded: relocated assets are accepted by content digest, and the body
+  mapping is audited against the compiled robot instead.
+
+  Shared by a loaded library and a metadata-only mapping, because a
+  clip-sharded parent records the digest of the cohort its workers built and a
+  single-process run of the same recipe must record the same value.
+  """
+  payload = json.dumps(
+    [
+      {
+        "motion_id": clip.motion_id,
+        "teacher_id": clip.teacher_id,
+        "teacher_code": clip.teacher_code,
+        "source_hash": clip.source_hash,
+        "frames": clip.frames,
+        "fps": clip.fps,
+      }
+      for clip in clips
+    ],
+    sort_keys=True,
+  )
+  return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _require_motion_ids(clips: Sequence[MotionClip]) -> tuple[int, ...]:
+  """Validate the clip ids a library holds, returning them in library order."""
+  ids = tuple(clip.motion_id for clip in clips)
+  seen: set[int] = set()
+  for position, motion_id in enumerate(ids):
+    if isinstance(motion_id, bool) or not isinstance(motion_id, int):
+      raise MotionLibraryError(
+        f"clip {position} needs an integer motion id, got {motion_id!r}"
+      )
+    if motion_id < 0:
+      raise MotionLibraryError(
+        f"clip {position} needs a non-negative motion id, got {motion_id}"
+      )
+    if motion_id in seen:
+      raise MotionLibraryError(f"duplicate motion id {motion_id}")
+    seen.add(motion_id)
+  return ids
 
 
 def _load_clip(
@@ -743,8 +909,10 @@ def _load_array(
 
 __all__ = [
   "BodySelection",
+  "ClipMapping",
   "MotionClip",
   "MotionClipSpec",
   "MotionLibrary",
   "MotionLibraryError",
+  "clip_mapping_digest",
 ]

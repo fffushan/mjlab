@@ -31,6 +31,7 @@ from mjlab.tasks.tracking.distillation.balanced_storage import BalancedReplayBuf
 from mjlab.tasks.tracking.distillation.config import CohortContract
 from mjlab.tasks.tracking.distillation.motion_library import (
   BodySelection,
+  ClipMapping,
   MotionLibrary,
 )
 from mjlab.tasks.tracking.distillation.multi_motion import (
@@ -958,7 +959,7 @@ class CohortIdentity:
 
 def build_cohort_identity(
   cohort: CohortContract,
-  library: MotionLibrary,
+  library: MotionLibrary | ClipMapping,
   slots: MotionSlotAllocation,
   *,
   phase_policy: PhasePolicy,
@@ -979,7 +980,10 @@ def build_cohort_identity(
 
   Args:
     cohort: resolved manifest contract of every member.
-    library: reference clips in the order the command was built with.
+    library: reference clips in the order the command was built with, or the
+      metadata-only :class:`ClipMapping` a clip-sharded parent merges from its
+      workers.  Both carry the ordered clip identity the record needs; only the
+      first owns reference storage.
     slots: realized per-row slot allocation of the command.
     phase_policy: phase-sampling policy the environment was built with.
     replay: the live per-motion balanced replay buffer.
@@ -997,8 +1001,8 @@ def build_cohort_identity(
   """
   if not isinstance(cohort, CohortContract):
     raise CohortContractError("a cohort identity needs a resolved CohortContract")
-  if not isinstance(library, MotionLibrary):
-    raise CohortContractError("a cohort identity needs a MotionLibrary")
+  if not isinstance(library, (MotionLibrary, ClipMapping)):
+    raise CohortContractError("a cohort identity needs a reference clip mapping")
   if not isinstance(slots, MotionSlotAllocation):
     raise CohortContractError("a cohort identity needs a MotionSlotAllocation")
   if phase_policy not in PHASE_POLICIES:
@@ -1180,6 +1184,9 @@ def cohort_identity_from_parts(
   environment seed is the single-process derivation, so a sharded run records
   the same identity a non-sharded run of the same recipe would record — the
   per-worker devices and seeds live in the resolved configuration instead.
+  ``library`` is a metadata-only :class:`ClipMapping` when the workers hold
+  disjoint clip slices, because the parent then owns no reference storage at
+  all.
 
   The audit is still required evidence: its slot allocation, ordered mapping
   digest, phase policy and seed provenance are recorded, so a caller cannot

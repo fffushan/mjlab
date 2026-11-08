@@ -28,6 +28,10 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import os
+import sys
+import time
+
 import torch
 
 from mjlab.tasks.tracking.distillation.collector import (
@@ -55,6 +59,43 @@ from mjlab.tasks.tracking.distillation.worker import (
   WorkerPoolError,
   validate_collect_reply,
 )
+
+
+
+class _PhaseTimer:
+  """Wall-clock marks for one iteration, printed only when asked for.
+
+  A 3261-clip run made the parent the bottleneck with no way to see which step
+  owned the time: the pool wait, the merge, the insert and the update loop all
+  happened inside one opaque call.  ``MJLAB_DISTILL_PHASE_TIMING=1`` prints one
+  line per iteration with each phase, so a slow run is diagnosed from numbers
+  rather than from inference about GPU utilisation.
+  """
+
+  def __init__(self) -> None:
+    self.enabled = os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1"
+    self._start = time.perf_counter()
+    self._last = self._start
+    self._marks: list[str] = []
+
+  def mark(self, name: str) -> None:
+    now = time.perf_counter()
+    self._marks.append(f"{name}={now - self._last:.2f}s")
+    self._last = now
+
+  def finish(self, label: str) -> None:
+    if not self.enabled:
+      return
+    total = time.perf_counter() - self._start
+    print(
+      f"[phase] {label} " + " ".join(self._marks) + f" total={total:.2f}s",
+      file=sys.stderr,
+      flush=True,
+    )
+
+
+def _phase_timer() -> _PhaseTimer:
+  return _PhaseTimer()
 
 
 class ShardedCollectionError(RuntimeError):
@@ -220,8 +261,15 @@ def union_motion_frames(
   return {motion: tuple(sorted(values)) for motion, values in frames.items()}
 
 
-def _require_mergeable(replies: Sequence[CollectReply]) -> tuple[int, int]:
-  """Validate the reply set's framing and return ``(ticks, rows_per_tick)``."""
+def _require_mergeable(replies: Sequence[CollectReply]) -> int:
+  """Validate the reply set's framing and return the shared tick count.
+
+  Every shard steps the same ticks, because one iteration is one number of
+  steps for the whole run.  The rows per tick may differ: a clip-sharded plan
+  sizes each shard as ``envs_per_motion x its clips``, so a cohort whose clip
+  count does not divide by the worker count leaves one shard short.  Each reply
+  is therefore checked against its own row count, and merged with it.
+  """
   if not replies:
     raise ShardedCollectionError("a merged collection needs at least one worker reply")
   ticks = replies[0].ticks
@@ -232,16 +280,21 @@ def _require_mergeable(replies: Sequence[CollectReply]) -> tuple[int, int]:
       f"rows_per_tick={rows_per_tick}"
     )
   for index, reply in enumerate(replies):
-    if reply.ticks != ticks or reply.rows_per_tick != rows_per_tick:
+    if reply.ticks != ticks:
       raise ShardedCollectionError(
         f"worker {index} returned ticks={reply.ticks} rows_per_tick="
         f"{reply.rows_per_tick} while worker 0 returned ticks={ticks} "
         f"rows_per_tick={rows_per_tick}"
       )
-    if reply.batch.batch_size != ticks * rows_per_tick:
+    if reply.rows_per_tick <= 0:
+      raise ShardedCollectionError(
+        f"worker {index} returned rows_per_tick={reply.rows_per_tick}; a shard "
+        "must contribute at least one row per tick"
+      )
+    if reply.batch.batch_size != ticks * reply.rows_per_tick:
       raise ShardedCollectionError(
         f"worker {index} returned {reply.batch.batch_size} rows, which is not "
-        f"{ticks} ticks of {rows_per_tick} rows"
+        f"{ticks} ticks of {reply.rows_per_tick} rows"
       )
     # Branch rows are variable size: a bounded branch work unit has its own
     # row count, so ticks * rows_per_tick cannot describe them.  Validate every
@@ -252,13 +305,18 @@ def _require_mergeable(replies: Sequence[CollectReply]) -> tuple[int, int]:
       raise ShardedCollectionError(
         f"worker {index} returned an unusable collect reply: {exc}"
       ) from exc
-  return ticks, rows_per_tick
+  return ticks
 
 
 def merge_batches_tick_major(
-  replies: Sequence[CollectReply], *, ticks: int, rows_per_tick: int
+  replies: Sequence[CollectReply], *, ticks: int
 ) -> LabeledReplayBatch:
-  """Concatenate shard rows tick by tick, workers ascending within a tick."""
+  """Concatenate shard rows tick by tick, workers ascending within a tick.
+
+  Each reply is sliced with its own ``rows_per_tick``; the shards' totals may
+  differ, and slicing every reply with one shard's framing would misalign the
+  rows of a smaller shard.
+  """
 
   def accessor(name: str) -> Callable[[LabeledReplayBatch], torch.Tensor]:
     if name.startswith("observations."):
@@ -268,7 +326,9 @@ def merge_batches_tick_major(
 
   def merged(name: str) -> torch.Tensor:
     blocks = [
-      accessor(name)(reply.batch)[tick * rows_per_tick : (tick + 1) * rows_per_tick]
+      accessor(name)(reply.batch)[
+        tick * reply.rows_per_tick : (tick + 1) * reply.rows_per_tick
+      ]
       for tick in range(ticks)
       for reply in replies
     ]
@@ -293,7 +353,7 @@ def merge_batches_tick_major(
     motion_id=merged("motion_id"),
     teacher_id=merged("teacher_id"),
     reference_frame=merged("reference_frame"),
-    episode_id=_merged_segment_ids(replies, ticks=ticks, rows_per_tick=rows_per_tick),
+    episode_id=_merged_segment_ids(replies, ticks=ticks),
     collector_iteration=merged("collector_iteration"),
   )
   if not all(provenance):
@@ -306,9 +366,7 @@ def merge_batches_tick_major(
   )
 
 
-def _merged_segment_ids(
-  replies: Sequence[CollectReply], *, ticks: int, rows_per_tick: int
-) -> torch.Tensor:
+def _merged_segment_ids(replies: Sequence[CollectReply], *, ticks: int) -> torch.Tensor:
   """Offset each shard's segment ids into its own namespace block.
 
   The offset is applied here, in the parent, because segment identity is a
@@ -333,7 +391,9 @@ def _merged_segment_ids(
   # a segment id stays aligned with the row block it belongs to.
   for tick in range(ticks):
     for index, reply in enumerate(replies):
-      block = reply.batch.episode_id[tick * rows_per_tick : (tick + 1) * rows_per_tick]
+      block = reply.batch.episode_id[
+        tick * reply.rows_per_tick : (tick + 1) * reply.rows_per_tick
+      ]
       blocks.append(block + index * WORKER_SEGMENT_STRIDE)
   return torch.cat([block.contiguous() for block in blocks], dim=0)
 
@@ -400,15 +460,15 @@ def merge_collection_replies(
 
   ``ticks`` is the union (every shard steps the same ticks, which the framing
   check enforces) while the row counters are sums, so the reported
-  samples-per-tick ratio keeps its meaning.  Boundaries are concatenated
-  worker-ascending and tagged with the worker that produced them, because
-  environment indices are per-shard and must never be read as one global index.
+  samples-per-tick ratio keeps its meaning.  Shards need not contribute the
+  same rows per tick: each reply is sliced and offset with its own count, which
+  is what lets a clip-sharded run cover a cohort whose clip count does not
+  divide by its worker count.  Boundaries are concatenated worker-ascending and
+  tagged with the worker that produced them, because environment indices are
+  per-shard and must never be read as one global index.
   """
-  ticks, rows_per_tick = _require_mergeable(replies)
-  batch = _move_batch(
-    merge_batches_tick_major(replies, ticks=ticks, rows_per_tick=rows_per_tick),
-    device,
-  )
+  ticks = _require_mergeable(replies)
+  batch = _move_batch(merge_batches_tick_major(replies, ticks=ticks), device)
   samples = sum(reply.samples for reply in replies)
   boundaries: list[SegmentBoundary] = []
   diagnostics: list[str] = []
@@ -644,6 +704,7 @@ class ShardedCollection:
       name: value.detach() if isinstance(value, torch.Tensor) else value
       for name, value in state.items()
     }
+    phase = _phase_timer()
     try:
       replies = self.pool.collect(
         iteration=config.collector_iteration,
@@ -653,6 +714,7 @@ class ShardedCollection:
         rollout_latent=config.rollout_latent,
         weights=weights,
       )
+      phase.mark("workers")
     except WorkerPoolError as exc:
       self._requires_reset = True
       self._invalidation_cause = f"{type(exc).__name__}: {exc}"
@@ -670,15 +732,17 @@ class ShardedCollection:
       all_rows = [result.fresh_data.batch]
       if result.coverage_batch is not None:
         all_rows.append(result.coverage_batch)
+      phase.mark("merge")
       merged_rows = concat_replay_batches(all_rows)
-      assert merged_rows is not None
       self.replay.insert(merged_rows)
+      phase.mark("insert")
     except BaseException as exc:
       self._requires_reset = True
       self._invalidation_cause = f"{type(exc).__name__}: {exc}"
       self.pool.close()
       raise
     self._requires_reset = False
+    phase.finish(f"shard iter={config.collector_iteration}")
     return result
 
   @property

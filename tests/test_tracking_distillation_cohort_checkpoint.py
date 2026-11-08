@@ -595,6 +595,15 @@ def partition_sizes(replay: Any) -> list[int]:
   return [int(part["size"]) for part in replay.state_dict()["partitions"]]
 
 
+def retained_row(payload: dict, slot: int, offset: int = 0) -> int:
+  """Global flat-ring row of the ``offset``-th retained record of one motion."""
+  replay = payload["replay"]
+  partition = replay["partitions"][slot]
+  base = sum(replay["quotas"][:slot])
+  start = (partition["next"] - partition["size"]) % partition["quota"]
+  return base + (start + offset) % partition["quota"]
+
+
 # Cohort identity.
 
 
@@ -1475,7 +1484,7 @@ def test_cohort_resume_rejects_a_corrupted_last_replay_partition(
   # itself a state change (it advances the partition's drawn counter).
   before_sample = sampled_reference(trainer.replay)
   before = capture_state(trainer, trainer.replay, None)
-  partition["storage"]["reference"][0, 0] = float("nan")
+  payload["replay"]["fields"]["reference"][retained_row(payload, 1), 0] = float("nan")
   torch.save(payload, path)
   with pytest.raises(CheckpointValidationError, match="'reference' is invalid"):
     load_cohort_checkpoint(path, trainer, trainer.replay, expected_cohort=identity)
@@ -1824,7 +1833,7 @@ def test_multi_teacher_resume_namespaces_above_every_retained_partition(
   payload = torch.load(path, weights_only=True)
   partition = payload["replay"]["partitions"][1]
   assert partition["size"] >= 1
-  partition["storage"]["episode_id"][0] = 10**6
+  payload["replay"]["fields"]["episode_id"][retained_row(payload, 1)] = 10**6
   torch.save(payload, path)
 
   resumed, resumed_adapter = make_runner(real_cohort, plan, body_selection, schema)

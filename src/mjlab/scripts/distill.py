@@ -20,7 +20,7 @@ import sys
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -85,7 +85,12 @@ from mjlab.tasks.tracking.distillation.export import (
   export_cohort_bundle,
 )
 from mjlab.tasks.tracking.distillation.model import ConditionalVAE
-from mjlab.tasks.tracking.distillation.multi_motion import plan_multi_motion
+from mjlab.tasks.tracking.distillation.motion_library import (
+  ClipMapping,
+  MotionClip,
+  MotionLibrary,
+)
+from mjlab.tasks.tracking.distillation.multi_motion import multi_motion_slots
 from mjlab.tasks.tracking.distillation.parity import (
   DEFAULT_ATOL,
   DEFAULT_RTOL,
@@ -113,7 +118,6 @@ from mjlab.tasks.tracking.distillation.sample_budget import (
 )
 from mjlab.tasks.tracking.distillation.sharded_collection import ShardedCollection
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBuffer
-from mjlab.tasks.tracking.distillation.teachers import build_cohort_teacher_bank
 from mjlab.tasks.tracking.distillation.trainer import (
   TrainingConfig,
   VaeDistillationTrainer,
@@ -123,7 +127,13 @@ from mjlab.tasks.tracking.distillation.training_config import (
   DEFAULT_MINIBATCH_SIZE,
 )
 from mjlab.tasks.tracking.distillation.vae_config import DEFAULT_MODEL_SETTINGS
-from mjlab.tasks.tracking.distillation.worker import WorkerPool, worker_specs
+from mjlab.tasks.tracking.distillation.worker import (
+  ClipShard,
+  WorkerPool,
+  clip_shard_plan,
+  clip_shard_worker_specs,
+  worker_specs,
+)
 
 _COMMANDS = (
   "validate-teachers",
@@ -591,7 +601,10 @@ def _resolve_coverage_choice(
 
 
 def _resolve_worker_devices(
-  worker_devices: tuple[str, ...] | None, *, num_envs: int
+  worker_devices: tuple[str, ...] | None,
+  *,
+  num_envs: int,
+  even_split: bool = True,
 ) -> tuple[str, ...]:
   """Validate and canonicalize the opt-in worker device list.
 
@@ -600,6 +613,10 @@ def _resolve_worker_devices(
   sharded collection worker and splits ``num_envs`` evenly across them, so the
   collected row count per iteration is unchanged and only the parallelism is.
   Every refusal below happens before a simulator exists.
+
+  ``even_split`` is false for a clip-sharded run, where the shards hold
+  different numbers of clips and therefore different environment counts.  Its
+  plan is what bounds the totals, not this even division.
 
   Entries are canonicalized through ``torch.device``, which needs no CUDA
   runtime: an unparseable device string is refused here rather than surfacing
@@ -646,7 +663,7 @@ def _resolve_worker_devices(
     raise ValueError(
       f"--worker-devices accepts at most {_MAX_WORKERS} workers; got {len(canonical)}"
     )
-  if num_envs % len(canonical) != 0:
+  if even_split and num_envs % len(canonical) != 0:
     raise ValueError(
       f"--num-envs {num_envs} does not split evenly over the {len(canonical)} "
       "worker devices in --worker-devices; every worker must own the same "
@@ -655,7 +672,13 @@ def _resolve_worker_devices(
   return tuple(canonical)
 
 
-def _workers_identity(worker_devices: tuple[str, ...], num_envs: int) -> dict[str, Any]:
+def _workers_identity(
+  worker_devices: tuple[str, ...],
+  num_envs: int,
+  *,
+  clip_shards: Sequence[ClipShard] = (),
+  envs_per_motion: int | None = None,
+) -> dict[str, Any]:
   """The worker identity one resume must reproduce, as a single object.
 
   A single-process run records ``mode: 'single'`` with no devices, so the record
@@ -664,15 +687,36 @@ def _workers_identity(worker_devices: tuple[str, ...], num_envs: int) -> dict[st
   legacy default safe: a checkpoint recorded before workers existed is defaulted
   as a whole, so a partially populated worker record can never be read as the
   single-process case.
+
+  A clip-sharded run records its plan beside the layout: each worker's clips,
+  their cohort-wide ids and its environment count.  A resume then has to
+  reproduce the same partition, because the replay was partitioned by the ids
+  those workers actually labelled their rows with -- and ``envs_per_worker``
+  becomes ``None``, since the shards are deliberately unequal.
   """
   count = max(len(worker_devices), 1)
-  return {
+  identity: dict[str, Any] = {
     "mode": "single" if not worker_devices else "sharded",
     "devices": list(worker_devices),
     "count": count,
-    "envs_per_worker": num_envs // count,
+    "envs_per_worker": None if clip_shards else num_envs // count,
     "seed_scheme": _WORKER_SEED_SCHEME_VERSION,
   }
+  if clip_shards:
+    identity["clip_sharding"] = {
+      "envs_per_motion": envs_per_motion,
+      "shards": [
+        {
+          "worker_index": shard.worker_index,
+          "device": shard.device,
+          "teacher_ids": list(shard.teacher_ids),
+          "motion_ids": list(shard.motion_ids),
+          "num_envs": shard.num_envs,
+        }
+        for shard in clip_shards
+      ],
+    }
+  return identity
 
 
 def _collection_transport(worker_devices: tuple[str, ...]) -> str:
@@ -812,8 +856,30 @@ def _resume_comparable_runtime(runtime: Mapping[str, Any]) -> dict[str, Any]:
   comparable.pop("device", None)
   workers = comparable.get("workers")
   if isinstance(workers, Mapping):
-    comparable["workers"] = {
-      key: value for key, value in workers.items() if key != "devices"
+    comparable["workers"] = _workers_without_devices(workers)
+  return comparable
+
+
+def _workers_without_devices(workers: Mapping[str, Any]) -> dict[str, Any]:
+  """The worker record with the cards it ran on removed, at every depth.
+
+  The card names are audited, never compared, so a resume may move to different
+  cards.  A clip-sharded plan names a device per shard for the same reason, and
+  everything else in it -- which clips go where, their ids, the environment
+  count -- is the partition the replay depends on and stays compared.
+  """
+  comparable = {key: value for key, value in workers.items() if key != "devices"}
+  sharding = comparable.get("clip_sharding")
+  if isinstance(sharding, Mapping):
+    shards = sharding.get("shards")
+    comparable["clip_sharding"] = {
+      **sharding,
+      "shards": [
+        {key: value for key, value in shard.items() if key != "device"}
+        if isinstance(shard, Mapping)
+        else shard
+        for shard in (shards if isinstance(shards, Sequence) else ())
+      ],
     }
   return comparable
 
@@ -1179,16 +1245,22 @@ def _build_sharded_cohort_runner(
   evaluate_every: int,
   evaluation_steps: int,
   rollout_latent: RolloutLatent,
+  clip_shards: tuple[ClipShard, ...] = (),
   owner: _RunOwner | None = None,
 ):
   """Build the sharded M4 cohort run: N worker environments, one parent replay.
 
-  The parent owns no environment in this layout, so the schema, the reference
-  library, the audited slot allocation and the motion-to-teacher codes come from
-  the workers that did build one.  Everything the run does with them — the
+  The parent owns no environment in this layout, so the schema, the clip
+  identity, the audited slot allocation and the motion-to-teacher codes come
+  from the workers that did build one.  Everything the run does with them — the
   replay, the trainer, the cohort identity, the checkpoints — is the same code
   the single-process path uses, on the same values, so a sharded run and a
   single-process run of one recipe record the same cohort identity.
+
+  ``clip_shards`` is the plan of a clip-sharded run: each worker builds one
+  disjoint slice, so the parent merges their metadata instead of materialising
+  the cohort.  Empty (the default) keeps every worker building the whole
+  selection, which is the layout that predates clip sharding.
 
   Returns the runner, the collection source, the identity, the sampling mode and
   the seed audit, exactly like the single-process builder.
@@ -1213,27 +1285,45 @@ def _build_sharded_cohort_runner(
     rollout_latent=rollout_latent,
     seed=seed,
   )
-  specs = worker_specs(setup, worker_devices, num_envs=num_envs)
+  specs = (
+    clip_shard_worker_specs(setup, clip_shards)
+    if clip_shards
+    else worker_specs(setup, worker_devices, num_envs=num_envs)
+  )
   pool = WorkerPool(specs)
   source = None
   try:
     pool.start()
     descriptions = pool.describe()
-    primary = _require_one_shard_contract(descriptions, setup)
+    merged = _require_one_shard_contract(
+      descriptions, setup, clip_shards=clip_shards or None
+    )
     torch.manual_seed(seed)
     model = ConditionalVAE(
-      primary.schema, DEFAULT_MODEL_SETTINGS, numerical_controls=numerical_controls
+      merged.schema, DEFAULT_MODEL_SETTINGS, numerical_controls=numerical_controls
     ).to(device)
-    weights = {
-      clip.motion_id: float(cohort.teacher(clip.teacher_id).entry.sampling_weight)
-      for clip in primary.library.clips
-    }
+    # Both layouts take the replay's clip weights and extents from the shards'
+    # own report.  A clip-sharded run must not resolve a teacher to discover a
+    # sampling weight: the weight is in the shard's allocation, and resolving
+    # every member would cost exactly the memory the split exists to save.
+    weights = (
+      merged.replay_weights()
+      if clip_shards
+      else {
+        clip.motion_id: float(cohort.teacher(clip.teacher_id).entry.sampling_weight)
+        for clip in merged.library.clips
+      }
+    )
     replay = BalancedReplayBuffer(
       replay_capacity,
-      primary.schema,
+      merged.schema,
       weights,
-      teacher_codes=dict(primary.motion_teacher_codes or {}),
-      frame_counts={clip.motion_id: int(clip.frames) for clip in primary.library.clips},
+      teacher_codes=dict(merged.motion_teacher_codes or {}),
+      frame_counts=(
+        merged.frame_counts()
+        if clip_shards
+        else {clip.motion_id: int(clip.frames) for clip in merged.library.clips}
+      ),
       device=torch.device(device),
       dtype=torch.float32,
       phase_bins=phase_bins,
@@ -1243,30 +1333,40 @@ def _build_sharded_cohort_runner(
     # rather than shard 0's: a shard's rows (and its seeded per-row clip
     # assignment) describe that shard alone.  Rebuilt through the same pure plan
     # a single-process run of this recipe builds, from the same base seed, so a
-    # sharded run and a single-process run record the same identity.
-    audit = replace(
-      primary.audit,
-      slots=_run_level_slots(
-        cohort,
-        tuple(teacher_ids),
-        num_envs,
-        device=device,
-        base_seed=setup.base_seed,
-      ),
+    # sharded run and a single-process run record the same identity.  The same
+    # holds for the mapping digest of a clip-sharded run: a shard's digest
+    # covers its own slice, and the identity records the merged cohort.
+    run_slots = _run_level_slots(
+      cohort,
+      tuple(teacher_ids),
+      num_envs,
+      device=device,
+      base_seed=setup.base_seed,
+    )
+    audit = (
+      replace(merged.audit, slots=run_slots)
+      if not clip_shards
+      else replace(
+        merged.audit,
+        slots=run_slots,
+        mapping_digest=merged.library.mapping_digest(),
+      )
     )
     identity = cohort_identity_from_parts(
       cohort=cohort,
-      library=primary.library,
+      library=merged.library,
       audit=audit,
       replay=replay,
       device=device,
     )
+    # No teacher bank here.  In this layout the parent labels no row: each
+    # worker's own shard-scoped bank labels the rows it collects, and sharded
+    # evaluation runs on the workers too.  A bank in the parent would resolve
+    # one frozen actor per cohort member on the trainer card -- 15.8 MiB times
+    # the member count, 50.3 GiB at 3 261 clips -- for a trainer that only keeps
+    # it frozen.
     trainer = VaeDistillationTrainer(
-      model,
-      replay,
-      training_config,
-      seed=seed,
-      teacher=build_cohort_teacher_bank(cohort, device=device),
+      model, replay, training_config, seed=seed, teacher=None
     )
     source = ShardedCollection(
       pool, replay=replay, model=model, descriptions=descriptions
@@ -1292,8 +1392,8 @@ def _build_sharded_cohort_runner(
     runner,
     source,
     identity,
-    primary.sampling_mode,
-    _seed_audit(SimpleNamespace(audit=primary.audit)),
+    merged.sampling_mode,
+    _seed_audit(SimpleNamespace(audit=merged.audit)),
   )
 
 
@@ -1309,6 +1409,8 @@ def _cohort_resolved_config(
   device: str,
   num_envs: int,
   worker_devices: tuple[str, ...] = (),
+  clip_shards: Sequence[ClipShard] = (),
+  envs_per_motion: int | None = None,
   seed: int,
   seed_audit: Mapping[str, Any],
   runner: DistillationRunner,
@@ -1356,7 +1458,12 @@ def _cohort_resolved_config(
       "seed": seed,
       "resolved_seed": seed_audit["effective_seed"],
       "seed_provenance": dict(seed_audit),
-      "workers": _workers_identity(worker_devices, num_envs),
+      "workers": _workers_identity(
+        worker_devices,
+        num_envs,
+        clip_shards=clip_shards,
+        envs_per_motion=envs_per_motion,
+      ),
     },
     "execution": {"transport": _collection_transport(worker_devices)},
     "schedule": _schedule_config(runner, sampling_mode),
@@ -1654,28 +1761,99 @@ def _run_level_slots(
   the plan for the run's row count, with the row assignment seeded from the base
   seed -- which is worker 0's derivation, and therefore the single-process one.
 
-  This is a pure computation: it selects clips, pins rows and validates the
-  phase policy without touching a simulator.
+  This is a pure computation that loads no reference clip: a clip-sharded parent
+  plans the whole run's rows from metadata alone, and the clips themselves live
+  only in the workers that build them.  For that reason ``device`` is accepted
+  and unused -- an allocation with no reference storage cannot depend on it --
+  and stays so a caller keeps naming the run's device in one call.
   """
-  return plan_multi_motion(
+  del device
+  return multi_motion_slots(
     cohort,
     teacher_ids,
     num_envs,
     phase_policy=_COHORT_PHASE_POLICY,
     slot_generator=torch.Generator().manual_seed(base_seed),
-    device=device,
-  ).slots
+  )
 
 
-def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup) -> Any:
-  """Require every shard to describe the same cohort contract as shard 0.
+@dataclass(frozen=True, slots=True)
+class _MergedShardCohort:
+  """Metadata-only view of a clip-sharded cohort, merged from its shards.
+
+  A clip-sharded parent owns no environment and holds no reference tensors: it
+  needs each clip's identity to partition the replay, to route rows to frozen
+  teachers, and to record the cohort identity, and nothing else.  What no single
+  shard can describe is the run, so ``weights`` is the sampling weight each
+  shard allocated rows with, aligned with ``library.clips`` (the identity
+  builder still checks every weight against the manifest), and ``audit`` is
+  shard 0's contract, which the caller completes with the run-level slots and
+  the merged mapping digest.
+
+  ``library`` is a :class:`ClipMapping` rather than a loaded
+  :class:`MotionLibrary`: same name, because it is the same thing -- the ordered
+  clip identity -- with the reference tensors left in the workers that own them.
+
+  Reads like a worker description on purpose, so the rest of the sharded build
+  is one code path for both collection layouts.
+
+  ``reset_window_counts`` is how many reset windows each shard reported, in
+  shard order, and it is recorded because it is the one reset-provenance member
+  the union check cannot compare: ``effective_windows`` holds one window per
+  clip of the slice that shard owns, so two shards of one cohort report
+  different tuples by construction.  The count keeps that per-slice set
+  auditable instead of dropping it, and ``None`` marks a shard that reported no
+  live reset provenance at all, which is not a shard with zero windows.
+  """
+
+  schema: Any
+  audit: Any
+  sampling_mode: str
+  library: ClipMapping
+  motion_teacher_codes: dict[int, int]
+  weights: tuple[float, ...]
+  reset_window_counts: tuple[int | None, ...]
+
+  @property
+  def clips(self) -> tuple[MotionClip, ...]:
+    """Merged clips in cohort order."""
+    return self.library.clips
+
+  def frame_counts(self) -> dict[int, int]:
+    """Per-motion clip length, the shape the balanced replay takes."""
+    return {clip.motion_id: int(clip.frames) for clip in self.clips}
+
+  def replay_weights(self) -> dict[int, float]:
+    """Per-motion sampling weight, the shape the balanced replay takes."""
+    return {
+      clip.motion_id: weight
+      for clip, weight in zip(self.clips, self.weights, strict=True)
+    }
+
+
+def _require_one_shard_contract(
+  descriptions: Sequence[Any],
+  setup: CohortSetup,
+  *,
+  clip_shards: Sequence[ClipShard] | None = None,
+) -> Any:
+  """Require every shard to describe one cohort contract, or one cohort's slices.
 
   The parent takes the replay's clip weights and frame counts, the
-  motion-to-teacher routing, and the whole cohort identity from worker 0, so a
+  motion-to-teacher routing, and the whole cohort identity from the shards, so a
   shard that disagrees about the library, the audited slots, the phase policy,
   the routing or the reset contract would have the model trained on one
   contract while that shard collected under another.  Comparing the observation
   schema alone left all of that unverified.
+
+  ``clip_shards`` selects the two layouts.  Unset, every shard holds the whole
+  selection, so their clip sets and routing tables must be equal.  Given, each
+  shard holds a disjoint slice, so those two are *merged* instead: the slices
+  must be disjoint and their union must be exactly the requested
+  ``teacher_id -> motion_id`` mapping, in cohort order.  A slice assigned to two
+  workers, a clip no worker built, and a shard that renumbers its clips are all
+  refused here, because each of them would silently cost one clip's rows or
+  train a clip's rows against another clip's partition.
 
   The environment seed is deliberately not compared for equality: each shard's
   environment is built on its own stratum by construction, so its recorded seed
@@ -1683,65 +1861,115 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
   actually carries the seed its index derives, which is the invariant the cohort
   identity's single seed record and a sharded resume both rest on.
 
+  A clip-sharded run also cannot compare the resets' ``effective_windows``: that
+  tuple holds one window per clip of the slice a shard owns, so two shards of
+  one cohort report different tuples by construction.  Everything else in the
+  live reset record is compared, and each shard's window count is recorded in
+  the merged metadata.
+
   Returns:
-    The description every shard agreed with.
+    Shard 0's description when every shard holds the whole selection, or the
+    merged metadata-only view when the shards hold disjoint slices.
 
   Raises:
     DistillationError: if any shard disagrees about any of the above.
   """
+  if not descriptions:
+    raise DistillationError("a sharded build needs at least one worker description")
   primary = descriptions[0]
+  clipped = clip_shards is not None
 
   def audited_contract(item: Any) -> Any:
     """The audited contract of one shard, minus what is per-shard by design.
 
     Comparing the whole record rather than a hand-picked list is what keeps this
-    honest as the audit grows: everything -- the clip set and compiled-asset
-    evidence, the mapping digest, the phase policy, the additional-gravity
-    policy, the semantic overrides, the joint order, the control period, the
-    actor terms, the slot weights and counts and teacher routing -- must agree
-    across shards.
+    honest as the audit grows: everything -- the compiled-asset evidence, the
+    mapping digest, the phase policy, the additional-gravity policy, the
+    semantic overrides, the joint order, the control period, the actor terms,
+    the slot weights and counts and teacher routing -- must agree across shards.
 
-    Exactly two members are excluded, both because each shard is *deliberately*
-    its own instance rather than a copy: the environment seed provenance (each
-    shard is its own seed stratum, checked below), and the per-row clip
-    assignment (`slots.row_motion_ids`), which the adapter seeds from that same
-    per-shard environment seed.  The weights, the counts and the teacher routing
-    are still compared.
+    Members excluded because each shard is *deliberately* its own instance: the
+    environment seed provenance (each shard is its own seed stratum, checked
+    below), and the per-row clip assignment (`slots.row_motion_ids`), which the
+    adapter seeds from that same per-shard environment seed.  The weights, the
+    counts and the teacher routing are still compared.
+
+    A clip-sharded run adds four more, all of which describe the shard's own
+    slice: its selected teacher ids, its row allocation, its per-clip asset
+    evidence, and its ordered mapping digest.  The compiled-asset facts stay
+    compared with the per-clip evidence removed, and the slice itself -- its
+    clips, their order, their ids, its allocation and its evidence -- is checked
+    against the plan by :func:`_merge_clip_shards`, which also produces the
+    merged digest and weights the run records.
     """
     audit = item.audit
     if audit is None:
       return None
-    # The audit is compared as a whole with only the seed stratum removed, so a
-    # field added to it later cannot escape.  The slots are compared as their
-    # shard-independent members: a blank row assignment cannot be constructed at
-    # all, because the allocation validates its own row count.
+    # The audit is compared as a whole with only the per-shard members removed,
+    # so a field added to it later cannot escape.  The slots are compared as
+    # their shard-independent members: a blank row assignment cannot be
+    # constructed at all, because the allocation validates its own row count.
     excluded = {"seed_provenance", "slots"}
-    return {
+    if clipped:
+      excluded |= {"teacher_ids", "slots", "asset", "mapping_digest"}
+    shared = {
       # Enumerated from the record itself, so a field added to the audit later
       # is compared without anyone remembering to add it here.
-      "audit": {
-        field.name: getattr(audit, field.name)
-        for field in dataclasses.fields(audit)
-        if field.name not in excluded
-      },
-      "slots": {
+      field.name: getattr(audit, field.name)
+      for field in dataclasses.fields(audit)
+      if field.name not in excluded
+    }
+    if not clipped:
+      shared["slots"] = {
         "weights": tuple(audit.slots.weights),
         "counts": tuple(audit.slots.counts),
         "teacher_ids": tuple(audit.slots.teacher_ids),
-      },
-    }
+      }
+    if clipped:
+      asset = audit.asset
+      shared["asset"] = None if asset is None else replace(asset, clips=())
+    return shared
+
+  def live_reset_contract(item: Any) -> Any:
+    """The shard's live reset record, minus a shard's own window set.
+
+    ``effective_windows`` is derived from the reset windows of the clips *that*
+    shard owns (``reset_provenance_from_adapter``), so two shards of one cohort
+    legitimately report different tuples: each tuple describes its own slice's
+    clip lengths.  A two-worker smoke of one cohort failed the union check on
+    exactly that member before this exclusion existed.
+
+    Every other member describes the cohort's reset contract -- the policy, the
+    boundary semantics, the standing pose, the perturbations, the provenance
+    labels and the replay layout -- so they stay compared, and a shard that
+    resets under a different policy still fails.  The windows themselves are not
+    dropped: :func:`_merge_clip_shards` records each shard's count.  The
+    whole-cohort layout keeps the full record, because there every shard holds
+    every clip, so its window set must be equal too.
+    """
+    provenance = item.reset_provenance
+    if provenance is None or not clipped:
+      return provenance
+    # Neutralise the per-slice member the same way the audited contract
+    # neutralises the seed provenance: with dataclasses.replace on the frozen
+    # record, so every remaining member is still compared as a whole.
+    return replace(provenance, effective_windows=())
 
   fields = (
     ("observation schema", lambda item: item.schema),
-    ("reference library clips", lambda item: item.library.clips),
     ("library body selection", lambda item: item.library.body_selection),
     ("library source body count", lambda item: item.library.source_body_count),
     ("audited contract", audited_contract),
-    ("live reset provenance", lambda item: item.reset_provenance),
-    ("motion teacher codes", lambda item: item.motion_teacher_codes),
+    ("live reset provenance", live_reset_contract),
     ("sampling mode", lambda item: item.sampling_mode),
     ("reset policy enablement", lambda item: item.reset_policy_enabled),
   )
+  if not clipped:
+    fields = (
+      ("reference library clips", lambda item: item.library.clips),
+      ("motion teacher codes", lambda item: item.motion_teacher_codes),
+      *fields,
+    )
   for index, description in enumerate(descriptions):
     for name, read in fields:
       theirs, ours = read(description), read(primary)
@@ -1769,7 +1997,151 @@ def _require_one_shard_contract(descriptions: Sequence[Any], setup: CohortSetup)
           f"worker {index} did not apply its seed before construction, so its "
           "startup randomization is not the one this run's seed record describes"
         )
-  return primary
+  if not clipped:
+    return primary
+  assert clip_shards is not None
+  return _merge_clip_shards(
+    descriptions, primary, clip_shards, tuple(setup.teacher_ids)
+  )
+
+
+def _merge_clip_shards(
+  descriptions: Sequence[Any],
+  primary: Any,
+  clip_shards: Sequence[ClipShard],
+  requested: tuple[str, ...],
+) -> _MergedShardCohort:
+  """Merge the disjoint clip slices of a clip-sharded run, metadata only.
+
+  Every slice is checked against the plan the run was started with and against
+  the other slices, so the parent's replay, routing table and cohort identity
+  describe the union of what the workers built rather than shard 0's subset.
+
+  Raises:
+    DistillationError: if a slice is missing, repeated, renumbered, or its
+      per-clip evidence disagrees with the plan.
+  """
+  if len(descriptions) != len(clip_shards):
+    raise DistillationError(
+      f"{len(descriptions)} worker descriptions do not match the "
+      f"{len(clip_shards)} planned clip shards"
+    )
+  expected: dict[str, int] = {}
+  for shard in clip_shards:
+    for teacher_id, motion_id in zip(shard.teacher_ids, shard.motion_ids, strict=True):
+      if teacher_id in expected:
+        raise DistillationError(
+          f"the clip-shard plan assigns clip {teacher_id!r} to two workers"
+        )
+      expected[teacher_id] = motion_id
+  if set(expected) != set(requested):
+    raise DistillationError(
+      f"the clip-shard plan covers {sorted(expected)} but the run requested "
+      f"{sorted(requested)}"
+    )
+  ids = sorted(expected.values())
+  if len(set(ids)) != len(ids) or ids != list(range(len(ids))):
+    raise DistillationError(
+      f"the clip-shard plan gives clip ids {ids}; a cohort's clip ids are "
+      f"0..{len(ids) - 1} in cohort order, one per clip"
+    )
+
+  merged: dict[int, MotionClip] = {}
+  weights: dict[int, float] = {}
+  codes: dict[int, int] = {}
+  window_counts: list[int | None] = []
+  for description, shard in zip(descriptions, clip_shards, strict=True):
+    if description.worker_index != shard.worker_index:
+      raise DistillationError(
+        f"worker {description.worker_index} answered for the shard planned for "
+        f"worker {shard.worker_index}; the descriptions are not in plan order"
+      )
+    if not isinstance(description.library, MotionLibrary):
+      raise DistillationError(
+        f"worker {shard.worker_index} did not describe a reference library"
+      )
+    clips = description.library.clips
+    planned = tuple(zip(shard.teacher_ids, shard.motion_ids, strict=True))
+    built = tuple((clip.teacher_id, clip.motion_id) for clip in clips)
+    if built != planned:
+      raise DistillationError(
+        f"worker {shard.worker_index} built clips {built} but the plan gave it "
+        f"{planned}; the shard does not describe the slice this run partitioned"
+      )
+    allocation = description.audit.slots
+    if tuple(allocation.teacher_ids) != shard.teacher_ids:
+      raise DistillationError(
+        f"worker {shard.worker_index} allocated rows over "
+        f"{tuple(allocation.teacher_ids)} but its clips are {shard.teacher_ids}"
+      )
+    if allocation.num_envs != description.num_envs:
+      raise DistillationError(
+        f"worker {shard.worker_index} describes {description.num_envs} "
+        f"environments but allocated {allocation.num_envs} rows"
+      )
+    asset = description.audit.asset
+    if asset is not None:
+      evidence = tuple(item.motion_id for item in asset.clips)
+      if evidence != shard.motion_ids:
+        raise DistillationError(
+          f"worker {shard.worker_index} audited clips {evidence} but built "
+          f"{shard.motion_ids}"
+        )
+    # The reset windows are the one provenance member the union check does not
+    # compare, because they describe this shard's own slice.  Record how many
+    # this shard reported, so the per-slice window set stays auditable.
+    provenance = description.reset_provenance
+    window_counts.append(
+      None if provenance is None else len(tuple(provenance.effective_windows))
+    )
+    routing = dict(description.motion_teacher_codes or {})
+    if set(routing) != set(shard.motion_ids):
+      raise DistillationError(
+        f"worker {shard.worker_index} routes motions {sorted(routing)} but holds "
+        f"{list(shard.motion_ids)}"
+      )
+    for position, clip in enumerate(clips):
+      if clip.motion_id in merged:
+        raise DistillationError(
+          f"clip {clip.teacher_id!r} was built by more than one worker"
+        )
+      if routing[clip.motion_id] != clip.teacher_code:
+        raise DistillationError(
+          f"worker {shard.worker_index} routes clip {clip.teacher_id!r} to teacher "
+          f"code {routing[clip.motion_id]} but its clip carries "
+          f"{clip.teacher_code}"
+        )
+      merged[clip.motion_id] = clip
+      weights[clip.motion_id] = float(allocation.weights[position])
+      codes[clip.motion_id] = int(clip.teacher_code)
+
+  missing = [position for position in range(len(ids)) if position not in merged]
+  if missing:
+    raise DistillationError(
+      f"no worker built clip ids {missing}; every requested clip must be built "
+      "exactly once"
+    )
+  # Offsets are recomputed over the merged order, so the stand-in carries the
+  # same placement a single-process library of this cohort would have.
+  placed: list[MotionClip] = []
+  offset = 0
+  for motion_id in range(len(merged)):
+    clip = merged[motion_id]
+    placed.append(replace(clip, storage_offset=offset))
+    offset += clip.frames
+  return _MergedShardCohort(
+    schema=primary.schema,
+    audit=primary.audit,
+    sampling_mode=primary.sampling_mode,
+    library=ClipMapping(
+      clips=tuple(placed),
+      source_body_count=primary.library.source_body_count,
+      body_selection=primary.library.body_selection,
+    ),
+    motion_teacher_codes=codes,
+    weights=tuple(weights[motion_id] for motion_id in range(len(merged))),
+    reset_window_counts=tuple(window_counts),
+  )
 
 
 def _validate_cohort_run(
@@ -1861,9 +2233,20 @@ def _drive_lifecycle(
     remaining = max_iterations - runner.iteration
     chunk = remaining if checkpoint_every <= 0 else min(checkpoint_every, remaining)
     for _ in range(chunk):
+      phase_t0 = time.perf_counter()
       iteration_report = _iteration_report(runner.run_iteration(), report_boundaries)
+      phase_t1 = time.perf_counter()
       if isinstance(runner.replay, BalancedReplayBuffer):
         iteration_report["replay"] = runner.replay.report().as_dict()
+      phase_t2 = time.perf_counter()
+      if os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1":
+        print(
+          f"[phase] loop iter={runner.iteration} "
+          f"run_iteration={phase_t1 - phase_t0:.2f}s "
+          f"replay_report={phase_t2 - phase_t1:.2f}s",
+          file=sys.stderr,
+          flush=True,
+        )
       iteration_reports.append(iteration_report)
       iterations_this_run += 1
       if progress_every > 0 and (
@@ -2076,6 +2459,8 @@ def _train_cohort(
   replay_capacity: int,
   phase_bins: int,
   worker_devices: tuple[str, ...] = (),
+  shard_clips: bool = False,
+  envs_per_motion: int | None = None,
   learning_rate: float,
   beta: float,
   schema_mode: str = "gravity",
@@ -2160,6 +2545,28 @@ def _train_cohort(
         None if not coverage_evidence else str(coverage_parity_evidence)
       ),
     )
+    clip_shards: tuple[ClipShard, ...] = ()
+    if shard_clips:
+      # Pure planning: every clip is assigned, and every refusal, before any
+      # worker process exists.
+      if envs_per_motion is None:
+        raise DistillationError(
+          "--shard-clips requires --envs-per-motion: each shard's environment "
+          "count is its clip count times this value"
+        )
+      clip_shards = clip_shard_plan(
+        cohort,
+        teacher_ids,
+        worker_devices,
+        envs_per_motion=envs_per_motion,
+      )
+      planned_envs = sum(shard.num_envs for shard in clip_shards)
+      if planned_envs != num_envs:
+        raise DistillationError(
+          f"the clip plan builds {planned_envs} environments but the run budget "
+          f"is {num_envs}; --shard-clips derives the total from "
+          "--envs-per-motion, so the two must agree"
+        )
     if worker_devices:
       primary_build = _build_sharded_cohort_runner(
         cohort=cohort,
@@ -2168,6 +2575,7 @@ def _train_cohort(
         device=device,
         num_envs=num_envs,
         worker_devices=worker_devices,
+        clip_shards=clip_shards,
         replay_capacity=replay_capacity,
         phase_bins=phase_bins,
         minibatch_size=minibatch_size,
@@ -2235,6 +2643,8 @@ def _train_cohort(
       device=device,
       num_envs=num_envs,
       worker_devices=worker_devices,
+      clip_shards=clip_shards,
+      envs_per_motion=envs_per_motion if clip_shards else None,
       seed=seed,
       seed_audit=seed_audit,
       runner=runner,
@@ -2384,6 +2794,7 @@ def _train(
   replay_retention_iterations: float | None = None,
   phase_bins: int | None = None,
   worker_devices: tuple[str, ...] | None = None,
+  shard_clips: bool = False,
   learning_rate: float = 5e-4,
   beta: float = 0.01,
   schema_mode: str = "gravity",
@@ -2454,6 +2865,16 @@ def _train(
   therefore a resume invariant.  A list that repeats a device, exceeds eight
   entries, or does not divide ``num_envs`` evenly is refused before any
   environment is constructed, as is any use on the single-teacher path.
+
+  ``shard_clips`` (``--shard-clips True``, off by default) gives each worker a
+  disjoint slice of the cohort's clips instead of the whole selection, which is
+  what a cohort too large for one card needs: every process that builds all
+  members pays the fixed per-member cost.  It requires ``--worker-devices`` and
+  ``--envs-per-motion``, and refuses an explicit ``--num-envs`` because the plan
+  derives the total (``clips times envs-per-motion``) and accepts unequal shard
+  totals.  The partition is recorded in the resolved configuration, so a resume
+  must reproduce it exactly; a different partition is refused rather than
+  silently re-sharded.
 
   ``coverage_policy`` selects the difficult-state coverage policy and is
   **enabled by default on the cohort path**: an omitted value resolves to
@@ -2541,6 +2962,36 @@ def _train(
         "cohort syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
       )
     )
+  if not teacher_ids and shard_clips:
+    return _fail(
+      ValueError(
+        "--shard-clips applies only to the cohort path; use singleton cohort "
+        "syntax --teacher-ids \"('tennis_000',)\" (and omit --teacher-id)"
+      )
+    )
+  if shard_clips:
+    # The plan, not the caller, decides the environment total: each shard holds
+    # a different number of clips, so its environment count is
+    # ``clips times envs-per-motion`` and the shards' totals are unequal by
+    # design.
+    if not worker_devices:
+      return _fail(
+        ValueError("--shard-clips requires --worker-devices: one shard per device")
+      )
+    if envs_per_motion is None:
+      return _fail(
+        ValueError(
+          "--shard-clips requires --envs-per-motion: each shard's environment "
+          "count is its clip count times this value"
+        )
+      )
+    if num_envs is not None:
+      return _fail(
+        ValueError(
+          "--shard-clips refuses --num-envs: the clip plan derives the total "
+          "from --envs-per-motion, and per-shard totals are unequal by design"
+        )
+      )
   try:
     sample_budget = resolve_sample_budget(
       motion_count=len(teacher_ids) if teacher_ids else 1,
@@ -2557,7 +3008,9 @@ def _train(
     num_envs = sample_budget.num_envs
     updates_per_iteration = sample_budget.updates_per_iteration
     replay_capacity = sample_budget.replay_capacity
-    resolved_worker_devices = _resolve_worker_devices(worker_devices, num_envs=num_envs)
+    resolved_worker_devices = _resolve_worker_devices(
+      worker_devices, num_envs=num_envs, even_split=not shard_clips
+    )
   except ValueError as exc:
     return _fail(exc)
   resolved_coverage_choice = _resolve_coverage_choice(
@@ -2586,6 +3039,8 @@ def _train(
       device=device,
       num_envs=num_envs,
       worker_devices=resolved_worker_devices,
+      shard_clips=shard_clips,
+      envs_per_motion=envs_per_motion,
       max_iterations=max_iterations,
       bootstrap_steps=bootstrap_steps,
       collection_steps=collection_steps,

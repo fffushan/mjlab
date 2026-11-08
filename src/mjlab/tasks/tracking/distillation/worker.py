@@ -25,6 +25,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue as queue_module
+import sys
 import threading
 import time
 import traceback
@@ -54,12 +55,16 @@ from mjlab.tasks.tracking.distillation.collector import (
   RolloutLatent,
   evaluate_distillation,
 )
-from mjlab.tasks.tracking.distillation.multi_motion import PhasePolicy
+from mjlab.tasks.tracking.distillation.multi_motion import (
+  PhasePolicy,
+  selected_cohort_teachers,
+)
 from mjlab.tasks.tracking.distillation.reset_policy import ResetPolicy
 from mjlab.tasks.tracking.distillation.storage import LabeledReplayBatch
 from mjlab.tasks.tracking.distillation.teachers import TeacherBank
 
 if TYPE_CHECKING:
+  from mjlab.tasks.tracking.distillation.config import CohortContract
   from mjlab.tasks.tracking.distillation.coverage_storage import CoverageReplayBatch
 
 DEFAULT_REQUEST_TIMEOUT_S = 900.0
@@ -137,6 +142,51 @@ class WorkerSpec:
   device: str
   num_envs: int
   setup: CohortSetup
+
+
+@dataclass(frozen=True, slots=True)
+class ClipShard:
+  """One worker's disjoint slice of a clip-sharded cohort.
+
+  ``teacher_ids`` and ``motion_ids`` are aligned and both in cohort order.
+  ``motion_ids`` are the cohort-wide clip ids, not this slice's positions: a
+  shard labels its rows with them, so the parent's replay partitions and its
+  cohort identity describe one cohort rather than N local renumberings.
+  """
+
+  worker_index: int
+  device: str
+  teacher_ids: tuple[str, ...]
+  motion_ids: tuple[int, ...]
+  num_envs: int
+
+  def __post_init__(self) -> None:
+    if not self.teacher_ids:
+      raise WorkerError("a clip shard needs at least one clip")
+    if len(self.teacher_ids) != len(self.motion_ids):
+      raise WorkerError(
+        f"clip shard {self.worker_index} has {len(self.teacher_ids)} teacher ids but "
+        f"{len(self.motion_ids)} motion ids"
+      )
+    if len(set(self.teacher_ids)) != len(self.teacher_ids):
+      raise WorkerError(f"clip shard {self.worker_index} repeats a clip")
+    if len(set(self.motion_ids)) != len(self.motion_ids):
+      raise WorkerError(f"clip shard {self.worker_index} repeats a motion id")
+    if any(
+      isinstance(motion_id, bool) or not isinstance(motion_id, int) or motion_id < 0
+      for motion_id in self.motion_ids
+    ):
+      raise WorkerError(
+        f"clip shard {self.worker_index} needs non-negative integer motion ids, got "
+        f"{self.motion_ids}"
+      )
+    # A slot allocation gives every motion at least one row, so a shard with
+    # fewer environments than clips could never be built.
+    if self.num_envs < len(self.teacher_ids):
+      raise WorkerError(
+        f"clip shard {self.worker_index} has {self.num_envs} environments for "
+        f"{len(self.teacher_ids)} clips; each clip needs at least one row"
+      )
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +549,7 @@ class _Worker:
     derive_reset_rng(self.adapter.env.command_manager.get_term("motion"), seed)
 
   def collect(self, request: CollectRequest) -> CollectReply:
+    _t_start = time.perf_counter()
     self.build()
     self.apply_weights(request.weights)
     generator_seed = worker_generator_seed(
@@ -512,6 +563,7 @@ class _Worker:
     # *whole* call reproducible after a resume rather than only the streams the
     # collector and the command own.
     torch.manual_seed(generator_seed)
+    _t_pre = time.perf_counter()
     result: CollectionResult = self.collector.collect(
       CollectionConfig(
         steps=request.steps,
@@ -531,12 +583,15 @@ class _Worker:
     batch = result.fresh_data.batch
     if result.ticks <= 0 or batch.batch_size % result.ticks != 0:
       raise WorkerError("collection returned an unsliceable fresh batch")
+    _t_sim = time.perf_counter()
     coverage_batch = getattr(result, "coverage_batch", None)
     staged_coverage = (
       None
       if not isinstance(coverage_batch, LabeledReplayBatch)
       else _stage_batch(coverage_batch)
     )
+    _staged_batch = _stage_batch(batch)
+    _t_stage = time.perf_counter()
     return CollectReply(
       call_id=request.call_id,
       iteration=request.iteration,
@@ -549,7 +604,7 @@ class _Worker:
       motion_stats=tuple(result.motion_stats),
       boundaries=tuple(result.boundaries),
       rows_per_tick=batch.batch_size // result.ticks,
-      batch=_stage_batch(batch),
+      batch=_staged_batch,
       coverage_batch=staged_coverage,
       coverage_report=dict(getattr(result, "coverage_report", {})),
       eligible_resets=dict(result.eligible_resets),
@@ -558,6 +613,14 @@ class _Worker:
       },
       motion_frames=_observed_frames(batch),
     )
+    if os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1":
+      print(
+        f"[phase] worker={self.spec.worker_index} split "
+        f"prep={_t_pre - _t_start:.2f}s sim={_t_sim - _t_pre:.2f}s "
+        f"stage={_t_stage - _t_sim:.2f}s",
+        file=sys.stderr,
+        flush=True,
+      )
 
   def evaluate(self, request: EvaluateRequest) -> EvaluateReply:
     self.build()
@@ -666,6 +729,7 @@ def worker_main(
         return
       if isinstance(request, ShutdownWorker):
         return
+      _t_popped = time.perf_counter()
       try:
         if isinstance(request, DescribeWorker):
           reply: WorkerReply = shard.describe(request)
@@ -681,7 +745,16 @@ def worker_main(
           message=f"{type(exc).__name__}: {exc}",
           traceback=traceback.format_exc(),
         )
+      _t_built = time.perf_counter()
       replies.put(reply)
+      _t_put = time.perf_counter()
+      if os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1":
+        print(
+          f"[phase] worker={spec.worker_index} cmd={type(request).__name__} "
+          f"sim={_t_built - _t_popped:.2f}s put={_t_put - _t_built:.2f}s",
+          file=sys.stderr,
+          flush=True,
+        )
   finally:
     stop_watch()
     shard.close()
@@ -883,9 +956,18 @@ class WorkerPool:
       )
     for index, request in enumerate(requests):
       self._send(index, request)
-    return tuple(
+    dispatched_at = time.perf_counter()
+    replies = tuple(
       self._receive(index, request) for index, request in enumerate(requests)
     )
+    if os.environ.get("MJLAB_DISTILL_PHASE_TIMING") == "1":
+      waited = time.perf_counter() - dispatched_at
+      print(
+        f"[phase] pool dispatch+wait={waited:.2f}s for {len(requests)} workers",
+        file=sys.stderr,
+        flush=True,
+      )
+    return replies
 
   def _request(self, worker_index: int, request: WorkerRequest) -> WorkerReply:
     """Send one request and wait for its reply (no overlap with other workers)."""
@@ -997,6 +1079,107 @@ class WorkerPool:
     return tuple(typed_replies)
 
 
+def clip_shard_plan(
+  cohort: CohortContract,
+  teacher_ids: Sequence[str],
+  worker_devices: Sequence[str],
+  *,
+  envs_per_motion: int,
+) -> tuple[ClipShard, ...]:
+  """Give each collection worker a disjoint slice of one cohort's clips.
+
+  A large cohort does not fit one card: every process that builds all of its
+  members pays the fixed per-member cost, which is about 50 GiB at 3261 clips.
+  Splitting the clips over the workers keeps each shard's cost proportional to
+  its own slice, and the slices are contiguous and balanced (sizes differ by at
+  most one) in cohort order, so the partition is deterministic and a resume can
+  reproduce it exactly.
+
+  Preconditions, all refused before any environment exists: an empty
+  selection, more shards than clips, ``envs_per_motion`` below one, a repeated
+  device, and a repeated clip.  A repeated device is refused because the point
+  of the split is one slice per card; two shards on one device would pay the
+  per-member cost twice on the card it was meant to relieve.
+
+  Args:
+    cohort: resolved cohort the requested clips belong to.
+    teacher_ids: requested clips; ids are cohort-wide positions in this
+      selection's manifest order.
+    worker_devices: one device per shard, in shard order.
+    envs_per_motion: rows per clip in each shard, the same for every shard.
+
+  Returns:
+    One :class:`ClipShard` per device, covering every requested clip once.
+
+  Raises:
+    WorkerError: if any precondition above is violated.
+    MultiMotionError: if the selection is empty, unknown, or duplicated.
+  """
+  selected = selected_cohort_teachers(cohort, teacher_ids)
+  devices = tuple(worker_devices)
+  if not devices:
+    raise WorkerError("a clip-sharded run needs at least one worker device")
+  if len(devices) > len(selected):
+    raise WorkerError(
+      f"{len(selected)} clips cannot be split over {len(devices)} workers; every "
+      "shard needs at least one clip"
+    )
+  if (
+    isinstance(envs_per_motion, bool)
+    or not isinstance(envs_per_motion, int)
+    or envs_per_motion < 1
+  ):
+    raise WorkerError(
+      f"envs_per_motion must be a positive integer, got {envs_per_motion!r}"
+    )
+  repeated = sorted({device for device in devices if devices.count(device) > 1})
+  if repeated:
+    raise WorkerError(
+      f"a clip-sharded run repeats a device: {repeated}; one shard per device"
+    )
+
+  base, extra = divmod(len(selected), len(devices))
+  shards: list[ClipShard] = []
+  start = 0
+  for index, device in enumerate(devices):
+    size = base + (1 if index < extra else 0)
+    shard = selected[start : start + size]
+    shards.append(
+      ClipShard(
+        worker_index=index,
+        device=device,
+        teacher_ids=tuple(teacher.id for teacher in shard),
+        motion_ids=tuple(range(start, start + size)),
+        num_envs=envs_per_motion * size,
+      )
+    )
+    start += size
+  return tuple(shards)
+
+
+def clip_shard_worker_specs(
+  setup: CohortSetup, shards: Sequence[ClipShard]
+) -> tuple[WorkerSpec, ...]:
+  """One worker spec per shard, each carrying its own clips and their ids.
+
+  The recipe travels unchanged except for the clip selection, so a worker
+  cannot build a different environment than the plan it was given.
+  """
+  return tuple(
+    WorkerSpec(
+      worker_index=shard.worker_index,
+      device=shard.device,
+      num_envs=shard.num_envs,
+      setup=replace(
+        setup,
+        teacher_ids=shard.teacher_ids,
+        motion_ids=tuple(zip(shard.teacher_ids, shard.motion_ids, strict=True)),
+      ),
+    )
+    for shard in shards
+  )
+
+
 def worker_specs(
   setup: CohortSetup,
   worker_devices: Sequence[str],
@@ -1031,6 +1214,7 @@ def worker_specs(
 
 
 __all__ = [
+  "ClipShard",
   "CollectReply",
   "CollectRequest",
   "DEFAULT_REQUEST_TIMEOUT_S",
@@ -1051,6 +1235,8 @@ __all__ = [
   "WorkerPool",
   "WorkerPoolError",
   "WorkerSpec",
+  "clip_shard_plan",
+  "clip_shard_worker_specs",
   "describe_environment",
   "freeze_student_normalizers",
   "worker_main",

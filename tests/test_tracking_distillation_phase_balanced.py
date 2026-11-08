@@ -99,15 +99,20 @@ def test_phase_bins_zero_reproduces_the_historical_draw_exactly() -> None:
     torch.testing.assert_close(left.reference_frame, right.reference_frame)
 
 
-def test_phase_bins_unset_reproduces_the_prechange_golden_sequences() -> None:
-  """Default-off rows/counters/RNG stream match pre-change golden values.
+def test_phase_bins_unset_keeps_a_pinned_draw_sequence() -> None:
+  """Default-off rows/counters/RNG stream match the pinned fixture.
 
-  The golden file was generated once from the HEAD implementation *before*
-  the phase-balanced change (see the plan doc): three multi-motion cases with
-  varied weights, batch sizes including one, four draws each of reference
-  tags + motion ids, per-partition ``drawn`` counters, and the first words of
-  the final generator state.  Any behavioral drift on the default path —
-  rows, generator consumption, or counter updates — fails here.
+  The fixture holds three multi-motion cases with varied weights, batch sizes
+  including one, four draws each of reference tags + motion ids, per-motion
+  ``drawn`` counters, and the first words of the final generator state.  Any
+  behavioural drift on the default path — rows, generator consumption, or
+  counter updates — fails here.
+
+  The fixture was regenerated for the flat-ring draw (2026-11-06).  That change
+  replaced one ``randint`` per motion with one uniform per output row, so the
+  pre-change row identities and generator words are not reproducible by design;
+  the motion mixture and the counters are unchanged.  The pinned values now
+  guard the current contract, not the pre-change stream.
   """
   cases = json.loads(_GOLDEN_PATH.read_text(encoding="utf-8"))
   assert len(cases) >= 3

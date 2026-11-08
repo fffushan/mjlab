@@ -45,6 +45,7 @@ from mjlab.tasks.tracking.distillation.config import (
   CohortContract,
   ResolvedTeacher,
   load_manifest,
+  require_onnx,
   resolve_cohort,
   sha256_file,
 )
@@ -356,6 +357,58 @@ def make_export_audit(
   }
 
 
+_REFERENCE_OUTPUTS = (
+  "joint_pos",
+  "joint_vel",
+  "body_pos_w",
+  "body_quat_w",
+  "body_lin_vel_w",
+  "body_ang_vel_w",
+)
+
+
+def strip_teacher_reference_tables(path: Path) -> None:
+  """Remove the embedded reference tables from one teacher export.
+
+  The graph keeps its weights, its ``obs``/``time_step`` inputs, its ``actions``
+  output and every metadata property.  Only the six constant reference tensors,
+  their producer nodes and their outputs are removed, which is what makes one
+  export serve a whole cohort instead of one clip.
+  """
+  onnx = require_onnx()
+  model = onnx.load(str(path))
+  graph = model.graph
+  kept_outputs = [
+    value for value in graph.output if value.name not in _REFERENCE_OUTPUTS
+  ]
+  graph.ClearField("output")
+  graph.output.extend(kept_outputs)
+
+  live: set[str] = {value.name for value in graph.output}
+  changed = True
+  while changed:
+    changed = False
+    for node in graph.node:
+      if any(name in live for name in node.output):
+        for name in node.input:
+          if name and name not in live:
+            live.add(name)
+            changed = True
+
+  kept_nodes = [node for node in graph.node if any(n in live for n in node.output)]
+  graph.ClearField("node")
+  graph.node.extend(kept_nodes)
+
+  referenced = {name for node in graph.node for name in node.input if name}
+  kept_initializers = [init for init in graph.initializer if init.name in referenced]
+  removed = len(graph.initializer) - len(kept_initializers)
+  graph.ClearField("initializer")
+  graph.initializer.extend(kept_initializers)
+  if removed <= 0:
+    raise ValueError(f"{path} carried no removable reference tables")
+  onnx.save(model, str(path))
+
+
 def _verify_motion_body_binding(teacher, audit: Mapping[str, Any]) -> None:
   indices = audit["tracked_body_indices"]
   body_count = len(audit["robot_bodies"])
@@ -371,7 +424,17 @@ def _verify_motion_body_binding(teacher, audit: Mapping[str, Any]) -> None:
           )
         embedded = teacher.onnx.reference_tensor(name)
         if embedded is None:
-          raise ExportValidationError(f"teacher export has no embedded {name!r}")
+          # A shared teacher export embeds no reference tables.  The body axis is
+          # still checked against the audited asset above; only the second copy
+          # of the same numbers is gone.
+          if (
+            len(set(indices)) != len(indices) or max(indices, default=-1) >= body_count
+          ):
+            raise ExportValidationError(
+              f"audited tracked body indices for {name!r} are not a valid subset "
+              "of the robot body list"
+            )
+          continue
         selected = raw[:, list(indices)]
         expected = np.asarray(embedded[1])
         if selected.shape != expected.shape or not np.allclose(

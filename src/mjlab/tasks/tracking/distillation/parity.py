@@ -263,7 +263,20 @@ def check_checkpoint_onnx_association(teacher: ResolvedTeacher) -> AssociationRe
 
 
 def compare_reference_arrays(teacher: ResolvedTeacher) -> tuple[ReferenceResult, ...]:
-  """Compare embedded ONNX reference joint arrays with the selected motion."""
+  """Compare embedded ONNX reference joint arrays with the selected motion.
+
+  A shared teacher export embeds no reference tables, so there is nothing to
+  compare and the result is empty.  That is not a pass mask: the table is read
+  from the clip NPZ by every other consumer, and the empty tuple keeps the
+  report honest about which checks ran.
+  """
+  present = [
+    kind
+    for kind in ("joint_pos", "joint_vel")
+    if teacher.onnx.reference_tensor(kind) is not None
+  ]
+  if not present:
+    return ()
   with np.load(teacher.reference.motion_path, allow_pickle=False) as data:
     results: list[ReferenceResult] = []
     for kind in ("joint_pos", "joint_vel"):

@@ -312,6 +312,85 @@ def test_mismatched_framing_is_refused_instead_of_reordered() -> None:
   assert "ticks=" in str(error.value)
 
 
+def test_unequal_shards_merge_each_reply_with_its_own_row_count() -> None:
+  """A shard with fewer rows per tick merges, sliced by its own count.
+
+  A clip-sharded plan sizes each shard as ``envs_per_motion x its clips``, so a
+  cohort whose clip count does not divide by the worker count leaves one shard
+  short: 3 261 clips over 7 workers is six shards of 16 776 rows per tick and
+  one of 16 740.  Slicing every reply with one shard's framing would misalign
+  the shorter shard's last tick, so each reply keeps its own count and every
+  tick block is the sum of what the shards contributed for that tick.
+  """
+  ticks = 2
+  rows_per_tick = (6, 6, 4)
+  replies = []
+  for index, per_tick in enumerate(rows_per_tick):
+    reply = _reply(worker_index=index, ticks=ticks, rows_per_tick=per_tick)
+    rows = ticks * per_tick
+    # Distinguishable segment ids, so the merge's namespacing can be read back.
+    replies.append(
+      replace(reply, batch=replace(reply.batch, episode_id=torch.arange(rows)))
+    )
+
+  result = merge_collection_replies(replies, iteration=4, device=torch.device("cpu"))
+
+  assert result.fresh_data is not None
+  merged = result.fresh_data.batch
+  total = ticks * sum(rows_per_tick)
+  assert merged.batch_size == total
+  assert result.samples == total
+  expected_ticks = [
+    [
+      index * 1000.0 + row
+      for index, per_tick in enumerate(rows_per_tick)
+      for row in range(tick * per_tick, (tick + 1) * per_tick)
+    ]
+    for tick in range(ticks)
+  ]
+  tick_blocks = merged.observations.reference.flatten().split(
+    [sum(rows_per_tick)] * ticks
+  )
+  assert [block.numel() for block in tick_blocks] == [sum(rows_per_tick)] * ticks
+  assert [block.tolist() for block in tick_blocks] == expected_ticks
+  # Segment ids follow the same nesting with the same per-reply counts, so a
+  # namespaced id never drifts away from its row.
+  stride = WORKER_SEGMENT_STRIDE
+  assert merged.episode_id.numel() == total
+  assert merged.episode_id.tolist() == [
+    index * stride + row
+    for tick in range(ticks)
+    for index, per_tick in enumerate(rows_per_tick)
+    for row in range(tick * per_tick, (tick + 1) * per_tick)
+  ]
+
+
+def test_a_reply_that_disagrees_with_its_own_row_count_is_refused() -> None:
+  """``batch_size`` must be ``ticks`` times *that reply's* ``rows_per_tick``.
+
+  Unequal shard sizes are accepted, a shard that misdescribes its own rows is
+  not: the merge would slice it with a row count it does not have, and the
+  shorter shard's last tick is exactly where that goes unnoticed.
+  """
+  reply = _reply(worker_index=0, ticks=2, rows_per_tick=4)
+  with pytest.raises(ShardedCollectionError, match="which is not 2 ticks of 3 rows"):
+    merge_collection_replies(
+      [replace(reply, rows_per_tick=3)],
+      iteration=4,
+      device=torch.device("cpu"),
+    )
+  # A shard that contributes nothing is a gap in the iteration, not a framing
+  # variant: its rows would simply be missing from the replay.  Worker 0's own
+  # positivity check cannot cover it, because a later shard is the one that can
+  # be empty.
+  with pytest.raises(ShardedCollectionError, match="at least one row per tick"):
+    merge_collection_replies(
+      [reply, replace(reply, rows_per_tick=0)],
+      iteration=4,
+      device=torch.device("cpu"),
+    )
+
+
 def test_replies_that_disagree_about_provenance_are_refused() -> None:
   """Provenance is all-or-nothing: a partial merge would invent history.
 

@@ -39,6 +39,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.play import select_multi_motion_playback_clip
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.tasks.tracking.distillation.export import strip_teacher_reference_tables
 from mjlab.tasks.tracking.mdp.multi_motion_ppo import resolve_manifest_clips
 
 DEFAULT_TASK = "Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion"
@@ -76,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--device", default="cpu")
   parser.add_argument("--run-name", default="local")
   parser.add_argument("--parity-samples", type=int, default=2)
+  parser.add_argument(
+    "--no-reference",
+    action="store_true",
+    help=(
+      "Write one shared teacher export: same weights, interface and metadata, "
+      "but no embedded reference tables. A shared export serves every clip of a "
+      "cohort; each member reads its reference from its own motion NPZ."
+    ),
+  )
   return parser
 
 
@@ -122,7 +132,9 @@ def sha256_file(path: Path) -> str:
   return digest.hexdigest()
 
 
-def verify_export(onnx_path: Path, obs_width: int, samples: int) -> list[str]:
+def verify_export(
+  onnx_path: Path, obs_width: int, samples: int, *, embedded_reference: bool = True
+) -> list[str]:
   """Check the loader's stated requirements, and parity against the exported graph."""
   problems: list[str] = []
   session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
@@ -133,8 +145,9 @@ def verify_export(onnx_path: Path, obs_width: int, samples: int) -> list[str]:
     problems.append(
       f"inputs must be exactly obs/time_step with a {obs_width} obs, got {inputs}"
     )
-  if outputs != EXPECTED_OUTPUTS:
-    problems.append(f"outputs must be the embedded-reference set, got {outputs}")
+  expected_outputs = list(EXPECTED_OUTPUTS) if embedded_reference else ["actions"]
+  if outputs != expected_outputs:
+    problems.append(f"outputs must be {expected_outputs}, got {outputs}")
   if problems:
     return problems
 
@@ -201,7 +214,14 @@ def export(args: argparse.Namespace) -> dict:
     runner.export_embedded_reference_onnx(
       clips[name], str(args.out_dir), target.name, args.run_name
     )
-    problems = verify_export(target, obs_width, args.parity_samples)
+    if args.no_reference:
+      strip_teacher_reference_tables(target)
+    problems = verify_export(
+      target,
+      obs_width,
+      args.parity_samples,
+      embedded_reference=not args.no_reference,
+    )
     if problems:
       failures.extend(f"{name}: {problem}" for problem in problems)
     entries.append(

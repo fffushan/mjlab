@@ -516,6 +516,21 @@ def _compare_body_reference_arrays(
     raise DistillationError("could not load selected reference motion arrays") from exc
   compared: list[str] = []
   errors: list[tuple[str, float]] = []
+  embedded_available = [
+    name
+    for name in reference_arrays
+    if selected.onnx.reference_tensor(name) is not None
+  ]
+  if not embedded_available:
+    # A shared teacher export carries no reference tables; the clip NPZ is the only
+    # reference source.  The body binding is then verified by name, not by array
+    # equality against a second copy of the same numbers.
+    return (), ()
+  if len(embedded_available) != len(reference_arrays):
+    missing = [name for name in reference_arrays if name not in embedded_available]
+    raise DistillationError(
+      f"teacher ONNX embeds only some reference arrays; missing {missing}"
+    )
   try:
     for name in reference_arrays:
       if name not in npz:
@@ -675,12 +690,15 @@ def _require_clip_teacher_mapping(
   A clip's numeric teacher code decides which frozen teacher labels its rows, so
   a code that the cohort assigns to a different teacher would silently train on
   the wrong labels.
+
+  Clip ids are only required to be unique and non-negative, not positional: a
+  worker that owns one slice of a larger cohort labels its rows with cohort-wide
+  ids, and the parent checks their union against the requested mapping before
+  it records an identity.
   """
-  positions = tuple(clip.motion_id for clip in library.clips)
-  if positions != tuple(range(library.num_motions)):
-    raise DistillationError(
-      f"library motion ids {positions} must be their position in the clip order"
-    )
+  ids = tuple(clip.motion_id for clip in library.clips)
+  if len(set(ids)) != len(ids) or any(motion_id < 0 for motion_id in ids):
+    raise DistillationError(f"library motion ids {ids} must be unique and non-negative")
   for clip in library.clips:
     if not 0 <= clip.teacher_code < len(cohort.teachers):
       raise DistillationError(
@@ -701,11 +719,13 @@ def _compare_clip_body_references(
 ) -> tuple[tuple[str, ...], tuple[tuple[str, float], ...]]:
   """Compare every frame of one library clip with its teacher export.
 
-  Both directions are compared with the milestone tolerance: the library's own
-  owned, tracked reference tensors using element-wise ``allclose``, and the saved
-  NPZ file itself (see :func:`_compare_body_reference_arrays`), so a library that
-  loaded the right bytes but indexed the wrong bodies is caught as well.
+  Returns ``((), ())`` when the export embeds no reference tables, which is the
+  shared-export shape: the clip binding is then verified by motion path, frame
+  count, cadence and tracked-body names, and the arrays are not compared against
+  a second copy of themselves.  A per-clip export keeps the array comparison.
   """
+  if teacher.onnx.reference_tensor(_BODY_REFERENCE_ARRAYS[0]) is None:
+    return (), ()
   library = command.library
   frames = torch.arange(clip.frames, dtype=torch.long, device=library.device)
   ids = torch.full(
@@ -856,6 +876,9 @@ def audit_multi_motion_live_asset(
         body_reference_convention=(
           "library-owned tracked reference tensors for every clip frame compared "
           "with the teacher export's embedded arrays in tracked-body order"
+          if errors
+          else "clip binding checked by motion path, frame count, cadence and "
+          "tracked-body names; the shared teacher export embeds no reference tables"
         ),
       )
     )
@@ -1703,13 +1726,21 @@ def make_multi_teacher_distillation_adapter(
   reset_policy: ResetPolicy | None = None,
   coverage_policy: CoveragePolicy | None = None,
   coverage_parity_evidence: str | None = None,
+  motion_ids: Mapping[str, int] | None = None,
 ) -> MultiMotionDistillationAdapter:
   """Build one mixed-slot env, audit every selected clip, and adapt it.
 
-  The frozen bank is built over the whole cohort in manifest order, which is the
-  same order the reference library uses for numeric teacher codes, so routing a
-  code can never select a different teacher than the one that trained on the
-  row's clip.
+  The frozen bank keeps the whole cohort in manifest order, which is the same
+  order the reference library uses for numeric teacher codes, so routing a code
+  can never select a different teacher than the one that trained on the row's
+  clip.
+
+  ``motion_ids`` gives each selected clip its cohort-wide id, and is what marks
+  this build as one shard of a larger cohort.  Such a shard registers only its
+  own teachers in the bank: one frozen actor per member is the measured
+  per-member cost, so a shard that built every member would pay exactly the cost
+  sharding exists to avoid.  Its routing codes stay cohort-wide, so its rows are
+  labelled exactly as a whole-cohort build labels them.
   """
   env = build_multi_motion_environment(
     cohort,
@@ -1723,9 +1754,14 @@ def make_multi_teacher_distillation_adapter(
     reset_policy=reset_policy,
     coverage_policy=coverage_policy,
     coverage_parity_evidence=coverage_parity_evidence,
+    motion_ids=motion_ids,
   )
   try:
-    bank = build_cohort_teacher_bank(cohort, device=device)
+    bank = build_cohort_teacher_bank(
+      cohort,
+      device=device,
+      teacher_ids=None if motion_ids is None else teacher_ids,
+    )
     audit = validate_multi_motion_live_contract(
       env, cohort, teacher_ids, task_id=task_id
     )
