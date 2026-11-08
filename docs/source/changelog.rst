@@ -4,6 +4,13 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **Target-height S3: the wide 40-140 ms band on top of the height command.**
+  ``...-Ball3-Pelvis-Nominal-S3-TargetHeight`` carries S2's target range and widens the
+  ball-history latency band to 40-140 ms, redrawn per acquisition -- the condition that
+  made the shipped ladder flat across 0-140 ms. The family's probe check 1b is now
+  table-driven over the ported rungs (S2 and S3) and asserts each one twice: it equals
+  its ladder stage plus the target machinery across twelve config sections, and it
+  differs from its parent in exactly one parameter, the latency band.
 - **Target-height S2: the height-conditioned policy at an 80-100 ms perception band.**
   ``...-Ball3-Pelvis-Nominal-S2-TargetHeight`` carries S1a's uniform 0.05-0.40 m target
   range and changes one condition: the ball-history latency band moves from 0-40 ms to

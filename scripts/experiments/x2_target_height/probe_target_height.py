@@ -81,8 +81,34 @@ S2_TASK = (
   "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
   "-Ball3-Pelvis-Nominal-S2-TargetHeight"
 )
-LADDER_S2_STAGE = "s2-80-100ms"
-"""The shipped rung S2 is built on: 15 Hz, an 80-100 ms transport band."""
+S3_TASK = (
+  "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+  "-Ball3-Pelvis-Nominal-S3-TargetHeight"
+)
+
+PORTED_RUNGS = (
+  # stage, task, previous stage, previous task, the ladder stage it is built on,
+  # the previous band, this band. The bands are the shipped ladder's own ranges.
+  ("s2", S2_TASK, "s1a", S1A_TASK, "s2-80-100ms", (0.0, 0.040), (0.080, 0.100)),
+  ("s3", S3_TASK, "s2", S2_TASK, "s3-40-140ms", (0.080, 0.100), (0.040, 0.140)),
+)
+"""Rungs of this family that differ from their parent in the perception band alone."""
+
+_COMPARED_SECTIONS = (
+  "observations",
+  "rewards",
+  "terminations",
+  "metrics",
+  "events",
+  "commands",
+  "actions",
+  "curriculum",
+  "scene",
+  "episode_length_s",
+  "decimation",
+  "sim",
+)
+"""Config sections two rungs of this family must agree on."""
 
 NUM_ENVS = 8
 """Environments per build. CPU only, so small; every check is per-environment."""
@@ -314,7 +340,12 @@ def check_1_widths() -> str:
   # Both registered tasks must carry the stage's own target range and a resampling
   # timer that cannot expire inside an episode. Without this the probe would prove
   # the machinery works and not that the two launched conditions ask for it.
-  for stage, task_id in (("s1", S1_TASK), ("s1a", S1A_TASK), ("s2", S2_TASK)):
+  for stage, task_id in (
+    ("s1", S1_TASK),
+    ("s1a", S1A_TASK),
+    ("s2", S2_TASK),
+    ("s3", S3_TASK),
+  ):
     registered = load_env_cfg(task_id)
     command = registered.commands.get(TARGET_HEIGHT_COMMAND)
     _require(command is not None, f"{task_id} has no target-height command")
@@ -362,10 +393,15 @@ def check_1_widths() -> str:
   )
   ranges = " and ".join(
     f"{stage} {load_env_cfg(task_id).commands[TARGET_HEIGHT_COMMAND].height_range_m}"
-    for stage, task_id in (("s1", S1_TASK), ("s1a", S1A_TASK), ("s2", S2_TASK))
+    for stage, task_id in (
+      ("s1", S1_TASK),
+      ("s1a", S1A_TASK),
+      ("s2", S2_TASK),
+      ("s3", S3_TASK),
+    )
   )
   return (
-    f"all three task ids registered with their stage range ({ranges}); actor {actor} "
+    f"all four task ids registered with their stage range ({ranges}); actor {actor} "
     f"(ladder {LADDER_ACTOR_WIDTH}), critic {critic} "
     f"(ladder {LADDER_CRITIC_WIDTH}), actions {actions}; the config stripped of the "
     f"declared target additions equals s1-15hz in {', '.join(sections)}"
@@ -377,97 +413,83 @@ def check_1_widths() -> str:
 ##
 
 
-def check_1b_s2_is_s1a_plus_latency() -> str:
-  """S2 must differ from S1a in one condition: the transport band.
+def check_1b_ported_rungs() -> str:
+  """Every ported rung must be its ladder stage plus the target machinery, and a
+  one-condition step from the rung before it.
 
-  Two independent statements, both worth having. Against its own ladder rung, S2 is
-  the shipped ``s2-80-100ms`` stage plus the target machinery, field for field.
-  Against S1a, the only differing parameter anywhere in the config is the ball
-  history's latency band -- which is what makes the pair an experiment rather than
-  two unrelated runs.
+  Two statements per rung, both worth having. Against its own ladder stage, the rung is
+  that stage plus the target machinery, field for field across the compared config
+  sections. Against the previous rung of this family, exactly one parameter differs --
+  the ball history's latency band -- which is what makes each pair an experiment rather
+  than two unrelated runs.
   """
-  s2_cfg = load_env_cfg(S2_TASK)
-  command = s2_cfg.commands.get(TARGET_HEIGHT_COMMAND)
-  _require(command is not None, f"{S2_TASK} has no target-height command")
-  _require(
-    command.height_range_m == S1A_TARGET_HEIGHT_RANGE_M,
-    f"S2 draws {command.height_range_m}, expected S1a's range "
-    f"{S1A_TARGET_HEIGHT_RANGE_M}: a rung carries the complete condition",
-  )
-
-  ladder_s2 = agibot_x2_tennis_juggle_stage_env_cfg(stage=LADDER_S2_STAGE)
-  stripped_s2 = _strip_target_machinery(s2_cfg)
-  _neutralise_scene(stripped_s2, ladder_s2)
-  sections = (
-    "observations",
-    "rewards",
-    "terminations",
-    "metrics",
-    "events",
-    "commands",
-    "actions",
-    "curriculum",
-    "scene",
-    "episode_length_s",
-    "decimation",
-    "sim",
-  )
-  for section in sections:
+  lines = []
+  for stage, task, prev_stage, prev_task, base, prev_band, band in PORTED_RUNGS:
+    cfg = load_env_cfg(task)
+    command = cfg.commands.get(TARGET_HEIGHT_COMMAND)
+    _require(command is not None, f"{task} has no target-height command")
     _require(
-      getattr(stripped_s2, section) == getattr(ladder_s2, section),
-      f"{section} of S2 differs from the shipped {LADDER_S2_STAGE} stage beyond the "
-      "target machinery",
+      command.height_range_m == S1A_TARGET_HEIGHT_RANGE_M,
+      f"{stage} draws {command.height_range_m}, expected S1a's range "
+      f"{S1A_TARGET_HEIGHT_RANGE_M}: a rung carries the complete condition",
     )
 
-  # S2 - S1a: exactly one parameter may move.
-  s1a_cfg = load_env_cfg(S1A_TASK)
-  stripped_s1a = _strip_target_machinery(s1a_cfg)
-  _neutralise_scene(stripped_s1a, stripped_s2)
-  latency_key = "stream_latency_s"
-  s2_latency = (
-    stripped_s2.observations["actor"].terms["ball_hist_pelvis"].params[latency_key]
-  )
-  s1a_latency = (
-    stripped_s1a.observations["actor"].terms["ball_hist_pelvis"].params[latency_key]
-  )
-  _require(
-    s1a_latency == (0.0, 0.040),
-    f"S1a does not carry S1's 0-40 ms band: {s1a_latency}",
-  )
-  _require(
-    s2_latency == (0.080, 0.100),
-    f"S2 does not carry the shipped {LADDER_S2_STAGE} band: {s2_latency}",
-  )
-  for section in sections:
-    left = getattr(stripped_s1a, section)
-    right = getattr(stripped_s2, section)
-    if section == "observations":
-      continue  # Holds the latency band, compared below on its own.
-    _require(
-      left == right,
-      f"{section} differs between S1a and S2: the pair is supposed to isolate the "
-      "band alone",
-    )
+    ladder = agibot_x2_tennis_juggle_stage_env_cfg(stage=base)
+    stripped = _strip_target_machinery(cfg)
+    _neutralise_scene(stripped, ladder)
+    for section in _COMPARED_SECTIONS:
+      _require(
+        getattr(stripped, section) == getattr(ladder, section),
+        f"{section} of {stage} differs from the shipped {base} stage beyond the target "
+        "machinery",
+      )
 
-  # The observation section differs only in that one parameter.
-  a = stripped_s1a.observations
-  b = stripped_s2.observations
-  differing = [
-    (group, term, key)
-    for group in ("actor", "critic")
-    for term in a[group].terms
-    for key in set(a[group].terms[term].params) | set(b[group].terms[term].params)
-    if a[group].terms[term].params.get(key) != b[group].terms[term].params.get(key)
-  ]
-  _require(
-    differing == [("actor", "ball_hist_pelvis", latency_key)],
-    f"S1a and S2 differ in more than the ball history's latency band: {differing}",
-  )
-  return (
-    f"S2 is {LADDER_S2_STAGE} plus the target machinery in {len(sections)} sections, "
-    f"and differs from S1a in exactly one parameter: actor/ball_hist_pelvis/"
-    f"{latency_key} {s1a_latency} -> {s2_latency}; S2 keeps S1a's target range "
-    f"{S1A_TARGET_HEIGHT_RANGE_M}"
+    prev = _strip_target_machinery(load_env_cfg(prev_task))
+    _neutralise_scene(prev, stripped)
+    prev_band_actual = (
+      prev.observations["actor"].terms["ball_hist_pelvis"].params["stream_latency_s"]
+    )
+    _require(
+      prev_band_actual == prev_band,
+      f"{prev_stage} does not carry the band this table says it does: "
+      f"{prev_band_actual} != {prev_band}",
+    )
+    band_actual = (
+      stripped.observations["actor"]
+      .terms["ball_hist_pelvis"]
+      .params["stream_latency_s"]
+    )
+    _require(
+      band_actual == band,
+      f"{stage} does not carry the shipped {base} band: {band_actual} != {band}",
+    )
+    for section in _COMPARED_SECTIONS:
+      if section == "observations":
+        continue  # Holds the latency band, compared below on its own.
+      _require(
+        getattr(prev, section) == getattr(stripped, section),
+        f"{section} differs between {prev_stage} and {stage}: the pair is supposed to "
+        "isolate the band alone",
+      )
+    a, b = prev.observations, stripped.observations
+    differing = [
+      (group, term, key)
+      for group in ("actor", "critic")
+      for term in a[group].terms
+      for key in set(a[group].terms[term].params) | set(b[group].terms[term].params)
+      if a[group].terms[term].params.get(key) != b[group].terms[term].params.get(key)
+    ]
+    _require(
+      differing == [("actor", "ball_hist_pelvis", "stream_latency_s")],
+      f"{prev_stage} and {stage} differ in more than the ball history's latency band: "
+      f"{differing}",
+    )
+    lines.append(
+      f"{stage} = {base} plus the target machinery; {prev_stage} -> {stage}: "
+      f"stream_latency_s {prev_band} -> {band} and nothing else"
+    )
+  return "; ".join(lines) + (
+    f"; every ported rung keeps the target range {S1A_TARGET_HEIGHT_RANGE_M}"
   )
 
 
@@ -1017,7 +1039,7 @@ def check_7_target_survives_a_reset() -> str:
 
 CHECKS = (
   ("1 widths", check_1_widths),
-  ("1b S2 is S1a plus the band", check_1b_s2_is_s1a_plus_latency),
+  ("1b ported rungs are one-delta", check_1b_ported_rungs),
   ("2 per-environment command", check_2_per_environment),
   ("3 equals the constant-0.40 path", check_3_matches_the_old_path),
   ("4 peaks at the commanded apex", check_4_peaks_at_the_command),

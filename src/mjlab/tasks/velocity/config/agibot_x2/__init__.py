@@ -560,3 +560,21 @@ register_mjlab_task(
   rl_cfg=agibot_x2_tennis_recovery_ppo_runner_cfg(),
   runner_cls=TennisRecoveryOnPolicyRunner,
 )
+
+# S3 keeps S2's target range and widens the perception band to 40-140 ms, redrawn per
+# acquisition. In the shipped ladder this was the rung that made the policy flat across
+# 0-140 ms; here it also has to hold the height command.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+    "-Ball3-Pelvis-Nominal-S3-TargetHeight"
+  ),
+  env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s3"),
+  play_env_cfg=agibot_x2_tennis_juggle_target_height_env_cfg(stage="s3", play=True),
+  rl_cfg=agibot_x2_velocity_ppo_runner_cfg(
+    experiment_name=(
+      "agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal_s1_target_height"
+    )
+  ),
+  runner_cls=VelocityOnPolicyRunner,
+)

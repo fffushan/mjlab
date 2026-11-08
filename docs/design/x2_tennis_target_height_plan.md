@@ -104,6 +104,7 @@ family, or they will command an apex the ball cannot reach. Not implemented here
 | `s1` | the shipped `s1-15hz`: 15 Hz stream, 0–40 ms latency | fixed 0.40 m | none, from scratch | 6000 iterations |
 | `s1a` | S1 | uniform 0.05–0.40 m | S1 | 6000 iterations |
 | `s2` | the shipped `s2-80-100ms`: 15 Hz, **80–100 ms** latency | uniform 0.05–0.40 m | S1a | 6000 iterations |
+| `s3` | the shipped `s3-40-140ms`: 15 Hz, **40–140 ms**, redrawn per acquisition | uniform 0.05–0.40 m | S2 | 6000 iterations |
 
 The perception condition of each stage comes from the ladder's own stage table:
 `STAGE_BASE_STAGE` maps `s1` and `s1a` to `s1-15hz` and `s2` to `s2-80-100ms`, so the

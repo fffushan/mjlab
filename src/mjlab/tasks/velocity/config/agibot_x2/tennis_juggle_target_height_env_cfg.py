@@ -83,6 +83,7 @@ STAGE_TARGET_HEIGHT_RANGE_M: dict[str, tuple[float, float]] = {
   "s1": S1_TARGET_HEIGHT_RANGE_M,
   "s1a": S1A_TARGET_HEIGHT_RANGE_M,
   "s2": S1A_TARGET_HEIGHT_RANGE_M,
+  "s3": S1A_TARGET_HEIGHT_RANGE_M,
 }
 """The target range each stage runs.
 
@@ -90,13 +91,16 @@ S1 is fixed at the reference height, so it reproduces the shipped reward, sigma,
 threshold and spawn exactly. S1a resumes S1 and draws the range instead, which is
 the only difference between the two. S2 resumes S1a and carries its range unchanged,
 which is the stage discipline: a rung carries the complete condition and adds one
-thing, so S2 differs from S1a only in the perception band.
+thing, so S2 differs from S1a only in the perception band. S3 carries the range the
+same way and widens the band to 40-140 ms, redrawn per acquisition, which is the rung
+that made the shipped ladder flat across 0-140 ms.
 """
 
 STAGE_BASE_STAGE: dict[str, str] = {
   "s1": "s1-15hz",
   "s1a": "s1-15hz",
   "s2": "s2-80-100ms",
+  "s3": "s3-40-140ms",
 }
 """The ladder stage each target-height stage is built on.
 
