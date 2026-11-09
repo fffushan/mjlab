@@ -1,11 +1,12 @@
-# Target-height juggle: S1 and S1a
+# Target-height juggle: S1, S1a, S2 and S3
 
-Date: 2026-11-08 (+08).
-Status: **plan, approved for implementation.** No run is authorized by this document.
+Date: 2026-11-08 (+08), results added 2026-11-09 (+08).
+Status: **plan and results for four rungs.** Section 8 reports what was measured.
 
 A second juggle task family that takes the target apex height as an **input** instead of a
 constant. S1 is the fixed 0.40 m condition, unchanged in behaviour. S1a draws the target
-uniformly from 0.05 to 0.40 m.
+uniformly from 0.05 to 0.40 m. S2 and S3 then carry that family through the shipped
+ladder's two perception bands, 80-100 ms and 40-140 ms.
 
 ## 1. Why a new family and not a stage
 
@@ -155,7 +156,47 @@ line near 0.22 m means it ignores it, which is the failure mode this design exis
 visible. The apex per ball bounce must be logged for that, which is a metrics addition, not a
 reward change.
 
-## 8. Out of scope
+## 8. Results so far
+
+Four rungs trained, two seeds each, 4096 envs, 6000 iterations per rung. All arms ended
+`exit=0` with zero errors. Values are the mean over the last 300 iterations.
+
+| term | S1 s7 / s17 | S1a s7 / s17 | S2 s7 / s17 | S3 s7 / s17 |
+|---|---|---|---|---|
+| `ball_energy` | 1.9518 / 1.9522 | 1.9374 / 1.9364 | 1.9367 / 1.9364 | 1.9361 / 1.9379 |
+| `ball_centred` | 0.2464 / 0.2465 | 0.2470 / 0.2469 | 0.2468 / 0.2467 | 0.2470 / 0.2469 |
+| `ball_in_fov` | 0.1996 / 0.1997 | 0.2000 / 0.2000 | 0.2000 / 0.2000 | 0.2000 / 0.2000 |
+| `pose` | 0.9370 / 0.9411 | 0.9444 / 0.9446 | 0.9440 / 0.9445 | 0.9441 / 0.9454 |
+| flight time | 0.5557 / 0.5559 s | 0.4063 / 0.4052 s | 0.4051 / 0.4041 s | 0.4053 / 0.4069 s |
+| impacts | 35.00 / 35.00 | 51.07 / 51.18 | 51.25 / 51.27 | 51.35 / 50.98 |
+| `time_out` | 4.1655 / 4.1647 | 4.1754 / 4.1725 | 4.1981 / 4.1828 | 4.1587 / 4.1668 |
+| `fell_over` | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| fall share | 0.00 / 0.00 % | 0.00 / 0.00 % | 0.00 / 0.00 % | 0.00 / 0.00 % |
+| logged target | 0.4000 / 0.4000 | 0.2261 / 0.2248 | 0.2252 / 0.2241 | 0.2241 / 0.2251 |
+| checkpoint | `model_5999.pt` | `model_11998.pt` | `model_17997.pt` | `model_23996.pt` |
+
+Three readings, in order of how much they settle.
+
+1. **The height command is used.** Flight time falls from 0.556 s to 0.406 s when the target
+   becomes uniform 0.05-0.40 m (mean 0.225 m). A ballistic arc with a 0.225 m apex lasts
+   `2 * sqrt(2h/g)` = 0.428 s, so the measured 0.406 s is that arc, minus restitution. The
+   shorter flight raises contacts from 35.0 to 51.2, which is the same apex at a higher rate.
+   A policy that ignored the input would keep the 0.40 m arc and 35 contacts.
+2. **Perception cost nothing.** S2 (80-100 ms band) is within 0.04 % of S1a on energy and
+   0.3 % on flight time, on both seeds. The 80-100 ms band is the shipped ladder's own
+   condition, and it transfers to this family without retraining damage.
+3. **The wide band held too.** S3 (40-140 ms, redrawn per acquisition) is within 0.07 % of
+   S2 on energy, 0.04 % and 0.69 % on flight time, with `fell_over` zero on both seeds. The
+   seed spread inside S3 (0.09 % on energy) is larger than the S2-to-S3 change, so the
+   correct verdict is "held, and cannot be distinguished from S2", not "improved".
+
+What this does **not** establish: the **commanded against achieved apex slope** is still
+unmeasured. Flight time and impact count show that the policy changes its timing with the
+commanded height; they do not show that the apex tracks the command bin by bin, and a
+policy that only reads the mean would look the same in these aggregate terms. The per-bounce
+apex recorder described in section 7 is still required before the slope can be reported.
+
+## 9. Out of scope
 
 * The 31-DOF variant and the head-actuated path.
 * The controller's 103-wide/29-action path and the ONNX export.
