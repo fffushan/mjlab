@@ -66,7 +66,8 @@ them from the steps rather than carrying these forward.
 **This is a training-side change, not a deployment gain.** The robot already produces
 zeta 0.70 at the commanded kd 3.0, so the extra damping in the simulator is imitating
 damping the hardware already has. Sending 4.74 / 4.78 / 4.38 / 3.90 to the robot would
-add it a second time and push the shoulders past critical. The controller takes the RL gains from the exported policy
+add it a second time. How much it would add is **not established** -- that assumes the
+hardware damping scales with commanded kd, which nobody has measured. The controller takes the RL gains from the exported policy
 metadata times ``policy.gain_multiplier`` (`x2_docker``'s ``x2_tennis_hardware.yaml``
 states this explicitly), so **a measured-variant policy must never be deployed without
 an explicit per-joint hardware gain override**. Nothing from this module has been
@@ -85,8 +86,8 @@ Deliberately *not* changed, with reasons:
 
 **This is a training-side change, not a deployment gain.** The robot already produces
 zeta 0.70 at the commanded kd 3.0, so the extra damping in the simulator is imitating
-damping the hardware already has. Sending these four values to the robot would add it a
-second time and push the shoulders past critical. The controller takes the RL gains from the exported policy
+damping the hardware already has. Sending these four values to the robot would plausibly
+add it a second time, and the size of that effect is unmeasured. The controller takes the RL gains from the exported policy
 metadata times ``policy.gain_multiplier`` (`x2_docker``'s ``x2_tennis_hardware.yaml``
 states this explicitly), so **a measured-variant policy must never be deployed without
 an explicit per-joint hardware gain override**. Nothing from this module has been

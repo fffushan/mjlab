@@ -24,8 +24,9 @@ wrong for this task family and is withdrawn.
 
 ## 2. What changed
 
-Damping only, on the four proximal right-arm joints. Stiffness is untouched, so the
-commanded response speed is untouched.
+Damping only, on the four proximal right-arm joints. Stiffness is untouched, but the
+**closed-loop response changes**: raising kd raises the damping ratio, which slows the
+rise and removes the overshoot. "Same kp, same speed" would be wrong.
 
 How the values were chosen: not by dividing a damping ratio by a frequency. The measured
 steps of each joint were matched by **the same shape residual the two-parameter servo fit
@@ -41,6 +42,14 @@ rather than a formula. Residual over the 3 and 10 deg steps:
 | `right_elbow` | 3.0 | 4.7 % | **3.90** | 2.9 % | 38 % |
 | `right_wrist_yaw` | 2.0 | 3.3 % | 2.06 (not applied) | 3.3 % | 1 % |
 | `right_wrist_pitch` | 2.0 | 4.9 % | 1.96 (not applied) | 4.9 % | 0 % |
+
+**Provenance of the sweep, stated as a limitation.** The optimisation itself was
+computed inline by the controller session and **no retained script or output exists**:
+`x2_docker/tools/joint_step_fit.py` holds the two-parameter fit and the shape residual,
+not a constrained sweep, and `~/data/robot234_step/fit.json` holds no swept optimum. The
+independent audit covers the fitter (2-4 % shape agreement), not the sweep. The numbers
+below are therefore a recorded computation, not a reproducible one, until the sweep is
+committed with its output.
 
 At those values the implied damping ratio in the tennis scene is **0.69** (pitch),
 **0.70** (roll), **1.05** (shoulder yaw) and **1.10** (elbow) — the two distal ones above
@@ -72,9 +81,11 @@ section 0.
 **Do not send 4.74 / 4.78 / 4.38 / 3.90 to the robot.** The robot already produces
 `zeta` 0.70 (shoulders) and 1.05-1.10 (yaw, elbow) at the commanded kd 3.0; that is what
 the measurement is. The extra damping in the simulator imitates damping the hardware
-already has, so commanding these values to the hardware would add it a second time and
-push the shoulders past critical, with the mismatch reappearing in the opposite
-direction.
+already has, so commanding these values to the hardware would plausibly add it a second
+time. **The size of that effect is not established**: it assumes the hardware damping
+scales with the commanded kd, which is exactly what nobody has measured. What is
+established is that the hardware already shows `zeta` 0.70 at kd 3.0, so kd 3.0 is the
+value consistent with the measured response, and the command should stay there.
 
 This is a live trap rather than a note, because the controller takes the RL gains from
 the exported policy metadata times `policy.gain_multiplier`, and
@@ -106,8 +117,10 @@ Nothing from this document has been exported, deployed or sent to a robot.
 | `right_wrist_roll` | 0.0052 | 3.11 | — | — | ridge spans 3-32 Hz, nothing identified |
 
 The wrists are the case where **both** of the rules on offer were wrong. The shipped
-`2.0` is within 3 % of the residual optimum and the residual already sits at the 3.3-4.9 %
-measurement floor. The `zeta` route would have softened them 15 %, the ratio route
+`2.0` lies within 3 % of the residual optimum, and the residual does not improve when kd
+moves (3.3 % and 4.9 % at the optimum against 3.3 % and 4.9 % shipped). Whether that is a
+noise floor is **not proved**: what is shown is that the residual stops responding, not
+that it has reached an irreducible level. The `zeta` route would have softened them 15 %, the ratio route
 stiffened them 10 %, and both would have moved away from the data. The reason to leave
 them is not that the inertia is uncertain — it is that there is nothing for kd to buy,
 which is a better reason because it also says when to stop.
@@ -183,7 +196,24 @@ PASS**. For all 23 pairs:
 `pytest tests/test_task_configs.py tests/test_x2_tennis_stage_task.py
 tests/test_x2_tennis_juggle_task.py` — **89 passed**.
 
-## 8. What this does not establish
+## 8. Independent review
+
+`docs/reports/x2_right_arm_measured_review_20261109.md` (IdentificationDiag, same day,
+reviewed commit `cfdd27014`). Verdict: a reasonable **calibration candidate**, not a
+validated robot-response model. It confirms the architecture (loaded arm and racket
+physics retained, no cascade onto the measured response, no direct joint overwrite) and
+the four-kd change, reran the probe (23 pairs PASS) and the focused tests (89 passed).
+
+Its three gates, all **open**:
+
+1. Replay the measured commands through the actual simulator and compare responses.
+   The residuals quoted here come from the scalar ODE, not from an `mj_step`.
+2. Preserve and independently reproduce the constrained damping sweep (see the
+   provenance limitation in section 2).
+3. Enforce the simulation-versus-hardware gain distinction before deployment. Section 3
+   describes the requirement; nothing enforces it yet.
+
+## 9. What this does not establish
 
 * The simulated frequency at 19-32 % above the measurement on the yaw, elbow and
   wrists is unresolved. It needs an independent torque calibration or a known added
@@ -191,10 +221,16 @@ tests/test_x2_tennis_juggle_task.py` — **89 passed**.
 * The amplitude dependence of the measured overshoot (0.9 % at 3 deg, 4.3-7.4 % at
   10 deg) is not reproduced by any linear servo. Dry friction is the candidate; it is
   not fitted and not added.
-* The transport delay of the measurement is 7.25 s plus a few milliseconds of scatter,
-  so nothing below about 0.1 s is resolved by it.
-* No policy has been trained on this variant. Whether the measured damping helps the
-  juggle is **not measured**. The falsifiable check, from the controller session:
+* The transport delay of the measurement is **not resolved**. The two logs share a
+  clock but their origins differ by a constant near 7.25 s, estimated to scatter over
+  7.30-7.43 s. That is a clock-origin offset, not a delay. Anything below about 0.1 s is
+  inside the scatter, so the fit cannot separate delay from shape at that scale.
+* Four arms are **training** on this variant at the time of writing (from scratch, 6000
+  iterations, two seeds for the fixed 0.40 m family and two for the target-height family).
+  They are a **damping ablation**: they can show that a policy learns under these gains,
+  not that the simulator matches the measured robot. Whether the measured damping helps
+  the juggle is **not measured** until those runs are analysed against their shipped
+  baselines, and no analysis from them establishes calibration. The falsifiable check, from the controller session:
   `~/data/sim_vs_robot/arm_compare.py` compares right-arm position and velocity spectra,
   simulation against a `.234` run at the same pose and gains. Before the change the
   simulated `shoulder_pitch` had 8.43 deg p-p against 22.80 on the robot, with 75 % of
