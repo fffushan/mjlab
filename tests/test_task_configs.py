@@ -5,6 +5,14 @@ import pytest
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
+from mjlab.tasks.velocity.config.agibot_x2 import RIGHT_ARM_MEASURED_TASK_IDS
+
+RIGHT_ARM_MEASURED_TASKS = frozenset(RIGHT_ARM_MEASURED_TASK_IDS)
+"""Tasks on the measured right-arm servo, generated from the stage tables.
+
+These keep the actor corruption off exactly as their shipped twins do, so they join the
+no-corruption set by name rather than being copied into a literal.
+"""
 
 NO_CORRUPTION_TRAINING_TASKS = frozenset(
   {
@@ -131,7 +139,7 @@ def test_play_mode_observation_corruption_disabled(all_task_ids: list[str]) -> N
 def test_training_mode_observation_corruption_enabled(all_task_ids: list[str]) -> None:
   """Training mode tasks should have observation corruption enabled for policy."""
   for task_id in all_task_ids:
-    if task_id in NO_CORRUPTION_TRAINING_TASKS:
+    if task_id in NO_CORRUPTION_TRAINING_TASKS | RIGHT_ARM_MEASURED_TASKS:
       continue
     cfg = load_env_cfg(task_id)
 

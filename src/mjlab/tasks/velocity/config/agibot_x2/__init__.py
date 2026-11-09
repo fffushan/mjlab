@@ -1,3 +1,5 @@
+from functools import partial
+
 from mjlab.tasks.registry import register_mjlab_task
 from mjlab.tasks.velocity.rl import (
   TennisRecoveryOnPolicyRunner,
@@ -12,8 +14,12 @@ from .rl_cfg import agibot_x2_velocity_ppo_runner_cfg
 from .tennis_ball_env_cfg import agibot_x2_tennis_ball_env_cfg
 from .tennis_juggle_env_cfg import agibot_x2_tennis_juggle_env_cfg
 from .tennis_juggle_nominal_env_cfg import agibot_x2_tennis_juggle_nominal_env_cfg
-from .tennis_juggle_stage_env_cfg import agibot_x2_tennis_juggle_stage_env_cfg
+from .tennis_juggle_stage_env_cfg import (
+  STAGE_DELTAS,
+  agibot_x2_tennis_juggle_stage_env_cfg,
+)
 from .tennis_juggle_target_height_env_cfg import (
+  STAGE_TARGET_HEIGHT_RANGE_M,
   agibot_x2_tennis_juggle_target_height_env_cfg,
 )
 from .tennis_recovery_env_cfg import agibot_x2_tennis_recovery_env_cfg
@@ -578,3 +584,79 @@ register_mjlab_task(
   ),
   runner_cls=VelocityOnPolicyRunner,
 )
+
+##
+# Measured right arm: the whole ladder again, on the measured servo.
+#
+# One change from each stage's shipped twin: the right shoulder pitch and roll damping
+# come from the robot's step response instead of the vendor value (4.25 and 4.46 rad/s
+# instead of 3.0, stiffness unchanged). See
+# ``mjlab.asset_zoo.robots.agibot_x2.right_arm_measured`` for the measurement, for what
+# the data does and does not support, and for why the actuator groups split per side.
+#
+# The stages are generated from ``STAGE_DELTAS`` rather than written out, so a stage
+# cannot exist in one ladder and be missing from the other. Each family gets its own
+# experiment name, so a run and its measured twin can never land in the same directory.
+##
+
+_RIGHT_ARM_MEASURED_TAG = "RightArmMeasured"
+_RIGHT_ARM_STAGE_EXPERIMENT = (
+  "agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal_right_arm_measured"
+)
+_RIGHT_ARM_TARGET_HEIGHT_EXPERIMENT = (
+  "agibot_x2_velocity_tennis_ball_juggle_29dof_ball3_pelvis_nominal_s1_target_height"
+  "_right_arm_measured"
+)
+_STAGE_TASK_PREFIX = (
+  "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
+  "-Ball3-Pelvis-Nominal"
+)
+
+
+def _measured_stage_suffix(stage: str) -> str:
+  """``s9c-pose-quad`` -> ``S9c-Pose-Quad``. Deterministic, no table to maintain."""
+  return "-".join(
+    token.capitalize() if token[:1].isalpha() else token for token in stage.split("-")
+  )
+
+
+RIGHT_ARM_MEASURED_TASK_IDS: list[str] = []
+"""Every registered task that runs the measured right-arm servo.
+
+Exported so the training-task tests can whitelist them by name instead of repeating
+the generated task ids in a literal, which would silently drift.
+"""
+
+
+def _register_measured_stage(task_id: str, env_cfg_fn, experiment_name: str) -> None:
+  RIGHT_ARM_MEASURED_TASK_IDS.append(task_id)
+  register_mjlab_task(
+    task_id=task_id,
+    env_cfg=env_cfg_fn(),
+    play_env_cfg=env_cfg_fn(play=True),
+    rl_cfg=agibot_x2_velocity_ppo_runner_cfg(experiment_name=experiment_name),
+    runner_cls=VelocityOnPolicyRunner,
+  )
+
+
+for _stage in STAGE_DELTAS:
+  _register_measured_stage(
+    task_id=f"{_STAGE_TASK_PREFIX}-{_RIGHT_ARM_MEASURED_TAG}-"
+    f"{_measured_stage_suffix(_stage)}",
+    env_cfg_fn=partial(
+      agibot_x2_tennis_juggle_stage_env_cfg, stage=_stage, right_arm_measured=True
+    ),
+    experiment_name=_RIGHT_ARM_STAGE_EXPERIMENT,
+  )
+
+for _target_stage in STAGE_TARGET_HEIGHT_RANGE_M:
+  _register_measured_stage(
+    task_id=f"{_STAGE_TASK_PREFIX}-{_RIGHT_ARM_MEASURED_TAG}-"
+    f"{_measured_stage_suffix(_target_stage)}-TargetHeight",
+    env_cfg_fn=partial(
+      agibot_x2_tennis_juggle_target_height_env_cfg,
+      stage=_target_stage,
+      right_arm_measured=True,
+    ),
+    experiment_name=_RIGHT_ARM_TARGET_HEIGHT_EXPERIMENT,
+  )

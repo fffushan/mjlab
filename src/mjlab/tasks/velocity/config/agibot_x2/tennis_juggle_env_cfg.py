@@ -126,6 +126,9 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 
+from mjlab.asset_zoo.robots.agibot_x2.right_arm_measured import (
+  apply_right_arm_measured_servo,
+)
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BALL_CENTRE_PLATEAU,
   BALL_CENTRE_SIGMA,
@@ -355,7 +358,7 @@ def _sim_to_real_events() -> dict[str, EventTermCfg]:
   return copied
 
 
-def _tennis_robot_cfg() -> EntityCfg:
+def _tennis_robot_cfg(right_arm_measured: bool = False) -> EntityCfg:
   """Tennis robot with the vendor servo gains and the velocity foot sites.
 
   Two layers on top of :func:`~mjlab.asset_zoo.robots.agibot_x2.
@@ -370,9 +373,19 @@ def _tennis_robot_cfg() -> EntityCfg:
     ``spec_fn``; the tennis spec supplies a different ``spec_fn``, so the sites are
     re-applied here rather than duplicated. The foot height scan and the foot
     clearance/slip rewards both resolve them by name.
+
+  Args:
+    right_arm_measured: If True, replace the right shoulder pitch/roll damping with
+      the values measured on the robot, through
+      :func:`~mjlab.asset_zoo.robots.agibot_x2.right_arm_measured.
+      apply_right_arm_measured_servo`. It must run after the vendor gains, which
+      would otherwise overwrite the right-arm values with the symmetric ones. The
+      actuator order, the action scale and the compiled armature are unchanged.
   """
   robot_cfg = get_x2_tennis_robot_cfg()
   apply_vendor_rl_gains(robot_cfg)
+  if right_arm_measured:
+    apply_right_arm_measured_servo(robot_cfg)
   tennis_spec_fn = robot_cfg.spec_fn
   robot_cfg.spec_fn = lambda: add_velocity_foot_sites(tennis_spec_fn())
   return robot_cfg
@@ -406,6 +419,7 @@ def agibot_x2_tennis_juggle_env_cfg(
   head_actuated: bool = True,
   ball_history: bool = False,
   ball_history_frame: str = "plate",
+  right_arm_measured: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create the AgiBot X2 tennis-ball juggling velocity environment config.
 
@@ -470,7 +484,7 @@ def agibot_x2_tennis_juggle_env_cfg(
   # ball at rest. Measured at 4000 iterations, the sweep policies never initiated
   # a bounce on their own.
   cfg.scene.entities = {
-    "robot": _tennis_robot_cfg(),
+    "robot": _tennis_robot_cfg(right_arm_measured=right_arm_measured),
     BALL_ENTITY: get_tennis_ball_cfg(BALL_SPAWN_DROP_HEIGHT),
   }
 

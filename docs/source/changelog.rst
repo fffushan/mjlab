@@ -4,6 +4,15 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **Measured right-arm servo, and 23 tasks that use it.**
+  ``right_shoulder_pitch_joint`` damping 3.0 -> 4.81 and
+  ``right_shoulder_roll_joint`` 3.0 -> 4.78, from the robot's step response with the
+  racket held (``zeta`` 0.44 -> 0.70 at the carry-pose inertia). Stiffness is untouched.
+  A ``BuiltinPositionActuatorCfg`` holds one damping for all its targets, so the two
+  shoulder groups split per side; the actuator order, the action scale and
+  ``dof_armature`` do not change. Both the fixed-height ladder and the target-height
+  family gain a ``-RightArmMeasured-`` twin for every stage (19 + 4 = 23), generated
+  from the stage tables. See ``docs/design/x2_right_arm_measured.md``.
 - **Target-height S3: the wide 40-140 ms band on top of the height command.**
   ``...-Ball3-Pelvis-Nominal-S3-TargetHeight`` carries S2's target range and widens the
   ball-history latency band to 40-140 ms, redrawn per acquisition -- the condition that

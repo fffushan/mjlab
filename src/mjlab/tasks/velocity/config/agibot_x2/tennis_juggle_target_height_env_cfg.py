@@ -192,6 +192,7 @@ def _apply_target_height(
 def agibot_x2_tennis_juggle_target_height_env_cfg(
   stage: str = "s1",
   play: bool = False,
+  right_arm_measured: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create a target-height juggling environment config.
 
@@ -199,6 +200,8 @@ def agibot_x2_tennis_juggle_target_height_env_cfg(
     stage: The condition to build. Must be a key of
       :data:`STAGE_TARGET_HEIGHT_RANGE_M`.
     play: If True, applies the staged factory's play-mode overrides first.
+    right_arm_measured: If True, build the same stage on the measured right-arm
+      servo, as the fixed-height ladder's measured twins do.
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` for the 29-DOF pelvis-history juggling task, equal to
@@ -217,7 +220,9 @@ def agibot_x2_tennis_juggle_target_height_env_cfg(
   # ``head_actuated=False``, so the actions stay 29 and the head stays an
   # observation. The base stage carries the perception condition; this family adds
   # the target machinery on top of it.
-  cfg = agibot_x2_tennis_juggle_stage_env_cfg(stage=STAGE_BASE_STAGE[stage], play=play)
+  cfg = agibot_x2_tennis_juggle_stage_env_cfg(
+    stage=STAGE_BASE_STAGE[stage], play=play, right_arm_measured=right_arm_measured
+  )
   _apply_target_height(cfg, _target_height_range(STAGE_TARGET_HEIGHT_RANGE_M[stage]))
   return cfg
 

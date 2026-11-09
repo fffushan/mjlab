@@ -562,13 +562,18 @@ is slightly optimistic rather than slightly harsh.
 
 
 def agibot_x2_tennis_juggle_stage_env_cfg(
-  stage: str = "s1-15hz", play: bool = False
+  stage: str = "s1-15hz",
+  play: bool = False,
+  right_arm_measured: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create a staged fine-tune's AgiBot X2 juggling environment config.
 
   Args:
     stage: The stage to build. Must be a key of :data:`STAGE_DELTAS`.
     play: If True, applies the nominal pilot's play-mode overrides first.
+    right_arm_measured: If True, build the same stage on the measured right-arm
+      servo. The stage condition and every other config section are identical, so
+      the two are comparable rung for rung.
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` for the 29-DOF pelvis-history juggling task, equal
@@ -594,7 +599,9 @@ def agibot_x2_tennis_juggle_stage_env_cfg(
   visibility_gate = bool(delta.pop("visibility_gate", False))
   tilted_start = bool(delta.pop("tilted_start", False))
   safety_mix = bool(delta.pop("safety_mix", False))
-  cfg = agibot_x2_tennis_juggle_nominal_env_cfg(play=play)
+  cfg = agibot_x2_tennis_juggle_nominal_env_cfg(
+    play=play, right_arm_measured=right_arm_measured
+  )
   cfg.observations["actor"].terms["ball_hist_pelvis"].params.update(delta)
   if reset_delta:
     cfg.events["reset_ball"].params.update(reset_delta)

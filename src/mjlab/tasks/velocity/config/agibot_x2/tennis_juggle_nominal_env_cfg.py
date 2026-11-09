@@ -77,6 +77,7 @@ from the six copied tracking axes.
 
 def agibot_x2_tennis_juggle_nominal_env_cfg(
   play: bool = False,
+  right_arm_measured: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create the nominal pilot's AgiBot X2 juggling environment config.
 
@@ -84,6 +85,9 @@ def agibot_x2_tennis_juggle_nominal_env_cfg(
     play: If True, applies the base task's play-mode overrides first (infinite
       episode, no corruption, no push, no curriculum). The nominal settings below
       are applied in both modes.
+    right_arm_measured: If True, use the right shoulder damping measured on the
+      robot instead of the vendor value. Everything else about the robot is
+      unchanged.
 
   Returns:
     A ``ManagerBasedRlEnvCfg`` for the 29-DOF pelvis-history juggling task with no
@@ -91,7 +95,11 @@ def agibot_x2_tennis_juggle_nominal_env_cfg(
     head/arm/waist resets, centred 0.20 m drop starts and a zero command.
   """
   cfg = agibot_x2_tennis_juggle_env_cfg(
-    play=play, head_actuated=False, ball_history=True, ball_history_frame="pelvis"
+    play=play,
+    head_actuated=False,
+    ball_history=True,
+    ball_history_frame="pelvis",
+    right_arm_measured=right_arm_measured,
   )
 
   # Randomization. Removal, not a zero range: the terms write sampled values at
