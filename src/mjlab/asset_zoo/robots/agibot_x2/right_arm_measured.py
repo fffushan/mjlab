@@ -16,8 +16,10 @@ What the data supports, and what it does not
 The report's own section 5 is the constraint: a wholesale replacement of the actuator
 model is *not* supported, and the one change it does support is that the simulator is
 more lightly damped than the robot on the shoulder group. Measured damping ratio 0.70
-on both shoulder axes against 0.50 and 0.47 in the simulator, and 0.8-0.9 % overshoot
-on the robot against 16.7-18.6 % at 10 deg.
+on both shoulder axes; at the racket-held inertia the shipped gains give 0.437 and
+0.439, so 0.8-0.9 % overshoot on the robot against **21.7 % and 21.5 %** in the
+simulator at 10 deg. (The report first quoted 16.7 / 18.6 %; those were computed on the
+bare robot's inertia and are corrected in its section 0.)
 
 So this module changes **damping only, on the two right shoulder axes**, and keeps the
 commanded stiffness. ``kd = 2 zeta sqrt(kp J)`` with ``zeta = 0.70`` and ``J`` the
@@ -30,18 +32,41 @@ With the racket included the shoulder frequency already agrees: the simulator gi
 2.32 Hz on the pitch axis against 2.34 Hz measured. So on that axis the inertia is
 corroborated and damping is the only defect.
 
+**This is a training-side change, not a deployment gain.** The robot already produces
+zeta 0.70 at the commanded kd 3.0, so the extra damping in the simulator is imitating
+damping the hardware already has. Sending kd 4.81 to the robot would add it a second
+time and land near zeta 1.0. The controller takes the RL gains from the exported policy
+metadata times ``policy.gain_multiplier`` (`x2_docker``'s ``x2_tennis_hardware.yaml``
+states this explicitly), so **a measured-variant policy must never be deployed without
+an explicit per-joint hardware gain override**. Nothing from this module has been
+exported or deployed.
+
 Deliberately *not* changed, with reasons:
 
-* ``shoulder_yaw``, ``elbow``, ``wrist_*``. Against the racket-held inertia the shipped
-  gains already sit close to the measured damping ratio -- 0.72 against 0.93 at the
-  shoulder yaw, 0.85 against 0.93 at the elbow, 1.07 and 1.12 against 0.93 at the
-  wrists. A damping-ratio match there would *soften* the wrists (kd 2.0 -> about 1.7)
-  and stiffen the yaw and elbow slightly, on joints whose simulated natural frequency
-  is 19-32 % above the measured one. That gap is the degenerate ``(J, alpha)`` axis of
-  the report's section 4a, which no damping value can fix: any ``(J, alpha)`` pair on
-  the same ratio reproduces the response, so the "x2.4 yaw, x1.7 elbow, x12 wrist"
-  inertia story stays withdrawn. Moving kd on those joints would trade a number with
-  hardware trials behind it for a small change that does not address the actual gap.
+* ``shoulder_yaw``, ``elbow``, ``wrist_*``. Two separate statements, because the peer
+  audit is right that they are not the same statement:
+
+  1. The **damping ratio is matchable without knowing the inertia**. For
+     ``q'' = a u - a q - b q'`` both ``omega`` and ``zeta`` scale with ``sqrt(alpha)``,
+     so ``zeta / omega_n = kd / (2 kp)`` contains neither ``J`` nor ``alpha``. An
+     earlier version of this docstring said the residual gap "is the ``(J, alpha)``
+     axis, which no damping value can fix". That is true of the **frequency** gap and
+     false of ``zeta``. Raising kd on those joints would fix their damping ratio.
+  2. It is still not done, for two reasons. The mismatch is small at the shipped gains
+     -- 0.72 against 0.93 at the shoulder yaw, 0.85 against 0.93 at the elbow -- and at
+     the wrists the shipped gains are already *over*-damped (1.07 and 1.12 against
+     0.93), because the simulated wrist frequency is 25-28 % above the measured one.
+     Matching ``kd / (2 kp)`` there, the inertia-free route, would raise the wrist kd to
+     2.23 and 2.17 and make that over-damping worse (1.19 against 0.93); matching
+     ``zeta`` at the simulated inertia would lower it to 1.74 and 1.65, trading a value
+     with hardware trials behind it for a 15 % move on a joint whose model is wrong for
+     a reason kd cannot address. The two prescriptions disagree by 20-35 % on exactly
+     the joints where the frequency gap is largest, which is the signal that the data
+     does not choose between them.
+
+  If the yaw and elbow overshoot is judged to matter, the ``zeta``-at-simulated-inertia
+  values are kd 3.88 and 3.30, and the report's ratio route gives 4.60 and 4.26. That is
+  a decision to take explicitly, not a default.
 * Dry friction, which the report names as the mechanism behind the amplitude-dependent
   overshoot but does not fit. Adding an unfitted friction term would be invention.
 * Anything on the left arm. The measurement covers the right arm only.

@@ -12,9 +12,12 @@ What it proves, and why each check is worth the line:
 [2] A measured twin's robot differs from the shipped robot in exactly two servo entries:
     the right shoulder pitch and roll damping. This is the whole change. If a third
     entry ever moves, the rung is not comparable with its pair.
-[3] The resolved actuator list is identical in order. The action vector is ordered by
-    actuator, so a reordering would silently remap every checkpoint and the
-    controller's 29-wide action contract.
+[3] The action-to-joint mapping is identical, taken from the compiled models'
+    ``actuator_trnid`` actuator by actuator rather than from the config objects. The
+    action vector is ordered by actuator, so a reordering would silently remap every
+    checkpoint and the controller's 29-wide action contract. The compiled stiffness of
+    every actuator and every effort limit are compared too, and the set of actuators
+    whose damping moved must be exactly the two the servo table names.
 [4] The compiled armature is identical. The measured data changed damping, not inertia,
     so `dof_armature` must not move.
 [5] The values match the fit they claim to come from: `kd = 2 zeta omega_n J` with
@@ -157,11 +160,43 @@ def compare(label: str, base_cfg, measured_cfg) -> None:
       f"{label}: {name} is {after}, expected {EXPECTED_MEASURED[name]}",
     )
 
-  arma_a = base.spec.compile().dof_armature
-  arma_b = measured.spec.compile().dof_armature
+  base_model = base.spec.compile()
+  measured_model = measured.spec.compile()
   check(
-    np.array_equal(arma_a, arma_b),
+    np.array_equal(base_model.dof_armature, measured_model.dof_armature),
     f"{label}: dof_armature changed, but the measurement was of damping",
+  )
+
+  # The action vector is ordered by actuator, and the action-to-joint mapping is what a
+  # reorder would break silently. Compare it on the compiled models, actuator by
+  # actuator, not on the config objects.
+  def action_map(model) -> list[str]:
+    return [
+      mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, int(joint))
+      for joint in model.actuator_trnid[:, 0]
+    ]
+
+  map_a, map_b = action_map(base_model), action_map(measured_model)
+  check(
+    map_a == map_b,
+    f"{label}: the action-to-joint mapping changed",
+  )
+  check(
+    np.array_equal(
+      base_model.actuator_gainprm[:, 0], measured_model.actuator_gainprm[:, 0]
+    ),
+    f"{label}: a stiffness changed in the compiled model",
+  )
+  kd_a = -base_model.actuator_biasprm[:, 2]
+  kd_b = -measured_model.actuator_biasprm[:, 2]
+  moved = [map_b[i] for i in range(len(kd_a)) if abs(kd_a[i] - kd_b[i]) > 1e-12]
+  check(
+    sorted(moved) == sorted(EXPECTED_MEASURED),
+    f"{label}: the compiled model damped {moved}",
+  )
+  check(
+    np.array_equal(base_model.actuator_forcerange, measured_model.actuator_forcerange),
+    f"{label}: an effort limit changed",
   )
 
   # Everything outside the robot must be untouched: a measured rung is the same
