@@ -5,11 +5,16 @@ Changed
 ^^^^^^^
 
 - **Measured right-arm servo, and 23 tasks that use it.**
-  ``right_shoulder_pitch_joint`` damping 3.0 -> 4.81 and
-  ``right_shoulder_roll_joint`` 3.0 -> 4.78, from the robot's step response with the
-  racket held (``zeta`` 0.44 -> 0.70 at the carry-pose inertia). Stiffness is untouched.
-  A ``BuiltinPositionActuatorCfg`` holds one damping for all its targets, so the two
-  shoulder groups split per side; the actuator order, the action scale and
+  Right-arm damping from the robot's step response with the racket held:
+  ``shoulder_pitch`` 3.0 -> 4.74, ``shoulder_roll`` 3.0 -> 4.78, ``shoulder_yaw``
+  3.0 -> 4.38, ``elbow`` 3.0 -> 3.90. The values are the optimum of the same shape
+  residual the servo fit uses, swept over kd with the simulated frequency held fixed;
+  the wrists stay at 2.0 because their residual is already at the measurement floor.
+  Stiffness is untouched. These are training gains, not deployment gains: the robot
+  already has this damping at the vendor kd, so a measured-variant policy must not be
+  exported without a hardware gain override.
+  A ``BuiltinPositionActuatorCfg`` holds one damping for all its targets, so the four
+  affected groups split per side; the action-to-joint mapping, the action scale and
   ``dof_armature`` do not change. Both the fixed-height ladder and the target-height
   family gain a ``-RightArmMeasured-`` twin for every stage (19 + 4 = 23), generated
   from the stage tables. See ``docs/design/x2_right_arm_measured.md``.

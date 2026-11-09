@@ -21,21 +21,72 @@ on both shoulder axes; at the racket-held inertia the shipped gains give 0.437 a
 simulator at 10 deg. (The report first quoted 16.7 / 18.6 %; those were computed on the
 bare robot's inertia and are corrected in its section 0.)
 
-So this module changes **damping only, on the two right shoulder axes**, and keeps the
-commanded stiffness. ``kd = 2 zeta sqrt(kp J)`` with ``zeta = 0.70`` and ``J`` the
-mass-matrix diagonal in the tennis scene at the carry pose, racket held:
+So this module changes **damping only**, on the four proximal right-arm joints, and
+keeps the commanded stiffness.
 
-  shoulder_pitch  J 0.2357  kp 50  ->  kd 4.81   (shipped 3.0 gives zeta 0.44)
-  shoulder_roll   J 0.2333  kp 50  ->  kd 4.78   (shipped 3.0 gives zeta 0.44)
+How the damping was chosen
+--------------------------
+Not by assuming a frequency to divide by. The measured steps of each joint were matched
+by the same shape residual the two-parameter servo fit uses, holding the simulator's
+frequency fixed (kd cannot move it) and sweeping kd alone. One parameter instead of two,
+same objective, so the result is the fit's own answer rather than a formula. Residual
+over the 3 and 10 deg steps:
 
-With the racket included the shoulder frequency already agrees: the simulator gives
-2.32 Hz on the pitch axis against 2.34 Hz measured. So on that axis the inertia is
-corroborated and damping is the only defect.
+  joint            shipped kd  residual   optimal kd  residual  removed
+  shoulder_pitch        3.0       9.5 %         4.74     2.1 %     78 %
+  shoulder_roll         3.0      10.1 %         4.78     2.8 %     72 %
+  shoulder_yaw          3.0       6.2 %         4.38     2.3 %     64 %
+  elbow                 3.0       4.7 %         3.90     2.9 %     38 %
+  wrist_yaw             2.0       3.3 %         2.06     3.3 %      1 %
+  wrist_pitch           2.0       4.9 %         1.96     4.9 %      0 %
+
+At those kd values the implied damping ratio in the tennis scene is 0.69 (pitch), 0.70
+(roll), **1.05 (shoulder yaw)** and **1.10 (elbow)** -- the two distal ones above
+critically damped, which is what the robot's 0-1.8 % overshoot there says.
+
+An earlier version of this module used `kd = 2 zeta sqrt(kp J)` at the racket-held
+diagonal and got 4.81 / 4.78 on the two shoulders plus a separate argument for leaving
+the yaw and the elbow alone. The shoulders agree (4.74 and 4.78), the yaw and the elbow
+do not: the residual shows that leaving their damping error in place costs more than the
+over-damping does, so they move. Note what the optimum tracks -- on the yaw and elbow it
+lands near the `kd / (2 kp)` ratio route, because their simulated frequency is 19-29 %
+above the measured one and the measured shape penalises the resulting time compression.
+
+The wrists are untouched because there is **no residual left for kd to buy**: the shipped
+2.0 is within 3 % of the optimum and the residual is already at the 3.3-4.9 % measurement
+floor. Both formulas on offer would have moved them -- `zeta` matching would have softened
+them 15 %, the ratio route stiffened them 10 % -- and both would have moved away from the
+data. That is a better reason than "the inertia is uncertain": it also says when to stop
+looking.
+
+The values inherit the frequency error of the simulator, which is the degenerate
+`(J, alpha)` axis of the report's section 4a. If that axis is ever resolved, recompute
+them from the steps rather than carrying these forward.
 
 **This is a training-side change, not a deployment gain.** The robot already produces
 zeta 0.70 at the commanded kd 3.0, so the extra damping in the simulator is imitating
-damping the hardware already has. Sending kd 4.81 to the robot would add it a second
-time and land near zeta 1.0. The controller takes the RL gains from the exported policy
+damping the hardware already has. Sending 4.74 / 4.78 / 4.38 / 3.90 to the robot would
+add it a second time and push the shoulders past critical. The controller takes the RL gains from the exported policy
+metadata times ``policy.gain_multiplier`` (`x2_docker``'s ``x2_tennis_hardware.yaml``
+states this explicitly), so **a measured-variant policy must never be deployed without
+an explicit per-joint hardware gain override**. Nothing from this module has been
+exported or deployed.
+
+Deliberately *not* changed, with reasons:
+
+* `wrist_yaw` and `wrist_pitch` -- see above: no residual left, so any change is
+  noise-fitting.
+* `wrist_roll` -- its ridge spans 3-32 Hz, so nothing is identified.
+* Dry friction, which the report names as the mechanism behind the amplitude-dependent
+  overshoot (0.9 % at 3 deg, 4.3-7.4 % at 10 deg). A linear servo cannot reproduce that
+  and this module does not pretend to. The controller session offers to fit a deadband;
+  it is not fitted and not added.
+* Anything on the left arm. The measurement covers the right arm only.
+
+**This is a training-side change, not a deployment gain.** The robot already produces
+zeta 0.70 at the commanded kd 3.0, so the extra damping in the simulator is imitating
+damping the hardware already has. Sending these four values to the robot would add it a
+second time and push the shoulders past critical. The controller takes the RL gains from the exported policy
 metadata times ``policy.gain_multiplier`` (`x2_docker``'s ``x2_tennis_hardware.yaml``
 states this explicitly), so **a measured-variant policy must never be deployed without
 an explicit per-joint hardware gain override**. Nothing from this module has been
@@ -99,8 +150,10 @@ from mjlab.entity import EntityCfg
 #: the vendor reference table; ``kp`` repeats the commanded value, so this table is a
 #: complete statement of the right arm's servo.
 RIGHT_ARM_MEASURED_SERVO: dict[str, tuple[float, float]] = {
-  "right_shoulder_pitch_joint": (50.0, 4.81),
+  "right_shoulder_pitch_joint": (50.0, 4.74),
   "right_shoulder_roll_joint": (50.0, 4.78),
+  "right_shoulder_yaw_joint": (50.0, 4.38),
+  "right_elbow_joint": (50.0, 3.90),
 }
 
 #: ``right joint -> the shipped shared group pattern it must be split out of``. The
@@ -108,12 +161,16 @@ RIGHT_ARM_MEASURED_SERVO: dict[str, tuple[float, float]] = {
 _SPLIT_FROM: dict[str, str] = {
   "right_shoulder_pitch_joint": ".*_shoulder_pitch_joint",
   "right_shoulder_roll_joint": ".*_shoulder_roll_joint",
+  "right_shoulder_yaw_joint": ".*_shoulder_yaw_joint",
+  "right_elbow_joint": ".*_elbow_joint",
 }
 
 #: The left joint that stays in each split group.
 _LEFT_OF: dict[str, str] = {
   "right_shoulder_pitch_joint": "left_shoulder_pitch_joint",
   "right_shoulder_roll_joint": "left_shoulder_roll_joint",
+  "right_shoulder_yaw_joint": "left_shoulder_yaw_joint",
+  "right_elbow_joint": "left_elbow_joint",
 }
 
 
