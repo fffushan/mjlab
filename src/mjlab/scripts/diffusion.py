@@ -901,6 +901,101 @@ def _command_build_token_cache(args: argparse.Namespace) -> int:
   return 0 if payload["complete"] else 1
 
 
+def _command_build_provenance_index(args: argparse.Namespace) -> int:
+  """Build the columnar provenance index beside each requested sidecar.
+
+  The sidecar is resolved exactly as validation resolves it, so the index
+  names the cache identity the run will later open.  A valid index is reported
+  as reused and is never rewritten.
+  """
+  from mjlab.tasks.tracking.diffusion.provenance_index import (
+    ProvenanceIndexError,
+    build_provenance_index,
+  )
+  from mjlab.tasks.tracking.diffusion.token_cache_lifecycle import (
+    parse_splits,
+    provenance_cache_path,
+  )
+  from mjlab.tasks.tracking.diffusion.window_dataset import (
+    DatasetSource,
+    WindowCacheError,
+    _read_cache_metadata,
+    _source_dataset_hash,
+    dataset_token_cache_path,
+  )
+
+  try:
+    requested = parse_splits(args.splits)
+  except (ValueError, TypeError) as exc:
+    print(f"build-provenance-index: {exc}", file=sys.stderr)
+    return 1
+  payload: dict[str, object] = {
+    "dataset": str(args.dataset_dir),
+    "splits": {},
+    "complete": False,
+  }
+  entries = cast(dict[str, object], payload["splits"])
+  try:
+    source = DatasetSource(Path(args.dataset_dir), Path(args.contract))
+    loaded = source.load()
+    source_hash = _source_dataset_hash(source, loaded)
+  except (OSError, RuntimeError, ValueError, TypeError) as exc:
+    payload["error"] = str(exc)
+    print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
+    return 1
+
+  failed = False
+  for split in requested:
+    started = time.perf_counter()
+    entry: dict[str, object] = {"status": "failed", "seconds": 0.0}
+    try:
+      cache_path = dataset_token_cache_path(
+        source, loaded, split, motion_ids=args.motion, source_hash=source_hash
+      )
+      metadata_path = cache_path.with_suffix(".json")
+      if not cache_path.is_file() or not metadata_path.is_file():
+        raise WindowCacheError(f"token cache is missing: {cache_path}")
+      build = build_provenance_index(
+        provenance_cache_path(cache_path),
+        _read_cache_metadata(metadata_path),
+        split,
+        cache_path.parent,
+      )
+      entry.update(
+        {
+          "status": build.status,
+          "path": str(build.binary_path),
+          "header": str(build.header_path),
+          "windows": build.count,
+          "bytes": build.binary_bytes,
+        }
+      )
+      print(
+        f"provenance index {split}: {build.status} windows={build.count} "
+        f"bytes={build.binary_bytes} in {time.perf_counter() - started:.1f}s",
+        flush=True,
+      )
+    except (
+      ProvenanceIndexError,
+      WindowCacheError,
+      OSError,
+      RuntimeError,
+      ValueError,
+      TypeError,
+    ) as exc:
+      failed = True
+      entry.update({"status": "failed", "error": str(exc)})
+      print(f"provenance index {split}: failed: {exc}", file=sys.stderr, flush=True)
+    entry["seconds"] = round(time.perf_counter() - started, 3)
+    entries[split] = entry
+
+  payload["complete"] = not failed and len(entries) == len(requested)
+  if args.json is not None:
+    _json_write(args.json, payload)
+  print(json.dumps(payload, indent=2, sort_keys=True))
+  return 0 if payload["complete"] else 1
+
+
 def _command_build_index(args: argparse.Namespace) -> int:
   """Build and persist the window index that belongs to a dataset.
 
@@ -1428,7 +1523,7 @@ def _command_train(args: argparse.Namespace) -> int:
       },
     }
 
-    def make_dataset(split: str) -> tuple[Any, list[Any], Path | None]:
+    def make_dataset(split: str) -> tuple[Any, Any, Path | None]:
       if args.cache_tokens:
         # A normal training run is a read-only cache consumer.  Building is an
         # explicit preparation action, so a missing cache cannot trigger a
@@ -1456,7 +1551,9 @@ def _command_train(args: argparse.Namespace) -> int:
             source_hash=source_hash,
             lock_timeout=args.cache_lock_timeout,
           )
-        provenance = list(prepared.provenance)
+        # The provenance may be a columnar index; keep it lazy so a
+        # multi-million window split never becomes one object per window.
+        provenance = prepared.provenance
         dataset = TokenWindowDataset(
           prepared.path,
           provenance,
@@ -2065,6 +2162,26 @@ def build_parser() -> argparse.ArgumentParser:
   )
   token_cache.add_argument("--json", type=Path)
   token_cache.set_defaults(handler=_command_build_token_cache)
+
+  provenance = commands.add_parser(
+    "build-provenance-index",
+    help="build the columnar provenance index beside each token-cache sidecar",
+  )
+  provenance.add_argument("--dataset-dir", type=Path, required=True)
+  provenance.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT_PATH)
+  provenance.add_argument(
+    "--splits",
+    default="train,validation",
+    help="comma-separated split names",
+  )
+  provenance.add_argument(
+    "--motion",
+    action="append",
+    default=None,
+    help="the motion filter of the cache to index; repeatable",
+  )
+  provenance.add_argument("--json", type=Path)
+  provenance.set_defaults(handler=_command_build_provenance_index)
 
   evaluate = commands.add_parser(
     "evaluate-offline", help="score a checkpoint without constructing a simulator"

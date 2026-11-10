@@ -3,6 +3,11 @@
 The token array remains the v2 cache format.  This module adds one aligned JSON
 sidecar for dataset-derived provenance.  The sidecar does not contain weights or
 training settings, so changing an arm configuration cannot change its identity.
+
+Provenance is read from the columnar index beside the sidecar when that index is
+valid, because re-parsing the sidecar costs minutes on a multi-million window
+split.  The JSON sidecar stays the source of truth: a missing index is silent, a
+changed one is reported in one line, and either case falls back to this path.
 """
 
 from __future__ import annotations
@@ -10,10 +15,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 
@@ -41,7 +47,12 @@ from .window_dataset import (
   iter_index_provenance,
 )
 
+if TYPE_CHECKING:
+  from .provenance_index import ProvenanceIndex
+
 _PROVENANCE_VERSION = "mjlab-x2-diffusion-token-cache-provenance-v1"
+_PROVENANCE_INDEX_ENV = "MJLAB_PROVENANCE_INDEX"
+_PROVENANCE_INDEX_OFF = frozenset(("0", "false", "no", "off"))
 
 
 class CacheProvenanceError(WindowCacheError):
@@ -53,7 +64,7 @@ class PreparedTokenCache:
   """A validated token cache and its aligned, token-free provenance."""
 
   cache: ValidatedTokenCache
-  provenance: tuple[WindowProvenance, ...]
+  provenance: Sequence[WindowProvenance] | ProvenanceIndex
   cache_status: str
   provenance_status: str
 
@@ -275,12 +286,62 @@ def _metadata_int(metadata: Mapping[str, object], key: str) -> int:
     raise CacheProvenanceError(f"provenance metadata field {key!r} is invalid") from exc
 
 
+def _provenance_index_enabled() -> bool:
+  """Report whether the columnar index may replace the JSON sidecar parse.
+
+  ``MJLAB_PROVENANCE_INDEX=off`` forces the JSON path for comparison runs.
+  """
+  setting = os.environ.get(_PROVENANCE_INDEX_ENV, "").strip().lower()
+  return setting not in _PROVENANCE_INDEX_OFF
+
+
+def _report_index_fallback(path: Path, detail: object) -> None:
+  print(
+    f"provenance index for {path.name} is unusable ({detail}); "
+    "reading the JSON sidecar",
+    file=sys.stderr,
+  )
+
+
+def _index_provenance(
+  path: Path, cache: ValidatedTokenCache
+) -> "ProvenanceIndex | None":
+  """Return columnar provenance when the index is present and valid.
+
+  A missing index is silent: an absent optimisation must not change a start.
+  A changed, malformed or unreadable index reports one line naming the reason
+  and the caller then reads the JSON sidecar.
+  """
+  if not _provenance_index_enabled():
+    return None
+  # ``provenance_index`` imports this module, so this import stays local.
+  from .provenance_index import ProvenanceIndexError, load_provenance_index
+
+  try:
+    return load_provenance_index(path, cache.metadata)
+  except ProvenanceIndexError as exc:
+    if exc.reason != "absent":
+      _report_index_fallback(path, exc)
+    return None
+  except (OSError, ValueError) as exc:
+    _report_index_fallback(path, exc)
+    return None
+
+
 def _validate_provenance(
   path: Path,
   *,
   cache: ValidatedTokenCache,
   expected: Mapping[str, object],
-) -> tuple[WindowProvenance, ...]:
+) -> Sequence[WindowProvenance] | "ProvenanceIndex":
+  """Read aligned provenance from the index, else from the JSON sidecar.
+
+  Both paths return the same records: the index is built only from a sidecar
+  whose records reproduce its recorded digest, and the JSON path re-derives it.
+  """
+  index = _index_provenance(path, cache)
+  if index is not None:
+    return index
   if not path.is_file():
     raise CacheProvenanceError(f"provenance sidecar is missing: {path}")
   try:
@@ -363,7 +424,7 @@ def validate_provenance_cache(
   split: str,
   *,
   motion_ids: Sequence[str] | None = None,
-) -> tuple[WindowProvenance, ...]:
+) -> Sequence[WindowProvenance] | ProvenanceIndex:
   """Validate an aligned provenance sidecar without touching token rows."""
   expected = _provenance_expected(cache, loaded, split, motion_ids)
   return _validate_provenance(

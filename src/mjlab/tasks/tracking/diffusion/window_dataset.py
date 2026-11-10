@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence, cast
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence, cast
 
 import numpy as np
 import torch
@@ -35,6 +35,9 @@ from .dataset import (
 )
 from .projection import ProjectionBundle, ProjectionError
 from .storage import AppendOnlyShardStore, TrajectoryRow
+
+if TYPE_CHECKING:
+  from .provenance_index import ProvenanceIndex
 
 _SPLITS = ("train", "validation", "test")
 _CACHE_VERSION = "mjlab-x2-diffusion-token-cache-v2"
@@ -1200,7 +1203,7 @@ class TokenWindowDataset(torch.utils.data.Dataset):
   def __init__(
     self,
     path: str | Path,
-    records: Sequence[WindowRecord | WindowProvenance] | None = None,
+    records: Sequence[WindowRecord | WindowProvenance] | ProvenanceIndex | None = None,
     *,
     clean_weight: float = 1.0,
     perturbed_weight: float = 1.0,
@@ -1221,9 +1224,16 @@ class TokenWindowDataset(torch.utils.data.Dataset):
     if split is None:
       split = str(metadata.get("split", ""))
     _validate_split(split)
-    values = None if records is None else tuple(records)
-    if values is not None and any(record.split != split for record in values):
-      raise WindowCacheError("record split does not match token cache split")
+    index = _as_provenance_index(records)
+    values: Sequence[WindowRecord | WindowProvenance] | ProvenanceIndex | None
+    if index is not None:
+      if index.split != split:
+        raise WindowCacheError("record split does not match token cache split")
+      values = index
+    else:
+      values = None if records is None else tuple(records)
+      if values is not None and any(record.split != split for record in values):
+        raise WindowCacheError("record split does not match token cache split")
     try:
       raw_count = metadata.get("window_count", -1)
       count = int(raw_count) if isinstance(raw_count, (int, str, float)) else -1
@@ -1360,13 +1370,47 @@ class TokenWindowDataset(torch.utils.data.Dataset):
     )
 
 
+def _as_provenance_index(records: object) -> "ProvenanceIndex | None":
+  """Return the columnar provenance container when ``records`` is one.
+
+  ``provenance_index`` imports this module, so this import stays local.
+  """
+  from .provenance_index import ProvenanceIndex
+
+  return records if isinstance(records, ProvenanceIndex) else None
+
+
+def _index_sampling_weights(
+  index: "ProvenanceIndex", clean_weight: float, perturbed_weight: float
+) -> np.ndarray:
+  """Map the int8 phase column through the phase table the sidecar recorded."""
+  table = index.dictionary["phase"]
+  lookup = np.empty(len(table), dtype=np.float64)
+  for position, phase in enumerate(table):
+    if phase == "ou":
+      lookup[position] = perturbed_weight
+    elif phase in {"", "clean"}:
+      lookup[position] = clean_weight
+    else:
+      raise DatasetError(f"unknown record phase {phase!r}")
+  codes = index.phase
+  if len(codes) and (int(codes.min()) < 0 or int(codes.max()) >= len(table)):
+    raise DatasetError("provenance index phase column is out of range")
+  return lookup[codes]
+
+
 def sampling_weights(
-  records: Sequence[WindowRecord | WindowProvenance],
+  records: Sequence[WindowRecord | WindowProvenance] | "ProvenanceIndex",
   *,
   clean_weight: float,
   perturbed_weight: float,
 ) -> np.ndarray:
-  """Return phase weights without changing which records are eligible."""
+  """Return phase weights without changing which records are eligible.
+
+  ``records`` may be the columnar provenance index.  Its phase column then
+  replaces the per-record loop, so a multi-million window split is weighted
+  without building one object per window.
+  """
   clean_weight = float(clean_weight)
   perturbed_weight = float(perturbed_weight)
   if (
@@ -1378,14 +1422,18 @@ def sampling_weights(
     raise DatasetError("sampling weights must be finite and non-negative")
   if records and clean_weight == 0.0 and perturbed_weight == 0.0:
     raise DatasetError("at least one sampling weight must be positive")
-  result = np.empty(len(records), dtype=np.float64)
-  for index, record in enumerate(records):
-    if record.phase == "ou":
-      result[index] = perturbed_weight
-    elif record.phase in {"", "clean"}:
-      result[index] = clean_weight
-    else:  # pragma: no cover - both provenance types validate this
-      raise DatasetError(f"unknown record phase {record.phase!r}")
+  index = _as_provenance_index(records)
+  if index is not None:
+    result = _index_sampling_weights(index, clean_weight, perturbed_weight)
+  else:
+    result = np.empty(len(records), dtype=np.float64)
+    for position, record in enumerate(records):
+      if record.phase == "ou":
+        result[position] = perturbed_weight
+      elif record.phase in {"", "clean"}:
+        result[position] = clean_weight
+      else:  # pragma: no cover - both provenance types validate this
+        raise DatasetError(f"unknown record phase {record.phase!r}")
   if len(result) and not np.any(result > 0.0):
     raise DatasetError("sampling weights select no windows")
   return result

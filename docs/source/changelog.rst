@@ -185,6 +185,17 @@ Removed
 Added
 ^^^^^
 
+- **A columnar provenance index beside each diffusion token cache.** Parsing
+  ``tokens-<split>-<hash>.provenance.json`` costs about 18 minutes for the
+  5 222 396-window train split. ``python -m mjlab.scripts.diffusion
+  build-provenance-index --dataset-dir DIR [--splits train,validation]`` writes
+  ``.provenance.bin`` and ``.provenance.bin.json`` beside that sidecar, atomically and
+  idempotently. Loading verifies the split, the count, the cache identity, the binary
+  digest and the sidecar digest; it does not re-derive the record digest, because the
+  sidecar bytes are pinned in the header. A missing index is silent and a changed one
+  prints one line, then the existing JSON path runs; ``MJLAB_PROVENANCE_INDEX=off``
+  forces that path. Open time on the real split is not measured yet, so the 5 s target
+  is not claimed.
 - **Target-height juggling family, S1 and S1a.** Two tasks,
   ``...-Ball3-Pelvis-Nominal-S1-TargetHeight`` and ``...-S1a-TargetHeight``, take the
   target apex height as an **input** instead of a reward constant. A new command term
