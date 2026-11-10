@@ -73,7 +73,7 @@ def _split_dataset(
   )
   dataset = TokenWindowDataset(
     prepared.path,
-    list(prepared.provenance),
+    prepared.provenance,
     source=source,
     split=split,
     validated_cache=prepared.cache,
