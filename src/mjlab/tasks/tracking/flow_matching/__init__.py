@@ -49,9 +49,13 @@ from .sampler import (
   sample_trajectory,
 )
 from .trainer import (
+  DistributedContext,
   FlowTrainer,
   FlowTrainerError,
   FlowTrainResult,
+  epoch_shard,
+  initialize_distributed,
+  per_rank_microbatch,
 )
 from .training_config import FlowTrainingConfig, FlowTrainingConfigError
 
@@ -59,6 +63,7 @@ __all__ = [
   "DEFAULT_CALLS",
   "DEFAULT_MAX_LEVEL",
   "DEFAULT_PROCESS",
+  "DistributedContext",
   "FAMILY",
   "FLOW_CHECKPOINT_FORMAT",
   "FlowCheckpointError",
@@ -79,11 +84,14 @@ __all__ = [
   "LinearNoiseProcess",
   "add_linear_noise",
   "draw_gaussian",
+  "epoch_shard",
   "euler_x0_update",
   "evaluate_generation",
   "identity_sha256",
+  "initialize_distributed",
   "load_flow_checkpoint",
   "model_identity",
+  "per_rank_microbatch",
   "sample_independent_levels",
   "sample_trajectory",
   "save_flow_checkpoint",

@@ -187,10 +187,22 @@ def _command_train(args: argparse.Namespace) -> int:
       FlowTrainer,
       FlowTrainingConfig,
       FlowTrainingConfigError,
+      initialize_distributed,
+      per_rank_microbatch,
     )
 
     if args.device == "cuda:0":
       os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    # Rank resolution comes before any dataset or model work: a data-parallel
+    # worker must claim its own card and join its group first, so a failed
+    # rendezvous cannot leave eight half-built dataset caches behind.
+    distributed = initialize_distributed(args.device)
+    if distributed.is_distributed and torch.device(args.device).type == "cuda":
+      print(
+        f"warning: WORLD_SIZE={distributed.world_size} overrides --device "
+        f"{args.device} with {distributed.device} for rank {distributed.rank}",
+        flush=True,
+      )
     config = FlowTrainingConfig.from_yaml(args.config)
     _validate_config_contract(args.config, args.contract)
     if (
@@ -238,7 +250,7 @@ def _command_train(args: argparse.Namespace) -> int:
     settings = DenoiserSettings.from_contract(contract, training_k=process.max_level)
     _set_seed(config.training.seed)
     model = _build_denoiser(settings, final_norm=bool(args.final_norm))
-    device = torch.device(args.device)
+    device = distributed.device
     if device.type == "cuda" and not torch.cuda.is_available():
       raise RuntimeError("CUDA device requested but CUDA is unavailable")
     run_metadata = {
@@ -264,10 +276,21 @@ def _command_train(args: argparse.Namespace) -> int:
       "windows": windows,
       "note": "bounded engineering run metadata; no model-quality claim",
     }
+    if distributed.is_distributed:
+      # The derived microbatch is the value the trainer consumes, so it belongs
+      # beside the global batch it preserves.
+      run_metadata["world_size"] = distributed.world_size
+      run_metadata["rank"] = distributed.rank
+      run_metadata["per_rank_microbatch"] = per_rank_microbatch(
+        config.training.effective_batch_size,
+        config.training.gradient_accumulation_steps,
+        distributed.world_size,
+      )
     metadata_path = output_dir / FLOW_RUN_METADATA_NAME
-    _json_write(metadata_path, run_metadata)
     preamble = {**run_metadata, "run_metadata": str(metadata_path)}
-    print(json.dumps(preamble, indent=2, sort_keys=True))
+    if distributed.rank == 0:
+      _json_write(metadata_path, run_metadata)
+      print(json.dumps(preamble, indent=2, sort_keys=True))
     trainer = FlowTrainer(
       config=config,
       contract=contract,
@@ -293,9 +316,10 @@ def _command_train(args: argparse.Namespace) -> int:
       "train_report": str(output_dir / "train-report.json"),
       "note": "bounded engineering training; no model-quality claim",
     }
-    if args.json is not None:
+    if args.json is not None and distributed.rank == 0:
       _json_write(args.json, payload)
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    if distributed.rank == 0:
+      print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
   except (OSError, RuntimeError, TypeError, ValueError) as exc:
     print(f"train: {exc}", file=sys.stderr)

@@ -196,6 +196,23 @@ Added
   prints one line, then the existing JSON path runs; ``MJLAB_PROVENANCE_INDEX=off``
   forces that path. Open time on the real split is not measured yet, so the 5 s target
   is not claimed.
+- **Data-parallel X2 flow-matching training.** ``WORLD_SIZE > 1`` now makes
+  ``python -m mjlab.scripts.flow_matching train`` run one process per card: the
+  denoiser is wrapped in ``DistributedDataParallel``, the global batch is held
+  fixed by a per-rank microbatch of ``effective_batch_size //
+  (gradient_accumulation_steps * world_size)`` (an inexact division is refused),
+  gradients are all-reduced once per update, every rank draws a disjoint
+  contiguous chunk of one shared epoch permutation, update metrics are
+  all-reduced and written by rank 0 alone, and validation is broadcast before
+  any save. Checkpoints store one RNG state per rank and record the world size,
+  so a resume at another world size is refused instead of restoring a stream no
+  rank drew. ``WORLD_SIZE == 1`` keeps the previous behaviour, sampler, metric
+  rows and checkpoint payload, apart from one ``rng_state.world_size`` field.
+  ``scripts/run_flow_3261.sh`` launches the multi-card run through torchrunx and
+  prints the resolved per-rank microbatch before launch. ``MJLAB_FLOW_DIAGNOSTICS_DIR``
+  is refused with data parallelism, because the recorded batch would be one
+  rank's subset. Only ``nccl``/``gloo`` data parallelism is claimed: no
+  measurement of throughput or loss agreement on real data was made here.
 - **Target-height juggling family, S1 and S1a.** Two tasks,
   ``...-Ball3-Pelvis-Nominal-S1-TargetHeight`` and ``...-S1a-TargetHeight``, take the
   target apex height as an **input** instead of a reward constant. A new command term
