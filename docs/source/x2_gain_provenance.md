@@ -487,3 +487,11 @@ time; the tennis task is constructed the other way round. Both are now covered:
 `apply_x2_tracking_robot_randomization` resolves the position from the articulation each
 config builds, and `measured_servo.retarget_wrist_effort_event` re-resolves it for a split
 applied afterwards. The test compares the group's target expressions, not a number.
+
+Checked across the registry, not only the suite: 21 registered tasks carry the event, and
+all 21 resolve it to a wrist group (tracking base and multi-motion 13, measured-servo 22,
+five measured tennis tasks 17, ten plain tennis tasks 13). Note what the fix does to
+reproducibility: restoring the four-target draw shifts the whole startup draw sequence, so
+a fresh run of a split task differs from an old one across every startup-randomised axis,
+not only at the wrists. Within a family the old runs stay comparable to each other, because
+they all carried the same wrong target.
