@@ -6,7 +6,10 @@ from mjlab.asset_zoo.robots import (
   X2_ACTION_SCALE,
   get_x2_robot_cfg,
 )
-from mjlab.asset_zoo.robots.agibot_x2.measured_servo import apply_measured_servo
+from mjlab.asset_zoo.robots.agibot_x2.measured_servo import (
+  apply_measured_servo,
+  group_index_of,
+)
 from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
   X2_ACTUATOR_GROUPS,
   actuator_group_index,
@@ -34,6 +37,10 @@ _FOOT_GEOMS = r"^(left|right)_foot[0-9]+_collision$"
 # Index of the wrist pitch/roll group in ``X2_ARTICULATION``, resolved by name so
 # a change to the group layout cannot silently point this at another joint.
 _WRIST_ACTUATOR_ID = actuator_group_index("wrist_pitch_roll")
+
+# The wrist group's own target expressions. A task that splits the actuator groups has to
+# re-resolve the position above by these, because the index then names another group.
+_WRIST_PATTERNS = (".*_wrist_pitch_joint", ".*_wrist_roll_joint")
 
 # The generic joint-damping range is an absolute value, not a scale, and it is
 # calibrated on a 120 N.m leg joint: even at the tracking tasks' narrowed bound
@@ -508,5 +515,29 @@ def agibot_x2_multi_motion_tracking_measured_servo_env_cfg(
   gain override; the robot already has the damping the simulator is missing.
   """
   cfg = agibot_x2_multi_motion_tracking_env_cfg(play=play)
-  apply_measured_servo(cfg.scene.entities["robot"])
+  robot = cfg.scene.entities["robot"]
+  apply_measured_servo(robot)
+  _retarget_wrist_effort_event(cfg, robot)
   return cfg
+
+
+def _retarget_wrist_effort_event(cfg: ManagerBasedRlEnvCfg, robot) -> None:
+  """Re-resolve the wrist effort-derating event after the measured split.
+
+  ``apply_x2_tracking_robot_randomization`` addresses the wrist group by *position* in
+  the actuator-group list (``_WRIST_ACTUATOR_ID``), because ``SceneEntityCfg.
+  actuator_ids`` indexes that list and not the compiled actuators. A split inserts groups
+  before the wrist one, so the stored position then points at whatever group moved into
+  it. In this task the split moves it to 22, and position 13 becomes
+  ``left_shoulder_pitch_joint``; the event would derate a shoulder's effort limit and
+  leave the wrists untouched, while the ordering assertion still passes because it checks
+  names, not positions.
+
+  So the index is re-resolved by the wrist group's own patterns. A split cannot change
+  those: the wrists keep ``kd`` 2.0, so their group is never split.
+  """
+  event = cfg.events.get("randomize_effort_limits_wrist")
+  if event is None:
+    return
+  index = group_index_of(robot, _WRIST_PATTERNS)
+  event.params["asset_cfg"] = SceneEntityCfg("robot", actuator_ids=[index])

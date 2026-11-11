@@ -121,6 +121,37 @@ def main() -> int:
     print(f"{joint:26s} {fa['stiffness']:6.1f} {fa['damping']:8.3f}"
           f" {fb['damping']:12.3f}{flag}")
 
+  # Position-keyed parameters break silently when a split moves a group, and the compiled
+  # spec cannot show it: the event would fire on the wrong joint at startup. So every
+  # event that addresses a group by position is resolved to its joints in both configs.
+  def group_targets(cfg, ids):
+    groups = cfg.scene.entities["robot"].articulation.actuators
+    out = []
+    for index in ids:
+      out.append(tuple(groups[index].target_names_expr))
+    return tuple(out)
+
+  events_a = {
+    name: tuple(term.params["asset_cfg"].actuator_ids)
+    for name, term in base.events.items()
+    if hasattr(term.params.get("asset_cfg"), "actuator_ids")
+    and isinstance(term.params["asset_cfg"].actuator_ids, list)
+  }
+  events_b = {
+    name: tuple(term.params["asset_cfg"].actuator_ids)
+    for name, term in measured.events.items()
+    if hasattr(term.params.get("asset_cfg"), "actuator_ids")
+    and isinstance(term.params["asset_cfg"].actuator_ids, list)
+  }
+  if set(events_a) != set(events_b):
+    failures.append(f"event sets differ: {sorted(set(events_a) ^ set(events_b))}")
+  for name in sorted(set(events_a) & set(events_b)):
+    targets_a = group_targets(base, events_a[name])
+    targets_b = group_targets(measured, events_b[name])
+    if targets_a != targets_b:
+      failures.append(f"event {name} targets {targets_b} against {targets_a}")
+  print(f"position-keyed events checked: {len(events_a)}")
+
   # The compiled MuJoCo spec is the only place that proves the values reach the model:
   # a position actuator stores [0, -kp, -kd] in biasprm.
   from mjlab.asset_zoo.robots.agibot_x2.x2_constants import get_x2_robot_cfg

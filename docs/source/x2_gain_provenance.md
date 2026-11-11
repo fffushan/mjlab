@@ -434,3 +434,53 @@ The probe compares the two configs and the compiled MuJoCo spec: 31 joints in th
 order, `kp` equal per joint, every non-gain field equal per joint, `kd` changed on exactly
 the 19 table joints, and the compiled `biasprm[2]` equal to `-kd` for each of them. No
 training run has used this task yet.
+
+### The split, and the three things it can break
+
+A `BuiltinPositionActuatorCfg` holds one damping for all of its targets, and the shipped
+layout covers both sides with one pattern per joint, so a per-joint `kd` requires splitting
+a group into one group per joint. The split is name-preserving and ordered by the model's
+joint order, which keeps the compiled actuator list and the action-index contract identical
+(31 actuators, same order). Three other things are position-keyed and do not follow
+automatically:
+
+1. **`SceneEntityCfg.actuator_ids` indexes the group list, not the compiled actuators.** The
+   wrist effort-derating event stores `actuator_group_index("wrist_pitch_roll")`, which is 13
+   in the shipped layout. Nine splits land before the wrist group, so position 13 becomes
+   `left_shoulder_pitch_joint`: the event would derate a shoulder's effort limit and leave
+   the wrists untouched, and the ordering assertion still passes because it compares names.
+   `agibot_x2_multi_motion_tracking_measured_servo_env_cfg` therefore re-resolves the index
+   by pattern after the split (22 in this task), and the probe compares the resolved target
+   patterns of every position-keyed event instead of trusting the number.
+2. **Domain randomisation draws per target, not per group** (`dr/actuator.py` samples
+   `actuator.num_targets` values). The total count is 31 targets either way, so the
+   distribution is unchanged, but the draw order is not: an equal-seed comparison between the
+   base task and this one is **not** sample-for-sample. Do not read a difference between them
+   as a pure damping effect, and do not treat one seed as a paired experiment.
+3. **The export writes the compiled gains.** `distillation/export.py` builds the deploy
+   contract's `action.kp` / `action.kd` from the compiled model, and the controller applies
+   them scaled only by `gain_multiplier`. Exporting a measured-servo policy therefore ships
+   `kd` 14.48 / 34.71 / 20.55 to the robot. Nothing in the code refuses it; that gate is
+   still open, and the module docstring is the only warning today.
+
+### Before anyone trains on it
+
+- Keep one **base-task eval arm** and compare tracking error on fast waist and hip sequences.
+  The waist pitch is overdamped on the robot (`zeta` 3.26) and under-damped in the simulator
+  (0.11), so a damping-dominated response is exactly where a policy learns to rely on
+  something the hardware will contradict.
+- The **leg jump is the larger risk**: hip pitch `kd` 5.0 -> 14.48 is 2.9x on the one group
+  whose contact state during the fit is unknown. Damping that large in the simulator can mask
+  a fall that would happen on hardware.
+- The distillation adapter refuses to pair a teacher whose `joint_damping` metadata disagrees
+  with the live compiled gains, so this task is a **separate cohort**: teacher ONNX, manifest,
+  token caches and every dataset have to be collected under it. An existing vendor-`kd`
+  dataset cannot be reused.
+
+**Open defect in the tennis family, same cause.** The measured right-arm split
+(`right_arm_measured.apply_right_arm_measured_servo`) inserts four groups before the wrist
+one, so `randomize_effort_limits_wrist` in every `...-RightArmMeasured-S*` tennis task points
+at position 13, which is now `right_shoulder_yaw_joint`. `tests/test_x2_tennis_ball_task.py`
+asserts that stale index, so the suite locks the defect in. Not fixed here, because it would
+change the configuration of a trained family; the fix is the same three lines the tracking
+task uses.

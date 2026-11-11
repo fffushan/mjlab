@@ -184,6 +184,39 @@ def _joints_of(group: BuiltinPositionActuatorCfg) -> tuple[str, ...]:
   )
 
 
+def group_index_of(robot_cfg: EntityCfg, patterns: tuple[str, ...]) -> int:
+  """Index of the one actuator group whose target expressions are exactly ``patterns``.
+
+  A split moves groups, so any parameter that addresses a group by position has to be
+  re-resolved after :func:`apply_measured_servo`. ``SceneEntityCfg.actuator_ids`` is such
+  a parameter: it indexes the config's group list, not the compiled actuators.
+
+  Args:
+    robot_cfg: The robot config, after any split.
+    patterns: The group's ``target_names_expr``, in its own order.
+
+  Returns:
+    The group's index in ``robot_cfg.articulation.actuators``.
+
+  Raises:
+    ValueError: if no group has exactly those patterns, or more than one does.
+  """
+  articulation = robot_cfg.articulation
+  if articulation is None:
+    raise ValueError("the robot config has no articulation")
+  wanted = tuple(patterns)
+  found = [
+    index
+    for index, group in enumerate(articulation.actuators)
+    if tuple(group.target_names_expr) == wanted
+  ]
+  if len(found) != 1:
+    raise ValueError(
+      f"{len(found)} actuator groups carry the targets {wanted}, expected exactly one"
+    )
+  return found[0]
+
+
 def apply_measured_servo(
   robot_cfg: EntityCfg,
 ) -> list[tuple[tuple[str, ...], float, float, float]]:
@@ -277,4 +310,5 @@ __all__ = [
   "X2_JOINT_ORDER",
   "X2_MEASURED_SERVO_KD",
   "apply_measured_servo",
+  "group_index_of",
 ]
