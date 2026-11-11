@@ -338,3 +338,99 @@ constants in the same way — its motor `ctrlrange` is the v1.3.0 set (48 waist,
   density because the body carries no `<inertial>` (our URDF-sourced 3.5235 kg). Every
   other body matches to four decimals. It is a reminder that a vendor MJCF is not
   ground truth just because it is the vendor's.
+
+## 8. Measured servo damping for every joint
+
+Section 2 measured what the robot *commands*; this section is the step response, i.e. what
+the robot *does*. Two runs on `.234` at the carry pose, 0.5-10 deg steps both signs, 3 s
+holds, at the vendor RL gains:
+
+| run | joints | report |
+|---|---|---|
+| `20261109T033956Z` | the seven right-arm joints, racket held | `x2_docker/docs/reports/REPORT-joint-step-response.md` |
+| `20261109T073458Z` | the other 24: legs, waist, left arm, head | `x2_docker/docs/reports/REPORT-sim-vs-robot-servo.md` |
+
+Both reports agree on the direction: the simulator is **under-damped** when the robot is
+not. On the shoulders the simulator predicts 21.5-21.7 % overshoot where the robot shows
+0.8-0.9 %; on the knees the simulated step overshoots 30-50 % and the measured step does
+not overshoot at all.
+
+### The rule
+
+`x2_docker/tools/joint_servo_kd.py` applies the residual rule of the right-arm report's
+section 4c to all 31 joints: hold the simulator's closed-loop frequency fixed (``kd``
+cannot move it), sweep ``kd`` alone, and take the value whose second-order step response
+matches that joint's measured steps with the smallest normalised shape residual. It
+reproduces the published right-arm answers from the raw steps (4.73 / 4.78 / 4.28 / 3.85
+against the published 4.74 / 4.78 / 4.38 / 3.90, with the same residuals), which is the
+reason to trust it on the other 24.
+
+### The table
+
+`src/mjlab/asset_zoo/robots/agibot_x2/measured_servo.py` carries the result. ``kp`` never
+moves; only the damping does.
+
+| group | joint | shipped kd | adopted kd | shape residual |
+|---|---|---:|---:|---|
+| legs | hip pitch | 5.0 | 14.48 L / 12.80 R | 26.1/23.7 % -> 6.7/7.0 % |
+| | hip roll | 4.0 | 10.20 / 9.88 | 23.8/22.7 % -> 9.8/8.6 % |
+| | hip yaw | 4.0 | 5.25 / 5.87 | 4.2/6.3 % -> 2.3/4.2 % |
+| | knee | 5.0 | 8.57 / 8.79 | 9.7/10.1 % -> 3.7/4.3 % |
+| waist | yaw | 4.0 | 7.55 | 18.9 % -> 4.9 % |
+| | pitch | 4.0 | 34.71 | 46.5 % -> 7.3 % |
+| | roll | 4.0 | 20.55 | 36.4 % -> 7.8 % |
+| left arm | shoulder pitch / roll / yaw / elbow | 3.0 | 4.93 / 4.45 / 3.65 / 3.75 | 11.2/9.1/4.0/4.1 % -> 3.4/3.5/3.1/2.2 % |
+| right arm | shoulder pitch / roll / yaw / elbow | 3.0 | 4.74 / 4.78 / 4.38 / 3.90 | 9.5/10.1/6.2/4.7 % -> 2.1/2.8/2.3/2.9 % |
+
+Unchanged, each with a reason rather than an omission: the four **ankles** (kd 2.0,
+residual already 2.1-3.8 %, the measurement floor), the six **wrists** (kd 2.0, residual
+2.7-6.2 %, the sweep saves at most 1 %), and the **head** (the step test drove it with
+`kp` 3.4 and 1, a degenerate overdamped corner that the 24-joint report says not to read
+as a servo).
+
+### How much of this is supported
+
+1. **At the floor** (adopted residual 2.1-4.9 %): knees, hip yaw, both shoulders, both
+   elbows, waist yaw. A second-order servo with this damping describes the measured steps
+   as well as the two-parameter fit did.
+2. **Compromise** (7.3-9.8 %): hip pitch, hip roll, waist pitch, waist roll. The sweep
+   removes 59-84 % of the shape error, but 7-10 % is two to three times the floor. The
+   cause is that the simulator's *frequency* is wrong there and `kd` cannot move it: the
+   waist pitch is overdamped on the robot (`zeta` 3.26) and under-damped in the simulator
+   (0.11 at 1.76 Hz). These four are the best single damping value, not an identified
+   servo.
+3. **The legs carry a further caveat**: the 24-joint run recorded `--load-bearing-deg 0`,
+   which is an assumption, not a measurement. If the feet touched the floor during the leg
+   steps, the fitted leg damping and inertia include contact. That is the report's first
+   open item.
+
+### Consequences and limits
+
+- **This is the simulator's error, not a deployment gain.** The robot already has the
+  measured damping at the vendor `kd`; the simulator is missing it. Never export a
+  measured-servo policy to the robot without an explicit per-joint hardware gain override.
+- `randomize_pd_gains` still scales every `kd` by 0.7-1.3 per environment, so these values
+  are the nominal centre of the domain-randomisation range.
+- The values inherit the simulator's frequency error, i.e. the degenerate `(J, alpha)`
+  axis both reports name. If that axis is resolved, **recompute from the steps**; do not
+  carry these forward.
+- Dry friction is not modelled. Both reports name it as the mechanism behind the
+  amplitude-dependent overshoot (0.9 % at 3 deg, 4.3-7.4 % at 10 deg on the shoulder
+  pitch), which no linear servo can reproduce.
+
+### The task and its probe
+
+`Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion-MeasuredServo` is the multi-motion teacher
+with this table applied and nothing else changed: same `kp`, effort limits, armature,
+action scale, observations, rewards, terminations, domain randomisation and motion
+command. The two head joints keep their mjlab gains because the vendor table does not
+cover them.
+
+```sh
+.venv/bin/python scripts/experiments/x2_measured_servo/probe_measured_servo.py
+```
+
+The probe compares the two configs and the compiled MuJoCo spec: 31 joints in the same
+order, `kp` equal per joint, every non-gain field equal per joint, `kd` changed on exactly
+the 19 table joints, and the compiled `biasprm[2]` equal to `-kd` for each of them. No
+training run has used this task yet.
