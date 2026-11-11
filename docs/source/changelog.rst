@@ -4,6 +4,18 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **The bed's ``solref`` is a per-run parameter for every tennis task.**
+  ``MJLAB_TENNIS_BED_SOLREF="stiffness,damping"`` overrides
+  ``BED_SOLREF = (-100000.0, -22.0)``, in the same direct form, so both values are negative.
+  The value is resolved when a task config is built (``tennis_constants.bed_solref``) and it
+  reaches every rung through ``get_x2_tennis_robot_cfg``: the ladder S1 to S11, the
+  target-height family, and the measured-right-arm twins. The geom, the collision config and
+  the resolved pair stay consistent, because both read the same resolver. Unset, the shipped
+  pair applies and an existing arm is unchanged. A malformed or positive value raises, because
+  a positive pair would silently switch MuJoCo to ``(timeconst, dampratio)``. The resolved
+  value is saved in the run's ``params/env.yaml``, so a damping arm is identifiable afterwards.
+  Reason: the fitted pair reproduces the free racket but not the held racket, and that
+  difference is unattributed. See ``docs/reports/x2_tennis_sim_restitution_20261111.md``.
 - **Fixed: the wrist effort derating fired on a shoulder once the actuators split.**
   ``randomize_effort_limits_wrist`` addressed the wrist group by position
   (``actuator_group_index("wrist_pitch_roll")`` = 13), and ``SceneEntityCfg.actuator_ids``

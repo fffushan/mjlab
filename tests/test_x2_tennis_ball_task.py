@@ -64,7 +64,7 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BED_HALF_WIDTH,
   BED_PRIORITY,
   BED_SOLIMP,
-  BED_SOLREF,
+  bed_solref,
   CLAMP_BODY,
   CLAMP_DIAGINERTIA,
   CLAMP_MASS,
@@ -187,7 +187,7 @@ def _bed_fixture_spec(
     priority=BED_PRIORITY,
     mass=0.0,
     friction=friction,
-    solref=list(BED_SOLREF),
+    solref=list(bed_solref()),
     solimp=list(BED_SOLIMP),
   )
   return spec
@@ -360,7 +360,7 @@ def test_bed_survives_the_shipped_collision_policy() -> None:
   assert model.geom_condim[geom_id] == CONTACT_CONDIM
   assert model.geom_priority[geom_id] == BED_PRIORITY
   assert tuple(model.geom_friction[geom_id]) == pytest.approx(CONTACT_FRICTION)
-  assert tuple(model.geom_solref[geom_id]) == pytest.approx(BED_SOLREF)
+  assert tuple(model.geom_solref[geom_id]) == pytest.approx(bed_solref())
   assert tuple(model.geom_solimp[geom_id]) == pytest.approx(BED_SOLIMP)
   # The repair pass must not disturb the robot's own collision story: the
   # original bed-less geoms are still off (visual) and the feet still collide.

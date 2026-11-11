@@ -532,6 +532,28 @@ tangential layers changed when the contact went from three to six dimensions;
 the values live in ``tennis_constants.py`` and the status column is evidence
 status, not confidence.
 
+.. note::
+
+   **The bed's ``solref`` is a per-run parameter.** ``MJLAB_TENNIS_BED_SOLREF`` sets it for
+   every tennis task, written as ``"stiffness,damping"`` in the same direct form, so both
+   numbers are negative::
+
+       MJLAB_TENNIS_BED_SOLREF="-100000,-40" bash jobs/<arm>/run.sh
+
+   Unset, the shipped pair above applies and an existing arm is byte-identical. The value is
+   resolved when a task config is built, so one variable reaches S1 through S11 without a
+   per-stage edit: every stage builds its robot through ``get_x2_tennis_robot_cfg()``. The
+   resolved pair lands in the run's ``params/env.yaml`` under
+   ``scene.entities.robot.collisions``, so two arms stay distinguishable after the fact.
+   A positive or malformed value raises instead of switching MuJoCo to the
+   ``(timeconst, dampratio)`` parameterisation.
+
+   The override exists because the fitted pair reproduces the **free** racket
+   (0.87 measured, 0.88-0.92 simulated) but not the **held** racket: the simulation returns
+   about 0.55 where the robot returns 0.45, and the cause is unattributed. A damping sweep is
+   the cheapest test of whether the held-contact loss belongs in the contact row. See
+   ``docs/reports/x2_tennis_sim_restitution_20261111.md``.
+
 .. list-table:: Bed–ball contact layers
    :header-rows: 1
 
@@ -542,7 +564,7 @@ status, not confidence.
    * - spring (normal)
      - stiffness 100000 N/m, damping 22 N·s/m
      - ``BED_SOLREF = (-100000.0, -22.0)``, MuJoCo's direct form
-     - **fitted** to the four recorded drop rebounds
+     - **fitted** to the four recorded drop rebounds; overridable per run, see below
    * - cushion (normal)
      - ``(0.95, 0.95, 0.001, 0.5, 2.0)``
      - ``BED_SOLIMP``

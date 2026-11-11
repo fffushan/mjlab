@@ -22,7 +22,7 @@ import torch
 from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BAT_CARRY_POSE,
   BED_GEOM,
-  BED_SOLREF,
+  bed_solref,
   CLAMP_BODY,
   FACE_SITE,
   RACKET_BODY,
@@ -225,7 +225,7 @@ def main() -> int:
       checks.check(
         "only the contact bits moved: the bed keeps its calibrated solref",
         tuple(float(v) for v in mj_model.geom_solref[bed_id])
-        == tuple(float(v) for v in BED_SOLREF),
+        == tuple(float(v) for v in bed_solref()),
         f"solref={tuple(float(v) for v in mj_model.geom_solref[bed_id])}",
       )
     # Consequence, stated rather than hidden: the bed is the racket's ONLY collider --

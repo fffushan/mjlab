@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+from dataclasses import replace
 from pathlib import Path
 
 import mujoco
@@ -291,6 +293,53 @@ CONTACT_CONDIM = 6
 ##
 
 BED_SOLREF = (-100000.0, -22.0)
+BED_SOLREF_ENV = "MJLAB_TENNIS_BED_SOLREF"
+"""Environment variable that overrides :data:`BED_SOLREF`, as ``"stiffness,damping"``.
+
+Both values are MuJoCo's *direct* contact parameters, so both are negative: the pair is
+``(-k, -b)``, not ``(timeconst, dampratio)``. A run that sets this variable changes only
+the bed's contact row; every task, reward, observation and gain is unchanged, so the arms
+stay comparable with the shipped family and with each other.
+
+Why it exists: the shipped pair was fitted so that the *free* racket reproduces the measured
+free-racket restitution (0.87 measured, 0.88-0.92 simulated). The *held* racket does not
+reproduce: the simulation returns about 0.55 where the robot returns 0.45, and the cause is
+still unattributed (see ``docs/reports/x2_tennis_sim_restitution_20261111.md``). A damping
+sweep is the cheapest way to test whether the held-contact loss can be modelled in the
+contact row. The default is the shipped pair, so an unset variable changes nothing.
+"""
+
+
+def bed_solref() -> tuple[float, float]:
+  """The bed's ``solref``: :data:`BED_SOLREF`, or ``MJLAB_TENNIS_BED_SOLREF``.
+
+  Read when a task config is built, not at import, so a launcher can export the value for
+  one run without touching another. Both numbers must be negative; a positive pair would
+  silently switch MuJoCo to the ``(timeconst, dampratio)`` parameterisation, which this
+  ladder has never used.
+  """
+  raw = os.environ.get(BED_SOLREF_ENV)
+  if raw in (None, ""):
+    return BED_SOLREF
+  parts = [part.strip() for part in raw.split(",")]
+  if len(parts) != 2:
+    raise ValueError(
+      f"{BED_SOLREF_ENV} must be 'stiffness,damping' (for example '-100000,-40'), "
+      f"got {raw!r}"
+    )
+  try:
+    stiffness, damping = float(parts[0]), float(parts[1])
+  except ValueError as exc:
+    raise ValueError(f"{BED_SOLREF_ENV} is not two numbers: {raw!r}") from exc
+  if stiffness >= 0.0 or damping >= 0.0:
+    raise ValueError(
+      f"{BED_SOLREF_ENV} is a direct-mode solref, so both values must be negative; "
+      f"got {stiffness}, {damping}. Positive values mean (timeconst, dampratio) and "
+      "would change the parameterisation, not its value."
+    )
+  return (stiffness, damping)
+
+
 BED_SOLIMP = (0.95, 0.95, 0.001, 0.5, 2.0)
 # The bed's ``priority=1`` is what makes the bed's contact row -- including
 # :data:`CONTACT_FRICTION` -- govern every bed-ball pair.
@@ -520,7 +569,7 @@ def attach_tennis_assembly(spec: mujoco.MjSpec) -> mujoco.MjSpec:
     mass=0.0,
     group=3,
     friction=list(CONTACT_FRICTION),
-    solref=list(BED_SOLREF),
+    solref=list(bed_solref()),
     solimp=list(BED_SOLIMP),
     rgba=[0.8, 0.8, 0.8, 0.15],
   )
@@ -1662,6 +1711,20 @@ def measure_bat_carry_state(
 ##
 
 
+def _bed_collision() -> CollisionCfg:
+  """ :data:`TENNIS_BED_COLLISION` with the resolved ``solref``.
+
+  The module constant keeps the shipped pair so the fitted value is visible in one place.
+  The entity config is built per run and resolves the environment override here, which is
+  also where a ladder stage picks it up: every stage task builds its robot through this
+  function, so one variable reaches S1 through S11 without a per-stage edit.
+  """
+  resolved = bed_solref()
+  if resolved == BED_SOLREF:
+    return TENNIS_BED_COLLISION
+  return replace(TENNIS_BED_COLLISION, solref=resolved)
+
+
 def get_x2_tennis_robot_cfg() -> EntityCfg:
   """X2 Ultra with the tennis assembly, in the bat-carry pose.
 
@@ -1676,7 +1739,7 @@ def get_x2_tennis_robot_cfg() -> EntityCfg:
       joint_pos=dict(BAT_CARRY_POSE),
       joint_vel={".*": 0.0},
     ),
-    collisions=(FULL_COLLISION, TENNIS_BED_COLLISION),
+    collisions=(FULL_COLLISION, _bed_collision()),
     spec_fn=get_tennis_spec,
     articulation=X2_ARTICULATION,
   )
@@ -1718,6 +1781,8 @@ __all__ = [
   "BAT_CARRY_POSE",
   "BED_GEOM",
   "BED_SOLREF",
+  "BED_SOLREF_ENV",
+  "bed_solref",
   "CLAMP_BODY",
   "FACE_SITE",
   "JUGGLE_ARM_RESET_RANGE_RAD",

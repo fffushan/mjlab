@@ -57,7 +57,7 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   BED_HALF_THICKNESS,
   BED_PRIORITY,
   BED_SOLIMP,
-  BED_SOLREF,
+  bed_solref,
   CONTACT_CONDIM,
   ROLLING_FRICTION,
   SLIDING_FRICTION,
@@ -158,7 +158,7 @@ def build_spec(rolling_friction: float) -> mujoco.MjSpec:
     priority=BED_PRIORITY,
     mass=0.0,
     friction=[SLIDING_FRICTION, SPIN_FRICTION, rolling_friction],
-    solref=list(BED_SOLREF),
+    solref=list(bed_solref()),
     solimp=list(BED_SOLIMP),
   )
   return spec
@@ -325,7 +325,7 @@ def main() -> None:
   )
   print(
     f"from tennis_constants: sliding {SLIDING_FRICTION}, spin {SPIN_FRICTION}, "
-    f"rolling {ROLLING_FRICTION:.2e}, bed solref {BED_SOLREF}, "
+    f"rolling {ROLLING_FRICTION:.2e}, bed solref {bed_solref()}, "
     f"timestep {TENNIS_PHYSICS_TIMESTEP * 1e3:.1f} ms"
   )
   print(
