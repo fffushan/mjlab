@@ -79,11 +79,35 @@ a zero-height release into the task. 0.05 m is 25 mm of release height and a
 0.1875 J/kg sigma, small but non-degenerate.
 """
 
+FIXED15_TARGET_HEIGHT_RANGE_M = (0.15, 0.15)
+"""A fixed 0.15 m target: the low part of the S1a draw, as a degenerate range."""
+
+FIXED30_TARGET_HEIGHT_RANGE_M = (0.30, 0.30)
+"""A fixed 0.30 m target: the middle of the S1a draw, as a degenerate range.
+
+These two ladders separate two causes of the S1a spread. S1a draws the target
+uniformly from 0.05 to 0.40 m and two of its seeds collapsed, so either drawing a
+target is itself the difficulty, or some heights are hard on their own. A fixed
+target removes the draw and leaves the height: if both fixed ladders hold, the draw
+is the difficulty; if 0.30 holds and 0.15 does not, the low target is. Each ladder
+runs the same perception rungs as the variable one (S1 15 Hz, S2 80-100 ms, S3
+40-140 ms), so it differs from it in the range alone.
+
+A fixed target also makes the appended ``target_height`` observation constant, so
+these policies do not follow a command: they are the same juggle at one apex.
+"""
+
 STAGE_TARGET_HEIGHT_RANGE_M: dict[str, tuple[float, float]] = {
   "s1": S1_TARGET_HEIGHT_RANGE_M,
   "s1a": S1A_TARGET_HEIGHT_RANGE_M,
   "s2": S1A_TARGET_HEIGHT_RANGE_M,
   "s3": S1A_TARGET_HEIGHT_RANGE_M,
+  "s1-fixed15": FIXED15_TARGET_HEIGHT_RANGE_M,
+  "s2-fixed15": FIXED15_TARGET_HEIGHT_RANGE_M,
+  "s3-fixed15": FIXED15_TARGET_HEIGHT_RANGE_M,
+  "s1-fixed30": FIXED30_TARGET_HEIGHT_RANGE_M,
+  "s2-fixed30": FIXED30_TARGET_HEIGHT_RANGE_M,
+  "s3-fixed30": FIXED30_TARGET_HEIGHT_RANGE_M,
 }
 """The target range each stage runs.
 
@@ -94,6 +118,11 @@ which is the stage discipline: a rung carries the complete condition and adds on
 thing, so S2 differs from S1a only in the perception band. S3 carries the range the
 same way and widens the band to 40-140 ms, redrawn per acquisition, which is the rung
 that made the shipped ladder flat across 0-140 ms.
+
+The six ``fixed15``/``fixed30`` rungs pin one height instead of drawing it. Each
+keeps its stage's perception condition and changes only the range, so
+``s2-fixed15`` differs from ``s1-fixed15`` in the latency band alone, exactly as
+``s2`` differs from ``s1a``.
 """
 
 STAGE_BASE_STAGE: dict[str, str] = {
@@ -101,6 +130,12 @@ STAGE_BASE_STAGE: dict[str, str] = {
   "s1a": "s1-15hz",
   "s2": "s2-80-100ms",
   "s3": "s3-40-140ms",
+  "s1-fixed15": "s1-15hz",
+  "s2-fixed15": "s2-80-100ms",
+  "s3-fixed15": "s3-40-140ms",
+  "s1-fixed30": "s1-15hz",
+  "s2-fixed30": "s2-80-100ms",
+  "s3-fixed30": "s3-40-140ms",
 }
 """The ladder stage each target-height stage is built on.
 
@@ -228,6 +263,8 @@ def agibot_x2_tennis_juggle_target_height_env_cfg(
 
 
 __all__ = [
+  "FIXED15_TARGET_HEIGHT_RANGE_M",
+  "FIXED30_TARGET_HEIGHT_RANGE_M",
   "S1A_TARGET_HEIGHT_RANGE_M",
   "S1_TARGET_HEIGHT_RANGE_M",
   "STAGE_BASE_STAGE",
