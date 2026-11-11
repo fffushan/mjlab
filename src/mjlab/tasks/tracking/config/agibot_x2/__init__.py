@@ -9,6 +9,7 @@ from .env_cfgs import (
   agibot_x2_flat_tracking_env_cfg,
   agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg,
   agibot_x2_multi_motion_tracking_env_cfg,
+  agibot_x2_multi_motion_tracking_measured_servo_env_cfg,
 )
 from .rl_cfg import (
   agibot_x2_multi_motion_ppo_runner_cfg,
@@ -77,6 +78,19 @@ register_mjlab_task(
   task_id="Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion",
   env_cfg=agibot_x2_multi_motion_tracking_env_cfg(),
   play_env_cfg=agibot_x2_multi_motion_tracking_env_cfg(play=True),
+  rl_cfg=agibot_x2_multi_motion_ppo_runner_cfg(),
+  runner_cls=MultiMotionTrackingOnPolicyRunner,
+)
+
+# The measured-servo variant is the same teacher with per-joint damping taken from the
+# two joint-step runs. It is a separate task id and not a flag, because a policy trained
+# on it is not interchangeable with one trained on the base: the plant differs, and the
+# exported metadata must carry the gains it was trained with. The runner is the same
+# multi-motion runner, so the export path and the preview contract are unchanged.
+register_mjlab_task(
+  task_id="Mjlab-Tracking-Flat-AgiBot-X2-Multi-Motion-MeasuredServo",
+  env_cfg=agibot_x2_multi_motion_tracking_measured_servo_env_cfg(),
+  play_env_cfg=agibot_x2_multi_motion_tracking_measured_servo_env_cfg(play=True),
   rl_cfg=agibot_x2_multi_motion_ppo_runner_cfg(),
   runner_cls=MultiMotionTrackingOnPolicyRunner,
 )

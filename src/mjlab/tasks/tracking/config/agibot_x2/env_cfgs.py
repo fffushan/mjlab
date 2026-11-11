@@ -6,6 +6,7 @@ from mjlab.asset_zoo.robots import (
   X2_ACTION_SCALE,
   get_x2_robot_cfg,
 )
+from mjlab.asset_zoo.robots.agibot_x2.measured_servo import apply_measured_servo
 from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
   X2_ACTUATOR_GROUPS,
   actuator_group_index,
@@ -472,4 +473,40 @@ def agibot_x2_multi_motion_tracking_env_cfg(
   if not play:
     cfg.scene.num_envs = 4096
 
+  return cfg
+
+
+def agibot_x2_multi_motion_tracking_measured_servo_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Multi-motion PPO teacher with the measured servo damping on every joint.
+
+  Identical to :func:`agibot_x2_multi_motion_tracking_env_cfg` except for the actuator
+  damping: :func:`~mjlab.asset_zoo.robots.agibot_x2.measured_servo.
+  apply_measured_servo` replaces the symmetric vendor ``kd`` with the value each joint
+  was measured to need, derived from the two joint-step runs by the shape-residual rule
+  of ``x2_docker/docs/reports/REPORT-joint-step-response.md`` section 4c.
+
+  What moves and what does not:
+
+  * ``kd`` on 19 joints: the legs, the waist and both arms. Four ankles, six wrists and
+    the head keep their task values, because the measurement shows nothing left for
+    damping to buy there.
+  * Nothing else. ``kp`` stays as the vendor table sets it (mjlab values on the two head
+    joints, which the vendor table does not cover), so the stiffness, the effort limits,
+    the armature, the action scale, the observations, the rewards, the terminations, the
+    domain randomization and the multi-motion command are all unchanged. A comparison
+    against the base task therefore isolates the damping.
+
+  The leg values inherit an unresolved caveat: the 24-joint run did not record whether
+  the feet were clear of the floor during the leg steps, and the report lists that as
+  its first open item. ``randomize_pd_gains`` still scales ``kd`` by 0.7-1.3 per
+  environment, so these values are the nominal centre and not a fixed configuration.
+
+  This is a training-side model of the simulator's error, not a deployment gain. Never
+  export a policy from this task to the robot without an explicit per-joint hardware
+  gain override; the robot already has the damping the simulator is missing.
+  """
+  cfg = agibot_x2_multi_motion_tracking_env_cfg(play=play)
+  apply_measured_servo(cfg.scene.entities["robot"])
   return cfg
