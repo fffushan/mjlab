@@ -4,6 +4,14 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **Five unused ladder rungs removed from the registry.**
+  ``S3b-80-140ms`` and ``S3c-0-140ms`` (band-centre siblings of S3), ``S4-Stalls`` (the assumed
+  stall model, rejected as seed-unstable), ``S7a-DelayedRelease`` (broken hold metric, replaced
+  by S7b) and ``S9d-DeadBall`` (aborted before launch) are deleted from ``STAGE_DELTAS`` and
+  from the task registry, together with their measured-right-arm twins, which are generated from
+  the same table. The ladder now holds exactly the fourteen rungs that trained: S1, S2, S3, S4b,
+  S5, S6, S7b, S7c, S8, S9a, S9b, S9c, S10, S11. Their conditions and the rejection evidence
+  stay in ``docs/design/x2_tennis_stage_ladder.md``. No surviving rung changes configuration.
 - **The bed's ``solref`` is a per-run parameter for every tennis task.**
   ``MJLAB_TENNIS_BED_SOLREF="stiffness,damping"`` overrides
   ``BED_SOLREF = (-100000.0, -22.0)``, in the same direct form, so both values are negative.

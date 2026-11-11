@@ -56,13 +56,13 @@ Resume mechanics, which have cost time to rediscover:
 | `s1-15hz` | nominal pilot | latency 0–40 ms, 15 Hz stream | adopted as the latency baseline |
 | `s2-80-100ms` | S1 | latency band 80–100 ms | **superseded by S3**; the band is too narrow |
 | `s3-40-140ms` | S2 | band 40–140 ms, redrawn per acquisition | **adopted**: flat 0–140 ms |
-| `s3b-80-140ms` | S2 | same width, centre 110 ms | sibling; band centre is not the operative property |
-| `s3c-0-140ms` | S2 | whole band, centre 70 ms | sibling; indistinguishable from S3 |
-| `s4-stalls` | S3 | stalls: 2 %, 0.1–0.6 s | **rejected**: seed-unstable |
+| `s3b-80-140ms` | S2 | same width, centre 110 ms | sibling; **removed from the registry 2026-11-11** |
+| `s3c-0-140ms` | S2 | whole band, centre 70 ms | sibling; **removed from the registry 2026-11-11** |
+| `s4-stalls` | S3 | stalls: 2 %, 0.1–0.6 s | **rejected**, seed-unstable; **removed 2026-11-11** |
 | `s4b-stalls` | S3 | stalls from a recorded clip: 10 %, 0.1–0.2 s | **adopted**; sets estimator requirement R9 |
 | `s5-noise` | S4b | per-acquisition noise ±10/10/15 mm, bias 0 | **adopted**: costs nothing inside the band |
 | `s6-release` | S5 | release anywhere 0–0.40 m, ±20 mm lateral | **adopted**; passes on three seeds |
-| `s7a-delayed-release` | S6 | fixed 0.40 m hold, 0–2 s delay | hold metric was broken; superseded by S7b |
+| `s7a-delayed-release` | S6 | fixed 0.40 m hold, 0–2 s delay | hold metric broken; superseded by S7b; **removed 2026-11-11** |
 | `s7b-variable-hold` | S6 | hold 0.10–0.40 m, 0–2 s delay | **adopted**; fixes the deployment band at 0–160 ms |
 | `s7c-long-hold` | S6 | hold with 0–6 s delay (mean 3.05 s) | adopted as the long-wait rung |
 | `s8-offset-hold` | S7c | one-time per-episode ball offset | **adopted**: alignment 25–30 mm |
@@ -70,7 +70,7 @@ Resume mechanics, which have cost time to rediscover:
 | `s9a2-drop-tail` (variant) | S9a | flatten the loss cost 4× → 1.2× | not adopted: the tail stops paying |
 | `s9b-sim-to-real` | S9a | the tracking family's full domain randomisation | **adopted** (second arm) |
 | `s9c-pose-quad` | S9b2 | `pose_quadratic`, std 0.05, weight −0.04 | **adopted**: posture 57 → 2–7 |
-| `s9d-dead-ball` | S9c | ball removed, ball rewards and endings removed | **aborted** before launch |
+| `s9d-dead-ball` | S9c | ball removed, ball rewards and endings removed | **aborted** before launch; **removed 2026-11-11** |
 | `s10-visible-ball` | S9c | visibility gate + 4-way ball-case mixture + 30 s budget | **adopted**: fall share 0.52–0.70 % |
 | `s11-tilted-start` | S10 | start 5° body / 15° ankle pitch off the carry pose | **adopted**: adaptation, not recovery |
 

@@ -536,19 +536,23 @@ task suffix                                 condition
 ``-Nominal-S1-15Hz``                        ball history at 15 Hz, 0-40 ms delay
 ``-Nominal-S2-80-100ms``                    15 Hz, 80-100 ms delay
 ``-Nominal-S3-40-140ms``                    15 Hz, 40-140 ms delay, redrawn per sample
-``-Nominal-S3b-80-140ms``                   15 Hz, 80-140 ms delay, redrawn per sample
-``-Nominal-S3c-0-140ms``                    15 Hz, 0-140 ms delay, redrawn per sample
-``-Nominal-S4-Stalls``                       S3's band plus the assumed stall model
 ``-Nominal-S4b-Stalls``                      S3's band plus the measured (clip) stall model
 ``-Nominal-S5-Noise``                        S4b plus +-(10, 10, 15) mm position noise
 ``-Nominal-S6-Release``                      S5 plus a release-position distribution
-``-Nominal-S7a-DelayedRelease``              S6's perception plus a 0-2 s held ball, then release
-``-Nominal-S7b-VariableHold``                S7a's hold with a 0.10-0.40 m release height
+``-Nominal-S7b-VariableHold``                S6 plus a 0.10-0.40 m hold and a 0-2 s release delay
 ``-Nominal-S7c-LongHold``                    S7b with the wait lengthened to a 0-6 s hold
 ``-Nominal-S8-OffsetHold``                   S7c with the ball placed up to 0.30 m off the plate
 ``-Nominal-S9a-DropTail``                    S8 with a lost ball priced instead of ending the episode
 ``-Nominal-S9b-SimToReal``                   S9a with the tracking family's full randomisation
 ==========================================  ==============================================
+
+Five rungs that once existed are **no longer registered**: ``S3b-80-140ms`` and
+``S3c-0-140ms`` (band-centre siblings of S3), ``S4-Stalls`` (the assumed stall model, rejected
+as seed-unstable), ``S7a-DelayedRelease`` (its hold metric was broken, replaced by S7b) and
+``S9d-DeadBall`` (aborted before launch). Their conditions and the reasons for rejecting them
+stay in ``docs/design/x2_tennis_stage_ladder.md``; the ladder now holds exactly the fourteen
+rungs that trained, and the measured-right-arm twins are generated from the same table, so
+those five left both families together.
 
 ``...-Ball3-Pelvis-Nominal-S1-15Hz`` is the first rung. It is the
 nominal pilot with the ball history arriving at

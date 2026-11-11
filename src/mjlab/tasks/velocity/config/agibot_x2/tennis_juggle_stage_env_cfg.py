@@ -48,7 +48,6 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   JUGGLE_ANKLE_PITCH_TILT_HALF_RANGE_RAD,
   JUGGLE_BALL_LOST_EVENT_WEIGHT,
   JUGGLE_BALL_LOST_PENALTY_WEIGHT,
-  JUGGLE_DEAD_BALL_DROP_RANGE_M,
   JUGGLE_HOLD_DELAY_S,
   JUGGLE_HOLD_HEIGHT_M,
   JUGGLE_HOLD_LATERAL_RANGE_M,
@@ -192,32 +191,18 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
   # run the same budget, so the pair isolates the effect of the band's CENTRE. The
   # deployed chain's mean is about 125 ms, so S3b brackets reality while S3 brackets
   # what a good estimator could deliver.
-  "s3b-80-140ms": {
-    "stream_rate_hz": (15.0, 15.0),
-    "stream_latency_s": (0.080, 0.140),
-  },
   # S3c is the third sibling: the whole band, 0-140 ms, mean 70 ms. Together with S3
   # (mean 90) and S3b (mean 110) it spans the band centres while keeping the width,
   # so the three curves say whether a wide band makes the policy track the age or
   # makes it settle on the band's mean. It also includes zero delay, where the S2
   # policy collapses to streaks of five flights, so it is the widest stress of the
   # three.
-  "s3c-0-140ms": {
-    "stream_rate_hz": (15.0, 15.0),
-    "stream_latency_s": (0.0, 0.140),
-  },
   # S4 changes the condition, not the delay: S3's band plus the measured stall model.
   # A stall is a longer gap before the next acquisition, so its only visible effect is
   # the growing age of the held sample: 10-30 control steps on top of 2-7 steps of
   # transport lag, up to about 0.74 s. S3 proved the policy reads the per-sample age,
   # so S4 asks the next question, whether it stays correct while the newest sample is
   # absent long enough that the ball must be extrapolated rather than observed.
-  "s4-stalls": {
-    "stream_rate_hz": (15.0, 15.0),
-    "stream_latency_s": (0.040, 0.140),
-    "stall_prob": 0.02,
-    "stall_range_s": (0.1, 0.6),
-  },
   # S4b is a sibling of S4 with the stall measured from a recorded hardware clip rather
   # than assumed: the ball leaves the camera field of view when it is raised high, for
   # about 0.1 s, on about 10 % of frames. The gap is therefore 5-10 control steps and it
@@ -297,25 +282,6 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
   # The hold height is fixed at 0.40 m, which is the energy target, so the release
   # energy equals `E*` and any change is attributable to waiting. Randomising the hold
   # height changes the drop energy as well and is a separate rung.
-  "s7a-delayed-release": {
-    "stream_rate_hz": (15.0, 15.0),
-    "stream_latency_s": (0.040, 0.140),
-    "stall_prob": 0.10,
-    "stall_range_s": (0.1, 0.2),
-    "position_noise_m": (0.010, 0.010, 0.015),
-    "bias_half_width_m": 0.0,
-    "reset": {
-      # S0 already releases every episode as a drop start (plate_start_fraction is 0),
-      # so only the height, the extra fall time and the lateral spread move.
-      "drop_height_range": (_hold_height(), _hold_height()),
-      "drop_lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
-    },
-    "hold": {
-      "hold_height_m": _hold_height(),
-      "hold_delay_s": _hold_delay(),
-      "lateral_range_m": JUGGLE_HOLD_LATERAL_RANGE_M,
-    },
-  },
   # S7b restores the randomisation S7a removed. S6 released the ball at rest from a
   # uniform 0.0-0.40 m; S7a replaced that with a fixed 0.40 m hold, so its difference
   # from S6 mixed the hold with the loss of the height range. S7b keeps S7a's hold and
@@ -467,21 +433,6 @@ STAGE_DELTAS: dict[str, dict[str, object]] = {
   # to stay upright and square while the ball lies on the floor instead of lunging at a
   # ball it cannot rescue. This is the posture rung the S9b2 screenshot asked for: it
   # must be followed by a re-juggle rung, because a dead ball gives no juggle gradient.
-  "s9d-dead-ball": {
-    "stream_rate_hz": (15.0, 15.0),
-    "stream_latency_s": (0.040, 0.140),
-    "stall_prob": 0.10,
-    "stall_range_s": (0.1, 0.2),
-    "position_noise_m": (0.010, 0.010, 0.015),
-    "bias_half_width_m": 0.0,
-    "reset": {
-      # Negative: the ball starts below the plate, where the racket cannot reach it.
-      "drop_height_range": JUGGLE_DEAD_BALL_DROP_RANGE_M,
-    },
-    "dead_ball": True,
-    "sim_to_real": True,
-    "pose_quad": True,
-  },
   # S10 - S9c with the ball stream gated on what the camera can see, plus the mixed
   # safety cases. The gate is the measurement condition; the mixture, the loss-charge
   # and termination changes and the 30 s budget are the safety condition. That makes S10

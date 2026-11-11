@@ -25,19 +25,11 @@ NO_CORRUPTION_TRAINING_TASKS = frozenset(
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S3-40-140ms",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
-    "-Ball3-Pelvis-Nominal-S3b-80-140ms",
-    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
-    "-Ball3-Pelvis-Nominal-S3c-0-140ms",
-    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
-    "-Ball3-Pelvis-Nominal-S4-Stalls",
-    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S4b-Stalls",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S5-Noise",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S6-Release",
-    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
-    "-Ball3-Pelvis-Nominal-S7a-DelayedRelease",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S7b-VariableHold",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
@@ -50,8 +42,6 @@ NO_CORRUPTION_TRAINING_TASKS = frozenset(
     "-Ball3-Pelvis-Nominal-S9b-SimToReal",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S9c-PoseQuad",
-    "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
-    "-Ball3-Pelvis-Nominal-S9d-DeadBall",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
     "-Ball3-Pelvis-Nominal-S10-VisibleBall",
     "Mjlab-Velocity-Flat-AgiBot-X2-No-State-Estimation-Tennis-Ball-Juggle-29DOF"
