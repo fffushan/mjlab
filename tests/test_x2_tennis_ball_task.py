@@ -100,10 +100,7 @@ from mjlab.asset_zoo.robots.agibot_x2.tennis_constants import (
   measure_bat_carry_state,
   mesh_sha256,
 )
-from mjlab.asset_zoo.robots.agibot_x2.x2_constants import (
-  actuator_group_index,
-  get_spec,
-)
+from mjlab.asset_zoo.robots.agibot_x2.x2_constants import get_spec
 from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.observation_manager import ObservationTermCfg
@@ -778,15 +775,26 @@ def test_sim_to_real_randomization_is_the_multi_motion_tracking_tasks() -> None:
 
 
 def test_wrist_effort_derating_runs_after_the_whole_robot_term() -> None:
-  """Both terms write the same actuator fields; only the last one takes effect."""
-  events = list(load_env_cfg(TASK_ID).events)
+  """Both terms write the same actuator fields; only the last one takes effect.
+
+  The target is checked by the group's own patterns, not by a position. A task that
+  splits the actuator groups (the measured right arm does) inserts entries before the
+  wrist group, so the shipped position then addresses another joint: asserting the number
+  would pin that defect instead of catching it.
+  """
+  cfg = load_env_cfg(TASK_ID)
+  events = list(cfg.events)
   assert events.index("randomize_effort_limits_wrist") > events.index(
     "randomize_effort_limits"
   )
-  wrist = load_env_cfg(TASK_ID).events["randomize_effort_limits_wrist"]
-  assert wrist.params["asset_cfg"].actuator_ids == [
-    actuator_group_index("wrist_pitch_roll")
-  ]
+  wrist = cfg.events["randomize_effort_limits_wrist"]
+  groups = cfg.scene.entities["robot"].articulation.actuators
+  ids = wrist.params["asset_cfg"].actuator_ids
+  assert len(ids) == 1
+  assert tuple(groups[ids[0]].target_names_expr) == (
+    ".*_wrist_pitch_joint",
+    ".*_wrist_roll_joint",
+  )
 
 
 def test_pd_gain_randomization_shares_one_scale_per_environment() -> None:

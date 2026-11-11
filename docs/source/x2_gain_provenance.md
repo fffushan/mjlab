@@ -477,10 +477,13 @@ automatically:
   token caches and every dataset have to be collected under it. An existing vendor-`kd`
   dataset cannot be reused.
 
-**Open defect in the tennis family, same cause.** The measured right-arm split
-(`right_arm_measured.apply_right_arm_measured_servo`) inserts four groups before the wrist
-one, so `randomize_effort_limits_wrist` in every `...-RightArmMeasured-S*` tennis task points
-at position 13, which is now `right_shoulder_yaw_joint`. `tests/test_x2_tennis_ball_task.py`
-asserts that stale index, so the suite locks the defect in. Not fixed here, because it would
-change the configuration of a trained family; the fix is the same three lines the tracking
-task uses.
+**The same defect was present in the tennis family, and is now fixed.** The measured
+right-arm split (`right_arm_measured.apply_right_arm_measured_servo`) inserts four groups
+before the wrist one, so every `...-RightArmMeasured-` tennis task had
+`randomize_effort_limits_wrist` pointing at `right_shoulder_yaw_joint`, and the test in
+`tests/test_x2_tennis_ball_task.py` asserted that stale index. The tracking task is
+constructed as `flat tracking cfg` then split, so it cannot resolve the position at creation
+time; the tennis task is constructed the other way round. Both are now covered:
+`apply_x2_tracking_robot_randomization` resolves the position from the articulation each
+config builds, and `measured_servo.retarget_wrist_effort_event` re-resolves it for a split
+applied afterwards. The test compares the group's target expressions, not a number.

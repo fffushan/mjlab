@@ -4,6 +4,21 @@ Upcoming version (not yet released)
 Changed
 ^^^^^^^
 
+- **Fixed: the wrist effort derating fired on a shoulder once the actuators split.**
+  ``randomize_effort_limits_wrist`` addressed the wrist group by position
+  (``actuator_group_index("wrist_pitch_roll")`` = 13), and ``SceneEntityCfg.actuator_ids``
+  indexes the config's group list. Both split families insert groups before the wrist
+  group, so the event derated the wrong joint and left the wrists undamped by that term:
+  ``right_shoulder_yaw`` in every ``...-RightArmMeasured-`` tennis task (the group moved to
+  17), ``left_shoulder_pitch`` in the measured-servo tracking task (moved to 22). Both
+  writer events use the same ``(0.95, 1.0)`` scale, so the affected joint was drawn twice
+  (mean 0.951) while the wrists were drawn once (mean 0.975). No gain, physics or reward
+  changed, and no earlier training result is invalid. Runs before 2026-11-11 (+08) on a
+  ``-RightArmMeasured-`` task therefore had the wrist derating applied to
+  ``right_shoulder_yaw``, and those runs do not reproduce bit-for-bit at the same seed,
+  because the fix restores the four-target draw. The index is now resolved from the
+  articulation each config builds (``actuator_group_index_by_patterns``), and the test that
+  pinned the stale position now compares the group's target expressions instead.
 - **Measured right-arm servo, and 23 tasks that use it.**
   Right-arm damping from the robot's step response with the racket held:
   ``shoulder_pitch`` 3.0 -> 4.74, ``shoulder_roll`` 3.0 -> 4.78, ``shoulder_yaw``

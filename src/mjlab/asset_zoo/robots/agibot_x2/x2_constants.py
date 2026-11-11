@@ -310,11 +310,49 @@ def actuator_group_index(key: str) -> int:
   Use this instead of a hard-coded position: the group layout changes whenever a
   joint's gains stop matching its neighbours, and ``SceneEntityCfg(actuator_ids=``
   ``...)`` needs the index, not the name.
+
+  This is the index in the *shipped* layout. A task that splits groups (measured
+  servo damping, the measured right arm) inserts entries and moves everything after
+  them, so on a split articulation resolve by
+  :func:`actuator_group_index_by_patterns` from the config you are about to build,
+  not from this constant.
   """
   keys = list(X2_ACTUATOR_GROUPS)
   if key not in X2_ACTUATOR_GROUPS:
     raise KeyError(f"unknown X2 actuator group {key!r}; known: {keys}")
   return keys.index(key)
+
+
+def actuator_group_index_by_patterns(
+  articulation: EntityArticulationInfoCfg, patterns: tuple[str, ...]
+) -> int:
+  """Index of the one group whose ``target_names_expr`` is exactly ``patterns``.
+
+  ``SceneEntityCfg.actuator_ids`` addresses the config's group list, so any split
+  moves the index of every group after it. Resolving by the group's own patterns
+  keeps a position-keyed parameter pointing at the group its name says.
+
+  Args:
+    articulation: The articulation of the config that will be built.
+    patterns: The group's target expressions, in its own order.
+
+  Returns:
+    The group's index in ``articulation.actuators``.
+
+  Raises:
+    ValueError: if no group has exactly those patterns, or more than one does.
+  """
+  wanted = tuple(patterns)
+  found = [
+    index
+    for index, group in enumerate(articulation.actuators)
+    if tuple(group.target_names_expr) == wanted
+  ]
+  if len(found) != 1:
+    raise ValueError(
+      f"{len(found)} actuator groups carry the targets {wanted}, expected exactly one"
+    )
+  return found[0]
 
 
 def get_x2_robot_cfg() -> EntityCfg:

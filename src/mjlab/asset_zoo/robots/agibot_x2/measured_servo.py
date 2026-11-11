@@ -107,6 +107,14 @@ from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.entity import EntityCfg
 
 from .right_arm_measured import RIGHT_ARM_MEASURED_SERVO
+from .x2_constants import actuator_group_index_by_patterns
+
+#: The wrist group's own target expressions. Both families keep the wrist damping at 2.0,
+#: so this group is never split and the patterns stay exact.
+WRIST_GROUP_PATTERNS: tuple[str, ...] = (
+  ".*_wrist_pitch_joint",
+  ".*_wrist_roll_joint",
+)
 
 #: The model's joint order, from ``get_spec().joints`` minus the free joint. Actuator
 #: groups resolve their regex targets in this order, so a split that follows it leaves
@@ -204,17 +212,34 @@ def group_index_of(robot_cfg: EntityCfg, patterns: tuple[str, ...]) -> int:
   articulation = robot_cfg.articulation
   if articulation is None:
     raise ValueError("the robot config has no articulation")
-  wanted = tuple(patterns)
-  found = [
-    index
-    for index, group in enumerate(articulation.actuators)
-    if tuple(group.target_names_expr) == wanted
-  ]
-  if len(found) != 1:
-    raise ValueError(
-      f"{len(found)} actuator groups carry the targets {wanted}, expected exactly one"
-    )
-  return found[0]
+  return actuator_group_index_by_patterns(articulation, patterns)
+
+
+def retarget_wrist_effort_event(cfg, robot_cfg) -> None:
+  """Re-resolve the wrist effort-derating event on ``cfg``, in place.
+
+  ``apply_x2_tracking_robot_randomization`` addresses the wrist group by position,
+  because ``SceneEntityCfg.actuator_ids`` indexes the config's group list. A split
+  inserts groups before the wrist one, so a stored position then points at whatever
+  group moved into it. The event would derate another joint's effort limit and leave
+  the wrists untouched, and the ordering assertion would still pass because it
+  compares names.
+
+  Call this on every config whose robot articulation was split after the domain
+  randomisation was installed. A split cannot change the wrist group's own patterns,
+  because the wrists keep ``kd`` 2.0 in both families, so their group is never split.
+
+  Args:
+    cfg: The environment config holding the event.
+    robot_cfg: The robot config, after any split.
+  """
+  from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+  event = cfg.events.get("randomize_effort_limits_wrist")
+  if event is None:
+    return
+  index = group_index_of(robot_cfg, WRIST_GROUP_PATTERNS)
+  event.params["asset_cfg"] = SceneEntityCfg("robot", actuator_ids=[index])
 
 
 def apply_measured_servo(
@@ -307,8 +332,10 @@ def apply_measured_servo(
 
 
 __all__ = [
+  "WRIST_GROUP_PATTERNS",
   "X2_JOINT_ORDER",
   "X2_MEASURED_SERVO_KD",
   "apply_measured_servo",
   "group_index_of",
+  "retarget_wrist_effort_event",
 ]
