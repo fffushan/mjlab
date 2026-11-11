@@ -106,6 +106,17 @@ family, or they will command an apex the ball cannot reach. Not implemented here
 | `s1a` | S1 | uniform 0.05–0.40 m | S1 | 6000 iterations |
 | `s2` | the shipped `s2-80-100ms`: 15 Hz, **80–100 ms** latency | uniform 0.05–0.40 m | S1a | 6000 iterations |
 | `s3` | the shipped `s3-40-140ms`: 15 Hz, **40–140 ms**, redrawn per acquisition | uniform 0.05–0.40 m | S2 | 6000 iterations |
+| `s1-fixed15` | `s1-15hz` | fixed 0.15 m | none, from scratch | 6000 iterations |
+| `s2-fixed15` | `s2-80-100ms` | fixed 0.15 m | `s1-fixed15` | 6000 iterations |
+| `s3-fixed15` | `s3-40-140ms` | fixed 0.15 m | `s2-fixed15` | 6000 iterations |
+| `s1-fixed30` | `s1-15hz` | fixed 0.30 m | none, from scratch | 6000 iterations |
+| `s2-fixed30` | `s2-80-100ms` | fixed 0.30 m | `s1-fixed30` | 6000 iterations |
+| `s3-fixed30` | `s3-40-140ms` | fixed 0.30 m | `s2-fixed30` | 6000 iterations |
+
+Only `s1-fixed15` and `s1-fixed30` have trained. Section 8.1 reports both gates, which
+failed. The S2 and S3 fixed rungs are defined in `STAGE_TARGET_HEIGHT_RANGE_M` and
+`STAGE_BASE_STAGE` but have not run, so their perception transfer to a fixed low target is
+unknown.
 
 The perception condition of each stage comes from the ladder's own stage table:
 `STAGE_BASE_STAGE` maps `s1` and `s1a` to `s1-15hz` and `s2` to `s2-80-100ms`, so the
@@ -195,6 +206,46 @@ unmeasured. Flight time and impact count show that the policy changes its timing
 commanded height; they do not show that the apex tracks the command bin by bin, and a
 policy that only reads the mean would look the same in these aggregate terms. The per-bounce
 apex recorder described in section 7 is still required before the slope can be reported.
+
+### 8.1 Fixed targets: two causes separated, and the low heights fail
+
+S1a draws its target, and two of its three seeds collapsed. Either the draw is the
+difficulty, or some heights are hard alone. The `s1-fixed15` and `s1-fixed30` stages pin one
+height and leave the draw behind, so they separate those two causes. The S1 rung of this
+family is already a fixed 0.40 m target, so it serves as the control at the top of the draw.
+
+All three ran 6000 iterations from scratch, 4096 envs, seed 7, the same perception condition
+(`s1-15hz`). The closed-loop gate ran 60 s in 16 envs. Apex, resets, bounces and heights are
+gate measurements; flight time and impacts are the last training window.
+
+| condition | gate | apex p50 | apex p90 | resets / min | bounces / min | flight time | impacts |
+|---|---|---:|---:|---:|---:|---:|---:|
+| fixed 0.40 (control), s7 / s17 | PASS | 0.3986 / 0.3949 | 0.4145 / 0.4111 | 16 | 1497 / 1456 | 0.5507 s | 35.0 |
+| fixed 0.30 | **FAIL** | 0.3008 | 0.3012 | **288** | 467 | 0.0192 s | 153.9 |
+| fixed 0.15 | **FAIL** | 0.1488 | 0.1504 | **320** | 315 | 0.0223 s | 183.6 |
+
+1. **At 0.40 m the family is exonerated.** The control matches the shipped ladder S1 to four
+digits: 1497 bounces per minute, 35.0 impacts, 0.55 s flight. Appending a `target_height`
+observation and reading it costs nothing at the top of the draw.
+2. **Both low targets start juggling and then collapse.** The early training windows show the
+control's own flight band, 0.18-0.23 s. By the last window it is 0.019 s. The policy settles
+into a cheaper solution: it pats the ball at the commanded height instead of lifting it. The
+ball then sits at the target, so every height metric reports success.
+3. **A dribble is not a low bounce rate.** The two collapsed arms bounce 315 and 467 times a
+minute. The control bounces 1497. A bounce-rate floor near 200 would accept a dribble, and
+`share_time_above_0p20_m` reaches 0.93 at the 0.30 m target. The separating measurement is
+the **flight time**, 0.019-0.022 s against 0.55 s, and the **impact count**, 154-184 against
+35.0. Apex p90 also separates them at fixed target: it is 0.0016 m above p50 when the policy
+dribbles, 0.016 m when the ball flies.
+4. **The draw is not the cause.** The failure reproduces at two fixed heights, and at 0.40 m
+the same code trains normally. The operative property is the height.
+5. **Both failures pass the apex rule.** `apex_p50` is at the commanded height in both cases,
+0.3008 and 0.1488. The gate rejected them on resets only, 288 and 320.
+
+What this does **not** establish: whether a low fixed target can be trained at all with a
+longer budget, a different seed, or a reward that rejects the dribble. Only seed 7 was run at
+each fixed height. The collapse onset is not measured per iteration, so the transition from
+juggling to dribble is bracketed by the training windows, not timed.
 
 ## 9. Out of scope
 
