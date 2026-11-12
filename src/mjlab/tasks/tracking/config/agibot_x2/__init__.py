@@ -7,6 +7,7 @@ from mjlab.tasks.tracking.rl import (
 from .env_cfgs import (
   agibot_x2_flat_tracking_correlated_dr_env_cfg,
   agibot_x2_flat_tracking_env_cfg,
+  agibot_x2_flat_tracking_increated_perturbations_measured_servo_env_cfg,
   agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg,
   agibot_x2_multi_motion_tracking_env_cfg,
   agibot_x2_multi_motion_tracking_measured_servo_env_cfg,
@@ -65,6 +66,25 @@ register_mjlab_task(
   ),
   rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
     experiment_name="agibot_x2_tracking_increated_perturbations_vendor_gains"
+  ),
+  runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+# The same single-clip task with the measured servo damping. This is the
+# ``base_task`` of the measured-servo distillation cohort: the collection
+# environment must carry the damping the teacher ONNX declares, or the adapter
+# refuses the cohort. Not a deployment gain; see the config docstring.
+register_mjlab_task(
+  task_id=(
+    "Mjlab-Tracking-Flat-AgiBot-X2-No-State-Estimation-Increated-Perturbations-"
+    "MeasuredServo"
+  ),
+  env_cfg=agibot_x2_flat_tracking_increated_perturbations_measured_servo_env_cfg(),
+  play_env_cfg=(
+    agibot_x2_flat_tracking_increated_perturbations_measured_servo_env_cfg(play=True)
+  ),
+  rl_cfg=agibot_x2_tracking_ppo_runner_cfg(
+    experiment_name="agibot_x2_tracking_increated_perturbations_measured_servo"
   ),
   runner_cls=MotionTrackingOnPolicyRunner,
 )

@@ -422,6 +422,36 @@ def agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
   return cfg
 
 
+def agibot_x2_flat_tracking_increated_perturbations_measured_servo_env_cfg(
+  play: bool = False,
+  anchor_body_name: str = "torso_link",
+) -> ManagerBasedRlEnvCfg:
+  """Single-clip tracking with the measured servo damping on every joint.
+
+  The single-motion counterpart of
+  :func:`agibot_x2_multi_motion_tracking_measured_servo_env_cfg`, and the
+  ``base_task`` that the measured-servo distillation cohort needs. Identical to
+  :func:`agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg`
+  except for the actuator damping, so a comparison against the vendor-gains task
+  isolates the damping and nothing else.
+
+  The split articulation moves the wrist effort event's group position, so the
+  event is re-resolved here, for the same reason as in the multi-motion variant.
+
+  This is a training-side model of the simulator's error, not a deployment gain.
+  Never export a policy from this task to the robot without an explicit per-joint
+  hardware gain override.
+  """
+  cfg = agibot_x2_flat_tracking_increated_perturbations_vendor_gains_env_cfg(
+    play=play,
+    anchor_body_name=anchor_body_name,
+  )
+  robot = cfg.scene.entities["robot"]
+  apply_measured_servo(robot)
+  retarget_wrist_effort_event(cfg, robot)
+  return cfg
+
+
 def agibot_x2_multi_motion_tracking_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
